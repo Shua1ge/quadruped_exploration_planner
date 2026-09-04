@@ -1,0 +1,17 @@
+# ROS
+build/
+devel/
+*.pyc
+__pycache__/
+
+# 日志
+*.log
+*.bag
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
