@@ -1453,6 +1453,10 @@ class FrontierExplorer(Node):
                 self.replacement_pending = True
                 self.replace_unsatisfied_observation()
         elif msg.data == "BLOCKED":
+            self.pending_path_publish_ns = 0
+            self.global_path_hold_active = False
+            self.global_path_hold_started_ns = 0
+            self.global_path_hold_reason = ""
             blocked_edge = self.pending_blocked_edge
             self.pending_blocked_edge = None
             if (blocked_edge is not None
@@ -1474,6 +1478,10 @@ class FrontierExplorer(Node):
             else:
                 self.publish_status("LOCAL_BLOCKED_WAITING_FOR_ROUTE")
         elif msg.data in ("REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
+            self.pending_path_publish_ns = 0
+            self.global_path_hold_active = False
+            self.global_path_hold_started_ns = 0
+            self.global_path_hold_reason = ""
             if self.active_goal is not None:
                 self.blacklist.append(self.active_goal)
             self.active_goal = None
@@ -1509,6 +1517,14 @@ class FrontierExplorer(Node):
 
     def exploration_timer(self):
         if not self.auto_start or self.position is None or self.map_update_count < 2:
+            return
+        if self.pending_path_publish_ns:
+            request_age = ((self.get_clock().now().nanoseconds
+                            - self.pending_path_publish_ns) * 1e-9)
+            self.get_logger().info(
+                f"[PATH_REQUEST_IN_FLIGHT] age={request_age:.2f}s; "
+                "waiting for SCAN before publishing another reference path",
+                throttle_duration_sec=2.0)
             return
         if self.active_goal is not None:
             if not self.validate_and_repair_active_path():

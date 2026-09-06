@@ -13,7 +13,11 @@ int main(int argc, char **argv)
   {
     scan_planner::SCANReplanFSM planner;
     planner.init(node.get());
-    rclcpp::executors::SingleThreadedExecutor executor;
+    // Planning, mapping and trajectory safety use separate callback groups.
+    // Three executor threads keep map fusion and the 20 Hz safety watchdog
+    // responsive while rebound optimization is running on its map snapshot.
+    rclcpp::executors::MultiThreadedExecutor executor(
+        rclcpp::ExecutorOptions(), 3);
     executor.add_node(node);
     executor.spin();
   }

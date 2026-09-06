@@ -1,6 +1,7 @@
 #include "plan_env/grid_map.h"
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
@@ -15,7 +16,76 @@ void load_parameter(rclcpp::Node *node, const std::string &name, T &value, const
 }
 }  // namespace
 
-void GridMap::initMap(rclcpp::Node *node)
+thread_local const GridMap* GridMap::tls_snapshot_owner_ = nullptr;
+thread_local GridMap::InflatedOccupancySnapshotPtr GridMap::tls_snapshot_ = nullptr;
+
+int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
+    const Eigen::Vector3d& pos, double yaw) const
+{
+  auto query = [this](const Eigen::Vector3d& point) {
+    Eigen::Vector3i id;
+    for (int dim = 0; dim < 3; ++dim)
+      id(dim) = static_cast<int>(std::floor(point(dim) * resolution_inv));
+    if ((id.array() < bound_min.array()).any() ||
+        (id.array() > bound_max.array()).any())
+      return -1;
+
+    Eigen::Vector3i local;
+    for (int dim = 0; dim < 3; ++dim)
+    {
+      local(dim) = id(dim) % voxel_num(dim);
+      if (local(dim) < 0)
+        local(dim) += voxel_num(dim);
+    }
+    const int address = local(0) * voxel_num(1) * voxel_num(2) +
+                        local(1) * voxel_num(2) + local(2);
+    return static_cast<int>(buffer[address]);
+  };
+
+  const Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
+  const int front = query(pos + body_offset * heading);
+  return front != 0 ? front : query(pos - body_offset * heading);
+}
+
+GridMap::InflatedOccupancySnapshotPtr GridMap::captureInflatedOccupancySnapshot() const
+{
+  std::shared_lock<std::shared_mutex> lock(map_mutex_);
+  auto snapshot = std::make_shared<InflatedOccupancySnapshot>();
+  snapshot->buffer = md_.occupancy_buffer_inflate_;
+  snapshot->voxel_num = mp_.map_voxel_num_;
+  snapshot->bound_min = mp_.map_bound_min_idx_;
+  snapshot->bound_max = mp_.map_bound_max_idx_;
+  snapshot->resolution_inv = mp_.resolution_inv_;
+  snapshot->body_offset = mp_.double_cylinder_offset_;
+  snapshot->revision = map_revision_.load();
+  return snapshot;
+}
+
+void GridMap::useInflatedOccupancySnapshotForCurrentThread(
+    InflatedOccupancySnapshotPtr snapshot) const
+{
+  tls_snapshot_owner_ = this;
+  tls_snapshot_ = std::move(snapshot);
+}
+
+void GridMap::clearInflatedOccupancySnapshotForCurrentThread() const
+{
+  if (tls_snapshot_owner_ == this)
+  {
+    tls_snapshot_.reset();
+    tls_snapshot_owner_ = nullptr;
+  }
+}
+
+double GridMap::getMapAgeSeconds() const
+{
+  const int64_t update_ns = last_map_update_ns_.load();
+  if (!node_ || update_ns <= 0)
+    return std::numeric_limits<double>::infinity();
+  return std::max(0.0, (node_->now().nanoseconds() - update_ns) * 1e-9);
+}
+
+void GridMap::initMap(rclcpp::Node *node, rclcpp::CallbackGroup::SharedPtr callback_group)
 {
   node_ = node;
 
@@ -148,22 +218,29 @@ void GridMap::initMap(rclcpp::Node *node)
   }
   else if (mp_.sensor_type_ == "lidar")
   {
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = callback_group;
     lidar_pose_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
         "sensor_pose", rclcpp::SensorDataQoS(),
-        std::bind(&GridMap::sensorPoseCallback, this, std::placeholders::_1));
+        std::bind(&GridMap::sensorPoseCallback, this, std::placeholders::_1), options);
     cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
         "cloud", rclcpp::SensorDataQoS(),
-        std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
+        std::bind(&GridMap::cloudCallback, this, std::placeholders::_1), options);
   }
 
+  rclcpp::SubscriptionOptions body_pose_options;
+  body_pose_options.callback_group = callback_group;
   sliding_map_frame_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
       "body_pose", rclcpp::SensorDataQoS(),
-      std::bind(&GridMap::slidingMapFrameCallback, this, std::placeholders::_1));
+      std::bind(&GridMap::slidingMapFrameCallback, this, std::placeholders::_1),
+      body_pose_options);
 
   occ_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
-                                        std::bind(&GridMap::updateOccupancyCallback, this));
+                                        std::bind(&GridMap::updateOccupancyCallback, this),
+                                        callback_group);
   vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
-                                        std::bind(&GridMap::visCallback, this));
+                                        std::bind(&GridMap::visCallback, this),
+                                        callback_group);
 
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", rclcpp::SensorDataQoS());
   map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", rclcpp::SensorDataQoS());
@@ -732,6 +809,7 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::visCallback()
 {
+  std::shared_lock<std::shared_mutex> lock(map_mutex_);
 
   publishMap();
   publishMapInflate(true);
@@ -742,6 +820,7 @@ void GridMap::visCallback()
 
 void GridMap::updateOccupancyCallback()
 {
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
   if (!md_.occ_need_update_)
     return;
 
@@ -753,6 +832,8 @@ void GridMap::updateOccupancyCallback()
     projectDepthImage();
   // t2 = ros::Time::now();
   raycastProcess();
+  map_revision_.fetch_add(1);
+  last_map_update_ns_.store(node_->now().nanoseconds());
   // t3 = ros::Time::now();
 
   // t4 = ros::Time::now();
@@ -774,6 +855,7 @@ void GridMap::updateOccupancyCallback()
 void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &img,
                                 const nav_msgs::msg::Odometry::ConstSharedPtr &pose)
 {
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
   if (mp_.sensor_type_ != "depth")
     return;
 
@@ -836,6 +918,7 @@ void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &i
 
 void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose_msg)
 {
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
   if (mp_.sensor_type_ != "lidar")
     return;
 
@@ -865,12 +948,14 @@ void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &
 
 void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose)
 {
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
   const geometry_msgs::msg::Point &pos = pose->pose.pose.position;
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
 }
 
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
   if (mp_.sensor_type_ != "lidar")
     return;
 

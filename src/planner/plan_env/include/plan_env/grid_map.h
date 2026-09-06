@@ -12,6 +12,9 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
+#include <atomic>
+#include <memory>
+#include <shared_mutex>
 #include <rmw/qos_profiles.h>
 #include <tuple>
 #include <sensor_msgs/msg/image.hpp>
@@ -177,7 +180,27 @@ public:
   inline bool isKnownFree(const Eigen::Vector3i& id);
   inline bool isKnownOccupied(const Eigen::Vector3i& id);
 
-  void initMap(rclcpp::Node* node);
+  struct InflatedOccupancySnapshot {
+    std::vector<char> buffer;
+    Eigen::Vector3i voxel_num{Eigen::Vector3i::Zero()};
+    Eigen::Vector3i bound_min{Eigen::Vector3i::Zero()};
+    Eigen::Vector3i bound_max{Eigen::Vector3i::Zero()};
+    double resolution_inv{1.0};
+    double body_offset{0.0};
+    uint64_t revision{0};
+
+    int getInflateOccupancy(const Eigen::Vector3d& pos, double yaw) const;
+  };
+  using InflatedOccupancySnapshotPtr = std::shared_ptr<const InflatedOccupancySnapshot>;
+
+  void initMap(rclcpp::Node* node,
+               rclcpp::CallbackGroup::SharedPtr callback_group = nullptr);
+  InflatedOccupancySnapshotPtr captureInflatedOccupancySnapshot() const;
+  void useInflatedOccupancySnapshotForCurrentThread(
+      InflatedOccupancySnapshotPtr snapshot) const;
+  void clearInflatedOccupancySnapshotForCurrentThread() const;
+  uint64_t getMapRevision() const { return map_revision_.load(); }
+  double getMapAgeSeconds() const;
 
   void publishMap();
   void publishMapInflate(bool all_info = false);
@@ -202,6 +225,11 @@ public:
 private:
   MappingParameters mp_;
   MappingData md_;
+  mutable std::shared_mutex map_mutex_;
+  std::atomic<uint64_t> map_revision_{0};
+  std::atomic<int64_t> last_map_update_ns_{0};
+  static thread_local const GridMap* tls_snapshot_owner_;
+  static thread_local InflatedOccupancySnapshotPtr tls_snapshot_;
 
   // get depth image and sensor pose
   void depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img,
@@ -369,6 +397,10 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
 }
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
+  if (tls_snapshot_owner_ == this && tls_snapshot_)
+    return tls_snapshot_->getInflateOccupancy(pos, yaw);
+
+  std::shared_lock<std::shared_mutex> lock(map_mutex_);
   Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
   Eigen::Vector3d front = pos + mp_.double_cylinder_offset_ * heading;
   Eigen::Vector3d rear = pos - mp_.double_cylinder_offset_ * heading;

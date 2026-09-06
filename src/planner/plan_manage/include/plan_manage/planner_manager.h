@@ -34,7 +34,9 @@ namespace scan_planner
     bool planGlobalTrajWaypoints(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                                  const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
 
-    void initPlanModules(rclcpp::Node *node, PlanningVisualization::Ptr vis = nullptr);
+    void initPlanModules(
+        rclcpp::Node *node, PlanningVisualization::Ptr vis = nullptr,
+        rclcpp::CallbackGroup::SharedPtr map_callback_group = nullptr);
 
     PlanParameters pp_;
     LocalTrajData local_data_;
