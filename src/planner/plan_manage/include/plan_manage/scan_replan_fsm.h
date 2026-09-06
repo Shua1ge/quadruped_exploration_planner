@@ -9,6 +9,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <vector>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -17,6 +18,7 @@
 #include <scan_planner_msgs/msg/bspline.hpp>
 #include <scan_planner_msgs/msg/data_disp.hpp>
 #include <plan_manage/planner_manager.h>
+#include <plan_manage/replan_fsm_utils.h>
 #include <traj_utils/planning_visualization.h>
 
 using std::vector;
@@ -56,7 +58,9 @@ namespace scan_planner
     std::vector<Eigen::Vector3d> preset_waypoints_;
     int waypoint_num_;
     double planning_horizon_;
+    double reference_path_lookahead_;
     double emergency_time_;
+    double goal_tolerance_;
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
@@ -72,7 +76,7 @@ namespace scan_planner
     FSM_EXEC_STATE exec_state_;
     int continuously_called_times_{0};
     int replan_fail_count_{0};
-    int max_replan_fail_count_{1000};
+    int max_replan_fail_count_{5};
     rclcpp::Time last_freeze_update_time_;
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
@@ -82,9 +86,19 @@ namespace scan_planner
     Eigen::Vector3d end_pt_, end_vel_;                                       // goal state
     Eigen::Vector3d local_target_pt_, local_target_vel_;                     // local target state
     std::vector<Eigen::Vector3d> active_waypoints_;
+    std::vector<Eigen::Vector3d> reference_path_;
+    size_t reference_progress_idx_{0};
+    double reference_progress_ratio_{0.0};
+    bool reference_path_active_{false};
+    bool reference_path_update_pending_{false};
     int current_wp_;
 
     bool flag_escape_emergency_;
+    bool emergency_path_pending_{false};
+    bool tracking_recovery_active_{false};
+    bool collision_segment_pending_{false};
+    Eigen::Vector3d last_collision_free_pos_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d first_collision_pos_{Eigen::Vector3d::Zero()};
 
     /* ROS utils */
     rclcpp::Node *node_{nullptr};
@@ -96,12 +110,16 @@ namespace scan_planner
     rclcpp::Publisher<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_pub_;
     rclcpp::Publisher<scan_planner_msgs::msg::DataDisp>::SharedPtr data_disp_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr self_inflation_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr blocked_segment_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
     void setStartStateFromOdomOrCurrentTraj();
+    void alignStartStateToReferencePath();
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
     void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
@@ -114,11 +132,15 @@ namespace scan_planner
     bool isWaypointSequenceMode() const;
     bool adjustGlobalTargetIfOccupied();
     void getLocalTarget();
+    void getReferencePathLocalTarget();
     void finishProcess();
     void publishSelfInflationMarker();
     double getOdomYaw() const;
     double estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
     void updateLocalTrajTimeFreeze();
+    void requestExecutionStop(const std::string &reason);
+    void publishStatus(const std::string &status);
+    void publishBlockedSegment();
 
     /* ROS functions */
     void execFSMCallback();

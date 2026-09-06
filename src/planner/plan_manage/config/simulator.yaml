@@ -55,8 +55,10 @@ pcl_render_node:
     dynamic.object_count: 0
     dynamic.mode: 0
     dynamic.velocity: 0.0
-    collision_check.enable: 0
-    collision_check.range: 0.3
+    collision_check.enable: 1
+    # Truth-contact monitor only; match SCAN's GO2 double-circle footprint.
+    collision_check.range: 0.35
+    collision_check.body_offset: 0.18
     use_global_map_topic: true
     pcd_map_file: ''
 

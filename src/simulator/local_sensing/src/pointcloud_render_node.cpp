@@ -10,6 +10,7 @@
 #include <pcl/io/pcd_io.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <Eigen/Dense>
 #include <iostream>
 #include <pcl/search/impl/kdtree.hpp>
@@ -77,6 +78,7 @@ rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud, pub_inter
 rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pinhole_depth_pub_;
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr camera_pose_pub_, lidar_pose_pub_;
 rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr comp_time_pub;
+rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr collision_pub;
 
 sensor_msgs::msg::PointCloud2 local_map_pcl;
 sensor_msgs::msg::PointCloud2 local_depth_pcl;
@@ -823,17 +825,24 @@ void rcvOdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr message)
     searchPoint.x = odom.pose.pose.position.x;
     searchPoint.y = odom.pose.pose.position.y;
     searchPoint.z = odom.pose.pose.position.z;
+    bool collision = false;
     if (_kdtreeLocalMap.radiusSearch(searchPoint, collision_range, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0)
     {
+      collision = true;
       RCLCPP_ERROR(ros_node->get_logger(), "Environment collision detected");
     }
     if (dynobj_enable && has_dyn_map)
     {
       if (kdtree_dyn.radiusSearch(searchPoint, collision_range, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0)
       {
+        collision = true;
         RCLCPP_ERROR(ros_node->get_logger(), "Dynamic-object collision detected");
       }
     }
+
+    std_msgs::msg::Bool collision_msg;
+    collision_msg.data = collision;
+    collision_pub->publish(collision_msg);
 
     double collision_check_time =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - collision_start).count();
@@ -2064,6 +2073,7 @@ int main(int argc, char **argv)
   use_uav_extra_model = ros_node->declare_parameter<int>("use_uav_extra_model", 0);
   collisioncheck_enable = ros_node->declare_parameter<int>("collision_check.enable", 0);
   collision_range = ros_node->declare_parameter<double>("collision_check.range", 0.3);
+  collision_pub = ros_node->create_publisher<std_msgs::msg::Bool>("simulation/collision", 10);
   output_pcd = ros_node->declare_parameter<int>("output_pcd", 0);
 
   // subscribe other uav pos
@@ -2171,6 +2181,25 @@ int main(int argc, char **argv)
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(ros_node);
   executor.spin();
-  rclcpp::shutdown();
+
+  executor.remove_node(ros_node);
+  local_sensing_timer.reset();
+  dynobj_timer.reset();
+  other_odom_subs.clear();
+  odom_sub.reset();
+  global_map_sub.reset();
+  pub_cloud.reset();
+  pub_intercloud.reset();
+  pub_dyncloud.reset();
+  pub_uavcloud.reset();
+  pinhole_depth_pub_.reset();
+  camera_pose_pub_.reset();
+  lidar_pose_pub_.reset();
+  comp_time_pub.reset();
+  collision_pub.reset();
+  tf_broadcaster.reset();
+  ros_node.reset();
+  if (rclcpp::ok())
+    rclcpp::shutdown();
   return 0;
 }

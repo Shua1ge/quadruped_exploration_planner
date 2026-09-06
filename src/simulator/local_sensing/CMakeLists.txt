@@ -20,6 +20,7 @@ find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 set(renderer_sources
@@ -27,7 +28,7 @@ set(renderer_sources
   include/FOV_Checker/FOV_Checker.cpp)
 set(renderer_dependencies
   ament_index_cpp cv_bridge geometry_msgs nav_msgs pcl_conversions rclcpp
-  sensor_msgs tf2_ros)
+  sensor_msgs std_msgs tf2_ros)
 
 add_executable(pcl_render_node src/pointcloud_render_node.cpp ${renderer_sources})
 target_include_directories(pcl_render_node PRIVATE

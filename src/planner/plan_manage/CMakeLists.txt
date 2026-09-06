@@ -51,13 +51,25 @@ install(TARGETS
   go2_kinematic_sim go2_gait_publisher
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
-install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME} OPTIONAL)
+install(DIRECTORY launch config maps DESTINATION share/${PROJECT_NAME} OPTIONAL)
 install(FILES launch/default.rviz DESTINATION share/${PROJECT_NAME}/rviz OPTIONAL)
-install(PROGRAMS scripts/keypoint_recorder.py
+install(PROGRAMS
+  scripts/keypoint_recorder.py
+  scripts/global_astar_planner.py
+  scripts/frontier_explorer.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 
 if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_pytest_test(test_global_astar test/test_global_astar.py)
+  ament_add_pytest_test(test_frontier_explorer test/test_frontier_explorer.py)
+  ament_add_gtest(test_replan_fsm_utils test/test_replan_fsm_utils.cpp)
+  if(TARGET test_replan_fsm_utils)
+    target_include_directories(test_replan_fsm_utils PRIVATE include)
+    target_link_libraries(test_replan_fsm_utils Eigen3::Eigen)
+  endif()
   add_launch_test(test/test_planner_startup.py TIMEOUT 30)
   add_launch_test(test/test_waypoint_parameters.py TIMEOUT 30)
 endif()

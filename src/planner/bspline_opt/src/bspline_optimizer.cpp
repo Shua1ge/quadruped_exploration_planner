@@ -977,6 +977,16 @@ namespace scan_planner
     bool flag_force_return, flag_occ, success;
     new_lambda2_ = lambda2_;
     constexpr int MAX_RESART_NUMS_SET = 3;
+    // Re-running projected A* against the same collision segment and map does
+    // not create a new route.  Keep a small local-repair budget, then return
+    // failure so the FSM can publish BLOCKED and let the global planner change
+    // the route topology.
+    // planFromCurrentTraj() may call this optimizer once with the normal
+    // initialization and once with a random initialization.  One rebound and
+    // 250 ms per call therefore bounds one collision recovery to roughly two
+    // projected-A* attempts and 500 ms in total.
+    constexpr int MAX_REBOUND_TIMES_SET = 1;
+    constexpr double MAX_REBOUND_TIME_MS = 250.0;
     do
     {
       /* ---------- prepare ---------- */
@@ -1015,7 +1025,11 @@ namespace scan_planner
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        for (double t = tm; t < tmp * 2 / 3; t += t_step) // Only check the closest 2/3 partition of the whole trajectory.
+        // Validate the complete optimized trajectory.  The original upstream
+        // code checked only the first two thirds and relied on a later replan;
+        // a ground robot can reach an unchecked obstacle before that replan
+        // succeeds.
+        for (double t = tm; t <= tmp; t += t_step)
         {
           Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
           Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
@@ -1066,8 +1080,17 @@ namespace scan_planner
         // while (ros::ok());
       }
 
+      if (total_time_ms >= MAX_REBOUND_TIME_MS && !success)
+      {
+        RCLCPP_WARN(rclcpp::get_logger("bspline_opt"),
+                    "Local rebound budget exhausted after %.1fms (%d A-star rebounds); "
+                    "returning BLOCKED to the global planner",
+                    total_time_ms, rebound_times);
+        break;
+      }
     } while ((flag_occ && restart_nums < MAX_RESART_NUMS_SET) ||
-             (flag_force_return && force_stop_type_ == STOP_FOR_REBOUND && rebound_times <= 20));
+             (flag_force_return && force_stop_type_ == STOP_FOR_REBOUND &&
+              rebound_times < MAX_REBOUND_TIMES_SET));
 
     return success;
   }

@@ -39,6 +39,12 @@ public:
         std::bind(&ClosedLoopController::odomCallback, this, std::placeholders::_1));
     cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 20);
     execution_frozen_pub_ = create_publisher<std_msgs::msg::Bool>("planning/go2_execution_frozen", 10);
+    emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
+        "planning/emergency_stop", 10,
+        std::bind(&ClosedLoopController::emergencyStopCallback, this, std::placeholders::_1));
+    simulation_collision_sub_ = create_subscription<std_msgs::msg::Bool>(
+        "simulation/collision", 10,
+        std::bind(&ClosedLoopController::simulationCollisionCallback, this, std::placeholders::_1));
     cmd_timer_ = create_wall_timer(std::chrono::milliseconds(10),
                                    std::bind(&ClosedLoopController::cmdCallback, this));
     last_update_time_ = now();
@@ -106,8 +112,28 @@ private:
     exec_time_ = 0.0;
     last_update_time_ = now();
     receive_traj_ = true;
+    // A planner-requested stop may be cleared by a replacement trajectory, but a
+    // physical simulation collision stays latched for the lifetime of this run.
+    emergency_stop_ = simulation_collision_latched_;
     RCLCPP_INFO(get_logger(), "Received trajectory %lld, duration %.3fs",
                 static_cast<long long>(traj_id_), traj_duration_);
+  }
+
+  void emergencyStopCallback(const std_msgs::msg::Bool::ConstSharedPtr msg)
+  {
+    if (msg->data)
+      emergency_stop_ = true;
+  }
+
+  void simulationCollisionCallback(const std_msgs::msg::Bool::ConstSharedPtr msg)
+  {
+    if (msg->data)
+    {
+      simulation_collision_latched_ = true;
+      emergency_stop_ = true;
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                            "Simulation collision guard stopped the robot");
+    }
   }
 
   void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
@@ -119,6 +145,13 @@ private:
 
   void cmdCallback()
   {
+    if (emergency_stop_)
+    {
+      publishExecutionFrozen(true);
+      publishStop();
+      return;
+    }
+
     if (!receive_traj_ || !have_odom_)
     {
       publishExecutionFrozen(false);
@@ -164,9 +197,13 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr execution_frozen_pub_;
   rclcpp::Subscription<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr simulation_collision_sub_;
   rclcpp::TimerBase::SharedPtr cmd_timer_;
   bool receive_traj_{false};
   bool have_odom_{false};
+  bool emergency_stop_{false};
+  bool simulation_collision_latched_{false};
   std::vector<UniformBspline> traj_;
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};

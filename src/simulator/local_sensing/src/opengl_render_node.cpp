@@ -1,6 +1,7 @@
 #include "opengl_sim.hpp"
 #include <cv_bridge/cv_bridge.h>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <chrono>
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <string>
@@ -46,6 +48,7 @@ rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud, pub_inter
 rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pinhole_depth_pub_;
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr camera_pose_pub_, lidar_pose_pub_;
 rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr comp_time_pub;
+rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr collision_pub;
 sensor_msgs::msg::PointCloud2 local_map_pcl;
 sensor_msgs::msg::PointCloud2 local_depth_pcl;
 rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
@@ -78,7 +81,8 @@ int use_avia_pattern, use_vlp32_pattern, use_minicf_pattern, use_os128_pattern, 
 use_gaussian_filter;
 double livox_linestep;
 double sensing_horizon, sensing_rate, estimation_rate, polar_resolution, yaw_fov, vertical_fov,
-min_raylength, downsample_res, curvature_limit, hash_cubesize, collision_range;
+min_raylength, downsample_res, curvature_limit, hash_cubesize, collision_range,
+collision_body_offset;
 double x_size, y_size, z_size;
 double gl_xl, gl_yl, gl_zl;
 double resolution, inv_resolution;
@@ -563,8 +567,12 @@ void dynobjGenerate() {
 }
 
 void rcvOdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr message) {
-  /*if(!has_global_map)
-    return;*/
+  // When the simulator supplies the map through a ROS topic, odometry can arrive
+  // before the transient-local map callback.  The renderer and collision k-d tree
+  // are not valid until that first map has been received.
+  if (!has_global_map) {
+    return;
+  }
   has_odom = true;
   odom_ = *message;
   const auto &odom = *message;
@@ -591,65 +599,50 @@ void rcvOdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr message) 
 
   if (collisioncheck_enable) {
     collision_points.points.clear();
-    PointType searchPoint;
-    searchPoint.x = odom.pose.pose.position.x;
-    searchPoint.y = odom.pose.pose.position.y;
-    searchPoint.z = odom.pose.pose.position.z;
-    if (_kdtreeLocalMap.radiusSearch(searchPoint, collision_range, pointIdxRadiusSearch,
-                                     pointRadiusSquaredDistance) > 0) {
-      if (use_uav_extra_model) {
-        // check if the neighbor points are in the uav model
-        bool collision = false;
-        for (int i = 0; i < pointIdxRadiusSearch.size(); i++) {
-          int index = pointIdxRadiusSearch[i];
-          PointType p = cloud_all_map.points[index];
+    bool collision = false;
+    const Eigen::Vector3f center = body2world.block<3, 1>(0, 3);
+    const Eigen::Vector3f heading = body2world.block<3, 1>(0, 0).normalized();
+    const std::array<Eigen::Vector3f, 2> body_centers = {
+      center + static_cast<float>(collision_body_offset) * heading,
+      center - static_cast<float>(collision_body_offset) * heading};
 
-          // transform the point to the uav model coordinate
-          Eigen::Vector3f p_eigen(p.x, p.y, p.z);
-          p_eigen =
-          body2world.block<3, 3>(0, 0).transpose() * (p_eigen - body2world.block<3, 1>(0, 3));
-
-          int hash_x = (p_eigen(0) - uav_modelmin.x) / downsample_res;
-          int hash_y = (p_eigen(1) - uav_modelmin.y) / downsample_res;
-          int hash_z = (p_eigen(2) - uav_modelmin.z) / downsample_res;
-          int hash_index = hash_x + hash_y * uavhash_xsize + hash_z * uavhash_xsize * uavhash_ysize;
-          if (uavpoint_hashmap.find(hash_index) != uavpoint_hashmap.end()) {
-            collision = true;
-            RCLCPP_ERROR(ros_node->get_logger(), "ENVIRONMENT COLLISION DETECTED!!!");
-            // break;
-            collision_points.points.push_back(p);
-          }
-        }
-      } else {
-        RCLCPP_ERROR(ros_node->get_logger(), "ENVIRONMENT COLLISION DETECTED!!!");
+    for (const auto &body_center : body_centers) {
+      PointType searchPoint;
+      searchPoint.x = body_center.x();
+      searchPoint.y = body_center.y();
+      searchPoint.z = body_center.z();
+      if (_kdtreeLocalMap.radiusSearch(searchPoint, collision_range,
+                                       pointIdxRadiusSearch,
+                                       pointRadiusSquaredDistance) > 0) {
+        collision = true;
+        for (const int index : pointIdxRadiusSearch)
+          collision_points.points.push_back(cloud_all_map.points[index]);
       }
+    }
+    if (collision) {
+      RCLCPP_ERROR_THROTTLE(
+          ros_node->get_logger(), *ros_node->get_clock(), 1000,
+          "Environment collision detected by GO2 double-circle footprint");
     }
     if (dynobj_enable || drone_num > 1) {
-      if (kdtree_dyn.radiusSearch(searchPoint, collision_range, pointIdxRadiusSearch,
-                                  pointRadiusSquaredDistance) > 0) {
-        if (use_uav_extra_model) {
-          // check if the neighbor points are in the uav model
-          bool collision = false;
-          for (int i = 0; i < pointIdxRadiusSearch.size(); i++) {
-            int index = pointIdxRadiusSearch[i];
-            PointType p = cloud_all_map.points[index];
-            int hash_x = (p.x - uav_modelmin.x) / downsample_res;
-            int hash_y = (p.y - uav_modelmin.y) / downsample_res;
-            int hash_z = (p.z - uav_modelmin.z) / downsample_res;
-            int hash_index =
-            hash_x + hash_y * uavhash_xsize + hash_z * uavhash_xsize * uavhash_ysize;
-            if (uavpoint_hashmap.find(hash_index) != uavpoint_hashmap.end()) {
-              collision = true;
-              RCLCPP_ERROR(ros_node->get_logger(), "DYNAMIC OBSTACLES COLLISION DETECTED!!!");
-              // break;
-              collision_points.points.push_back(p);
-            }
-          }
-        } else {
-          RCLCPP_ERROR(ros_node->get_logger(), "DYNAMIC OBSTACLES COLLISION DETECTED!!!");
+      for (const auto &body_center : body_centers) {
+        PointType searchPoint;
+        searchPoint.x = body_center.x();
+        searchPoint.y = body_center.y();
+        searchPoint.z = body_center.z();
+        if (kdtree_dyn.radiusSearch(searchPoint, collision_range,
+                                    pointIdxRadiusSearch,
+                                    pointRadiusSquaredDistance) > 0) {
+          collision = true;
+          RCLCPP_ERROR_THROTTLE(
+              ros_node->get_logger(), *ros_node->get_clock(), 1000,
+              "Dynamic-obstacle collision detected by GO2 double-circle footprint");
         }
       }
     }
+    std_msgs::msg::Bool collision_msg;
+    collision_msg.data = collision;
+    collision_pub->publish(collision_msg);
   }
 
   // publish collision points
@@ -989,6 +982,8 @@ int main(int argc, char **argv) {
   use_uav_extra_model = ros_node->declare_parameter<int>("use_uav_extra_model", 0);
   collisioncheck_enable = ros_node->declare_parameter<int>("collision_check.enable", 0);
   collision_range = ros_node->declare_parameter<double>("collision_check.range", 0.3);
+  collision_body_offset = ros_node->declare_parameter<double>("collision_check.body_offset", 0.0);
+  collision_pub = ros_node->create_publisher<std_msgs::msg::Bool>("simulation/collision", 10);
   output_pcd = ros_node->declare_parameter<int>("output_pcd", 0);
   use_global_map_topic = ros_node->declare_parameter<bool>("use_global_map_topic", false);
   file_name = ros_node->declare_parameter<std::string>("pcd_map_file", "");
@@ -1083,19 +1078,23 @@ int main(int argc, char **argv) {
   // /home/dji/meshmap/Knowles_local_sor_001.pcd
 
   if (collisioncheck_enable) {
-    if (cloud_all_map.empty()) {
+    if (!use_global_map_topic && cloud_all_map.empty()) {
       if (file_name.empty() || !loadPinholeMapFromFile(file_name)) {
         cout << "can't read global" << endl;
         return 0;
       }
     }
 
-    if (cloud_all_map.empty()) {
+    if (!use_global_map_topic && cloud_all_map.empty()) {
       RCLCPP_ERROR(ros_node->get_logger(), "Global map is empty.");
       return 0;
     }
 
-    RCLCPP_INFO(ros_node->get_logger(), "Global map and kdtree ready.");
+    if (use_global_map_topic) {
+      RCLCPP_INFO(ros_node->get_logger(), "Waiting for global map topic before rendering.");
+    } else {
+      RCLCPP_INFO(ros_node->get_logger(), "Global map and kdtree ready.");
+    }
 
     if (use_uav_extra_model) {
       // get max and min xyz of uav model

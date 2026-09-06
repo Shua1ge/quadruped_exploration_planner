@@ -1,6 +1,7 @@
 
 #include <plan_manage/scan_replan_fsm.h>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace
@@ -29,6 +30,9 @@ namespace scan_planner
     go2_execution_frozen_ = false;
     flag_escape_emergency_ = true;
     need_hover_stop_ = false;
+    emergency_path_pending_ = false;
+    tracking_recovery_active_ = false;
+    collision_segment_pending_ = false;
     replan_fail_count_ = 0;
     last_freeze_update_time_ = node_->now();
 
@@ -37,9 +41,11 @@ namespace scan_planner
     replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_replan", -1.0);
     no_replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_no_replan", -1.0);
     planning_horizon_ = load_parameter<double>(node_, "fsm.planning_horizon", -1.0);
+    reference_path_lookahead_ = load_parameter<double>(node_, "fsm.reference_path_lookahead", 3.0);
     emergency_time_ = load_parameter<double>(node_, "fsm.emergency_time", 1.0);
+    goal_tolerance_ = load_parameter<double>(node_, "fsm.goal_tolerance", 0.25);
     enable_fail_safe_ = load_parameter<bool>(node_, "fsm.fail_safe", true);
-    max_replan_fail_count_ = load_parameter<int>(node_, "fsm.max_replan_fail_count", 1000);
+    max_replan_fail_count_ = load_parameter<int>(node_, "fsm.max_replan_fail_count", 5);
     self_inflation_z_up_ = load_parameter<double>(node_, "grid_map.obstacles_inflation_z_up", 0.0);
     self_inflation_z_down_ = load_parameter<double>(node_, "grid_map.obstacles_inflation_z_down", 0.0);
     self_double_cylinder_radius_ = load_parameter<double>(node_, "grid_map.double_cylinder_radius", 0.0);
@@ -82,6 +88,11 @@ namespace scan_planner
     data_disp_pub_ = node_->create_publisher<scan_planner_msgs::msg::DataDisp>("planning/data_display", 100);
     self_inflation_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>(
         "self_inflation", rclcpp::QoS(1).reliable().transient_local());
+    blocked_segment_pub_ = node_->create_publisher<nav_msgs::msg::Path>(
+        "planning/blocked_segment", 10);
+    emergency_stop_pub_ = node_->create_publisher<std_msgs::msg::Bool>("planning/emergency_stop", 10);
+    status_pub_ = node_->create_publisher<std_msgs::msg::String>("planning/status", 10);
+    publishStatus("IDLE");
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
       goal_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -303,6 +314,56 @@ namespace scan_planner
     if (!map || duration < 1e-3)
       return true;
 
+    if (reference_path_active_ && reference_path_.size() >= 2)
+    {
+      const Eigen::Vector3d final_pt = reference_path_.back();
+      const Eigen::Vector3d final_prev = reference_path_[reference_path_.size() - 2];
+      if (map->getInflateOccupancy(
+              final_pt, estimateYawFromSegment(final_prev, final_pt)) <= 0)
+        return true;
+
+      constexpr double sample_distance = 0.05;
+      const Eigen::Vector3d raw_end = end_pt_;
+      for (size_t reverse_index = reference_path_.size() - 1;
+           reverse_index > 0; --reverse_index)
+      {
+        const size_t segment_index = reverse_index - 1;
+        const Eigen::Vector3d &from = reference_path_[segment_index];
+        const Eigen::Vector3d &to = reference_path_[segment_index + 1];
+        const Eigen::Vector3d segment = to - from;
+        const double length = segment.norm();
+        const int samples = std::max(1, static_cast<int>(std::ceil(length / sample_distance)));
+        const double yaw = estimateYawFromSegment(from, to);
+
+        for (int sample = samples - 1; sample >= 0; --sample)
+        {
+          const double ratio = static_cast<double>(sample) / samples;
+          const Eigen::Vector3d candidate = from + ratio * segment;
+          if (map->getInflateOccupancy(candidate, yaw) != 0)
+            continue;
+
+          end_pt_ = candidate;
+          reference_path_.resize(segment_index + 1);
+          if (reference_path_.empty() ||
+              (reference_path_.back() - candidate).norm() > 1e-3)
+            reference_path_.push_back(candidate);
+          else
+            reference_path_.back() = candidate;
+
+          RCLCPP_WARN(node_->get_logger(),
+                      "Reference target [%.2f, %.2f, %.2f] is occupied; "
+                      "retreating on the supplied path to [%.2f, %.2f, %.2f]",
+                      raw_end(0), raw_end(1), raw_end(2),
+                      end_pt_(0), end_pt_(1), end_pt_(2));
+          return true;
+        }
+      }
+
+      RCLCPP_ERROR(node_->get_logger(),
+                   "Reference target is occupied and no free point exists on the supplied path");
+      return false;
+    }
+
     constexpr double sample_dt = 0.05;
     const int sample_num = std::max(1, static_cast<int>(std::ceil(duration / sample_dt)));
     const Eigen::Vector3d final_pt = global_data.global_traj_.evaluate(duration);
@@ -345,8 +406,6 @@ namespace scan_planner
       return;
     }
 
-    trigger_ = true;
-
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
 
@@ -356,12 +415,50 @@ namespace scan_planner
       wp(0) = pose_stamped.pose.position.x;
       wp(1) = pose_stamped.pose.position.y;
       wp(2) = pose_stamped.pose.position.z + body_height_; // Adjust for body height
-      waypoints.push_back(wp);
+      if (waypoints.empty() || (wp - waypoints.back()).norm() > 1e-3)
+        waypoints.push_back(wp);
     }
-    bool success = planGlobalTrajByWaypoints(waypoints);
+
+    if (waypoints.size() < 2)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "Reference path must contain at least two distinct poses");
+      requestExecutionStop("INVALID_REFERENCE_PATH");
+      return;
+    }
+
+    // Keep the collision-checked polyline as the global reference.  Fitting a
+    // single high-order polynomial through a maze path can overshoot corners
+    // and leave the A-star safety corridor before local planning even starts.
+    trigger_ = true;
+    init_pt_ = odom_pos_;
+    reference_path_ = waypoints;
+    reference_progress_idx_ = 0;
+    reference_progress_ratio_ = 0.0;
+    reference_path_active_ = true;
+    end_pt_ = reference_path_.back();
+
+    bool success = planner_manager_->planGlobalTraj(
+        odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_,
+        Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+
+    if (success && !adjustGlobalTargetIfOccupied())
+      success = false;
 
     if (success)
     {
+      visualization_->displayGlobalPathList(reference_path_, 0.1, 0);
+      visualization_->displayGoalPoint(end_pt_, Eigen::Vector4d(0, 0.5, 0.5, 1), 0.3, 0);
+      end_vel_.setZero();
+      have_target_ = true;
+      have_new_target_ = true;
+      reference_path_update_pending_ = true;
+      if (exec_state_ == EMERGENCY_STOP)
+        emergency_path_pending_ = true;
+    }
+
+    if (success)
+    {
+      collision_segment_pending_ = false;
       /*** FSM ***/
       if (exec_state_ == WAIT_TARGET)
       {
@@ -373,9 +470,12 @@ namespace scan_planner
       }
 
       RCLCPP_INFO(node_->get_logger(), "Reference path accepted");
+      publishStatus("PATH_ACCEPTED");
     }
     else
     {
+      reference_path_active_ = false;
+      requestExecutionStop("REFERENCE_PATH_REJECTED");
       RCLCPP_ERROR(node_->get_logger(), "Unable to generate global trajectory from reference path");
     }
   }
@@ -416,6 +516,48 @@ namespace scan_planner
   void SCANReplanFSM::go2ExecutionFrozenCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
   {
     go2_execution_frozen_ = msg->data;
+  }
+
+  void SCANReplanFSM::publishStatus(const std::string &status)
+  {
+    std_msgs::msg::String msg;
+    msg.data = status;
+    status_pub_->publish(msg);
+  }
+
+  void SCANReplanFSM::publishBlockedSegment()
+  {
+    if (!collision_segment_pending_)
+      return;
+
+    nav_msgs::msg::Path msg;
+    msg.header.stamp = node_->now();
+    msg.header.frame_id = self_inflation_frame_id_;
+    msg.poses.resize(2);
+    for (auto &pose : msg.poses)
+    {
+      pose.header = msg.header;
+      pose.pose.orientation.w = 1.0;
+    }
+    msg.poses[0].pose.position.x = last_collision_free_pos_(0);
+    msg.poses[0].pose.position.y = last_collision_free_pos_(1);
+    msg.poses[0].pose.position.z = last_collision_free_pos_(2);
+    msg.poses[1].pose.position.x = first_collision_pos_(0);
+    msg.poses[1].pose.position.y = first_collision_pos_(1);
+    msg.poses[1].pose.position.z = first_collision_pos_(2);
+    blocked_segment_pub_->publish(msg);
+    RCLCPP_WARN(node_->get_logger(),
+                "Published locally blocked segment [%.2f, %.2f] -> [%.2f, %.2f]",
+                last_collision_free_pos_(0), last_collision_free_pos_(1),
+                first_collision_pos_(0), first_collision_pos_(1));
+  }
+
+  void SCANReplanFSM::requestExecutionStop(const std::string &reason)
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = true;
+    emergency_stop_pub_->publish(msg);
+    publishStatus(reason);
   }
 
   void SCANReplanFSM::updateLocalTrajTimeFreeze()
@@ -503,6 +645,13 @@ namespace scan_planner
     int pre_s = int(exec_state_);
     exec_state_ = new_state;
     cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
+
+    if (new_state == EXEC_TRAJ)
+      publishStatus("RUNNING");
+    else if (new_state == GEN_NEW_TRAJ || new_state == REPLAN_TRAJ)
+      publishStatus("PLANNING");
+    else if (new_state == EMERGENCY_STOP)
+      publishStatus("EMERGENCY_STOP");
   }
 
   std::pair<int, SCANReplanFSM::FSM_EXEC_STATE> SCANReplanFSM::timesOfConsecutiveStateCalls()
@@ -579,6 +728,8 @@ namespace scan_planner
       {
 
         replan_fail_count_ = 0;
+        tracking_recovery_active_ = false;
+        collision_segment_pending_ = false;
         changeFSMExecState(EXEC_TRAJ, "FSM");
         flag_escape_emergency_ = true;
       }
@@ -592,14 +743,26 @@ namespace scan_planner
 
     case REPLAN_TRAJ:
     {
+      if (!isWaypointSequenceMode() &&
+          (end_pt_.head<2>() - odom_pos_.head<2>()).norm() <= goal_tolerance_)
+      {
+        have_target_ = false;
+        reference_path_active_ = false;
+        requestExecutionStop("REACHED");
+        changeFSMExecState(WAIT_TARGET, "GOAL_REACHED");
+        return;
+      }
 
       if (planFromCurrentTraj())
       {
         replan_fail_count_ = 0;
+        tracking_recovery_active_ = false;
+        collision_segment_pending_ = false;
         changeFSMExecState(EXEC_TRAJ, "FSM");
       }
       else
       {
+        requestExecutionStop("REPLANNING");
         replan_fail_count_++;
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
@@ -616,6 +779,16 @@ namespace scan_planner
       t_cur = min(info->duration_, t_cur);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
+
+      if (!isWaypointSequenceMode() &&
+          (end_pt_.head<2>() - odom_pos_.head<2>()).norm() <= goal_tolerance_)
+      {
+        have_target_ = false;
+        reference_path_active_ = false;
+        requestExecutionStop("REACHED");
+        changeFSMExecState(WAIT_TARGET, "GOAL_REACHED");
+        return;
+      }
 
       if (isWaypointSequenceMode() &&
           current_wp_ + 1 < (int)active_waypoints_.size() &&
@@ -635,6 +808,28 @@ namespace scan_planner
       /* && (end_pt_ - pos).norm() < 0.5 */
       if (t_cur > info->duration_ - 1e-2)
       {
+        // A local B-spline ending is not the end of a long reference path.
+        // Continue from odometry immediately instead of reporting a false
+        // global REACHED and waiting for the explorer to issue another task.
+        if (reference_path_active_ &&
+            (end_pt_.head<2>() - odom_pos_.head<2>()).norm() > goal_tolerance_)
+        {
+          if (planFromCurrentTraj())
+          {
+            replan_fail_count_ = 0;
+            tracking_recovery_active_ = false;
+            collision_segment_pending_ = false;
+            changeFSMExecState(EXEC_TRAJ, "LOCAL_SEGMENT_DONE");
+          }
+          else
+          {
+            requestExecutionStop("REPLANNING");
+            replan_fail_count_++;
+            changeFSMExecState(REPLAN_TRAJ, "LOCAL_SEGMENT_DONE");
+          }
+          return;
+        }
+
         if (isWaypointSequenceMode() && current_wp_ + 1 < (int)active_waypoints_.size())
         {
           current_wp_++;
@@ -655,6 +850,8 @@ namespace scan_planner
         }
 
         have_target_ = false;
+        reference_path_active_ = false;
+        requestExecutionStop("REACHED");
 
         changeFSMExecState(WAIT_TARGET, "FSM");
         return;
@@ -689,12 +886,24 @@ namespace scan_planner
           changeFSMExecState(GEN_NEW_TRAJ, "FSM");
         else if (enable_fail_safe_ && need_hover_stop_ && odom_vel_.norm() < 0.1)
         {
-          RCLCPP_INFO(node_->get_logger(),
-                      "Exiting EMERGENCY_STOP; switching to WAIT_TARGET for a new target");
           need_hover_stop_ = false;
-          have_target_ = false;
-          trigger_ = false;
-          changeFSMExecState(WAIT_TARGET, "EMERGENCY_EXIT");
+          if (shouldResumePendingEmergencyPath(emergency_path_pending_, have_target_))
+          {
+            emergency_path_pending_ = false;
+            trigger_ = true;
+            replan_fail_count_ = 0;
+            RCLCPP_INFO(node_->get_logger(),
+                        "Exiting EMERGENCY_STOP; planning the path received while stopping");
+            changeFSMExecState(GEN_NEW_TRAJ, "EMERGENCY_PATH");
+          }
+          else
+          {
+            RCLCPP_INFO(node_->get_logger(),
+                        "Exiting EMERGENCY_STOP; switching to WAIT_TARGET for a new target");
+            have_target_ = false;
+            trigger_ = false;
+            changeFSMExecState(WAIT_TARGET, "EMERGENCY_EXIT");
+          }
         }
       }
 
@@ -713,12 +922,21 @@ namespace scan_planner
   {
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
+      const bool tracking_recovery_failed = tracking_recovery_active_;
       RCLCPP_WARN(node_->get_logger(),
-                  "Replan failed %d times; emergency stop and wait for a new target", replan_fail_count_);
+                  tracking_recovery_failed
+                      ? "Tracking recovery failed %d times; emergency stop and retry the committed reference path"
+                      : "Replan failed %d times; emergency stop and wait for a new target",
+                  replan_fail_count_);
       replan_fail_count_ = 0;
       need_hover_stop_ = true;
       flag_escape_emergency_ = true;
+      emergency_path_pending_ = tracking_recovery_failed && have_target_;
       changeFSMExecState(EMERGENCY_STOP, "finishProcess");
+      requestExecutionStop(tracking_recovery_failed
+                               ? "TRACKING_RECOVERY_FAILED"
+                               : "BLOCKED");
+      tracking_recovery_active_ = false;
     }
   }
 
@@ -732,8 +950,21 @@ namespace scan_planner
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
     start_pt_ = odom_pos_;
-    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
-    start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+    if (reference_path_active_)
+    {
+      // A replacement global path may turn away from the previous local
+      // trajectory.  Inherit the measured motion only in the new path
+      // direction; carrying the old desired velocity creates a large entry
+      // arc before collision optimization begins.
+      start_vel_ = odom_vel_;
+      start_acc_.setZero();
+      alignStartStateToReferencePath();
+    }
+    else
+    {
+      start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
+      start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+    }
 
     const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
     if (to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
@@ -775,6 +1006,12 @@ namespace scan_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
+    if (reference_path_active_)
+    {
+      alignStartStateToReferencePath();
+      return;
+    }
+
     LocalTrajData *info = &planner_manager_->local_data_;
     if (info->start_time_.seconds() < 1e-5 || info->duration_ <= 1e-5)
       return;
@@ -795,6 +1032,31 @@ namespace scan_planner
     }
   }
 
+  void SCANReplanFSM::alignStartStateToReferencePath()
+  {
+    if (!reference_path_active_ || reference_path_.size() < 2)
+      return;
+
+    // Use the segment at the robot, not a segment beyond the next corner.
+    const ReferencePathLookahead entry = projectReferencePathLookahead(
+        reference_path_, start_pt_, reference_progress_idx_,
+        reference_progress_ratio_, 0.20);
+    Eigen::Vector2d tangent = entry.tangent.head<2>();
+    const double tangent_norm = tangent.norm();
+    if (!entry.valid || tangent_norm < 1e-6)
+    {
+      start_vel_.setZero();
+      start_acc_.setZero();
+      return;
+    }
+
+    tangent /= tangent_norm;
+    const double forward_speed = std::max(0.0, start_vel_.head<2>().dot(tangent));
+    start_vel_.head<2>() = forward_speed * tangent;
+    start_vel_(2) = 0.0;
+    start_acc_.setZero();
+  }
+
   void SCANReplanFSM::checkCollisionCallback()
   {
     updateLocalTrajTimeFreeze();
@@ -808,23 +1070,108 @@ namespace scan_planner
     /* ---------- check trajectory ---------- */
     constexpr double time_step = 0.01;
     double t_cur = (node_->now() - info->start_time_).seconds();
-    double t_2_3 = info->duration_ * 2 / 3;
+    t_cur = std::min(std::max(t_cur, 0.0), info->duration_);
+
+    // The controller adds a position-error correction to the nominal
+    // B-spline velocity. Check that short correction connector here with the
+    // same map and body footprint as every other SCAN collision decision.
+    const double actual_yaw = std::atan2(
+        2.0 * (odom_orient_.w() * odom_orient_.z()
+               + odom_orient_.x() * odom_orient_.y()),
+        1.0 - 2.0 * (odom_orient_.y() * odom_orient_.y()
+                     + odom_orient_.z() * odom_orient_.z()));
+    if (map->getInflateOccupancy(odom_pos_, actual_yaw))
+    {
+      requestExecutionStop("TRACKING_POSE_OCCUPIED");
+      need_hover_stop_ = true;
+      flag_escape_emergency_ = true;
+      emergency_path_pending_ = false;
+      tracking_recovery_active_ = false;
+      changeFSMExecState(EMERGENCY_STOP, "TRACKING_SAFETY");
+      RCLCPP_ERROR_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "Actual GO2 footprint is inside the local inflated map; execution latched stopped");
+      return;
+    }
+
+    const Eigen::Vector3d tracked_pos = info->position_traj_.evaluateDeBoorT(t_cur);
+    const Eigen::Vector3d connector = tracked_pos - odom_pos_;
+    const double connector_length = connector.head<2>().norm();
+    constexpr double connector_sample_step = 0.05;
+    bool connector_blocked = false;
+    Eigen::Vector3d connector_hit = tracked_pos;
+    if (connector_length > connector_sample_step)
+    {
+      const int samples = std::max(
+          1, static_cast<int>(std::ceil(connector_length / connector_sample_step)));
+      const double connector_yaw = estimateYawFromSegment(odom_pos_, tracked_pos);
+      for (int sample = 1; sample <= samples; ++sample)
+      {
+        const double ratio = static_cast<double>(sample) / samples;
+        const Eigen::Vector3d point = odom_pos_ + ratio * connector;
+        if (map->getInflateOccupancy(point, connector_yaw))
+        {
+          connector_blocked = true;
+          connector_hit = point;
+          break;
+        }
+      }
+    }
+
+    if (connector_blocked)
+    {
+      requestExecutionStop("TRACKING_CONNECTOR_BLOCKED");
+      tracking_recovery_active_ = true;
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "Tracking connector is blocked (error=%.3fm, hit=[%.2f, %.2f]); frozen and reconnecting to the same reference path",
+          connector_length, connector_hit.x(), connector_hit.y());
+      if (planFromCurrentTraj())
+      {
+        tracking_recovery_active_ = false;
+        replan_fail_count_ = 0;
+        collision_segment_pending_ = false;
+        changeFSMExecState(EXEC_TRAJ, "TRACKING_RECOVERY");
+      }
+      else
+      {
+        replan_fail_count_++;
+        changeFSMExecState(REPLAN_TRAJ, "TRACKING_RECOVERY");
+      }
+      return;
+    }
+
+    Eigen::Vector3d last_free_pos = odom_pos_;
     for (double t = t_cur; t < info->duration_; t += time_step)
     {
-      if (t_cur < t_2_3 && t >= t_2_3) // If t_cur < t_2_3, only the first 2/3 partition of the trajectory is considered valid and will get checked.
-        break;
-
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t);
       Eigen::Vector3d pos_next = info->position_traj_.evaluateDeBoorT(std::min(t + time_step, info->duration_));
       if (map->getInflateOccupancy(pos, estimateYawFromSegment(pos, pos_next)))
       {
+        tracking_recovery_active_ = false;
+        // Stop first.  Rebound replanning is synchronous and can take longer
+        // than the remaining collision time; letting the controller execute
+        // the stale trajectory while it runs is unsafe even if replanning
+        // eventually succeeds.
+        requestExecutionStop("REPLANNING");
+        RCLCPP_WARN(node_->get_logger(),
+                    "Upcoming collision at t=%.3fs; execution frozen before replanning",
+                    std::max(0.0, t - t_cur));
         if (planFromCurrentTraj()) // Make a chance
         {
+          collision_segment_pending_ = false;
           changeFSMExecState(EXEC_TRAJ, "SAFETY");
           return;
         }
         else
         {
+          if (!collision_segment_pending_)
+          {
+            last_collision_free_pos_ = last_free_pos;
+            first_collision_pos_ = pos;
+            collision_segment_pending_ = true;
+            publishBlockedSegment();
+          }
           if (t - t_cur < emergency_time_) // 0.8s of emergency time
           {
             RCLCPP_WARN(node_->get_logger(), "Obstacle discovered; emergency stop in %.3fs", t - t_cur);
@@ -839,6 +1186,7 @@ namespace scan_planner
         }
         break;
       }
+      last_free_pos = pos;
     }
   }
 
@@ -857,6 +1205,25 @@ namespace scan_planner
     {
 
       auto info = &planner_manager_->local_data_;
+
+      // The optimizer is not the final safety authority.  Sample the complete
+      // B-spline again immediately before publishing it to the controller so a
+      // successful solver result can never authorize an occupied trajectory.
+      constexpr double validation_dt = 0.02;
+      for (double t = 0.0; t <= info->duration_; t += validation_dt)
+      {
+        const Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t);
+        const Eigen::Vector3d pos_next = info->position_traj_.evaluateDeBoorT(
+            std::min(t + validation_dt, info->duration_));
+        if (planner_manager_->grid_map_->getInflateOccupancy(
+                pos, estimateYawFromSegment(pos, pos_next)))
+        {
+          RCLCPP_ERROR(node_->get_logger(),
+                       "Rejecting optimized trajectory: collision at t=%.3fs, position=(%.3f, %.3f, %.3f)",
+                       t, pos.x(), pos.y(), pos.z());
+          return false;
+        }
+      }
 
       /* publish traj */
       scan_planner_msgs::msg::Bspline bspline;
@@ -883,6 +1250,11 @@ namespace scan_planner
       }
 
       bspline_pub_->publish(bspline);
+      if (reference_path_update_pending_)
+      {
+        publishStatus("PATH_TRAJECTORY_READY");
+        reference_path_update_pending_ = false;
+      }
 
       visualization_->displayOptimalTraj(info->position_traj_, 0);
     }
@@ -928,6 +1300,12 @@ namespace scan_planner
 
   void SCANReplanFSM::getLocalTarget()
   {
+    if (reference_path_active_)
+    {
+      getReferencePathLocalTarget();
+      return;
+    }
+
     double t;
 
     double t_step = planning_horizon_ / 20 / planner_manager_->pp_.max_vel_;
@@ -1029,6 +1407,79 @@ namespace scan_planner
       local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
       // cout << "AA" << endl;
     }
+  }
+
+  void SCANReplanFSM::getReferencePathLocalTarget()
+  {
+    if (reference_path_.size() < 2)
+    {
+      local_target_pt_ = end_pt_;
+      local_target_vel_.setZero();
+      return;
+    }
+
+    const double lookahead = std::max(0.5, reference_path_lookahead_);
+    ReferencePathLookahead path_sample = projectReferencePathLookahead(
+        reference_path_, start_pt_, reference_progress_idx_, reference_progress_ratio_, lookahead);
+    if (!path_sample.valid)
+    {
+      local_target_pt_ = end_pt_;
+      local_target_vel_.setZero();
+      return;
+    }
+
+    reference_progress_idx_ = path_sample.progress_segment;
+    reference_progress_ratio_ = path_sample.progress_ratio;
+    Eigen::Vector3d target = path_sample.target;
+    Eigen::Vector3d tangent = path_sample.tangent;
+
+    auto isOccupied = [&](const Eigen::Vector3d &pt) {
+      return planner_manager_->grid_map_->getInflateOccupancy(
+                 pt, estimateYawFromSegment(start_pt_, pt)) != 0;
+    };
+
+    // Sensor-map inflation can be slightly more conservative than the global
+    // grid.  Stay on the supplied polyline and shorten lookahead; never move a
+    // target sideways off the globally validated corridor.
+    if (isOccupied(target))
+    {
+      bool found = false;
+      for (double shorter_lookahead = lookahead - 0.2;
+           shorter_lookahead >= 0.4;
+           shorter_lookahead -= 0.2)
+      {
+        const ReferencePathLookahead shorter_sample = projectReferencePathLookahead(
+            reference_path_, start_pt_, reference_progress_idx_, reference_progress_ratio_,
+            shorter_lookahead);
+        if (shorter_sample.valid &&
+            (shorter_sample.target - start_pt_).norm() > 0.4 &&
+            !isOccupied(shorter_sample.target))
+        {
+          target = shorter_sample.target;
+          tangent = shorter_sample.tangent;
+          path_sample.remaining_after_target = shorter_sample.remaining_after_target;
+          found = true;
+          break;
+        }
+      }
+      if (!found)
+      {
+        target = start_pt_;
+        tangent.setZero();
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                             "No free reference-path lookahead is currently visible");
+      }
+    }
+
+    local_target_pt_ = target;
+
+    const double stop_distance =
+        planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_ /
+        (2.0 * planner_manager_->pp_.max_acc_);
+    if (path_sample.remaining_after_target <= stop_distance || tangent.norm() < 1e-6)
+      local_target_vel_.setZero();
+    else
+      local_target_vel_ = tangent * planner_manager_->pp_.max_vel_;
   }
 
 } // namespace scan_planner
