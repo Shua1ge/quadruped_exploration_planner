@@ -36,7 +36,8 @@ namespace scan_planner
 
     void initPlanModules(
         rclcpp::Node *node, PlanningVisualization::Ptr vis = nullptr,
-        rclcpp::CallbackGroup::SharedPtr map_callback_group = nullptr);
+        rclcpp::CallbackGroup::SharedPtr map_callback_group = nullptr,
+        rclcpp::CallbackGroup::SharedPtr map_visualization_callback_group = nullptr);
 
     PlanParameters pp_;
     LocalTrajData local_data_;

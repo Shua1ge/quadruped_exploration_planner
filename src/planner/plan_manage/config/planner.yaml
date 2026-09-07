@@ -10,6 +10,8 @@ scan_planner_node:
     # Reference paths therefore use a shorter arc-length lookahead.
     fsm.reference_path_lookahead: 4.5
     fsm.emergency_time: 1.0
+    fsm.rolling_replan_retry_period: 0.25
+    fsm.rolling_replan_max_start_error: 0.30
     fsm.goal_tolerance: 0.25
     fsm.fail_safe: true
     fsm.max_replan_fail_count: 5

@@ -14,6 +14,7 @@
 #include <tf2/utils.hpp>
 
 #include "bspline_opt/uniform_bspline.h"
+#include "plan_manage/replan_fsm_utils.h"
 
 namespace scan_planner
 {
@@ -30,6 +31,13 @@ public:
     max_vy_ = declare_parameter<double>("max_vy", 0.35);
     max_vyaw_ = std::min(declare_parameter<double>("max_vyaw", 1.0), kMaxVYawLimit);
     finish_dist_ = declare_parameter<double>("finish_dist", 0.15);
+    handoff_search_time_ = declare_parameter<double>("handoff_search_time", 1.0);
+    handoff_sample_dt_ = declare_parameter<double>("handoff_sample_dt", 0.02);
+    max_handoff_error_ = declare_parameter<double>("max_handoff_error", 0.30);
+    if (handoff_search_time_ < 0.0 || handoff_sample_dt_ <= 0.0 ||
+        max_handoff_error_ <= 0.0)
+      throw std::runtime_error(
+          "handoff parameters must have a non-negative search time and positive sample interval/error limit");
 
     bspline_sub_ = create_subscription<scan_planner_msgs::msg::Bspline>(
         "planning/bspline", 10,
@@ -105,18 +113,65 @@ private:
     for (size_t i = 0; i < msg->knots.size(); ++i) knots(i) = msg->knots[i];
     UniformBspline position(points, msg->order, 0.1);
     position.setKnot(knots);
-    traj_ = {position, position.getDerivative()};
-    traj_.push_back(traj_[1].getDerivative());
-    traj_duration_ = traj_[0].getTimeSum();
+
+    std::vector<Eigen::Vector3d> control_points;
+    control_points.reserve(points.cols());
+    for (Eigen::Index column = 0; column < points.cols(); ++column)
+      control_points.push_back(points.col(column));
+    if (trajectorySamplesAreStationary(control_points, 1e-4))
+    {
+      emergency_stop_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "[EMERGENCY_HOLD_TRAJECTORY_IGNORED] trajectory=%lld; keeping cmd_vel stopped instead of tracking an old stop position",
+                  static_cast<long long>(msg->traj_id));
+      return;
+    }
+
+    std::vector<UniformBspline> candidate = {position, position.getDerivative()};
+    candidate.push_back(candidate[1].getDerivative());
+    const double candidate_duration = candidate[0].getTimeSum();
+    double matched_time = 0.0;
+    double start_error = 0.0;
+    double matched_error = 0.0;
+    if (have_odom_)
+    {
+      const double search_end = std::min(candidate_duration, handoff_search_time_);
+      std::vector<Eigen::Vector3d> samples;
+      std::vector<double> sample_times;
+      for (double t = 0.0; t < search_end; t += handoff_sample_dt_)
+      {
+        samples.push_back(candidate[0].evaluateDeBoorT(t));
+        sample_times.push_back(t);
+      }
+      samples.push_back(candidate[0].evaluateDeBoorT(search_end));
+      sample_times.push_back(search_end);
+      const size_t match = closestForwardTrajectorySample(samples, odom_pos_);
+      matched_time = sample_times[match];
+      start_error = (samples.front().head<2>() - odom_pos_.head<2>()).norm();
+      matched_error = (samples[match].head<2>() - odom_pos_.head<2>()).norm();
+      if (matched_error > max_handoff_error_)
+      {
+        RCLCPP_WARN(get_logger(),
+                    "[TRAJECTORY_HANDOFF_REJECTED] trajectory=%lld start_error=%.3fm matched_error=%.3fm limit=%.3fm; preserving current execution state",
+                    static_cast<long long>(msg->traj_id), start_error,
+                    matched_error, max_handoff_error_);
+        return;
+      }
+    }
+
+    traj_ = std::move(candidate);
+    traj_duration_ = candidate_duration;
     traj_id_ = msg->traj_id;
-    exec_time_ = 0.0;
+    exec_time_ = matched_time;
     last_update_time_ = now();
     receive_traj_ = true;
     // A planner-requested stop may be cleared by a replacement trajectory, but a
     // physical simulation collision stays latched for the lifetime of this run.
     emergency_stop_ = simulation_collision_latched_;
-    RCLCPP_INFO(get_logger(), "Received trajectory %lld, duration %.3fs",
-                static_cast<long long>(traj_id_), traj_duration_);
+    RCLCPP_INFO(get_logger(),
+                "[TRAJECTORY_HANDOFF] trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm",
+                static_cast<long long>(traj_id_), traj_duration_, exec_time_,
+                start_error, matched_error);
   }
 
   void emergencyStopCallback(const std_msgs::msg::Bool::ConstSharedPtr msg)
@@ -213,6 +268,7 @@ private:
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
   double time_forward_, heading_error_threshold_, kp_pos_, kp_yaw_;
   double max_vx_, max_vy_, max_vyaw_, finish_dist_;
+  double handoff_search_time_, handoff_sample_dt_, max_handoff_error_;
 };
 }  // namespace scan_planner
 

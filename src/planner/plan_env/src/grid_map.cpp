@@ -49,7 +49,19 @@ int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
 
 GridMap::InflatedOccupancySnapshotPtr GridMap::captureInflatedOccupancySnapshot() const
 {
+  auto snapshot = std::atomic_load(&latest_inflated_snapshot_);
+  if (snapshot)
+    return snapshot;
+
   std::shared_lock<std::shared_mutex> lock(map_mutex_);
+  snapshot = buildInflatedOccupancySnapshotLocked();
+  std::atomic_store(&latest_inflated_snapshot_, snapshot);
+  return snapshot;
+}
+
+GridMap::InflatedOccupancySnapshotPtr
+GridMap::buildInflatedOccupancySnapshotLocked() const
+{
   auto snapshot = std::make_shared<InflatedOccupancySnapshot>();
   snapshot->buffer = md_.occupancy_buffer_inflate_;
   snapshot->voxel_num = mp_.map_voxel_num_;
@@ -85,7 +97,10 @@ double GridMap::getMapAgeSeconds() const
   return std::max(0.0, (node_->now().nanoseconds() - update_ns) * 1e-9);
 }
 
-void GridMap::initMap(rclcpp::Node *node, rclcpp::CallbackGroup::SharedPtr callback_group)
+void GridMap::initMap(
+    rclcpp::Node *node,
+    rclcpp::CallbackGroup::SharedPtr update_callback_group,
+    rclcpp::CallbackGroup::SharedPtr visualization_callback_group)
 {
   node_ = node;
 
@@ -219,7 +234,7 @@ void GridMap::initMap(rclcpp::Node *node, rclcpp::CallbackGroup::SharedPtr callb
   else if (mp_.sensor_type_ == "lidar")
   {
     rclcpp::SubscriptionOptions options;
-    options.callback_group = callback_group;
+    options.callback_group = update_callback_group;
     lidar_pose_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
         "sensor_pose", rclcpp::SensorDataQoS(),
         std::bind(&GridMap::sensorPoseCallback, this, std::placeholders::_1), options);
@@ -229,7 +244,7 @@ void GridMap::initMap(rclcpp::Node *node, rclcpp::CallbackGroup::SharedPtr callb
   }
 
   rclcpp::SubscriptionOptions body_pose_options;
-  body_pose_options.callback_group = callback_group;
+  body_pose_options.callback_group = update_callback_group;
   sliding_map_frame_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
       "body_pose", rclcpp::SensorDataQoS(),
       std::bind(&GridMap::slidingMapFrameCallback, this, std::placeholders::_1),
@@ -237,10 +252,10 @@ void GridMap::initMap(rclcpp::Node *node, rclcpp::CallbackGroup::SharedPtr callb
 
   occ_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                         std::bind(&GridMap::updateOccupancyCallback, this),
-                                        callback_group);
-  vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
+                                        update_callback_group);
+  vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(250),
                                         std::bind(&GridMap::visCallback, this),
-                                        callback_group);
+                                        visualization_callback_group);
 
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", rclcpp::SensorDataQoS());
   map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", rclcpp::SensorDataQoS());
@@ -809,10 +824,20 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::visCallback()
 {
-  std::shared_lock<std::shared_mutex> lock(map_mutex_);
+  // RViz output is optional.  Never queue it ahead of sensor fusion, and
+  // never wait for the map lock when a writer is active or pending.
+  if (map_update_requested_.load())
+    return;
+  std::shared_lock<std::shared_mutex> lock(map_mutex_, std::try_to_lock);
+  if (!lock.owns_lock() || map_update_requested_.load())
+    return;
 
   publishMap();
+  if (map_update_requested_.load())
+    return;
   publishMapInflate(true);
+  if (map_update_requested_.load())
+    return;
   publishSlidingMapFrame();
   publishSlidingMapBBox();
   publishDepthCloud();
@@ -820,9 +845,14 @@ void GridMap::visCallback()
 
 void GridMap::updateOccupancyCallback()
 {
+  const auto callback_started = std::chrono::steady_clock::now();
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
+  const auto lock_acquired = std::chrono::steady_clock::now();
   if (!md_.occ_need_update_)
+  {
+    map_update_requested_.store(false);
     return;
+  }
 
   /* update occupancy */
   // ros::Time t1, t2, t3, t4;
@@ -831,9 +861,14 @@ void GridMap::updateOccupancyCallback()
   if (!md_.use_cloud_update_)
     projectDepthImage();
   // t2 = ros::Time::now();
+  const int projected_points = md_.proj_points_cnt;
   raycastProcess();
   map_revision_.fetch_add(1);
   last_map_update_ns_.store(node_->now().nanoseconds());
+  const auto fusion_finished = std::chrono::steady_clock::now();
+  auto snapshot = buildInflatedOccupancySnapshotLocked();
+  std::atomic_store(&latest_inflated_snapshot_, snapshot);
+  const auto snapshot_finished = std::chrono::steady_clock::now();
   // t3 = ros::Time::now();
 
   // t4 = ros::Time::now();
@@ -850,6 +885,20 @@ void GridMap::updateOccupancyCallback()
 
   md_.occ_need_update_ = false;
   md_.use_cloud_update_ = false;
+  map_update_requested_.store(false);
+  lock.unlock();
+
+  const double lock_wait_ms = std::chrono::duration<double, std::milli>(
+      lock_acquired - callback_started).count();
+  const double fusion_ms = std::chrono::duration<double, std::milli>(
+      fusion_finished - lock_acquired).count();
+  const double snapshot_ms = std::chrono::duration<double, std::milli>(
+      snapshot_finished - fusion_finished).count();
+  RCLCPP_INFO_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 2000,
+      "[MAP_FUSION_TIMING] lock_wait=%.1fms raycast=%.1fms snapshot=%.1fms points=%d revision=%lu",
+      lock_wait_ms, fusion_ms, snapshot_ms, projected_points,
+      static_cast<unsigned long>(snapshot->revision));
 }
 
 void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &img,
@@ -918,15 +967,20 @@ void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &i
 
 void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose_msg)
 {
+  map_update_requested_.store(true);
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   if (mp_.sensor_type_ != "lidar")
+  {
     return;
+  }
 
   const geometry_msgs::msg::Pose &sensor_pose = pose_msg->pose.pose;
   Eigen::Quaterniond ray_q(sensor_pose.orientation.w, sensor_pose.orientation.x,
                            sensor_pose.orientation.y, sensor_pose.orientation.z);
   if (ray_q.norm() < 1e-6)
+  {
     return;
+  }
   ray_q.normalize();
 
   Eigen::Vector3d ray_pos(sensor_pose.position.x, sensor_pose.position.y, sensor_pose.position.z);
@@ -938,7 +992,9 @@ void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &
     ray_q.normalize();
   }
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))
+  {
     return;
+  }
 
   md_.ray_pos_ = ray_pos;
   md_.ray_q_ = ray_q;
@@ -955,33 +1011,43 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstShared
 
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
-  std::unique_lock<std::shared_mutex> lock(map_mutex_);
+  const auto callback_started = std::chrono::steady_clock::now();
+  map_update_requested_.store(true);
   if (mp_.sensor_type_ != "lidar")
-    return;
-
-  if (!md_.has_ray_pose_)
   {
-    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                         "[GridMap] no sensor_pose received for lidar cloud update");
     return;
   }
 
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
-
-  md_.has_cloud_ = true;
-
-  if (latest_cloud.points.size() == 0)
+  const auto decoded = std::chrono::steady_clock::now();
+  if (latest_cloud.points.empty())
+  {
     return;
+  }
 
-  const Eigen::Matrix3d sensor_r = md_.ray_q_.toRotationMatrix();
-  const Eigen::Vector3d ray_pos = md_.ray_pos_;
+  Eigen::Vector3d ray_pos;
+  Eigen::Quaterniond ray_q;
+  {
+    std::shared_lock<std::shared_mutex> lock(map_mutex_);
+    if (!md_.has_ray_pose_)
+    {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                           "[GridMap] no sensor_pose received for lidar cloud update");
+      return;
+    }
+    ray_pos = md_.ray_pos_;
+    ray_q = md_.ray_q_;
+  }
+
+  const Eigen::Matrix3d sensor_r = ray_q.toRotationMatrix();
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))
+  {
     return;
+  }
 
-  updateSlidingMap(ray_pos);
-
-  md_.proj_points_cnt = 0;
+  std::vector<Eigen::Vector3d> projected_points;
+  projected_points.reserve(latest_cloud.points.size());
 
   for (size_t i = 0; i < latest_cloud.points.size(); ++i)
   {
@@ -1007,19 +1073,42 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     if (!in_local_range && ray_length <= mp_.max_ray_length_)
       continue;
 
-    if (md_.proj_points_cnt >= static_cast<int>(md_.proj_points_.size()))
-      md_.proj_points_.push_back(pt_world);
-    else
-      md_.proj_points_[md_.proj_points_cnt] = pt_world;
-
-    md_.proj_points_cnt++;
+    projected_points.push_back(pt_world);
   }
 
-  if (md_.proj_points_cnt == 0)
+  const auto filtered = std::chrono::steady_clock::now();
+  if (projected_points.empty())
+  {
     return;
+  }
 
+  const auto lock_requested = std::chrono::steady_clock::now();
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
+  const auto lock_acquired = std::chrono::steady_clock::now();
+  updateSlidingMap(ray_pos);
+  md_.ray_pos_ = ray_pos;
+  md_.ray_q_ = ray_q;
+  md_.has_cloud_ = true;
+  md_.proj_points_.assign(projected_points.begin(), projected_points.end());
+  md_.proj_points_cnt = static_cast<int>(projected_points.size());
   md_.use_cloud_update_ = true;
   md_.occ_need_update_ = true;
+
+  const auto committed = std::chrono::steady_clock::now();
+  lock.unlock();
+  const double decode_ms = std::chrono::duration<double, std::milli>(
+      decoded - callback_started).count();
+  const double filter_ms = std::chrono::duration<double, std::milli>(
+      filtered - decoded).count();
+  const double lock_wait_ms = std::chrono::duration<double, std::milli>(
+      lock_acquired - lock_requested).count();
+  const double commit_ms = std::chrono::duration<double, std::milli>(
+      committed - lock_acquired).count();
+  RCLCPP_INFO_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 2000,
+      "[CLOUD_TIMING] decode=%.1fms filter=%.1fms lock_wait=%.1fms commit=%.1fms input=%zu accepted=%zu",
+      decode_ms, filter_ms, lock_wait_ms, commit_ms,
+      latest_cloud.points.size(), projected_points.size());
 }
 
 void GridMap::publishMap()
@@ -1035,6 +1124,9 @@ void GridMap::publishMap()
   Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
 
   for (int x = min_cut(0); x <= max_cut(0); ++x)
+  {
+    if (map_update_requested_.load())
+      return;
     for (int y = min_cut(1); y <= max_cut(1); ++y)
       for (int z = min_cut(2); z <= max_cut(2); ++z)
       {
@@ -1050,6 +1142,7 @@ void GridMap::publishMap()
         pt.z = pos(2);
         cloud.push_back(pt);
       }
+  }
 
   cloud.width = cloud.points.size();
   cloud.height = 1;
@@ -1076,6 +1169,9 @@ void GridMap::publishMapInflate(bool all_info)
 
   const std::vector<char> &inflate_buffer = md_.occupancy_buffer_inflate_;
   for (int x = min_cut(0); x <= max_cut(0); ++x)
+  {
+    if (map_update_requested_.load())
+      return;
     for (int y = min_cut(1); y <= max_cut(1); ++y)
       for (int z = min_cut(2); z <= max_cut(2); ++z)
       {
@@ -1092,6 +1188,7 @@ void GridMap::publishMapInflate(bool all_info)
         pt.z = pos(2);
         cloud.push_back(pt);
       }
+  }
 
   cloud.width = cloud.points.size();
   cloud.height = 1;

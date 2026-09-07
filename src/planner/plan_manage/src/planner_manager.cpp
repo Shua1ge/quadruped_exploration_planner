@@ -47,7 +47,8 @@ namespace scan_planner
 
   void SCANPlannerManager::initPlanModules(
       rclcpp::Node *node, PlanningVisualization::Ptr vis,
-      rclcpp::CallbackGroup::SharedPtr map_callback_group)
+      rclcpp::CallbackGroup::SharedPtr map_callback_group,
+      rclcpp::CallbackGroup::SharedPtr map_visualization_callback_group)
   {
     node_ = node;
     /* read algorithm parameters */
@@ -66,7 +67,8 @@ namespace scan_planner
 
     local_data_.traj_id_ = 0;
     grid_map_.reset(new GridMap);
-    grid_map_->initMap(node_, map_callback_group);
+    grid_map_->initMap(
+        node_, map_callback_group, map_visualization_callback_group);
 
     bspline_optimizer_rebound_.reset(new BsplineOptimizer);
     bspline_optimizer_rebound_->setParam(node_);

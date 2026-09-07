@@ -63,6 +63,8 @@ namespace scan_planner
     double planning_horizon_;
     double reference_path_lookahead_;
     double emergency_time_;
+    double rolling_replan_retry_period_;
+    double rolling_replan_max_start_error_;
     double goal_tolerance_;
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
@@ -80,6 +82,7 @@ namespace scan_planner
     int continuously_called_times_{0};
     int replan_fail_count_{0};
     int max_replan_fail_count_{5};
+    int64_t next_rolling_replan_attempt_ns_{0};
     rclcpp::Time last_freeze_update_time_;
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
@@ -94,6 +97,8 @@ namespace scan_planner
     double reference_progress_ratio_{0.0};
     bool reference_path_active_{false};
     bool reference_path_update_pending_{false};
+    std::atomic<uint64_t> active_reference_request_id_{0};
+    uint64_t pending_reference_request_id_{0};
     int current_wp_;
 
     bool flag_escape_emergency_;
@@ -108,6 +113,7 @@ namespace scan_planner
       UniformBspline position;
       rclcpp::Time start_time;
       double duration{0.0};
+      uint64_t request_id{0};
       bool valid{false};
     };
     std::mutex execution_snapshot_mutex_;
@@ -124,6 +130,7 @@ namespace scan_planner
     rclcpp::Node *node_{nullptr};
     rclcpp::CallbackGroup::SharedPtr planning_callback_group_;
     rclcpp::CallbackGroup::SharedPtr map_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr map_visualization_callback_group_;
     rclcpp::CallbackGroup::SharedPtr safety_callback_group_;
     rclcpp::TimerBase::SharedPtr exec_timer_, safety_timer_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
@@ -164,11 +171,13 @@ namespace scan_planner
     void updateLocalTrajTimeFreeze();
     void requestExecutionStop(const std::string &reason);
     void publishStatus(const std::string &status);
+    void publishReferenceStatus(const std::string &status, uint64_t request_id = 0);
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info);
     void tripRealtimeSafety(const std::string &reason,
                             const Eigen::Vector3d *last_free = nullptr,
-                            const Eigen::Vector3d *first_blocked = nullptr);
+                            const Eigen::Vector3d *first_blocked = nullptr,
+                            uint64_t request_id = 0);
 
     /* ROS functions */
     void execFSMCallback();

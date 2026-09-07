@@ -64,6 +64,17 @@ def test_frontiers_separate_known_free_from_unknown():
     assert (5, 5) not in frontiers
 
 
+def test_small_frontier_fragments_are_excluded_from_visible_usable_cells():
+    frontiers = {(1, 1), (1, 2), (8, 8), (8, 9), (9, 8), (9, 9)}
+
+    clusters = MODULE.cluster_frontiers(frontiers, minimum_size=3)
+    visible = MODULE.clustered_frontier_cells(clusters)
+
+    assert visible == {(8, 8), (8, 9), (9, 8), (9, 9)}
+    assert (1, 1) not in visible
+    assert (1, 2) not in visible
+
+
 def test_safe_viewpoint_stands_back_on_known_side_of_frontier():
     grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
     grid.data[:, :] = MODULE.UNKNOWN
@@ -416,3 +427,52 @@ def test_completion_streak_requires_consecutive_updates_above_threshold():
         streak = MODULE.advance_completion_streak(progress, 0.80, streak)
 
     assert streak == 3
+
+
+def test_reroute_failure_streak_abandons_at_configured_map_update_limit():
+    streak = 0
+
+    streak, abandon = MODULE.advance_reroute_failure_streak(streak, 3)
+    assert (streak, abandon) == (1, False)
+    streak, abandon = MODULE.advance_reroute_failure_streak(streak, 3)
+    assert (streak, abandon) == (2, False)
+    streak, abandon = MODULE.advance_reroute_failure_streak(streak, 3)
+    assert (streak, abandon) == (3, True)
+
+
+def test_reference_status_generation_rejects_late_previous_request():
+    status, request_id = MODULE.parse_planning_status(
+        "BLOCKED request_id=101")
+
+    assert status == "BLOCKED"
+    assert request_id == 101
+    assert not MODULE.planning_status_matches_request(
+        status, request_id, pending_generation=202, active_generation=202)
+    assert MODULE.planning_status_matches_request(
+        "BLOCKED", 202, pending_generation=202, active_generation=202)
+
+
+def test_ready_status_must_match_pending_not_only_active_request():
+    assert not MODULE.planning_status_matches_request(
+        "PATH_TRAJECTORY_READY", 101,
+        pending_generation=202, active_generation=202)
+    assert MODULE.planning_status_matches_request(
+        "PATH_TRAJECTORY_READY", 202,
+        pending_generation=202, active_generation=202)
+    assert not MODULE.planning_status_matches_request(
+        "PATH_TRAJECTORY_READY", 202,
+        pending_generation=None, active_generation=202)
+
+
+def test_failure_cooldown_expires_after_configured_map_revision():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.blacklist_radius = 1.5
+    explorer.map_update_count = 10
+    explorer.goal_failure_cooldowns = {(2.0, 3.0): 16}
+
+    assert explorer.is_goal_on_failure_cooldown((2.5, 3.0))
+    assert not explorer.is_goal_on_failure_cooldown((4.0, 3.0))
+
+    explorer.map_update_count = 16
+    assert not explorer.is_goal_on_failure_cooldown((2.5, 3.0))
+    assert explorer.goal_failure_cooldowns == {}

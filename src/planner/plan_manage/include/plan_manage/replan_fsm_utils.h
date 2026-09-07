@@ -114,6 +114,71 @@ inline bool shouldResumePendingEmergencyPath(bool path_pending, bool have_target
   return path_pending && have_target;
 }
 
+inline bool shouldKeepExecutingAfterRollingReplanFailure(
+    bool reference_path_active, bool reference_path_update_pending,
+    bool safety_stop_active, bool execution_frozen,
+    double remaining_time, double emergency_time)
+{
+  return reference_path_active && !reference_path_update_pending &&
+         !safety_stop_active && !execution_frozen &&
+         remaining_time > std::max(0.0, emergency_time);
+}
+
+inline bool isRollingTrajectoryStartFresh(
+    double start_error, double maximum_start_error)
+{
+  return std::isfinite(start_error) && maximum_start_error >= 0.0 &&
+         start_error <= maximum_start_error;
+}
+
+inline size_t closestForwardTrajectorySample(
+    const std::vector<Eigen::Vector3d> &samples,
+    const Eigen::Vector3d &position)
+{
+  if (samples.empty())
+    return 0;
+
+  size_t best = 0;
+  double best_distance2 = std::numeric_limits<double>::infinity();
+  for (size_t index = 0; index < samples.size(); ++index)
+  {
+    const double distance2 =
+        (samples[index].head<2>() - position.head<2>()).squaredNorm();
+    // Prefer the later point for an exact tie so a handoff never asks the
+    // controller to replay an already completed part of the new trajectory.
+    if (distance2 <= best_distance2)
+    {
+      best_distance2 = distance2;
+      best = index;
+    }
+  }
+  return best;
+}
+
+inline bool trajectorySamplesAreStationary(
+    const std::vector<Eigen::Vector3d> &samples, double tolerance)
+{
+  if (samples.empty() || tolerance < 0.0)
+    return false;
+  const double tolerance2 = tolerance * tolerance;
+  return std::all_of(
+      samples.begin() + 1, samples.end(),
+      [&](const Eigen::Vector3d &sample) {
+        return (sample - samples.front()).squaredNorm() <= tolerance2;
+      });
+}
+
+inline bool shouldReuseCurrentTrajectorySuffix(
+    bool reference_path_update_pending, bool trajectory_valid,
+    double remaining_time, double tracking_error,
+    double maximum_tracking_error)
+{
+  return !reference_path_update_pending && trajectory_valid &&
+         remaining_time > 0.0 && std::isfinite(tracking_error) &&
+         maximum_tracking_error >= 0.0 &&
+         tracking_error <= maximum_tracking_error;
+}
+
 } // namespace scan_planner
 
 #endif // SCAN_PLANNER_REPLAN_FSM_UTILS_H_

@@ -65,6 +65,7 @@ def generate_launch_description():
                 "min_frontier_size": 6,
                 "min_goal_distance": 2.0,
                 "blacklist_radius": 1.5,
+                "global_reroute_failure_updates": 3,
                 "map_update_period": 0.5,
                 "goal_timeout": 120.0,
                 "region_size": 8.0,

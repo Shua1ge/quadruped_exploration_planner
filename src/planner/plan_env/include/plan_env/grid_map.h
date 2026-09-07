@@ -194,7 +194,8 @@ public:
   using InflatedOccupancySnapshotPtr = std::shared_ptr<const InflatedOccupancySnapshot>;
 
   void initMap(rclcpp::Node* node,
-               rclcpp::CallbackGroup::SharedPtr callback_group = nullptr);
+               rclcpp::CallbackGroup::SharedPtr update_callback_group = nullptr,
+               rclcpp::CallbackGroup::SharedPtr visualization_callback_group = nullptr);
   InflatedOccupancySnapshotPtr captureInflatedOccupancySnapshot() const;
   void useInflatedOccupancySnapshotForCurrentThread(
       InflatedOccupancySnapshotPtr snapshot) const;
@@ -228,6 +229,8 @@ private:
   mutable std::shared_mutex map_mutex_;
   std::atomic<uint64_t> map_revision_{0};
   std::atomic<int64_t> last_map_update_ns_{0};
+  std::atomic<bool> map_update_requested_{false};
+  mutable InflatedOccupancySnapshotPtr latest_inflated_snapshot_;
   static thread_local const GridMap* tls_snapshot_owner_;
   static thread_local InflatedOccupancySnapshotPtr tls_snapshot_;
 
@@ -241,6 +244,7 @@ private:
   // update occupancy by raycasting
   void updateOccupancyCallback();
   void visCallback();
+  InflatedOccupancySnapshotPtr buildInflatedOccupancySnapshotLocked() const;
 
   // main update process
   void projectDepthImage();

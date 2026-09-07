@@ -35,6 +35,43 @@ GRID_MOVES = (
     (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
 )
 
+REFERENCE_SCOPED_STATUSES = {
+    "PATH_ACCEPTED", "PATH_TRAJECTORY_READY", "REACHED", "BLOCKED",
+    "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH",
+}
+
+
+def parse_planning_status(value: str) -> Tuple[str, Optional[int]]:
+    """Decode SCAN status while retaining compatibility with plain statuses."""
+    fields = value.split()
+    if not fields:
+        return "", None
+    request_generation = None
+    for field in fields[1:]:
+        if not field.startswith("request_id="):
+            continue
+        try:
+            parsed = int(field.partition("=")[2])
+        except ValueError:
+            continue
+        if parsed > 0:
+            request_generation = parsed
+    return fields[0], request_generation
+
+
+def planning_status_matches_request(
+        status: str, request_generation: Optional[int],
+        pending_generation: Optional[int],
+        active_generation: Optional[int]) -> bool:
+    """Return true only when a path-scoped status belongs to this request."""
+    if status not in REFERENCE_SCOPED_STATUSES:
+        return True
+    expected = (pending_generation if status in (
+        "PATH_ACCEPTED", "PATH_TRAJECTORY_READY",
+        "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH")
+        else active_generation)
+    return expected is not None and request_generation == expected
+
 
 def dilate_hit_ranges(ranges: Sequence[float], bins: int) -> np.ndarray:
     """Conservatively widen finite returns in bearing space.
@@ -205,6 +242,11 @@ def cluster_frontiers(frontiers: Set[Cell], minimum_size: int) -> List[List[Cell
     return clusters
 
 
+def clustered_frontier_cells(clusters: Sequence[Sequence[Cell]]) -> Set[Cell]:
+    """Return only frontier cells that survived cluster-size filtering."""
+    return {cell for cluster in clusters for cell in cluster}
+
+
 def observation_target_cells(grid: ExplorationGrid, center: Cell,
                              radius: float) -> Set[Cell]:
     """Freeze the currently unknown cells associated with an observation task.
@@ -239,6 +281,13 @@ def advance_completion_streak(progress: float, done_ratio: float,
                               current_streak: int) -> int:
     """Require consecutive map updates above threshold before completion."""
     return current_streak + 1 if progress >= done_ratio else 0
+
+
+def advance_reroute_failure_streak(current_streak: int,
+                                   failure_limit: int) -> Tuple[int, bool]:
+    """Bound how long an invalid active route can keep the robot stopped."""
+    next_streak = current_streak + 1
+    return next_streak, next_streak >= failure_limit
 
 
 def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
@@ -882,6 +931,14 @@ class FrontierExplorer(Node):
         self.min_frontier_size = int(self.declare_parameter("min_frontier_size", 6).value)
         self.min_goal_distance = float(self.declare_parameter("min_goal_distance", 2.0).value)
         self.blacklist_radius = float(self.declare_parameter("blacklist_radius", 1.5).value)
+        self.goal_failure_cooldown_updates = int(
+            self.declare_parameter("goal_failure_cooldown_updates", 6).value)
+        if self.goal_failure_cooldown_updates < 1:
+            raise ValueError("goal_failure_cooldown_updates must be at least one")
+        self.global_reroute_failure_updates = int(
+            self.declare_parameter("global_reroute_failure_updates", 3).value)
+        if self.global_reroute_failure_updates < 1:
+            raise ValueError("global_reroute_failure_updates must be at least one")
         self.map_update_period = float(self.declare_parameter("map_update_period", 0.5).value)
         self.goal_timeout = float(self.declare_parameter("goal_timeout", 120.0).value)
         self.blocked_edge_ttl = float(
@@ -941,12 +998,17 @@ class FrontierExplorer(Node):
         self.last_handoff_attempt_update = -1
         self.pipeline_latency_ewma = 0.0
         self.pending_path_publish_ns = 0
+        self.last_path_request_generation = 0
+        self.pending_path_request_generation: Optional[int] = None
+        self.active_path_request_generation: Optional[int] = None
         self.global_path_hold_active = False
         self.global_path_hold_started_ns = 0
         self.global_path_hold_reason = ""
+        self.global_reroute_failure_streak = 0
         self.active_since_ns = 0
         self.blacklist: List[Point2] = []
         self.completed_goals: List[Point2] = []
+        self.goal_failure_cooldowns: Dict[Point2, int] = {}
         self.temporary_blocked_edges: Dict[DirectedEdge, int] = {}
         self.pending_blocked_edge: Optional[DirectedEdge] = None
         self.disabled_by_collision = False
@@ -1134,8 +1196,9 @@ class FrontierExplorer(Node):
         inflated.discard(start)
         frontiers = self.grid.frontier_cells(inflated)
         clusters = cluster_frontiers(frontiers, self.min_frontier_size)
-        self.latest_frontier_count = len(frontiers)
-        self.publish_frontiers(frontiers)
+        filtered_frontiers = clustered_frontier_cells(clusters)
+        self.latest_frontier_count = len(filtered_frontiers)
+        self.publish_frontiers(filtered_frontiers)
         candidate = self.choose_frontier(
             start, clusters, inflated, blocked_edges,
             excluded_goals=(self.active_goal,), allow_region_release=False)
@@ -1156,6 +1219,9 @@ class FrontierExplorer(Node):
         """Reuse the safe suffix of a prepared route from the current pose."""
         candidate = self.prepared_candidate
         if self.position is None or candidate is None:
+            return False
+        if self.is_goal_on_failure_cooldown(candidate.goal):
+            self.prepared_candidate = None
             return False
 
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
@@ -1199,6 +1265,7 @@ class FrontierExplorer(Node):
 
     def activate_candidate(self, path: Sequence[Cell], candidate: FrontierCandidate):
         """Publish a candidate while keeping region accounting in one place."""
+        self.global_reroute_failure_streak = 0
         if (self.last_selected_region_id is not None
                 and candidate.region_id != self.last_selected_region_id):
             self.region_switches += 1
@@ -1281,6 +1348,7 @@ class FrontierExplorer(Node):
         self.active_path_progress_index = check.progress_index
 
         if check.valid:
+            self.global_reroute_failure_streak = 0
             self.get_logger().debug(
                 f"[GLOBAL_PATH_OK] map_update={self.map_update_count} "
                 f"progress={check.progress_index + 1}/{len(self.active_raw_path)} "
@@ -1304,6 +1372,7 @@ class FrontierExplorer(Node):
         self.request_execution_stop(check.reason)
         started = time.perf_counter()
         if self.reroute_active_goal():
+            self.global_reroute_failure_streak = 0
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self.publish_status("GLOBAL_PATH_REROUTED_TO_SAME_OBSERVATION")
             self.get_logger().info(
@@ -1314,6 +1383,8 @@ class FrontierExplorer(Node):
 
         previous_goal = self.active_goal
         if self.plan_from_current_position(excluded_goals=(previous_goal,)):
+            self.global_reroute_failure_streak = 0
+            self.add_goal_failure_cooldown(previous_goal, "GLOBAL_PATH_INVALID")
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             new_goal = self.active_goal
             new_goal_text = ("none" if new_goal is None else
@@ -1325,12 +1396,38 @@ class FrontierExplorer(Node):
                 "waiting for a replacement local trajectory")
             return False
 
+        self.global_reroute_failure_streak, abandon_goal = (
+            advance_reroute_failure_streak(
+                self.global_reroute_failure_streak,
+                self.global_reroute_failure_updates))
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if abandon_goal:
+            self.add_goal_failure_cooldown(previous_goal, "GLOBAL_REROUTE_FAILED")
+            self.active_goal = None
+            self.active_goal_cell = None
+            self.active_observation = None
+            self.active_raw_path = []
+            self.active_path_progress_index = 0
+            self.pending_blocked_edge = None
+            self.prepared_candidate = None
+            self.replacement_pending = False
+            self.active_path_request_generation = None
+            self.global_reroute_failure_streak = 0
+            self.publish_status("GLOBAL_PATH_ABANDONED_WAITING_FOR_ROUTE")
+            self.get_logger().error(
+                f"[GLOBAL_REROUTE_ABANDONED] goal={goal_text} "
+                f"reason={check.reason} after "
+                f"{self.global_reroute_failure_updates} failed map updates; "
+                "goal placed on cooldown and a different route will be selected")
+            return False
+
         self.publish_status("GLOBAL_PATH_INVALID_WAITING_FOR_ROUTE")
         self.get_logger().error(
             f"[GLOBAL_REROUTE_FAILED] goal={goal_text} reason={check.reason} "
-            f"elapsed={elapsed_ms:.1f}ms; robot remains stopped and the current "
-            "observation task is retained for the next map update",
+            f"attempt={self.global_reroute_failure_streak}/"
+            f"{self.global_reroute_failure_updates} elapsed={elapsed_ms:.1f}ms; "
+            "robot remains stopped and the current observation task is retained "
+            "for the next map update",
             throttle_duration_sec=2.0)
         return False
 
@@ -1346,6 +1443,8 @@ class FrontierExplorer(Node):
         self.pending_blocked_edge = None
         self.prepared_candidate = None
         self.replacement_pending = False
+        self.active_path_request_generation = None
+        self.pending_path_request_generation = None
         self.publish_status(status)
 
     def replace_unsatisfied_observation(self) -> bool:
@@ -1404,7 +1503,19 @@ class FrontierExplorer(Node):
         return False
 
     def planning_status_callback(self, msg: String):
-        if msg.data == "PATH_TRAJECTORY_READY" and self.pending_path_publish_ns:
+        status, request_generation = parse_planning_status(msg.data)
+        if not planning_status_matches_request(
+                status, request_generation,
+                self.pending_path_request_generation,
+                self.active_path_request_generation):
+            self.get_logger().warning(
+                f"[STALE_PLANNING_STATUS_IGNORED] status={status} "
+                f"request_id={request_generation} pending_id="
+                f"{self.pending_path_request_generation} active_id="
+                f"{self.active_path_request_generation}")
+            return
+
+        if status == "PATH_TRAJECTORY_READY" and self.pending_path_publish_ns:
             latency = ((self.get_clock().now().nanoseconds - self.pending_path_publish_ns) * 1e-9)
             if latency >= 0.0:
                 self.pipeline_latency_ewma = (
@@ -1414,6 +1525,7 @@ class FrontierExplorer(Node):
                     f"[LOCAL_TRAJECTORY_READY] pipeline_latency={latency:.2f}s, "
                     f"ewma={self.pipeline_latency_ewma:.2f}s")
             self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
             if self.global_path_hold_active:
                 hold_time = ((self.get_clock().now().nanoseconds
                               - self.global_path_hold_started_ns) * 1e-9)
@@ -1424,12 +1536,12 @@ class FrontierExplorer(Node):
                 self.global_path_hold_active = False
                 self.global_path_hold_started_ns = 0
                 self.global_path_hold_reason = ""
-        elif msg.data in ("RUNNING", "PATH_ACCEPTED"):
+        elif status in ("RUNNING", "PATH_ACCEPTED"):
             # A successful replacement trajectory resolves the pending local
             # failure.  Keep the short-lived edge record, but do not let it be
             # mistaken for the cause of a later unrelated BLOCKED status.
             self.pending_blocked_edge = None
-        elif msg.data == "REACHED" and self.active_goal is not None:
+        elif status == "REACHED" and self.active_goal is not None:
             task = self.evaluate_active_observation()
             self.goals_reached += 1
             if task is not None and task.progress >= self.observation_done_ratio:
@@ -1452,8 +1564,11 @@ class FrontierExplorer(Node):
                     self.blacklist.append(self.active_goal)
                 self.replacement_pending = True
                 self.replace_unsatisfied_observation()
-        elif msg.data == "BLOCKED":
+        elif status == "BLOCKED":
+            self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
+            self.active_path_request_generation = None
             self.global_path_hold_active = False
             self.global_path_hold_started_ns = 0
             self.global_path_hold_reason = ""
@@ -1472,13 +1587,17 @@ class FrontierExplorer(Node):
             self.pending_blocked_edge = None
             self.prepared_candidate = None
             self.replacement_pending = False
-            if previous_goal is not None and self.plan_from_current_position(
-                    excluded_goals=(previous_goal,)):
+            if previous_goal is not None:
+                self.add_goal_failure_cooldown(previous_goal, "BLOCKED")
+            if previous_goal is not None and self.plan_from_current_position():
                 self.publish_status("LOCAL_BLOCKED_VIEWPOINT_CHANGED")
             else:
                 self.publish_status("LOCAL_BLOCKED_WAITING_FOR_ROUTE")
-        elif msg.data in ("REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
+        elif status in ("REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
+            self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
+            self.active_path_request_generation = None
             self.global_path_hold_active = False
             self.global_path_hold_started_ns = 0
             self.global_path_hold_reason = ""
@@ -1491,7 +1610,7 @@ class FrontierExplorer(Node):
             self.pending_blocked_edge = None
             self.prepared_candidate = None
             self.replacement_pending = False
-            self.publish_status(f"RECOVER_FROM_{msg.data}")
+            self.publish_status(f"RECOVER_FROM_{status}")
 
     def collision_callback(self, msg: Bool):
         if msg.data:
@@ -1514,6 +1633,25 @@ class FrontierExplorer(Node):
         history = self.blacklist + self.completed_goals
         return any(math.hypot(point[0] - old[0], point[1] - old[1]) < self.blacklist_radius
                    for old in history)
+
+    def add_goal_failure_cooldown(self, point: Point2, reason: str):
+        release_update = self.map_update_count + self.goal_failure_cooldown_updates
+        self.goal_failure_cooldowns[point] = max(
+            release_update, self.goal_failure_cooldowns.get(point, 0))
+        self.get_logger().warning(
+            f"[GOAL_FAILURE_COOLDOWN] goal=({point[0]:.2f},{point[1]:.2f}) "
+            f"reason={reason} release_update={release_update}")
+
+    def is_goal_on_failure_cooldown(self, point: Point2) -> bool:
+        expired = [goal for goal, release in self.goal_failure_cooldowns.items()
+                   if self.map_update_count >= release]
+        for goal in expired:
+            del self.goal_failure_cooldowns[goal]
+        return any(
+            self.map_update_count < release
+            and math.hypot(point[0] - goal[0], point[1] - goal[1])
+            < self.blacklist_radius
+            for goal, release in self.goal_failure_cooldowns.items())
 
     def exploration_timer(self):
         if not self.auto_start or self.position is None or self.map_update_count < 2:
@@ -1574,16 +1712,19 @@ class FrontierExplorer(Node):
         inflated.discard(start)
         frontiers = self.grid.frontier_cells(inflated)
         clusters = cluster_frontiers(frontiers, self.min_frontier_size)
-        self.latest_frontier_count = len(frontiers)
-        self.publish_frontiers(frontiers)
+        filtered_frontiers = clustered_frontier_cells(clusters)
+        self.latest_frontier_count = len(filtered_frontiers)
+        self.publish_frontiers(filtered_frontiers)
         best = self.choose_frontier(
             start, clusters, inflated, blocked_edges,
             excluded_goals=excluded_goals)
         if best is None:
-            status = "EXPLORATION_COMPLETE" if not frontiers else "NO_REACHABLE_FRONTIER"
+            status = ("EXPLORATION_COMPLETE" if not filtered_frontiers
+                      else "NO_REACHABLE_FRONTIER")
             self.publish_status(status)
             self.get_logger().info(
-                f"{status}: {len(frontiers)} frontier cells", throttle_duration_sec=5.0)
+                f"{status}: {len(filtered_frontiers)} usable frontier cells",
+                throttle_duration_sec=5.0)
             return False
         raw_path = best.path
         goal_xy = best.goal
@@ -1654,7 +1795,9 @@ class FrontierExplorer(Node):
                             math.hypot(goal_xy[0] - point[0], goal_xy[1] - point[1])
                             < self.blacklist_radius for point in excluded_goals)
                         if (direct_distance < self.min_goal_distance
-                                or self.is_blacklisted(goal_xy) or excluded):
+                                or self.is_blacklisted(goal_xy)
+                                or self.is_goal_on_failure_cooldown(goal_xy)
+                                or excluded):
                             continue
                         proposals.append((
                             region.region_id, viewpoint, frontier, goal_xy,
@@ -1870,7 +2013,11 @@ class FrontierExplorer(Node):
 
     def publish_reference_path(self, cells: Sequence[Cell]):
         msg = Path()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        now_ns = self.get_clock().now().nanoseconds
+        request_generation = max(now_ns, self.last_path_request_generation + 1)
+        self.last_path_request_generation = request_generation
+        msg.header.stamp.sec = request_generation // 1_000_000_000
+        msg.header.stamp.nanosec = request_generation % 1_000_000_000
         msg.header.frame_id = self.frame_id
         world_points = [self.grid.cell_to_world(cell) for cell in cells]
         world_points[0] = self.position
@@ -1888,7 +2035,9 @@ class FrontierExplorer(Node):
             msg.poses.append(pose)
         self.path_pub.publish(msg)
         self.path_vis_pub.publish(msg)
-        self.pending_path_publish_ns = self.get_clock().now().nanoseconds
+        self.pending_path_publish_ns = now_ns
+        self.pending_path_request_generation = request_generation
+        self.active_path_request_generation = request_generation
 
     def publish_path(self, cells: Sequence[Cell], candidate: FrontierCandidate):
         goal_xy = candidate.goal

@@ -9,6 +9,9 @@ closed_loop_controller:
     max_vy: 0.35
     max_vyaw: 1.0
     finish_dist: 0.15
+    handoff_search_time: 1.0
+    handoff_sample_dt: 0.02
+    max_handoff_error: 0.30
 
 open_loop_controller:
   ros__parameters:

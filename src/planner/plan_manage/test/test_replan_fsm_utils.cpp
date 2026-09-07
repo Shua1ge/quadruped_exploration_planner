@@ -46,4 +46,85 @@ TEST(EmergencyRecovery, OnlyAPathReceivedWhileStoppingCanResume)
   EXPECT_FALSE(shouldResumePendingEmergencyPath(true, false));
 }
 
+TEST(RollingReplanFailure, KeepsSafeRemainderUntilEmergencyWindow)
+{
+  EXPECT_TRUE(shouldKeepExecutingAfterRollingReplanFailure(
+      true, false, false, false, 1.01, 1.0));
+  EXPECT_FALSE(shouldKeepExecutingAfterRollingReplanFailure(
+      true, false, false, false, 1.0, 1.0));
+  EXPECT_FALSE(shouldKeepExecutingAfterRollingReplanFailure(
+      true, false, false, false, 0.0, 1.0));
+}
+
+TEST(RollingReplanFailure, NeverBypassesReplacementOrSafetyStops)
+{
+  EXPECT_FALSE(shouldKeepExecutingAfterRollingReplanFailure(
+      false, false, false, false, 5.0, 1.0));
+  EXPECT_FALSE(shouldKeepExecutingAfterRollingReplanFailure(
+      true, true, false, false, 5.0, 1.0));
+  EXPECT_FALSE(shouldKeepExecutingAfterRollingReplanFailure(
+      true, false, true, false, 5.0, 1.0));
+  EXPECT_FALSE(shouldKeepExecutingAfterRollingReplanFailure(
+      true, false, false, true, 5.0, 1.0));
+}
+
+TEST(RollingTrajectoryHandoff, RejectsStaleStartBeyondTrackingMargin)
+{
+  EXPECT_TRUE(isRollingTrajectoryStartFresh(0.0, 0.30));
+  EXPECT_TRUE(isRollingTrajectoryStartFresh(0.30, 0.30));
+  EXPECT_FALSE(isRollingTrajectoryStartFresh(0.3001, 0.30));
+  EXPECT_FALSE(isRollingTrajectoryStartFresh(
+      std::numeric_limits<double>::infinity(), 0.30));
+}
+
+TEST(RollingTrajectoryHandoff, StartsAtCurrentForwardPointInsteadOfReplayingFromA1)
+{
+  const std::vector<Eigen::Vector3d> samples = {
+      Eigen::Vector3d(0.0, 0.0, 0.4),
+      Eigen::Vector3d(0.2, 0.0, 0.4),
+      Eigen::Vector3d(0.4, 0.0, 0.4),
+      Eigen::Vector3d(0.6, 0.0, 0.4)};
+
+  EXPECT_EQ(closestForwardTrajectorySample(
+                samples, Eigen::Vector3d(0.41, 0.0, 0.4)),
+            2U);
+}
+
+TEST(RollingTrajectoryHandoff, PrefersLaterSampleWhenDistanceIsTied)
+{
+  const std::vector<Eigen::Vector3d> samples = {
+      Eigen::Vector3d(0.0, 0.0, 0.4),
+      Eigen::Vector3d(0.2, 0.0, 0.4)};
+
+  EXPECT_EQ(closestForwardTrajectorySample(
+                samples, Eigen::Vector3d(0.1, 0.0, 0.4)),
+            1U);
+}
+
+TEST(RollingTrajectoryHandoff, IdentifiesEmergencyStationaryTrajectory)
+{
+  const std::vector<Eigen::Vector3d> stationary(
+      6, Eigen::Vector3d(-19.0, 12.0, 0.4));
+  const std::vector<Eigen::Vector3d> moving = {
+      Eigen::Vector3d(-19.0, 12.0, 0.4),
+      Eigen::Vector3d(-18.9, 12.0, 0.4)};
+
+  EXPECT_TRUE(trajectorySamplesAreStationary(stationary, 1e-4));
+  EXPECT_FALSE(trajectorySamplesAreStationary(moving, 1e-4));
+}
+
+TEST(RollingTrajectoryReuse, UsesValidatedSuffixBeforeFreshPlanning)
+{
+  EXPECT_TRUE(shouldReuseCurrentTrajectorySuffix(
+      false, true, 2.0, 0.05, 0.30));
+  EXPECT_FALSE(shouldReuseCurrentTrajectorySuffix(
+      true, true, 2.0, 0.05, 0.30));
+  EXPECT_FALSE(shouldReuseCurrentTrajectorySuffix(
+      false, false, 2.0, 0.05, 0.30));
+  EXPECT_FALSE(shouldReuseCurrentTrajectorySuffix(
+      false, true, 0.0, 0.05, 0.30));
+  EXPECT_FALSE(shouldReuseCurrentTrajectorySuffix(
+      false, true, 2.0, 0.31, 0.30));
+}
+
 } // namespace scan_planner

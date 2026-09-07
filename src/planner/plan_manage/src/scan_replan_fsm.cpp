@@ -43,6 +43,14 @@ namespace scan_planner
     planning_horizon_ = load_parameter<double>(node_, "fsm.planning_horizon", -1.0);
     reference_path_lookahead_ = load_parameter<double>(node_, "fsm.reference_path_lookahead", 3.0);
     emergency_time_ = load_parameter<double>(node_, "fsm.emergency_time", 1.0);
+    rolling_replan_retry_period_ = load_parameter<double>(
+        node_, "fsm.rolling_replan_retry_period", 0.25);
+    if (rolling_replan_retry_period_ <= 0.0)
+      throw std::runtime_error("fsm.rolling_replan_retry_period must be positive");
+    rolling_replan_max_start_error_ = load_parameter<double>(
+        node_, "fsm.rolling_replan_max_start_error", 0.30);
+    if (rolling_replan_max_start_error_ <= 0.0)
+      throw std::runtime_error("fsm.rolling_replan_max_start_error must be positive");
     goal_tolerance_ = load_parameter<double>(node_, "fsm.goal_tolerance", 0.25);
     enable_fail_safe_ = load_parameter<bool>(node_, "fsm.fail_safe", true);
     max_replan_fail_count_ = load_parameter<int>(node_, "fsm.max_replan_fail_count", 5);
@@ -72,12 +80,16 @@ namespace scan_planner
         rclcpp::CallbackGroupType::MutuallyExclusive);
     map_callback_group_ = node_->create_callback_group(
         rclcpp::CallbackGroupType::MutuallyExclusive);
+    map_visualization_callback_group_ = node_->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
     safety_callback_group_ = node_->create_callback_group(
         rclcpp::CallbackGroupType::MutuallyExclusive);
 
     visualization_.reset(new PlanningVisualization(node_));
     planner_manager_.reset(new SCANPlannerManager);
-    planner_manager_->initPlanModules(node_, visualization_, map_callback_group_);
+    planner_manager_->initPlanModules(
+        node_, visualization_, map_callback_group_,
+        map_visualization_callback_group_);
 
     /* callback */
     exec_timer_ = node_->create_wall_timer(std::chrono::milliseconds(10),
@@ -197,6 +209,7 @@ namespace scan_planner
 
     if (success)
     {
+      next_rolling_replan_attempt_ns_ = 0;
       if (safety_stop_active_.exchange(false))
         RCLCPP_INFO(node_->get_logger(),
                     "[SAFETY_RELEASE] source=new_manual_goal; planning may resume");
@@ -431,6 +444,21 @@ namespace scan_planner
       return;
     }
 
+    const uint64_t request_id =
+        static_cast<uint64_t>(msg->header.stamp.sec) * 1000000000ULL
+        + static_cast<uint64_t>(msg->header.stamp.nanosec);
+    const uint64_t active_request_id = active_reference_request_id_.load();
+    if (request_id != 0 && active_request_id != 0 && request_id <= active_request_id)
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Ignoring stale initial_path request_id=%llu active_request_id=%llu",
+                  static_cast<unsigned long long>(request_id),
+                  static_cast<unsigned long long>(active_request_id));
+      return;
+    }
+    active_reference_request_id_.store(request_id);
+    next_rolling_replan_attempt_ns_ = 0;
+
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
 
@@ -477,6 +505,7 @@ namespace scan_planner
       have_target_ = true;
       have_new_target_ = true;
       reference_path_update_pending_ = true;
+      pending_reference_request_id_ = request_id;
       if (exec_state_ == EMERGENCY_STOP)
         emergency_path_pending_ = true;
     }
@@ -498,7 +527,7 @@ namespace scan_planner
       }
 
       RCLCPP_INFO(node_->get_logger(), "Reference path accepted");
-      publishStatus("PATH_ACCEPTED");
+      publishReferenceStatus("PATH_ACCEPTED", request_id);
     }
     else
     {
@@ -572,6 +601,19 @@ namespace scan_planner
     status_pub_->publish(msg);
   }
 
+  void SCANReplanFSM::publishReferenceStatus(
+      const std::string &status, uint64_t request_id)
+  {
+    if (request_id == 0)
+      request_id = active_reference_request_id_.load();
+    if (request_id == 0)
+    {
+      publishStatus(status);
+      return;
+    }
+    publishStatus(status + " request_id=" + std::to_string(request_id));
+  }
+
   void SCANReplanFSM::publishBlockedSegment()
   {
     if (!collision_segment_pending_)
@@ -604,7 +646,10 @@ namespace scan_planner
     std_msgs::msg::Bool msg;
     msg.data = true;
     emergency_stop_pub_->publish(msg);
-    publishStatus(reason);
+    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+      publishReferenceStatus(reason);
+    else
+      publishStatus(reason);
   }
 
   void SCANReplanFSM::updateLocalTrajTimeFreeze()
@@ -784,7 +829,7 @@ namespace scan_planner
       bool success = callReboundReplan(true, flag_random_poly_init);
       if (success)
       {
-
+        next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
         collision_segment_pending_ = false;
@@ -813,6 +858,7 @@ namespace scan_planner
 
       if (planFromCurrentTraj())
       {
+        next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
         collision_segment_pending_ = false;
@@ -820,9 +866,31 @@ namespace scan_planner
       }
       else
       {
-        requestExecutionStop("REPLANNING");
-        replan_fail_count_++;
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        const auto *info = &planner_manager_->local_data_;
+        const double t_cur = std::clamp(
+            (node_->now() - info->start_time_).seconds(), 0.0, info->duration_);
+        const double remaining_time = std::max(0.0, info->duration_ - t_cur);
+        if (shouldKeepExecutingAfterRollingReplanFailure(
+                reference_path_active_, reference_path_update_pending_,
+                safety_stop_active_.load(), go2_execution_frozen_.load(),
+                remaining_time, emergency_time_))
+        {
+          next_rolling_replan_attempt_ns_ =
+              node_->now().nanoseconds() + static_cast<int64_t>(
+                  rolling_replan_retry_period_ * 1e9);
+          RCLCPP_WARN_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 1000,
+              "[ROLLING_REPLAN_RETRY] planning failed with %.2fs left; continuing the validated current trajectory and retrying in %.2fs",
+              remaining_time, rolling_replan_retry_period_);
+          changeFSMExecState(EXEC_TRAJ, "ROLLING_RETRY");
+        }
+        else
+        {
+          next_rolling_replan_attempt_ns_ = 0;
+          requestExecutionStop("REPLANNING");
+          replan_fail_count_++;
+          changeFSMExecState(REPLAN_TRAJ, "FSM");
+        }
       }
 
       break;
@@ -874,6 +942,7 @@ namespace scan_planner
         {
           if (planFromCurrentTraj())
           {
+            next_rolling_replan_attempt_ns_ = 0;
             replan_fail_count_ = 0;
             tracking_recovery_active_ = false;
             collision_segment_pending_ = false;
@@ -881,6 +950,7 @@ namespace scan_planner
           }
           else
           {
+            next_rolling_replan_attempt_ns_ = 0;
             requestExecutionStop("REPLANNING");
             replan_fail_count_++;
             changeFSMExecState(REPLAN_TRAJ, "LOCAL_SEGMENT_DONE");
@@ -912,6 +982,11 @@ namespace scan_planner
         requestExecutionStop("REACHED");
 
         changeFSMExecState(WAIT_TARGET, "FSM");
+        return;
+      }
+      else if (next_rolling_replan_attempt_ns_ > 0 &&
+               time_now.nanoseconds() < next_rolling_replan_attempt_ns_)
+      {
         return;
       }
       else if ((end_pt_ - pos).norm() < no_replan_thresh_)
@@ -1005,6 +1080,18 @@ namespace scan_planner
     double t_cur = (time_now - info->start_time_).seconds();
     t_cur = std::min(std::max(t_cur, 0.0), info->duration_);
 
+    const bool trajectory_valid =
+        info->start_time_.seconds() > 1e-5 && info->duration_ > 1e-5;
+    const double remaining_time =
+        trajectory_valid ? std::max(0.0, info->duration_ - t_cur) : 0.0;
+    const double tracking_error = trajectory_valid
+        ? (info->position_traj_.evaluateDeBoorT(t_cur).head<2>() -
+           odom_pos_.head<2>()).norm()
+        : std::numeric_limits<double>::infinity();
+    const bool reuse_suffix = shouldReuseCurrentTrajectorySuffix(
+        reference_path_update_pending_, trajectory_valid, remaining_time,
+        tracking_error, rolling_replan_max_start_error_);
+
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
     start_pt_ = odom_pos_;
@@ -1047,15 +1134,26 @@ namespace scan_planner
     if (!adjustGlobalTargetIfOccupied())
       return false;
 
-    bool success = callReboundReplan(true, false);
-    if (!success)
+    bool success = false;
+    if (reuse_suffix)
     {
-      success = callReboundReplan(true, true);
-      if (!success)
-        return false;
+      RCLCPP_INFO(node_->get_logger(),
+                  "[ROLLING_REPLAN_MODE] reuse_validated_suffix remaining=%.2fs tracking_error=%.2fm",
+                  remaining_time, tracking_error);
+      success = callReboundReplan(false, false);
+      if (success)
+        return true;
+      RCLCPP_WARN(node_->get_logger(),
+                  "[ROLLING_REPLAN_FALLBACK] validated suffix could not be repaired; regenerating from current odometry");
     }
 
-    return true;
+    success = callReboundReplan(true, false);
+    if (success)
+      return true;
+
+    RCLCPP_WARN(node_->get_logger(),
+                "[ROLLING_REPLAN_FALLBACK] deterministic regeneration failed; trying randomized initialization");
+    return callReboundReplan(true, true);
   }
 
   void SCANReplanFSM::setStartStateFromOdomOrCurrentTraj()
@@ -1121,13 +1219,21 @@ namespace scan_planner
     execution_snapshot_.position = info.position_traj_;
     execution_snapshot_.start_time = info.start_time_;
     execution_snapshot_.duration = info.duration_;
+    execution_snapshot_.request_id = active_reference_request_id_.load();
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
   }
 
   void SCANReplanFSM::tripRealtimeSafety(
       const std::string &reason, const Eigen::Vector3d *last_free,
-      const Eigen::Vector3d *first_blocked)
+      const Eigen::Vector3d *first_blocked, uint64_t request_id)
   {
+    if (request_id != 0 && request_id != active_reference_request_id_.load())
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Ignoring safety result for stale request_id=%llu",
+                  static_cast<unsigned long long>(request_id));
+      return;
+    }
     bool expected = false;
     if (!safety_stop_active_.compare_exchange_strong(expected, true))
       return;
@@ -1164,6 +1270,13 @@ namespace scan_planner
     last_safety_callback_wall_ = wall_now;
 
     auto map = planner_manager_->grid_map_;
+    const auto map_snapshot = map->captureInflatedOccupancySnapshot();
+    map->useInflatedOccupancySnapshotForCurrentThread(map_snapshot);
+    struct SnapshotScope
+    {
+      GridMap::Ptr map;
+      ~SnapshotScope() { map->clearInflatedOccupancySnapshotForCurrentThread(); }
+    } snapshot_scope{map};
     if (callback_gap > 0.15)
       RCLCPP_WARN(node_->get_logger(),
                   "[SAFETY_SCHEDULER_LAG] callback_gap=%.1fms map_age=%.1fms",
@@ -1231,7 +1344,7 @@ namespace scan_planner
             (static_cast<double>(sample) / samples) * connector;
         if (map->getInflateOccupancy(point, yaw) != 0)
         {
-          tripRealtimeSafety("BLOCKED", &odom_pos, &point);
+          tripRealtimeSafety("BLOCKED", &odom_pos, &point, trajectory.request_id);
           RCLCPP_WARN(node_->get_logger(),
                       "[REALTIME_SAFETY_STOP] reason=connector_blocked error=%.2fm hit=(%.2f,%.2f) map_age=%.1fms",
                       connector_length, point.x(), point.y(), map_age * 1000.0);
@@ -1249,7 +1362,7 @@ namespace scan_planner
           std::min(t + time_step, trajectory.duration));
       if (map->getInflateOccupancy(pos, segment_yaw(pos, next)) != 0)
       {
-        tripRealtimeSafety("BLOCKED", &last_free, &pos);
+        tripRealtimeSafety("BLOCKED", &last_free, &pos, trajectory.request_id);
         RCLCPP_WARN(node_->get_logger(),
                     "[REALTIME_SAFETY_STOP] reason=trajectory_blocked time_to_hit=%.2fs hit=(%.2f,%.2f) map_age=%.1fms",
                     std::max(0.0, t - t_cur), pos.x(), pos.y(), map_age * 1000.0);
@@ -1266,6 +1379,14 @@ namespace scan_planner
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
     auto map = planner_manager_->grid_map_;
+    // reboundReplan commits its successful result to local_data_ before the
+    // real-time publication checks below.  Preserve the trajectory that the
+    // controller is actually executing so every rejected result is atomic.
+    const LocalTrajData executing_trajectory = planner_manager_->local_data_;
+    const auto reject_planned_trajectory = [&]() {
+      planner_manager_->local_data_ = executing_trajectory;
+      return false;
+    };
     const auto map_snapshot = map->captureInflatedOccupancySnapshot();
     const uint64_t safety_generation_before = safety_generation_.load();
     const auto planning_started = std::chrono::steady_clock::now();
@@ -1296,7 +1417,7 @@ namespace scan_planner
       {
         RCLCPP_WARN(node_->get_logger(),
                     "[PLAN_RESULT_DISCARDED] realtime safety stopped execution while this plan was computing");
-        return false;
+        return reject_planned_trajectory();
       }
 
       auto info = &planner_manager_->local_data_;
@@ -1316,7 +1437,7 @@ namespace scan_planner
           RCLCPP_ERROR(node_->get_logger(),
                        "Rejecting optimized trajectory: collision at t=%.3fs, position=(%.3f, %.3f, %.3f)",
                        t, pos.x(), pos.y(), pos.z());
-          return false;
+          return reject_planned_trajectory();
         }
       }
 
@@ -1332,6 +1453,14 @@ namespace scan_planner
         const Eigen::Vector3d trajectory_start = info->position_traj_.evaluateDeBoorT(0.0);
         const Eigen::Vector3d connector = trajectory_start - live_odom;
         const double connector_length = connector.head<2>().norm();
+        if (!isRollingTrajectoryStartFresh(
+                connector_length, rolling_replan_max_start_error_))
+        {
+          RCLCPP_ERROR(node_->get_logger(),
+                       "[PLAN_RESULT_DISCARDED] stale trajectory start error=%.2fm limit=%.2fm; preserving the currently executing trajectory",
+                       connector_length, rolling_replan_max_start_error_);
+          return reject_planned_trajectory();
+        }
         if (connector_length > 0.05)
         {
           const int samples = std::max(1, static_cast<int>(std::ceil(connector_length / 0.05)));
@@ -1345,7 +1474,7 @@ namespace scan_planner
               RCLCPP_ERROR(node_->get_logger(),
                            "[PLAN_RESULT_DISCARDED] latest odom connector is blocked error=%.2fm hit=(%.2f,%.2f)",
                            connector_length, point.x(), point.y());
-              return false;
+              return reject_planned_trajectory();
             }
           }
         }
@@ -1379,8 +1508,9 @@ namespace scan_planner
       bspline_pub_->publish(bspline);
       if (reference_path_update_pending_)
       {
-        publishStatus("PATH_TRAJECTORY_READY");
+        publishReferenceStatus("PATH_TRAJECTORY_READY", pending_reference_request_id_);
         reference_path_update_pending_ = false;
+        pending_reference_request_id_ = 0;
       }
 
       visualization_->displayOptimalTraj(info->position_traj_, 0);
@@ -1600,6 +1730,12 @@ namespace scan_planner
     }
 
     local_target_pt_ = target;
+
+    RCLCPP_INFO_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 1000,
+        "[ROLLING_LOCAL_TARGET] lookahead=%.2fm target_distance=%.2fm remaining_after_target=%.2fm",
+        lookahead, (local_target_pt_ - start_pt_).norm(),
+        path_sample.remaining_after_target);
 
     const double stop_distance =
         planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_ /
