@@ -341,18 +341,47 @@ def test_region_commitment_replans_when_active_region_disappears():
 
 
 def test_region_release_requires_consecutive_missing_updates():
-    active, streak, released = MODULE.advance_region_release(7, {8}, 0, 3)
-    assert (active, streak, released) == (7, 1, False)
+    update = MODULE.update_region_commitment(
+        7, {8}, {8}, 0, None, 10.0, 3, 5.0)
+    assert (update.active_region_id, update.missing_streak,
+            update.release_reason) == (7, 1, None)
 
-    active, streak, released = MODULE.advance_region_release(7, {8}, streak, 3)
-    assert (active, streak, released) == (7, 2, False)
+    update = MODULE.update_region_commitment(
+        7, {8}, {8}, update.missing_streak, None, 10.5, 3, 5.0)
+    assert (update.active_region_id, update.missing_streak,
+            update.release_reason) == (7, 2, None)
 
-    active, streak, released = MODULE.advance_region_release(7, {8}, streak, 3)
-    assert (active, streak, released) == (None, 0, True)
+    update = MODULE.update_region_commitment(
+        7, {8}, {8}, update.missing_streak, None, 11.0, 3, 5.0)
+    assert (update.active_region_id, update.missing_streak,
+            update.release_reason) == (None, 0, "frontier_missing")
 
 
 def test_region_release_streak_resets_while_frontier_region_still_exists():
-    assert MODULE.advance_region_release(7, {7, 8}, 2, 3) == (7, 0, False)
+    update = MODULE.update_region_commitment(
+        7, {7, 8}, {7, 8}, 2, None, 10.0, 3, 5.0)
+    assert update == MODULE.RegionCommitmentUpdate(7, 0, None)
+
+
+def test_region_commitment_releases_after_persistent_unreachability():
+    update = MODULE.update_region_commitment(
+        7, {7, 8}, {8}, 0, None, 10.0, 3, 5.0)
+    assert update == MODULE.RegionCommitmentUpdate(7, 0, 10.0)
+
+    update = MODULE.update_region_commitment(
+        7, {7, 8}, {8}, 0, update.unreachable_since, 14.9, 3, 5.0)
+    assert update == MODULE.RegionCommitmentUpdate(7, 0, 10.0)
+
+    update = MODULE.update_region_commitment(
+        7, {7, 8}, {8}, 0, update.unreachable_since, 15.0, 3, 5.0)
+    assert update == MODULE.RegionCommitmentUpdate(
+        None, 0, None, "persistently_unreachable")
+
+
+def test_region_commitment_cancels_unreachable_timer_when_candidate_returns():
+    update = MODULE.update_region_commitment(
+        7, {7, 8}, {7, 8}, 0, 10.0, 12.0, 3, 5.0)
+    assert update == MODULE.RegionCommitmentUpdate(7, 0, None)
 
 
 def test_path_length_uses_grid_resolution():

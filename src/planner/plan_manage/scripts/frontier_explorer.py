@@ -838,18 +838,39 @@ class PersistentRegionTracker:
         return sorted(assigned, key=lambda region: region.region_id)
 
 
-def advance_region_release(active_region_id: Optional[int],
-                           observed_region_ids: Set[int],
-                           missing_streak: int,
-                           release_updates: int
-                           ) -> Tuple[Optional[int], int, bool]:
-    """Release only after the committed region's frontier has disappeared."""
-    if active_region_id is None or active_region_id in observed_region_ids:
-        return active_region_id, 0, False
-    missing_streak += 1
-    if missing_streak >= max(1, release_updates):
-        return None, 0, True
-    return active_region_id, missing_streak, False
+@dataclass(frozen=True)
+class RegionCommitmentUpdate:
+    active_region_id: Optional[int]
+    missing_streak: int
+    unreachable_since: Optional[float]
+    release_reason: Optional[str] = None
+
+
+def update_region_commitment(
+        active_region_id: Optional[int], observed_region_ids: Set[int],
+        candidate_region_ids: Set[int], missing_streak: int,
+        unreachable_since: Optional[float], now: float,
+        missing_release_updates: int,
+        unreachable_timeout: float) -> RegionCommitmentUpdate:
+    """Debounce transient map changes without retaining an unusable region forever."""
+    if active_region_id is None:
+        return RegionCommitmentUpdate(None, 0, None)
+
+    if active_region_id not in observed_region_ids:
+        missing_streak += 1
+        if missing_streak >= max(1, missing_release_updates):
+            return RegionCommitmentUpdate(None, 0, None, "frontier_missing")
+        return RegionCommitmentUpdate(active_region_id, missing_streak, None)
+
+    if active_region_id in candidate_region_ids:
+        return RegionCommitmentUpdate(active_region_id, 0, None)
+
+    if unreachable_since is None:
+        unreachable_since = now
+    if now - unreachable_since >= max(0.0, unreachable_timeout):
+        return RegionCommitmentUpdate(
+            None, 0, None, "persistently_unreachable")
+    return RegionCommitmentUpdate(active_region_id, 0, unreachable_since)
 
 
 def solve_open_held_karp(cost_matrix: Sequence[Sequence[float]],
@@ -1001,6 +1022,10 @@ class FrontierExplorer(Node):
             self.declare_parameter("region_release_updates", 3).value)
         if self.region_release_updates < 1:
             raise ValueError("region_release_updates must be at least one")
+        self.region_unreachable_timeout = float(
+            self.declare_parameter("region_unreachable_timeout", 5.0).value)
+        if self.region_unreachable_timeout <= 0.0:
+            raise ValueError("region_unreachable_timeout must be positive")
         self.max_global_regions = int(
             self.declare_parameter("max_global_regions", 10).value)
         self.metrics_period = float(self.declare_parameter("metrics_period", 2.0).value)
@@ -1059,6 +1084,7 @@ class FrontierExplorer(Node):
         self.region_sequence: List[int] = []
         self.active_region_id: Optional[int] = None
         self.active_region_missing_streak = 0
+        self.active_region_unreachable_since: Optional[float] = None
         self.last_region_release_evaluation_update = -1
         self.last_selected_region_id: Optional[int] = None
         self.last_global_plan_ms = 0.0
@@ -1321,6 +1347,8 @@ class FrontierExplorer(Node):
             self.region_switches += 1
         self.last_selected_region_id = candidate.region_id
         self.active_region_id = candidate.region_id
+        self.active_region_missing_streak = 0
+        self.active_region_unreachable_since = None
         self.publish_path(path, candidate)
 
     def reroute_active_goal(self) -> bool:
@@ -1890,25 +1918,46 @@ class FrontierExplorer(Node):
         if (allow_region_release
                 and self.last_region_release_evaluation_update != self.map_update_count):
             previous_active = self.active_region_id
-            self.active_region_id, self.active_region_missing_streak, released = (
-                advance_region_release(
-                    self.active_region_id, observed_ids,
-                    self.active_region_missing_streak,
-                    self.region_release_updates))
+            update = update_region_commitment(
+                self.active_region_id, observed_ids, available_ids,
+                self.active_region_missing_streak,
+                self.active_region_unreachable_since, time.monotonic(),
+                self.region_release_updates, self.region_unreachable_timeout)
+            self.active_region_id = update.active_region_id
+            self.active_region_missing_streak = update.missing_streak
+            self.active_region_unreachable_since = update.unreachable_since
             self.last_region_release_evaluation_update = self.map_update_count
-            if released:
+            if update.release_reason == "frontier_missing":
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
                     f"after {self.region_release_updates} map updates with no "
                     "remaining frontier cluster")
+            elif update.release_reason == "persistently_unreachable":
+                self.get_logger().warning(
+                    f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
+                    f"reason=persistently_unreachable timeout="
+                    f"{self.region_unreachable_timeout:.1f}s; re-evaluating all "
+                    "reachable regions")
 
         if (self.active_region_id is not None
                 and self.active_region_id not in available_ids):
             if allow_region_release:
+                frontier_cells = next((
+                    len(region.cells) for region in regions
+                    if region.region_id == self.active_region_id), 0)
+                unreachable_duration = 0.0
+                if self.active_region_unreachable_since is not None:
+                    unreachable_duration = max(
+                        0.0, time.monotonic()
+                        - self.active_region_unreachable_since)
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RETAINED] region={self.active_region_id} "
                     f"frontier_present={self.active_region_id in observed_ids} "
-                    f"candidate_reachable=False missing_frontier="
+                    f"frontier_cells={frontier_cells} candidate_reachable=False "
+                    f"other_reachable_regions="
+                    f"{len(available_ids - {self.active_region_id})} "
+                    f"unreachable_for={unreachable_duration:.1f}/"
+                    f"{self.region_unreachable_timeout:.1f}s missing_frontier="
                     f"{self.active_region_missing_streak}/{self.region_release_updates}; "
                     "waiting for a reachable viewpoint in the committed region",
                     throttle_duration_sec=2.0)

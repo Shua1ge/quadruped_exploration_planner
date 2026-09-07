@@ -71,6 +71,9 @@ def generate_launch_description():
                 "region_size": 8.0,
                 "region_match_distance": 6.0,
                 "region_release_updates": 3,
+                # Keep brief perception gaps from causing region thrashing,
+                # but never wait forever when no usable viewpoint remains.
+                "region_unreachable_timeout": 5.0,
                 "max_global_regions": 10,
                 "metrics_period": 2.0,
                 "observation_preplanning_enabled": True,
