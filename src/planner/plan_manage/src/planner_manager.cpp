@@ -1,5 +1,6 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
+#include <plan_manage/replan_fsm_utils.h>
 #include <chrono>
 #include <thread>
 
@@ -192,6 +193,17 @@ namespace scan_planner
         }
         t -= ts;
 
+        if (!sampledSuffixIsReusable(
+                segment_point.size(), pseudo_arc_length.back()))
+        {
+          RCLCPP_WARN(node_->get_logger(),
+                      "[ROLLING_REPLAN_FALLBACK] sampled suffix has no usable arc (samples=%zu arc=%.6fm); regenerating from current state",
+                      segment_point.size(), pseudo_arc_length.back());
+          flag_force_polynomial = true;
+          flag_regenerate = true;
+          continue;
+        }
+
         double poly_time = (local_data_.position_traj_.evaluateDeBoorT(t) - local_target_pt).norm() / pp_.max_vel_ * 2;
         if (poly_time > ts)
         {
@@ -219,8 +231,10 @@ namespace scan_planner
         double sample_length = 0;
         double cps_dist = pp_.ctrl_pt_dist * 1.5; // cps_dist will be divided by 1.5 in the next
         size_t id = 0;
+        int resample_attempts = 0;
         do
         {
+          ++resample_attempts;
           cps_dist /= 1.5;
           point_set.clear();
           sample_length = 0;
@@ -237,7 +251,17 @@ namespace scan_planner
               id++;
           }
           point_set.push_back(local_target_pt);
-        } while (point_set.size() < 7); // If the start point is very close to end point, this will help
+        } while (point_set.size() < 7 && resample_attempts < 16);
+
+        if (point_set.size() < 7)
+        {
+          RCLCPP_WARN(node_->get_logger(),
+                      "[ROLLING_REPLAN_FALLBACK] suffix resampling produced only %zu points after %d attempts; regenerating from current state",
+                      point_set.size(), resample_attempts);
+          flag_force_polynomial = true;
+          flag_regenerate = true;
+          continue;
+        }
 
         start_end_derivatives.push_back(local_data_.velocity_traj_.evaluateDeBoorT(t_cur));
         start_end_derivatives.push_back(local_target_vel);

@@ -351,7 +351,7 @@ def test_region_release_requires_consecutive_missing_updates():
     assert (active, streak, released) == (None, 0, True)
 
 
-def test_region_release_streak_resets_when_candidate_returns():
+def test_region_release_streak_resets_while_frontier_region_still_exists():
     assert MODULE.advance_region_release(7, {7, 8}, 2, 3) == (7, 0, False)
 
 

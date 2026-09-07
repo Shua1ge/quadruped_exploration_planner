@@ -352,6 +352,17 @@ namespace scan_planner
     if (!map || duration < 1e-3)
       return true;
 
+    const auto map_snapshot = map->captureInflatedOccupancySnapshot();
+    map->useInflatedOccupancySnapshotForCurrentThread(map_snapshot);
+    struct TargetCheckSnapshotScope
+    {
+      GridMap::Ptr map;
+      ~TargetCheckSnapshotScope()
+      {
+        map->clearInflatedOccupancySnapshotForCurrentThread();
+      }
+    } target_check_snapshot_scope{map};
+
     if (reference_path_active_ && reference_path_.size() >= 2)
     {
       const Eigen::Vector3d final_pt = reference_path_.back();
@@ -437,12 +448,14 @@ namespace scan_planner
 
   void SCANReplanFSM::pathCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg)
   {
+    const auto callback_started = std::chrono::steady_clock::now();
     if (!msg || msg->poses.empty())
     {
       RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
                            "Received empty initial_path; ignoring");
       return;
     }
+    refreshPlanningOdomFromSafety();
 
     const uint64_t request_id =
         static_cast<uint64_t>(msg->header.stamp.sec) * 1000000000ULL
@@ -526,7 +539,14 @@ namespace scan_planner
         changeFSMExecState(REPLAN_TRAJ, "TRIG");
       }
 
-      RCLCPP_INFO(node_->get_logger(), "Reference path accepted");
+      const double processing_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - callback_started).count();
+      const double queue_age_ms = std::max(
+          0.0, (node_->now() - msg->header.stamp).seconds() * 1000.0);
+      RCLCPP_INFO(node_->get_logger(),
+                  "[REFERENCE_PATH_ACCEPTED] request_id=%llu queue_age=%.1fms processing=%.1fms waypoints=%zu",
+                  static_cast<unsigned long long>(request_id), queue_age_ms,
+                  processing_ms, reference_path_.size());
       publishReferenceStatus("PATH_ACCEPTED", request_id);
     }
     else
@@ -577,6 +597,9 @@ namespace scan_planner
     safety_odom_pos_ << msg->pose.pose.position.x,
                         msg->pose.pose.position.y,
                         msg->pose.pose.position.z;
+    safety_odom_vel_ << msg->twist.twist.linear.x,
+                        msg->twist.twist.linear.y,
+                        msg->twist.twist.linear.z;
     safety_odom_orient_ = Eigen::Quaterniond(
         msg->pose.pose.orientation.w,
         msg->pose.pose.orientation.x,
@@ -587,6 +610,17 @@ namespace scan_planner
     else
       safety_odom_orient_ = Eigen::Quaterniond::Identity();
     safety_have_odom_ = true;
+  }
+
+  void SCANReplanFSM::refreshPlanningOdomFromSafety()
+  {
+    std::lock_guard<std::mutex> lock(safety_odom_mutex_);
+    if (!safety_have_odom_)
+      return;
+    odom_pos_ = safety_odom_pos_;
+    odom_vel_ = safety_odom_vel_;
+    odom_orient_ = safety_odom_orient_;
+    have_odom_ = true;
   }
 
   void SCANReplanFSM::go2ExecutionFrozenCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
@@ -1075,6 +1109,7 @@ namespace scan_planner
 
   bool SCANReplanFSM::planFromCurrentTraj()
   {
+    refreshPlanningOdomFromSafety();
     LocalTrajData *info = &planner_manager_->local_data_;
     rclcpp::Time time_now = node_->now();
     double t_cur = (time_now - info->start_time_).seconds();
@@ -1158,6 +1193,7 @@ namespace scan_planner
 
   void SCANReplanFSM::setStartStateFromOdomOrCurrentTraj()
   {
+    refreshPlanningOdomFromSafety();
     start_pt_ = odom_pos_;
     start_vel_ = odom_vel_;
     start_acc_.setZero();

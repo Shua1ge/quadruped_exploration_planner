@@ -120,6 +120,7 @@ namespace scan_planner
     ExecutionTrajectorySnapshot execution_snapshot_;
     std::mutex safety_odom_mutex_;
     Eigen::Vector3d safety_odom_pos_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d safety_odom_vel_{Eigen::Vector3d::Zero()};
     Eigen::Quaterniond safety_odom_orient_{Eigen::Quaterniond::Identity()};
     bool safety_have_odom_{false};
     std::atomic<bool> safety_stop_active_{false};
@@ -150,6 +151,7 @@ namespace scan_planner
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
     void setStartStateFromOdomOrCurrentTraj();
+    void refreshPlanningOdomFromSafety();
     void alignStartStateToReferencePath();
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */

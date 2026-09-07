@@ -839,12 +839,12 @@ class PersistentRegionTracker:
 
 
 def advance_region_release(active_region_id: Optional[int],
-                           available_region_ids: Set[int],
+                           observed_region_ids: Set[int],
                            missing_streak: int,
                            release_updates: int
                            ) -> Tuple[Optional[int], int, bool]:
-    """Debounce release of a committed region with no usable candidate."""
-    if active_region_id is None or active_region_id in available_region_ids:
+    """Release only after the committed region's frontier has disappeared."""
+    if active_region_id is None or active_region_id in observed_region_ids:
         return active_region_id, 0, False
     missing_streak += 1
     if missing_streak >= max(1, release_updates):
@@ -1885,29 +1885,32 @@ class FrontierExplorer(Node):
             by_region.setdefault(candidate.region_id, []).append(candidate)
         available = [region for region in regions if region.region_id in by_region]
         available_ids = {region.region_id for region in available}
+        observed_ids = {region.region_id for region in regions}
 
         if (allow_region_release
                 and self.last_region_release_evaluation_update != self.map_update_count):
             previous_active = self.active_region_id
             self.active_region_id, self.active_region_missing_streak, released = (
                 advance_region_release(
-                    self.active_region_id, available_ids,
+                    self.active_region_id, observed_ids,
                     self.active_region_missing_streak,
                     self.region_release_updates))
             self.last_region_release_evaluation_update = self.map_update_count
             if released:
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
-                    f"after {self.region_release_updates} map updates without "
-                    "a usable observation candidate")
+                    f"after {self.region_release_updates} map updates with no "
+                    "remaining frontier cluster")
 
         if (self.active_region_id is not None
                 and self.active_region_id not in available_ids):
             if allow_region_release:
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RETAINED] region={self.active_region_id} "
-                    f"missing={self.active_region_missing_streak}/"
-                    f"{self.region_release_updates}; waiting for a stable candidate",
+                    f"frontier_present={self.active_region_id in observed_ids} "
+                    f"candidate_reachable=False missing_frontier="
+                    f"{self.active_region_missing_streak}/{self.region_release_updates}; "
+                    "waiting for a reachable viewpoint in the committed region",
                     throttle_duration_sec=2.0)
             else:
                 self.get_logger().info(

@@ -127,4 +127,12 @@ TEST(RollingTrajectoryReuse, UsesValidatedSuffixBeforeFreshPlanning)
       false, true, 2.0, 0.31, 0.30));
 }
 
+TEST(RollingTrajectoryReuse, RejectsDegenerateSampledSuffix)
+{
+  EXPECT_FALSE(sampledSuffixIsReusable(1, 1.0));
+  EXPECT_FALSE(sampledSuffixIsReusable(4, 0.0));
+  EXPECT_FALSE(sampledSuffixIsReusable(4, 1e-5));
+  EXPECT_TRUE(sampledSuffixIsReusable(4, 0.25));
+}
+
 } // namespace scan_planner

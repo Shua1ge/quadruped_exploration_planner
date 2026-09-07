@@ -179,6 +179,11 @@ inline bool shouldReuseCurrentTrajectorySuffix(
          tracking_error <= maximum_tracking_error;
 }
 
+inline bool sampledSuffixIsReusable(size_t sample_count, double arc_length)
+{
+  return sample_count >= 2 && std::isfinite(arc_length) && arc_length > 1e-4;
+}
+
 } // namespace scan_planner
 
 #endif // SCAN_PLANNER_REPLAN_FSM_UTILS_H_
