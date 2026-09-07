@@ -1396,22 +1396,29 @@ namespace scan_planner
     bool plan_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
     map->clearInflatedOccupancySnapshotForCurrentThread();
-    const double planning_ms = std::chrono::duration<double, std::milli>(
+    const double optimization_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - planning_started).count();
     have_new_target_ = false;
-
-    RCLCPP_INFO(node_->get_logger(),
-                "[PLAN_TIMING] duration=%.1fms snapshot_revision=%lu live_revision=%lu map_age=%.1fms result=%s",
-                planning_ms,
-                static_cast<unsigned long>(map_snapshot->revision),
-                static_cast<unsigned long>(map->getMapRevision()),
-                map->getMapAgeSeconds() * 1000.0,
-                plan_success ? "success" : "failure");
 
     cout << "final_plan_success=" << plan_success << endl;
 
     if (plan_success)
     {
+
+      // The optimizer and final validation use separate immutable revisions.
+      // Keep the newest completed snapshot bound through every occupancy query
+      // below so concurrent ray fusion cannot stall trajectory publication.
+      const auto validation_started = std::chrono::steady_clock::now();
+      const auto validation_snapshot = map->captureInflatedOccupancySnapshot();
+      map->useInflatedOccupancySnapshotForCurrentThread(validation_snapshot);
+      struct ValidationSnapshotScope
+      {
+        GridMap::Ptr map;
+        ~ValidationSnapshotScope()
+        {
+          map->clearInflatedOccupancySnapshotForCurrentThread();
+        }
+      } validation_snapshot_scope{map};
 
       if (safety_generation_.load() != safety_generation_before)
       {
@@ -1480,6 +1487,13 @@ namespace scan_planner
         }
       }
 
+      if (safety_generation_.load() != safety_generation_before)
+      {
+        RCLCPP_WARN(node_->get_logger(),
+                    "[PLAN_RESULT_DISCARDED] realtime safety stopped execution during final validation");
+        return reject_planned_trajectory();
+      }
+
       /* publish traj */
       scan_planner_msgs::msg::Bspline bspline;
       bspline.order = 3;
@@ -1514,6 +1528,25 @@ namespace scan_planner
       }
 
       visualization_->displayOptimalTraj(info->position_traj_, 0);
+
+      const double validation_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - validation_started).count();
+      RCLCPP_INFO(node_->get_logger(),
+                  "[PLAN_TIMING] optimization=%.1fms validation=%.1fms total=%.1fms planning_revision=%lu validation_revision=%lu live_revision=%lu map_age=%.1fms result=success",
+                  optimization_ms, validation_ms, optimization_ms + validation_ms,
+                  static_cast<unsigned long>(map_snapshot->revision),
+                  static_cast<unsigned long>(validation_snapshot->revision),
+                  static_cast<unsigned long>(map->getMapRevision()),
+                  map->getMapAgeSeconds() * 1000.0);
+    }
+    else
+    {
+      RCLCPP_INFO(node_->get_logger(),
+                  "[PLAN_TIMING] optimization=%.1fms validation=0.0ms total=%.1fms planning_revision=%lu validation_revision=0 live_revision=%lu map_age=%.1fms result=failure",
+                  optimization_ms, optimization_ms,
+                  static_cast<unsigned long>(map_snapshot->revision),
+                  static_cast<unsigned long>(map->getMapRevision()),
+                  map->getMapAgeSeconds() * 1000.0);
     }
 
     return plan_success;

@@ -168,6 +168,32 @@ def test_single_source_tree_reuses_one_search_for_multiple_goals():
             MODULE.path_length_cells(astar_path, grid.resolution))
 
 
+def test_start_escape_opens_only_shortest_free_corridor():
+    grid = MODULE.ExplorationGrid(9.0, 7.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    start = (3, 3)
+    inflated = {(3, 3), (4, 3), (5, 3), (3, 2), (3, 4), (2, 3), (7, 5)}
+
+    adjusted = MODULE.open_start_escape_corridor(
+        grid, start, inflated, max_distance=4.0)
+
+    assert adjusted is not None
+    tree = MODULE.build_shortest_path_tree(grid, start, adjusted)
+    assert tree.path_to((6, 3))
+    assert (7, 5) in adjusted
+    assert inflated - adjusted == {(3, 3), (2, 3)}
+
+
+def test_start_escape_rejects_raw_occupied_robot_cell():
+    grid = MODULE.ExplorationGrid(5.0, 5.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    start = (2, 2)
+    grid.data[start[1], start[0]] = MODULE.OCCUPIED
+
+    assert MODULE.open_start_escape_corridor(
+        grid, start, {start}, max_distance=2.0) is None
+
+
 def test_prepared_path_splices_to_current_pose_and_drops_invalid_prefix():
     grid = MODULE.ExplorationGrid(8.0, 6.0, 1.0, 0.0, 0.0)
     grid.data[:, :] = MODULE.FREE

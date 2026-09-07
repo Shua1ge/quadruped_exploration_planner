@@ -242,6 +242,51 @@ def cluster_frontiers(frontiers: Set[Cell], minimum_size: int) -> List[List[Cell
     return clusters
 
 
+def open_start_escape_corridor(
+        grid: ExplorationGrid, start: Cell, inflated: Set[Cell],
+        max_distance: float) -> Optional[Set[Cell]]:
+    """Open only the shortest raw-free corridor out of start inflation.
+
+    The robot pose can legitimately lie inside the conservative obstacle
+    inflation near a wall. Clearing only ``start`` leaves A* in an isolated
+    cell, while clearing a disk would remove unrelated safety clearance.
+    """
+    if not grid.in_bounds(start) or grid.value(start) != FREE:
+        return None
+    adjusted = set(inflated)
+    if start not in inflated:
+        return adjusted
+
+    max_steps = max(1, int(math.ceil(max_distance / grid.resolution)))
+    queue = deque([start])
+    parents: Dict[Cell, Optional[Cell]] = {start: None}
+    distances = {start: 0}
+    exit_cell: Optional[Cell] = None
+    while queue:
+        current = queue.popleft()
+        if current not in inflated:
+            exit_cell = current
+            break
+        if distances[current] >= max_steps:
+            continue
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nxt = (current[0] + dx, current[1] + dy)
+            if (nxt in parents or not grid.in_bounds(nxt)
+                    or grid.value(nxt) != FREE):
+                continue
+            parents[nxt] = current
+            distances[nxt] = distances[current] + 1
+            queue.append(nxt)
+
+    if exit_cell is None:
+        return None
+    current: Optional[Cell] = exit_cell
+    while current is not None:
+        adjusted.discard(current)
+        current = parents[current]
+    return adjusted
+
+
 def clustered_frontier_cells(clusters: Sequence[Sequence[Cell]]) -> Set[Cell]:
     """Return only frontier cells that survived cluster-size filtering."""
     return {cell for cluster in clusters for cell in cluster}
@@ -1001,9 +1046,6 @@ class FrontierExplorer(Node):
         self.last_path_request_generation = 0
         self.pending_path_request_generation: Optional[int] = None
         self.active_path_request_generation: Optional[int] = None
-        self.global_path_hold_active = False
-        self.global_path_hold_started_ns = 0
-        self.global_path_hold_reason = ""
         self.global_reroute_failure_streak = 0
         self.active_since_ns = 0
         self.blacklist: List[Point2] = []
@@ -1048,8 +1090,6 @@ class FrontierExplorer(Node):
         transient_qos.reliability = ReliabilityPolicy.RELIABLE
         transient_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.path_pub = self.create_publisher(Path, "initial_path", 10)
-        self.execution_stop_pub = self.create_publisher(
-            Bool, "planning/emergency_stop", 10)
         self.path_vis_pub = self.create_publisher(Path, "explorer/path", transient_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, "explorer/map", transient_qos)
         self.planning_map_pub = self.create_publisher(
@@ -1193,7 +1233,12 @@ class FrontierExplorer(Node):
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         blocked_edges = self.current_blocked_edges()
         start = self.grid.world_to_cell(*self.position)
-        inflated.discard(start)
+        inflated = open_start_escape_corridor(
+            self.grid, start, inflated,
+            self.inflation_radius + self.grid.resolution)
+        if inflated is None:
+            self.publish_status("START_ESCAPE_UNAVAILABLE")
+            return False
         frontiers = self.grid.frontier_cells(inflated)
         clusters = cluster_frontiers(frontiers, self.min_frontier_size)
         filtered_frontiers = clustered_frontier_cells(clusters)
@@ -1227,7 +1272,12 @@ class FrontierExplorer(Node):
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         blocked_edges = self.current_blocked_edges()
         start = self.grid.world_to_cell(*self.position)
-        inflated.discard(start)
+        inflated = open_start_escape_corridor(
+            self.grid, start, inflated,
+            self.inflation_radius + self.grid.resolution)
+        if inflated is None:
+            self.prepared_candidate = None
+            return False
         target_cells = observation_target_cells(
             self.grid, candidate.frontier_cell, self.observation_radius)
         if (not segment_known_free(
@@ -1282,7 +1332,11 @@ class FrontierExplorer(Node):
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         blocked_edges = self.current_blocked_edges()
         start = self.grid.world_to_cell(*self.position)
-        inflated.discard(start)
+        inflated = open_start_escape_corridor(
+            self.grid, start, inflated,
+            self.inflation_radius + self.grid.resolution)
+        if inflated is None:
+            return False
         raw_path = astar_known(
             self.grid, start, self.active_goal_cell, inflated, blocked_edges)
         if not raw_path:
@@ -1307,24 +1361,6 @@ class FrontierExplorer(Node):
             f"Rerouted active observation to ({self.active_goal[0]:.2f}, "
             f"{self.active_goal[1]:.2f}) without resetting observation progress")
         return True
-
-    def request_execution_stop(self, reason: str):
-        """Freeze the old local trajectory before replacing an invalid path."""
-        if self.global_path_hold_active:
-            self.get_logger().debug(
-                f"[GLOBAL_PATH_HOLD_ACTIVE] original_reason="
-                f"{self.global_path_hold_reason} latest_reason={reason}")
-            return
-        msg = Bool()
-        msg.data = True
-        self.execution_stop_pub.publish(msg)
-        self.global_path_hold_active = True
-        self.global_path_hold_started_ns = self.get_clock().now().nanoseconds
-        self.global_path_hold_reason = reason
-        self.publish_status("GLOBAL_PATH_HOLD_REQUESTED")
-        self.get_logger().warning(
-            f"[GLOBAL_PATH_HOLD] reason={reason}; old local trajectory stopped "
-            "before global-route replacement")
 
     def validate_and_repair_active_path(self) -> bool:
         """Validate one new map revision and atomically repair an invalid route.
@@ -1369,7 +1405,6 @@ class FrontierExplorer(Node):
             f"path_error={check.lateral_error:.2f}m goal={goal_text}",
             throttle_duration_sec=2.0)
 
-        self.request_execution_stop(check.reason)
         started = time.perf_counter()
         if self.reroute_active_goal():
             self.global_reroute_failure_streak = 0
@@ -1378,7 +1413,7 @@ class FrontierExplorer(Node):
             self.get_logger().info(
                 f"[GLOBAL_REROUTE_OK] mode=same_observation goal={goal_text} "
                 f"path_cells={len(self.active_raw_path)} elapsed={elapsed_ms:.1f}ms; "
-                "waiting for a replacement local trajectory")
+                "current safe local trajectory continues during replacement")
             return False
 
         previous_goal = self.active_goal
@@ -1393,7 +1428,7 @@ class FrontierExplorer(Node):
             self.get_logger().info(
                 f"[GLOBAL_REROUTE_OK] mode=new_observation old_goal={goal_text} "
                 f"new_goal={new_goal_text} elapsed={elapsed_ms:.1f}ms; "
-                "waiting for a replacement local trajectory")
+                "current safe local trajectory continues during replacement")
             return False
 
         self.global_reroute_failure_streak, abandon_goal = (
@@ -1526,16 +1561,6 @@ class FrontierExplorer(Node):
                     f"ewma={self.pipeline_latency_ewma:.2f}s")
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
-            if self.global_path_hold_active:
-                hold_time = ((self.get_clock().now().nanoseconds
-                              - self.global_path_hold_started_ns) * 1e-9)
-                self.get_logger().info(
-                    f"[GLOBAL_PATH_RESUME_READY] replacement local trajectory "
-                    f"ready after {hold_time:.2f}s; original_reason="
-                    f"{self.global_path_hold_reason}")
-                self.global_path_hold_active = False
-                self.global_path_hold_started_ns = 0
-                self.global_path_hold_reason = ""
         elif status in ("RUNNING", "PATH_ACCEPTED"):
             # A successful replacement trajectory resolves the pending local
             # failure.  Keep the short-lived edge record, but do not let it be
@@ -1569,9 +1594,6 @@ class FrontierExplorer(Node):
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
-            self.global_path_hold_active = False
-            self.global_path_hold_started_ns = 0
-            self.global_path_hold_reason = ""
             blocked_edge = self.pending_blocked_edge
             self.pending_blocked_edge = None
             if (blocked_edge is not None
@@ -1598,9 +1620,6 @@ class FrontierExplorer(Node):
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
-            self.global_path_hold_active = False
-            self.global_path_hold_started_ns = 0
-            self.global_path_hold_reason = ""
             if self.active_goal is not None:
                 self.blacklist.append(self.active_goal)
             self.active_goal = None
@@ -1709,7 +1728,17 @@ class FrontierExplorer(Node):
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         blocked_edges = self.current_blocked_edges()
         start = self.grid.world_to_cell(*self.position)
-        inflated.discard(start)
+        inflated = open_start_escape_corridor(
+            self.grid, start, inflated,
+            self.inflation_radius + self.grid.resolution)
+        if inflated is None:
+            self.publish_status("START_ESCAPE_UNAVAILABLE")
+            self.get_logger().warning(
+                f"[FRONTIER_REACHABILITY] start={start} raw_start_free="
+                f"{self.grid.in_bounds(start) and self.grid.value(start) == FREE} "
+                "escape_corridor=unavailable",
+                throttle_duration_sec=2.0)
+            return False
         frontiers = self.grid.frontier_cells(inflated)
         clusters = cluster_frontiers(frontiers, self.min_frontier_size)
         filtered_frontiers = clustered_frontier_cells(clusters)
