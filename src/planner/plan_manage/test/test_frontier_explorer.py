@@ -161,6 +161,7 @@ def test_single_source_tree_reuses_one_search_for_multiple_goals():
     tree = MODULE.build_shortest_path_tree(
         grid, start, inflated, targets=goals)
 
+    assert 0 < tree.expanded_cells <= grid.width * grid.height
     for goal in goals:
         shared_path = tree.path_to(goal)
         astar_path = MODULE.astar_known(grid, start, goal, inflated)

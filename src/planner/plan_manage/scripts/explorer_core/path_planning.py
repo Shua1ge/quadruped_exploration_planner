@@ -104,6 +104,7 @@ class ShortestPathTree:
     start: Cell
     costs: Dict[Cell, float]
     parents: Dict[Cell, Cell]
+    expanded_cells: int = 0
 
     def path_to(self, goal: Cell) -> Optional[List[Cell]]:
         if goal not in self.costs:
@@ -122,7 +123,7 @@ def build_shortest_path_tree(
         targets: Optional[Set[Cell]] = None) -> ShortestPathTree:
     """Run Dijkstra once and retain paths to every requested reachable goal."""
     if not grid.planning_free(start, inflated):
-        return ShortestPathTree(start, {}, {})
+        return ShortestPathTree(start, {}, {}, 0)
 
     forbidden = blocked_edges or set()
     remaining = None if targets is None else {
@@ -154,7 +155,7 @@ def build_shortest_path_tree(
             costs[nxt] = candidate
             parents[nxt] = current
             heapq.heappush(queue, (candidate, nxt))
-    return ShortestPathTree(start, costs, parents)
+    return ShortestPathTree(start, costs, parents, len(closed))
 
 
 def adjacent_grid_path_is_valid(

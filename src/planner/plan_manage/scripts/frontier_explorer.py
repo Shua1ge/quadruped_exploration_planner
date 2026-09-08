@@ -231,6 +231,18 @@ class FrontierExplorer(Node):
         self.last_selected_region_id: Optional[int] = None
         self.last_global_plan_ms = 0.0
         self.cumulative_planning_ms = 0.0
+        self.planning_events = 0
+        self.map_preprocess_calls = 0
+        self.candidate_tree_searches = 0
+        self.region_pair_tree_searches = 0
+        self.expanded_grid_cells = 0
+        self.last_map_preprocess_ms = 0.0
+        self.last_candidate_tree_ms = 0.0
+        self.last_region_sequence_ms = 0.0
+        self.last_candidate_tree_searches = 0
+        self.last_region_pair_tree_searches = 0
+        self.last_expanded_grid_cells = 0
+        self.global_path_invalid_count = 0
         self.region_switches = 0
         self.goals_reached = 0
         self.paths_published = 0
@@ -402,6 +414,7 @@ class FrontierExplorer(Node):
             return self.prepared_candidate is not None
         self.last_preparation_attempt_update = self.map_update_count
 
+        preprocess_started = time.perf_counter()
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         blocked_edges = self.current_blocked_edges()
         start = self.grid.world_to_cell(*self.position)
@@ -415,11 +428,14 @@ class FrontierExplorer(Node):
         clusters = cluster_frontiers(frontiers, self.min_frontier_size)
         filtered_frontiers = clustered_frontier_cells(clusters)
         self.latest_frontier_count = len(filtered_frontiers)
+        preprocess_ms = (
+            time.perf_counter() - preprocess_started) * 1000.0
         self.publish_frontiers(filtered_frontiers)
         candidate = self.choose_frontier(
             start, clusters, inflated, blocked_edges,
             excluded_goals=(self.active_goal,), allow_region_release=False,
-            allow_cross_region_preparation=True)
+            allow_cross_region_preparation=True,
+            map_preprocess_prefix_ms=preprocess_ms)
         if candidate is None:
             self.publish_status("NEXT_OBSERVATION_NOT_YET_AVAILABLE")
             return False
@@ -587,6 +603,7 @@ class FrontierExplorer(Node):
             f"remaining={check.remaining_distance:.2f}m "
             f"path_error={check.lateral_error:.2f}m goal={goal_text}",
             throttle_duration_sec=2.0)
+        self.global_path_invalid_count += 1
 
         started = time.perf_counter()
         if self.reroute_active_goal():
@@ -908,6 +925,7 @@ class FrontierExplorer(Node):
         if self.position is None:
             return False
 
+        preprocess_started = time.perf_counter()
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         blocked_edges = self.current_blocked_edges()
         start = self.grid.world_to_cell(*self.position)
@@ -926,10 +944,13 @@ class FrontierExplorer(Node):
         clusters = cluster_frontiers(frontiers, self.min_frontier_size)
         filtered_frontiers = clustered_frontier_cells(clusters)
         self.latest_frontier_count = len(filtered_frontiers)
+        preprocess_ms = (
+            time.perf_counter() - preprocess_started) * 1000.0
         self.publish_frontiers(filtered_frontiers)
         best = self.choose_frontier(
             start, clusters, inflated, blocked_edges,
-            excluded_goals=excluded_goals)
+            excluded_goals=excluded_goals,
+            map_preprocess_prefix_ms=preprocess_ms)
         if best is None:
             status = ("EXPLORATION_COMPLETE" if not filtered_frontiers
                       else "NO_REACHABLE_FRONTIER")
@@ -959,11 +980,24 @@ class FrontierExplorer(Node):
                         blocked_edges: Set[DirectedEdge],
                         excluded_goals: Sequence[Point2] = (),
                         allow_region_release: bool = True,
-                        allow_cross_region_preparation: bool = False):
-        planning_started = time.perf_counter()
+                        allow_cross_region_preparation: bool = False,
+                        map_preprocess_prefix_ms: float = 0.0):
+        selection_started = time.perf_counter()
+        self.last_candidate_tree_ms = 0.0
+        self.last_region_sequence_ms = 0.0
+        self.last_candidate_tree_searches = 0
+        self.last_region_pair_tree_searches = 0
+        self.last_expanded_grid_cells = 0
+
+        partition_started = time.perf_counter()
         observations = partition_frontier_clusters(
             clusters, int(round(self.region_size / self.grid.resolution)))
         regions = self.region_tracker.update(observations, self.active_region_id)
+        self.last_map_preprocess_ms = (
+            map_preprocess_prefix_ms
+            + (time.perf_counter() - partition_started) * 1000.0)
+        self.map_preprocess_calls += 1
+        self.planning_events += 1
         self.latest_region_count = len(regions)
         candidates = self.build_frontier_candidates(
             start, regions, inflated, blocked_edges, excluded_goals)
@@ -975,8 +1009,20 @@ class FrontierExplorer(Node):
                 start, regions, candidates, inflated, blocked_edges,
                 allow_region_release, allow_cross_region_preparation)
 
-        self.last_global_plan_ms = (time.perf_counter() - planning_started) * 1000.0
+        self.last_global_plan_ms = (
+            map_preprocess_prefix_ms
+            + (time.perf_counter() - selection_started) * 1000.0)
         self.cumulative_planning_ms += self.last_global_plan_ms
+        self.get_logger().info(
+            f"[GLOBAL_PLAN_BASELINE] revision={self.map_update_count} "
+            f"regions={len(regions)} candidates={len(candidates)} "
+            f"map_preprocess_ms={self.last_map_preprocess_ms:.1f} "
+            f"candidate_tree_ms={self.last_candidate_tree_ms:.1f} "
+            f"region_sequence_ms={self.last_region_sequence_ms:.1f} "
+            f"total_ms={self.last_global_plan_ms:.1f} "
+            f"candidate_tree_searches={self.last_candidate_tree_searches} "
+            f"region_pair_tree_searches={self.last_region_pair_tree_searches} "
+            f"expanded_grid_cells={self.last_expanded_grid_cells}")
         return result
 
     def build_frontier_candidates(self, start: Cell,
@@ -1018,9 +1064,16 @@ class FrontierExplorer(Node):
 
         # All candidate paths share one start and one planning map.  A single
         # shortest-path tree replaces one complete A* invocation per viewpoint.
+        tree_started = time.perf_counter()
         tree = build_shortest_path_tree(
             self.grid, start, inflated, blocked_edges,
             {proposal[1] for proposal in proposals})
+        self.last_candidate_tree_ms += (
+            time.perf_counter() - tree_started) * 1000.0
+        self.candidate_tree_searches += 1
+        self.last_candidate_tree_searches += 1
+        self.expanded_grid_cells += tree.expanded_cells
+        self.last_expanded_grid_cells += tree.expanded_cells
         records = []
         for (region_id, viewpoint, frontier, goal_xy,
              unknown_gain, cluster_size, target_cells) in proposals:
@@ -1165,8 +1218,11 @@ class FrontierExplorer(Node):
         self.region_sequence, need_global_plan = retain_region_commitment(
             self.region_sequence, available_ids, self.active_region_id)
         if need_global_plan:
+            sequence_started = time.perf_counter()
             self.region_sequence = self.plan_region_sequence(
                 start, available, by_region, inflated, blocked_edges)
+            self.last_region_sequence_ms += (
+                time.perf_counter() - sequence_started) * 1000.0
 
         # The full tour is only a prediction for future preparation.  Immediate
         # control is a one-step rolling decision based on real A* access cost.
@@ -1266,6 +1322,10 @@ class FrontierExplorer(Node):
                 continue
             tree = build_shortest_path_tree(
                 self.grid, source_cell, inflated, blocked_edges, missing_targets)
+            self.region_pair_tree_searches += 1
+            self.last_region_pair_tree_searches += 1
+            self.expanded_grid_cells += tree.expanded_cells
+            self.last_expanded_grid_cells += tree.expanded_cells
             for target in range(count):
                 if source == target:
                     continue
@@ -1399,6 +1459,16 @@ class FrontierExplorer(Node):
                 if self.active_observation else 0),
             "next_observation_prepared": self.prepared_candidate is not None,
             "pipeline_latency_ewma_s": self.pipeline_latency_ewma,
+            "map_updates": self.map_update_count,
+            "planning_events": self.planning_events,
+            "map_preprocess_calls": self.map_preprocess_calls,
+            "candidate_tree_searches": self.candidate_tree_searches,
+            "region_pair_tree_searches": self.region_pair_tree_searches,
+            "expanded_grid_cells": self.expanded_grid_cells,
+            "global_path_invalid_count": self.global_path_invalid_count,
+            "last_map_preprocess_ms": self.last_map_preprocess_ms,
+            "last_candidate_tree_ms": self.last_candidate_tree_ms,
+            "last_region_sequence_ms": self.last_region_sequence_ms,
             "last_planning_ms": self.last_global_plan_ms,
             "cumulative_planning_ms": self.cumulative_planning_ms,
             "collision": self.disabled_by_collision,
