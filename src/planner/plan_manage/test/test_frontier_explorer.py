@@ -576,3 +576,43 @@ def test_rolling_region_switches_for_clearly_better_challenger():
         {3: 10.0, 7: 14.0}, active_region_id=3, switch_ratio=1.35)
 
     assert selected == 7
+
+
+def test_rolling_region_selects_reachable_standby_when_committed_is_unavailable():
+    selected = MODULE.select_rolling_region(
+        {7: 12.0, 9: 10.0}, active_region_id=3, switch_ratio=1.35)
+
+    assert selected == 7
+
+
+def test_cross_region_preparation_does_not_release_current_commitment():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.active_region_id = 3
+
+    # Preparing another region is speculative: activation, not preparation,
+    # is the only operation allowed to change active_region_id.
+    MODULE.select_rolling_region(
+        {7: 12.0, 9: 10.0}, explorer.active_region_id, 1.35)
+
+    assert explorer.active_region_id == 3
+
+
+def test_handoff_activates_existing_standby_without_replanning():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.activate_prepared_observation = lambda: True
+    explorer.prepare_next_observation = lambda force=False: (_ for _ in ()).throw(
+        AssertionError("existing standby must be reused"))
+
+    assert explorer.activate_or_prepare_next_observation()
+
+
+def test_handoff_forces_preparation_when_no_standby_exists():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    activations = iter((False, True))
+    force_arguments = []
+    explorer.activate_prepared_observation = lambda: next(activations)
+    explorer.prepare_next_observation = lambda force=False: (
+        force_arguments.append(force) or True)
+
+    assert explorer.activate_or_prepare_next_observation()
+    assert force_arguments == [True]

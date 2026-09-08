@@ -392,12 +392,13 @@ class FrontierExplorer(Node):
             ratio, self.observation_done_ratio, task.completion_streak)
         return task
 
-    def prepare_next_observation(self) -> bool:
+    def prepare_next_observation(self, force: bool = False) -> bool:
         """Select the next information objective without publishing its path."""
         task = self.active_observation
         if self.position is None or self.active_goal is None or task is None:
             return False
-        if self.last_preparation_attempt_update == self.map_update_count:
+        if (not force
+                and self.last_preparation_attempt_update == self.map_update_count):
             return self.prepared_candidate is not None
         self.last_preparation_attempt_update = self.map_update_count
 
@@ -417,7 +418,8 @@ class FrontierExplorer(Node):
         self.publish_frontiers(filtered_frontiers)
         candidate = self.choose_frontier(
             start, clusters, inflated, blocked_edges,
-            excluded_goals=(self.active_goal,), allow_region_release=False)
+            excluded_goals=(self.active_goal,), allow_region_release=False,
+            allow_cross_region_preparation=True)
         if candidate is None:
             self.publish_status("NEXT_OBSERVATION_NOT_YET_AVAILABLE")
             return False
@@ -430,6 +432,14 @@ class FrontierExplorer(Node):
             f"{candidate.goal[1]:.2f}), region={candidate.region_id}, "
             f"expected_gain={candidate.unknown_gain}")
         return True
+
+    def activate_or_prepare_next_observation(self) -> bool:
+        """Activate a standby route, preparing one immediately if necessary."""
+        if self.activate_prepared_observation():
+            return True
+        if not self.prepare_next_observation(force=True):
+            return False
+        return self.activate_prepared_observation()
 
     def activate_prepared_observation(self) -> bool:
         """Reuse the safe suffix of a prepared route from the current pose."""
@@ -665,7 +675,7 @@ class FrontierExplorer(Node):
         self.last_handoff_attempt_update = self.map_update_count
         previous_goal = self.active_goal
 
-        switched = self.activate_prepared_observation()
+        switched = self.activate_or_prepare_next_observation()
         if not switched:
             switched = self.plan_from_current_position(
                 excluded_goals=(previous_goal,))
@@ -689,7 +699,7 @@ class FrontierExplorer(Node):
         self.last_handoff_attempt_update = self.map_update_count
         previous_goal = self.active_goal
 
-        switched = self.activate_prepared_observation()
+        switched = self.activate_or_prepare_next_observation()
         if not switched:
             switched = self.plan_from_current_position(
                 excluded_goals=(previous_goal,))
@@ -948,7 +958,8 @@ class FrontierExplorer(Node):
                         inflated: Set[Cell],
                         blocked_edges: Set[DirectedEdge],
                         excluded_goals: Sequence[Point2] = (),
-                        allow_region_release: bool = True):
+                        allow_region_release: bool = True,
+                        allow_cross_region_preparation: bool = False):
         planning_started = time.perf_counter()
         observations = partition_frontier_clusters(
             clusters, int(round(self.region_size / self.grid.resolution)))
@@ -962,7 +973,7 @@ class FrontierExplorer(Node):
         else:
             result = self.choose_hierarchical_candidate(
                 start, regions, candidates, inflated, blocked_edges,
-                allow_region_release)
+                allow_region_release, allow_cross_region_preparation)
 
         self.last_global_plan_ms = (time.perf_counter() - planning_started) * 1000.0
         self.cumulative_planning_ms += self.last_global_plan_ms
@@ -1065,7 +1076,8 @@ class FrontierExplorer(Node):
                                       candidates: Sequence[FrontierCandidate],
                                       inflated: Set[Cell],
                                       blocked_edges: Set[DirectedEdge],
-                                      allow_region_release: bool = True):
+                                      allow_region_release: bool = True,
+                                      allow_cross_region_preparation: bool = False):
         by_region: Dict[int, List[FrontierCandidate]] = {}
         for candidate in candidates:
             by_region.setdefault(candidate.region_id, []).append(candidate)
@@ -1099,7 +1111,14 @@ class FrontierExplorer(Node):
 
         if (self.active_region_id is not None
                 and self.active_region_id not in available_ids):
-            if allow_region_release:
+            if allow_cross_region_preparation and available_ids:
+                self.get_logger().info(
+                    f"[CROSS_REGION_FALLBACK_PREPARATION] committed_region="
+                    f"{self.active_region_id} has no reachable successor; "
+                    f"preparing standby from {len(available_ids)} other "
+                    "reachable region(s) without releasing commitment",
+                    throttle_duration_sec=2.0)
+            elif allow_region_release:
                 frontier_cells = next((
                     len(region.cells) for region in regions
                     if region.region_id == self.active_region_id), 0)
@@ -1119,13 +1138,14 @@ class FrontierExplorer(Node):
                     f"{self.active_region_missing_streak}/{self.region_release_updates}; "
                     "waiting for a reachable viewpoint in the committed region",
                     throttle_duration_sec=2.0)
+                return None
             else:
                 self.get_logger().info(
                     f"[REGION_PREPARATION_WAIT] region={self.active_region_id} "
                     "has no usable successor in this map update; commitment "
                     "was not released by background preparation",
                     throttle_duration_sec=2.0)
-            return None
+                return None
 
         if not available:
             self.region_sequence = []
