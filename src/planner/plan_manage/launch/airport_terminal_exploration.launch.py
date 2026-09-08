@@ -91,6 +91,13 @@ def generate_launch_description():
                 ("simulation/collision", "/simulation/collision"),
             ],
         ),
+        Node(
+            package="scan_planner",
+            executable="global_representation_node.py",
+            name="global_representation",
+            output="screen",
+            parameters=[{"max_oracle_queries": 8}],
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(scan_share, "launch", "rviz.launch.py"))),
     ])

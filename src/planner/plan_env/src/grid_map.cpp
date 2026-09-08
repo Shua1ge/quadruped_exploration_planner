@@ -2,6 +2,7 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
@@ -145,6 +146,13 @@ void GridMap::initMap(
   load_parameter(node_, "grid_map.frame_id", mp_.frame_id_, string("world"));
   load_parameter(node_, "grid_map.sliding_map_frame_id", mp_.sliding_map_frame_id_, string("sliding_map"));
   load_parameter(node_, "grid_map.ground_height", mp_.ground_height_, 0.0);
+  load_parameter(node_, "grid_map.local_patch_enabled", local_patch_enabled_, true);
+  load_parameter(node_, "grid_map.local_patch_period", local_patch_period_, 0.5);
+  load_parameter(node_, "grid_map.local_patch_resolution", local_patch_resolution_, 0.2);
+  load_parameter(node_, "grid_map.local_patch_z", local_patch_z_, mp_.ground_height_ + 0.3);
+  if (local_patch_period_ <= 0.0 || local_patch_resolution_ < mp_.resolution_)
+    throw std::invalid_argument(
+        "grid_map local patch period must be positive and resolution must not be finer than the voxel map");
 
   load_parameter(node_, "grid_map.sensor_type", mp_.sensor_type_, string("lidar"));
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
@@ -264,6 +272,8 @@ void GridMap::initMap(
   unknown_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/unknown", rclcpp::SensorDataQoS());
   depth_cloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/depth_cloud", rclcpp::SensorDataQoS());
   extrinsic_pose_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>("grid_map/sensor_pose_extrinsic", 10);
+  local_patch_pub_ = node_->create_publisher<scan_planner_msgs::msg::LocalMapPatch>(
+      "grid_map/local_map_patch", rclcpp::QoS(1).best_effort().durability_volatile());
 
   md_.occ_need_update_ = false;
   md_.use_cloud_update_ = false;
@@ -846,6 +856,8 @@ void GridMap::visCallback()
 void GridMap::updateOccupancyCallback()
 {
   const auto callback_started = std::chrono::steady_clock::now();
+  scan_planner_msgs::msg::LocalMapPatch local_patch;
+  bool local_patch_ready = false;
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   const auto lock_acquired = std::chrono::steady_clock::now();
   if (!md_.occ_need_update_)
@@ -869,6 +881,14 @@ void GridMap::updateOccupancyCallback()
   auto snapshot = buildInflatedOccupancySnapshotLocked();
   std::atomic_store(&latest_inflated_snapshot_, snapshot);
   const auto snapshot_finished = std::chrono::steady_clock::now();
+  const auto patch_started = std::chrono::steady_clock::now();
+  local_patch_ready = buildLocalMapPatchLocked(local_patch);
+  if (local_patch_ready)
+  {
+    local_patch.generation_ms = static_cast<float>(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - patch_started).count());
+  }
   // t3 = ros::Time::now();
 
   // t4 = ros::Time::now();
@@ -888,6 +908,18 @@ void GridMap::updateOccupancyCallback()
   map_update_requested_.store(false);
   lock.unlock();
 
+  if (local_patch_ready)
+  {
+    local_patch_pub_->publish(local_patch);
+    last_local_patch_revision_ = local_patch.map_revision;
+    last_local_patch_time_ = std::chrono::steady_clock::now();
+    RCLCPP_INFO_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 2000,
+        "[LOCAL_MAP_PATCH] revision=%lu size=%ux%u generation=%.1fms",
+        static_cast<unsigned long>(local_patch.map_revision),
+        local_patch.width, local_patch.height, local_patch.generation_ms);
+  }
+
   const double lock_wait_ms = std::chrono::duration<double, std::milli>(
       lock_acquired - callback_started).count();
   const double fusion_ms = std::chrono::duration<double, std::milli>(
@@ -899,6 +931,84 @@ void GridMap::updateOccupancyCallback()
       "[MAP_FUSION_TIMING] lock_wait=%.1fms raycast=%.1fms snapshot=%.1fms points=%d revision=%lu",
       lock_wait_ms, fusion_ms, snapshot_ms, projected_points,
       static_cast<unsigned long>(snapshot->revision));
+}
+
+bool GridMap::buildLocalMapPatchLocked(
+    scan_planner_msgs::msg::LocalMapPatch& patch) const
+{
+  if (!local_patch_enabled_ || !local_patch_pub_ ||
+      local_patch_pub_->get_subscription_count() == 0)
+    return false;
+
+  const uint64_t revision = map_revision_.load();
+  const auto now = std::chrono::steady_clock::now();
+  const bool previously_published =
+      last_local_patch_time_.time_since_epoch().count() != 0;
+  if (revision == 0 || revision == last_local_patch_revision_ ||
+      (previously_published &&
+       std::chrono::duration<double>(now - last_local_patch_time_).count() <
+           local_patch_period_))
+    return false;
+
+  const double min_x = mp_.map_bound_min_idx_(0) * mp_.resolution_;
+  const double min_y = mp_.map_bound_min_idx_(1) * mp_.resolution_;
+  const double max_x = (mp_.map_bound_max_idx_(0) + 1) * mp_.resolution_;
+  const double max_y = (mp_.map_bound_max_idx_(1) + 1) * mp_.resolution_;
+  const double origin_x =
+      std::floor(min_x / local_patch_resolution_) * local_patch_resolution_;
+  const double origin_y =
+      std::floor(min_y / local_patch_resolution_) * local_patch_resolution_;
+  patch.resolution = static_cast<float>(local_patch_resolution_);
+  patch.origin.x = origin_x;
+  patch.origin.y = origin_y;
+  patch.origin.z = local_patch_z_;
+  patch.width = static_cast<uint32_t>(
+      std::ceil((max_x - origin_x) / local_patch_resolution_));
+  patch.height = static_cast<uint32_t>(
+      std::ceil((max_y - origin_y) / local_patch_resolution_));
+  patch.occupancy.assign(static_cast<size_t>(patch.width) * patch.height, -1);
+
+  const int z =
+      static_cast<int>(std::floor(local_patch_z_ * mp_.resolution_inv_));
+  if (z >= mp_.map_bound_min_idx_(2) && z <= mp_.map_bound_max_idx_(2))
+  {
+    auto address = [this, z](int x, int y) {
+      int lx = x % mp_.map_voxel_num_(0);
+      int ly = y % mp_.map_voxel_num_(1);
+      int lz = z % mp_.map_voxel_num_(2);
+      if (lx < 0) lx += mp_.map_voxel_num_(0);
+      if (ly < 0) ly += mp_.map_voxel_num_(1);
+      if (lz < 0) lz += mp_.map_voxel_num_(2);
+      return lx * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
+             ly * mp_.map_voxel_num_(2) + lz;
+    };
+    for (uint32_t row = 0; row < patch.height; ++row)
+    {
+      const int y = static_cast<int>(std::floor(
+          (origin_y + (row + 0.5) * local_patch_resolution_) *
+          mp_.resolution_inv_));
+      if (y < mp_.map_bound_min_idx_(1) || y > mp_.map_bound_max_idx_(1))
+        continue;
+      for (uint32_t col = 0; col < patch.width; ++col)
+      {
+        const int x = static_cast<int>(std::floor(
+            (origin_x + (col + 0.5) * local_patch_resolution_) *
+            mp_.resolution_inv_));
+        if (x < mp_.map_bound_min_idx_(0) || x > mp_.map_bound_max_idx_(0))
+          continue;
+        const int addr = address(x, y);
+        int8_t state = -1;
+        if (md_.occupancy_buffer_[addr] >= mp_.clamp_min_log_ - 1e-3)
+          state = md_.occupancy_buffer_inflate_[addr] == 0 ? 0 : 100;
+        patch.occupancy[static_cast<size_t>(row) * patch.width + col] = state;
+      }
+    }
+  }
+  patch.header.stamp = node_->now();
+  patch.header.frame_id = mp_.frame_id_;
+  patch.map_revision = revision;
+  patch.pose_revision = 0;
+  return true;
 }
 
 void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &img,

@@ -1,0 +1,9 @@
+std_msgs/Header header
+uint64 map_revision
+uint64 pose_revision
+float32 resolution
+geometry_msgs/Point origin
+uint32 width
+uint32 height
+int8[] occupancy
+float32 generation_ms

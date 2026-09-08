@@ -1,0 +1,9 @@
+std_msgs/Header header
+uint64 source_map_revision
+uint64 graph_revision
+scan_planner_msgs/TopoNode[] added_nodes
+scan_planner_msgs/TopoNode[] updated_nodes
+uint64[] removed_node_ids
+scan_planner_msgs/TopoEdge[] added_edges
+scan_planner_msgs/TopoEdge[] updated_edges
+uint64[] removed_edge_ids

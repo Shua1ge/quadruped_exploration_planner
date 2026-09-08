@@ -57,6 +57,7 @@ install(PROGRAMS
   scripts/keypoint_recorder.py
   scripts/global_astar_planner.py
   scripts/frontier_explorer.py
+  scripts/global_representation_node.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}
@@ -69,6 +70,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_pytest_test(test_global_astar test/test_global_astar.py)
   ament_add_pytest_test(test_frontier_explorer test/test_frontier_explorer.py)
+  ament_add_pytest_test(test_topology test/test_topology.py)
   ament_add_gtest(test_replan_fsm_utils test/test_replan_fsm_utils.cpp)
   if(TARGET test_replan_fsm_utils)
     target_include_directories(test_replan_fsm_utils PRIVATE include)

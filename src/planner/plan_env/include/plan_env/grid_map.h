@@ -13,6 +13,7 @@
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <rmw/qos_profiles.h>
@@ -20,6 +21,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <scan_planner_msgs/msg/local_map_patch.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -244,6 +246,8 @@ private:
   // update occupancy by raycasting
   void updateOccupancyCallback();
   void visCallback();
+  bool buildLocalMapPatchLocked(
+      scan_planner_msgs::msg::LocalMapPatch& patch) const;
   InflatedOccupancySnapshotPtr buildInflatedOccupancySnapshotLocked() const;
 
   // main update process
@@ -295,7 +299,14 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr unknown_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr depth_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr extrinsic_pose_pub_;
+  rclcpp::Publisher<scan_planner_msgs::msg::LocalMapPatch>::SharedPtr local_patch_pub_;
   rclcpp::TimerBase::SharedPtr occ_timer_, vis_timer_;
+  bool local_patch_enabled_{true};
+  double local_patch_period_{0.5};
+  double local_patch_resolution_{0.2};
+  double local_patch_z_{0.3};
+  uint64_t last_local_patch_revision_{0};
+  std::chrono::steady_clock::time_point last_local_patch_time_{};
 
   //
   uniform_real_distribution<double> rand_noise_;

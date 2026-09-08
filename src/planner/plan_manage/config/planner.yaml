@@ -57,6 +57,12 @@ scan_planner_node:
     grid_map.max_ray_length: 5.0
     grid_map.vis_height: 0.3
     grid_map.show_occ_time: false
+    # Shadow global-representation input. After a fusion revision completes, it
+    # samples the consistent inflated map without acquiring another map lock.
+    grid_map.local_patch_enabled: true
+    grid_map.local_patch_period: 0.5
+    grid_map.local_patch_resolution: 0.2
+    grid_map.local_patch_z: 0.3
 
     manager.max_vel: 0.75
     manager.max_acc: 0.5
