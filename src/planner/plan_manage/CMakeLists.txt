@@ -58,6 +58,8 @@ install(PROGRAMS
   scripts/global_astar_planner.py
   scripts/frontier_explorer.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
+install(DIRECTORY scripts/explorer_core
+  DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)

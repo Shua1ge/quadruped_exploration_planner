@@ -1,11 +1,13 @@
 import importlib.util
 import math
 import pathlib
+import sys
 
 import numpy as np
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_file_location(
     "frontier_explorer", ROOT / "scripts" / "frontier_explorer.py")
 MODULE = importlib.util.module_from_spec(SPEC)
