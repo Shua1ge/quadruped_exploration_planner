@@ -14,6 +14,8 @@ SCAN-Planner 是一款面向四足机器人导航的空间碰撞感知局部规�
 
 本仓库是 [wuyi2121/SCAN-Planner](https://github.com/wuyi2121/SCAN-Planner) 的衍生 ROS 2 移植版。核心算法、项目设计与原始研究工作归功于 Han Zheng、Zhe Chen、Yiwen Fu、Ming Yang 和 Tong Qin；ROS 2 适配由本仓库维护者完成，不代表原作者的官方发布或认可。
 
+当前维护版本为 `v0.2.0`。第一次了解项目建议先阅读[简明架构说明](docs/ARCHITECTURE_SIMPLE_ZH.md)，版本改动和验证范围见 [v0.2.0 版本说明](docs/RELEASE_V0.2.0_ZH.md)，完整技术交接见[项目交接文档](docs/PROJECT_HANDOFF_ZH.md)。
+
 ## 构建
 
 安装 ROS 2 Humble 及包依赖后，在工作空间根目录下执行构建：
