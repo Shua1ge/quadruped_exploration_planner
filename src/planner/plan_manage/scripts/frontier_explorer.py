@@ -25,7 +25,8 @@ from explorer_core.frontier_regions import (
     advance_completion_streak, advance_reroute_failure_streak, candidate_cells,
     cluster_frontiers, clustered_frontier_cells, observation_progress,
     observation_target_cells, partition_frontier_clusters, retain_region_commitment,
-    safe_viewpoint_cells, solve_open_held_karp, update_region_commitment,
+    region_information_efficiency, safe_viewpoint_cells, select_rolling_region,
+    solve_open_held_karp, update_region_commitment,
 )
 from explorer_core.grid import (
     Cell, DirectedEdge, ExplorationGrid, FREE, GRID_MOVES, OCCUPIED, Point2, UNKNOWN,
@@ -156,6 +157,10 @@ class FrontierExplorer(Node):
             raise ValueError("region_unreachable_timeout must be positive")
         self.max_global_regions = int(
             self.declare_parameter("max_global_regions", 10).value)
+        self.region_switch_ratio = float(
+            self.declare_parameter("region_switch_ratio", 1.35).value)
+        if self.region_switch_ratio < 1.0:
+            raise ValueError("region_switch_ratio must be at least one")
         self.metrics_period = float(self.declare_parameter("metrics_period", 2.0).value)
         self.metrics_file = str(self.declare_parameter("metrics_file", "").value)
         self.observation_preplanning_enabled = bool(
@@ -1117,20 +1122,47 @@ class FrontierExplorer(Node):
         if need_global_plan:
             self.region_sequence = self.plan_region_sequence(
                 start, available, by_region, inflated, blocked_edges)
+
+        # The full tour is only a prediction for future preparation.  Immediate
+        # control is a one-step rolling decision based on real A* access cost.
+        best_by_region = {
+            region_id: max(options, key=lambda item: (
+                region_information_efficiency(
+                    item.unknown_gain, item.cluster_size,
+                    item.path_length, item.turn_cost),
+                self.candidate_utility(item, options),
+                -item.path_length, -item.cell[0], -item.cell[1]))
+            for region_id, options in by_region.items() if options}
+        region_scores = {
+            region_id: region_information_efficiency(
+                candidate.unknown_gain, candidate.cluster_size,
+                candidate.path_length, candidate.turn_cost)
+            for region_id, candidate in best_by_region.items()}
+        selected_region = select_rolling_region(
+            region_scores, self.active_region_id, self.region_switch_ratio)
+        if selected_region is None:
+            return None
+
+        # Keep the prediction observable, but make its first item agree with
+        # the rolling decision rather than letting Held-Karp choose the action.
+        prediction = [selected_region] + [
+            region_id for region_id in self.region_sequence
+            if region_id != selected_region and region_id in available_ids]
+        if prediction != self.region_sequence:
+            self.region_sequence = prediction
+            self.publish_region_sequence()
+        elif need_global_plan:
             self.publish_region_sequence()
 
-        # If a region has no usable goal, remove it and continue along the
-        # current global sequence rather than falling back across all regions.
-        while self.region_sequence:
-            region_id = self.region_sequence[0]
-            options = by_region.get(region_id, [])
-            if options:
-                selected = max(options, key=lambda item: (
-                    self.candidate_utility(item, options),
-                    -item.path_length, -item.cell[0], -item.cell[1]))
-                return selected
-            self.region_sequence.pop(0)
-        return None
+        selected = best_by_region[selected_region]
+        active_score = region_scores.get(self.active_region_id)
+        self.get_logger().info(
+            f"[ROLLING_REGION_CHOICE] selected={selected_region} "
+            f"active={self.active_region_id} score={region_scores[selected_region]:.3f} "
+            f"active_score={'none' if active_score is None else f'{active_score:.3f}'} "
+            f"switch_ratio={self.region_switch_ratio:.2f}",
+            throttle_duration_sec=2.0)
+        return selected
 
     def plan_region_sequence(self, start: Cell,
                              regions: Sequence[FrontierRegion],

@@ -533,3 +533,24 @@ def test_failure_cooldown_expires_after_configured_map_revision():
     explorer.map_update_count = 16
     assert not explorer.is_goal_on_failure_cooldown((2.5, 3.0))
     assert explorer.goal_failure_cooldowns == {}
+
+
+def test_region_information_efficiency_prefers_near_useful_frontier():
+    nearby = MODULE.region_information_efficiency(40, 20, 4.0, 1.0)
+    distant = MODULE.region_information_efficiency(45, 20, 18.0, 1.0)
+
+    assert nearby > distant
+
+
+def test_rolling_region_keeps_active_region_within_switch_margin():
+    selected = MODULE.select_rolling_region(
+        {3: 10.0, 7: 12.0}, active_region_id=3, switch_ratio=1.35)
+
+    assert selected == 3
+
+
+def test_rolling_region_switches_for_clearly_better_challenger():
+    selected = MODULE.select_rolling_region(
+        {3: 10.0, 7: 14.0}, active_region_id=3, switch_ratio=1.35)
+
+    assert selected == 7

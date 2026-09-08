@@ -10,6 +10,39 @@ import numpy as np
 from .grid import Cell, ExplorationGrid, UNKNOWN
 from .path_planning import segment_known_free
 
+
+def region_information_efficiency(unknown_gain: int, frontier_size: int,
+                                  path_length: float, turn_cost: float) -> float:
+    """Return useful observable frontier information per unit travel effort."""
+    information = max(0.0, float(unknown_gain)) + 0.25 * math.sqrt(
+        max(0.0, float(frontier_size)))
+    travel_effort = 1.0 + max(0.0, float(path_length)) + 0.25 * max(
+        0.0, float(turn_cost))
+    return information / travel_effort
+
+
+def select_rolling_region(region_scores: Dict[int, float],
+                          active_region_id: Optional[int],
+                          switch_ratio: float) -> Optional[int]:
+    """Choose only the next region, retaining the active one with hysteresis.
+
+    The current region remains selected unless another reachable region is
+    better by ``switch_ratio``.  This avoids letting a predicted full tour
+    control the immediate exploration action.
+    """
+    if not region_scores:
+        return None
+    best_region = max(region_scores, key=lambda region_id: (
+        region_scores[region_id], -region_id))
+    if active_region_id not in region_scores:
+        return best_region
+    if best_region == active_region_id:
+        return active_region_id
+    active_score = max(0.0, region_scores[active_region_id])
+    threshold = active_score * max(1.0, float(switch_ratio))
+    return best_region if region_scores[best_region] > threshold else active_region_id
+
+
 def cluster_frontiers(frontiers: Set[Cell], minimum_size: int) -> List[List[Cell]]:
     remaining = set(frontiers)
     clusters = []
