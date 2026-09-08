@@ -184,6 +184,26 @@ inline bool sampledSuffixIsReusable(size_t sample_count, double arc_length)
   return sample_count >= 2 && std::isfinite(arc_length) && arc_length > 1e-4;
 }
 
+inline bool shouldAcceptTrajectoryVersion(
+    uint64_t incoming_request, int64_t incoming_trajectory,
+    uint64_t active_request, int64_t active_trajectory)
+{
+  if (incoming_request < active_request)
+    return false;
+  if (incoming_request == active_request &&
+      incoming_trajectory <= active_trajectory)
+    return false;
+  return true;
+}
+
+inline bool safetyResultMatchesExecution(
+    uint64_t checked_request, int64_t checked_trajectory,
+    uint64_t executing_request, int64_t executing_trajectory)
+{
+  return checked_request == executing_request &&
+         checked_trajectory == executing_trajectory;
+}
+
 } // namespace scan_planner
 
 #endif // SCAN_PLANNER_REPLAN_FSM_UTILS_H_

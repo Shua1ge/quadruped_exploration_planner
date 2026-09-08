@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
+
 #include <plan_manage/replan_fsm_utils.h>
 
 namespace scan_planner
@@ -133,6 +136,23 @@ TEST(RollingTrajectoryReuse, RejectsDegenerateSampledSuffix)
   EXPECT_FALSE(sampledSuffixIsReusable(4, 0.0));
   EXPECT_FALSE(sampledSuffixIsReusable(4, 1e-5));
   EXPECT_TRUE(sampledSuffixIsReusable(4, 0.25));
+}
+
+TEST(TrajectoryVersion, RejectsLateRequestAndDuplicateTrajectory)
+{
+  EXPECT_TRUE(shouldAcceptTrajectoryVersion(
+      0, 0, 0, std::numeric_limits<int64_t>::min()));
+  EXPECT_FALSE(shouldAcceptTrajectoryVersion(10, 30, 11, 31));
+  EXPECT_FALSE(shouldAcceptTrajectoryVersion(11, 31, 11, 31));
+  EXPECT_TRUE(shouldAcceptTrajectoryVersion(11, 32, 11, 31));
+  EXPECT_TRUE(shouldAcceptTrajectoryVersion(12, 1, 11, 31));
+}
+
+TEST(TrajectoryVersion, SafetyResultFollowsExecutedTrajectoryNotNewestReference)
+{
+  EXPECT_TRUE(safetyResultMatchesExecution(10, 30, 10, 30));
+  EXPECT_FALSE(safetyResultMatchesExecution(10, 30, 11, 31));
+  EXPECT_FALSE(safetyResultMatchesExecution(11, 30, 11, 31));
 }
 
 } // namespace scan_planner

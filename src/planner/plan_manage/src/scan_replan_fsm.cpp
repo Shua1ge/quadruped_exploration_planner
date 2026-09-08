@@ -1249,26 +1249,44 @@ namespace scan_planner
     start_acc_.setZero();
   }
 
-  void SCANReplanFSM::updateExecutionTrajectorySnapshot(const LocalTrajData &info)
+  void SCANReplanFSM::updateExecutionTrajectorySnapshot(
+      const LocalTrajData &info, uint64_t request_id)
   {
     std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
     execution_snapshot_.position = info.position_traj_;
     execution_snapshot_.start_time = info.start_time_;
     execution_snapshot_.duration = info.duration_;
-    execution_snapshot_.request_id = active_reference_request_id_.load();
+    execution_snapshot_.request_id = request_id;
+    execution_snapshot_.trajectory_id = info.traj_id_;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
   }
 
   void SCANReplanFSM::tripRealtimeSafety(
       const std::string &reason, const Eigen::Vector3d *last_free,
-      const Eigen::Vector3d *first_blocked, uint64_t request_id)
+      const Eigen::Vector3d *first_blocked, uint64_t request_id,
+      int64_t trajectory_id)
   {
-    if (request_id != 0 && request_id != active_reference_request_id_.load())
+    // A pose collision describes the robot's physical state and must never be
+    // discarded because a trajectory handoff is in progress.  Look-ahead
+    // results, however, are valid only for the exact trajectory they checked.
+    const bool versioned_lookahead = request_id != 0 || trajectory_id != 0;
+    if (versioned_lookahead)
     {
-      RCLCPP_WARN(node_->get_logger(),
-                  "Ignoring safety result for stale request_id=%llu",
-                  static_cast<unsigned long long>(request_id));
-      return;
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      if (!execution_snapshot_.valid || !safetyResultMatchesExecution(
+              request_id, trajectory_id,
+              execution_snapshot_.request_id,
+              execution_snapshot_.trajectory_id))
+      {
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "[STALE_SAFETY_RESULT_IGNORED] checked_request=%llu checked_trajectory=%lld executing_request=%llu executing_trajectory=%lld",
+            static_cast<unsigned long long>(request_id),
+            static_cast<long long>(trajectory_id),
+            static_cast<unsigned long long>(execution_snapshot_.request_id),
+            static_cast<long long>(execution_snapshot_.trajectory_id));
+        return;
+      }
     }
     bool expected = false;
     if (!safety_stop_active_.compare_exchange_strong(expected, true))
@@ -1380,7 +1398,8 @@ namespace scan_planner
             (static_cast<double>(sample) / samples) * connector;
         if (map->getInflateOccupancy(point, yaw) != 0)
         {
-          tripRealtimeSafety("BLOCKED", &odom_pos, &point, trajectory.request_id);
+          tripRealtimeSafety("BLOCKED", &odom_pos, &point,
+                             trajectory.request_id, trajectory.trajectory_id);
           RCLCPP_WARN(node_->get_logger(),
                       "[REALTIME_SAFETY_STOP] reason=connector_blocked error=%.2fm hit=(%.2f,%.2f) map_age=%.1fms",
                       connector_length, point.x(), point.y(), map_age * 1000.0);
@@ -1398,7 +1417,8 @@ namespace scan_planner
           std::min(t + time_step, trajectory.duration));
       if (map->getInflateOccupancy(pos, segment_yaw(pos, next)) != 0)
       {
-        tripRealtimeSafety("BLOCKED", &last_free, &pos, trajectory.request_id);
+        tripRealtimeSafety("BLOCKED", &last_free, &pos,
+                           trajectory.request_id, trajectory.trajectory_id);
         RCLCPP_WARN(node_->get_logger(),
                     "[REALTIME_SAFETY_STOP] reason=trajectory_blocked time_to_hit=%.2fs hit=(%.2f,%.2f) map_age=%.1fms",
                     std::max(0.0, t - t_cur), pos.x(), pos.y(), map_age * 1000.0);
@@ -1415,6 +1435,7 @@ namespace scan_planner
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
     auto map = planner_manager_->grid_map_;
+    const uint64_t planning_request_id = active_reference_request_id_.load();
     // reboundReplan commits its successful result to local_data_ before the
     // real-time publication checks below.  Preserve the trajectory that the
     // controller is actually executing so every rejected result is atomic.
@@ -1440,6 +1461,16 @@ namespace scan_planner
 
     if (plan_success)
     {
+      if (planning_request_id != active_reference_request_id_.load())
+      {
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "[PLAN_RESULT_DISCARDED] reference changed while planning old_request_id=%llu active_request_id=%llu",
+            static_cast<unsigned long long>(planning_request_id),
+            static_cast<unsigned long long>(
+                active_reference_request_id_.load()));
+        return reject_planned_trajectory();
+      }
 
       // The optimizer and final validation use separate immutable revisions.
       // Keep the newest completed snapshot bound through every occupancy query
@@ -1460,6 +1491,18 @@ namespace scan_planner
       {
         RCLCPP_WARN(node_->get_logger(),
                     "[PLAN_RESULT_DISCARDED] realtime safety stopped execution while this plan was computing");
+        return reject_planned_trajectory();
+      }
+
+      // Validation can take long enough for a newer global route to arrive.
+      // Never publish a spline derived from the superseded request.
+      if (planning_request_id != active_reference_request_id_.load())
+      {
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "[PLAN_RESULT_DISCARDED] reference changed during final validation old_request_id=%llu active_request_id=%llu",
+            static_cast<unsigned long long>(planning_request_id),
+            static_cast<unsigned long long>(active_reference_request_id_.load()));
         return reject_planned_trajectory();
       }
 
@@ -1530,11 +1573,22 @@ namespace scan_planner
         return reject_planned_trajectory();
       }
 
+      if (planning_request_id != active_reference_request_id_.load())
+      {
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "[PLAN_RESULT_DISCARDED] reference changed before publication old_request_id=%llu active_request_id=%llu",
+            static_cast<unsigned long long>(planning_request_id),
+            static_cast<unsigned long long>(active_reference_request_id_.load()));
+        return reject_planned_trajectory();
+      }
+
       /* publish traj */
       scan_planner_msgs::msg::Bspline bspline;
       bspline.order = 3;
       bspline.start_time = info->start_time_;
       bspline.traj_id = info->traj_id_;
+      bspline.request_id = planning_request_id;
 
       Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
       bspline.pos_pts.reserve(pos_pts.cols());
@@ -1554,8 +1608,11 @@ namespace scan_planner
         bspline.knots.push_back(knots(i));
       }
 
-      updateExecutionTrajectorySnapshot(*info);
       bspline_pub_->publish(bspline);
+      // Keep safety bound to the old spline until the replacement has actually
+      // been published.  From this point on request_id + traj_id is the single
+      // execution version used by the controller and safety checker.
+      updateExecutionTrajectorySnapshot(*info, planning_request_id);
       if (reference_path_update_pending_)
       {
         publishReferenceStatus("PATH_TRAJECTORY_READY", pending_reference_request_id_);
@@ -1600,6 +1657,8 @@ namespace scan_planner
     bspline.order = 3;
     bspline.start_time = info->start_time_;
     bspline.traj_id = info->traj_id_;
+    const uint64_t stop_request_id = active_reference_request_id_.load();
+    bspline.request_id = stop_request_id;
 
     Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
     bspline.pos_pts.reserve(pos_pts.cols());
@@ -1619,8 +1678,8 @@ namespace scan_planner
       bspline.knots.push_back(knots(i));
     }
 
-    updateExecutionTrajectorySnapshot(*info);
     bspline_pub_->publish(bspline);
+    updateExecutionTrajectorySnapshot(*info, stop_request_id);
 
     return true;
   }

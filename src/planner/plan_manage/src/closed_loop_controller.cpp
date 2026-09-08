@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -106,6 +107,20 @@ private:
       RCLCPP_WARN(get_logger(), "Ignoring invalid B-spline");
       return;
     }
+    if (!shouldAcceptTrajectoryVersion(
+            msg->request_id, msg->traj_id,
+            active_request_id_,
+            receive_traj_ ? traj_id_ : std::numeric_limits<std::int64_t>::min()))
+    {
+      RCLCPP_WARN(
+          get_logger(),
+          "[STALE_TRAJECTORY_IGNORED] request_id=%llu trajectory=%lld active_request_id=%llu active_trajectory=%lld",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->traj_id),
+          static_cast<unsigned long long>(active_request_id_),
+          static_cast<long long>(traj_id_));
+      return;
+    }
     Eigen::MatrixXd points(3, msg->pos_pts.size());
     for (size_t i = 0; i < msg->pos_pts.size(); ++i)
       points.col(i) << msg->pos_pts[i].x, msg->pos_pts[i].y, msg->pos_pts[i].z;
@@ -162,6 +177,7 @@ private:
     traj_ = std::move(candidate);
     traj_duration_ = candidate_duration;
     traj_id_ = msg->traj_id;
+    active_request_id_ = msg->request_id;
     exec_time_ = matched_time;
     last_update_time_ = now();
     receive_traj_ = true;
@@ -169,7 +185,8 @@ private:
     // physical simulation collision stays latched for the lifetime of this run.
     emergency_stop_ = simulation_collision_latched_;
     RCLCPP_INFO(get_logger(),
-                "[TRAJECTORY_HANDOFF] trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm",
+                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm",
+                static_cast<unsigned long long>(active_request_id_),
                 static_cast<long long>(traj_id_), traj_duration_, exec_time_,
                 start_error, matched_error);
   }
@@ -262,6 +279,7 @@ private:
   std::vector<UniformBspline> traj_;
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
+  std::uint64_t active_request_id_{0};
   Eigen::Vector3d odom_pos_{Eigen::Vector3d::Zero()};
   double odom_yaw_{0.0};
   double exec_time_{0.0};

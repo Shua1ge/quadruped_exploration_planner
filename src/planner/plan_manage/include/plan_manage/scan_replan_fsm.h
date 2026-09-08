@@ -114,6 +114,7 @@ namespace scan_planner
       rclcpp::Time start_time;
       double duration{0.0};
       uint64_t request_id{0};
+      int64_t trajectory_id{0};
       bool valid{false};
     };
     std::mutex execution_snapshot_mutex_;
@@ -175,11 +176,13 @@ namespace scan_planner
     void publishStatus(const std::string &status);
     void publishReferenceStatus(const std::string &status, uint64_t request_id = 0);
     void publishBlockedSegment();
-    void updateExecutionTrajectorySnapshot(const LocalTrajData &info);
+    void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
+                                           uint64_t request_id);
     void tripRealtimeSafety(const std::string &reason,
                             const Eigen::Vector3d *last_free = nullptr,
                             const Eigen::Vector3d *first_blocked = nullptr,
-                            uint64_t request_id = 0);
+                            uint64_t request_id = 0,
+                            int64_t trajectory_id = 0);
 
     /* ROS functions */
     void execFSMCallback();
