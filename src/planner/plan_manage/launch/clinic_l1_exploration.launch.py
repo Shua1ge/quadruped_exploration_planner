@@ -63,6 +63,8 @@ def generate_launch_description():
                 "viewpoint_standoff": 1.0,
                 "min_frontier_size": 6,
                 "min_goal_distance": 2.0,
+                "preferred_goal_path_length": 3.5,
+                "long_horizon_min_gain_ratio": 0.65,
                 "blacklist_radius": 1.5,
                 "global_reroute_failure_updates": 3,
                 "map_update_period": 0.5,

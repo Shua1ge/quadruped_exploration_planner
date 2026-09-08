@@ -125,6 +125,15 @@ class FrontierExplorer(Node):
             self.declare_parameter("viewpoint_standoff", 1.0).value)
         self.min_frontier_size = int(self.declare_parameter("min_frontier_size", 6).value)
         self.min_goal_distance = float(self.declare_parameter("min_goal_distance", 2.0).value)
+        self.preferred_goal_path_length = float(
+            self.declare_parameter("preferred_goal_path_length", 3.5).value)
+        self.long_horizon_min_gain_ratio = float(
+            self.declare_parameter("long_horizon_min_gain_ratio", 0.65).value)
+        if self.preferred_goal_path_length < self.min_goal_distance:
+            raise ValueError(
+                "preferred_goal_path_length must not be shorter than min_goal_distance")
+        if not 0.0 <= self.long_horizon_min_gain_ratio <= 1.0:
+            raise ValueError("long_horizon_min_gain_ratio must be within [0, 1]")
         self.blacklist_radius = float(self.declare_parameter("blacklist_radius", 1.5).value)
         self.goal_failure_cooldown_updates = int(
             self.declare_parameter("goal_failure_cooldown_updates", 6).value)
@@ -224,6 +233,9 @@ class FrontierExplorer(Node):
         self.cumulative_planning_ms = 0.0
         self.region_switches = 0
         self.goals_reached = 0
+        self.paths_published = 0
+        self.short_paths_published = 0
+        self.last_published_path_length = 0.0
         self.observations_satisfied = 0
         self.total_distance = 0.0
         self.revisit_distance = 0.0
@@ -1022,6 +1034,19 @@ class FrontierExplorer(Node):
                 - 0.25 * candidate.path_length / max_length
                 - 0.10 * candidate.turn_cost / max_turn)
 
+    def preferred_horizon_pool(
+            self, options: Sequence[FrontierCandidate]) -> List[FrontierCandidate]:
+        """Prefer a useful longer observation path, retaining short fallback goals."""
+        if not options:
+            return []
+        best_gain = max(candidate.unknown_gain for candidate in options)
+        minimum_gain = best_gain * self.long_horizon_min_gain_ratio
+        longer_useful = [
+            candidate for candidate in options
+            if candidate.path_length >= self.preferred_goal_path_length
+            and candidate.unknown_gain >= minimum_gain]
+        return longer_useful or list(options)
+
     def choose_greedy_candidate(self, candidates: Sequence[FrontierCandidate]):
         best = None
         for candidate in candidates:
@@ -1125,14 +1150,17 @@ class FrontierExplorer(Node):
 
         # The full tour is only a prediction for future preparation.  Immediate
         # control is a one-step rolling decision based on real A* access cost.
+        selection_options = {
+            region_id: self.preferred_horizon_pool(options)
+            for region_id, options in by_region.items()}
         best_by_region = {
-            region_id: max(options, key=lambda item: (
+            region_id: max(preferred, key=lambda item: (
                 region_information_efficiency(
                     item.unknown_gain, item.cluster_size,
                     item.path_length, item.turn_cost),
-                self.candidate_utility(item, options),
+                self.candidate_utility(item, preferred),
                 -item.path_length, -item.cell[0], -item.cell[1]))
-            for region_id, options in by_region.items() if options}
+            for region_id, preferred in selection_options.items() if preferred}
         region_scores = {
             region_id: region_information_efficiency(
                 candidate.unknown_gain, candidate.cluster_size,
@@ -1171,9 +1199,14 @@ class FrontierExplorer(Node):
                              blocked_edges: Set[DirectedEdge]) -> List[int]:
         # Each region is represented by its cheapest currently reachable
         # frontier entry.  Every matrix edge is an actual known-free A* route.
+        representative_options = {
+            region.region_id: self.preferred_horizon_pool(
+                by_region[region.region_id])
+            for region in regions}
         representatives = [
-            max(by_region[region.region_id], key=lambda item: (
-                self.candidate_utility(item, by_region[region.region_id]),
+            max(representative_options[region.region_id], key=lambda item: (
+                self.candidate_utility(
+                    item, representative_options[region.region_id]),
                 -item.path_length, -item.cell[0], -item.cell[1]))
             for region in regions]
         count = len(representatives)
@@ -1305,6 +1338,10 @@ class FrontierExplorer(Node):
         world_points[0] = self.position
         length = sum(math.hypot(b[0] - a[0], b[1] - a[1])
                      for a, b in zip(world_points[:-1], world_points[1:]))
+        self.paths_published += 1
+        self.last_published_path_length = length
+        if length < self.preferred_goal_path_length:
+            self.short_paths_published += 1
         self.get_logger().info(
             f"Selected observation ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}), "
             f"region={region_id}, strategy={self.selection_strategy}; "
@@ -1326,6 +1363,12 @@ class FrontierExplorer(Node):
             "revisit_distance_m": self.revisit_distance,
             "region_switches": self.region_switches,
             "goals_reached": self.goals_reached,
+            "paths_published": self.paths_published,
+            "short_paths_published": self.short_paths_published,
+            "short_path_ratio": (
+                self.short_paths_published / self.paths_published
+                if self.paths_published else 0.0),
+            "last_published_path_length_m": self.last_published_path_length,
             "observations_satisfied": self.observations_satisfied,
             "observation_progress": (
                 self.active_observation.progress if self.active_observation else 0.0),

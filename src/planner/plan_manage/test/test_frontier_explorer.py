@@ -2,6 +2,7 @@ import importlib.util
 import math
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -540,6 +541,27 @@ def test_region_information_efficiency_prefers_near_useful_frontier():
     distant = MODULE.region_information_efficiency(45, 20, 18.0, 1.0)
 
     assert nearby > distant
+
+
+def test_preferred_horizon_uses_longer_candidate_with_sufficient_gain():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.preferred_goal_path_length = 3.5
+    explorer.long_horizon_min_gain_ratio = 0.65
+    short = SimpleNamespace(path_length=2.1, unknown_gain=100)
+    longer = SimpleNamespace(path_length=3.8, unknown_gain=70)
+
+    assert explorer.preferred_horizon_pool([short, longer]) == [longer]
+
+
+def test_preferred_horizon_retains_short_fallback_when_long_gain_is_too_low():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.preferred_goal_path_length = 3.5
+    explorer.long_horizon_min_gain_ratio = 0.65
+    short = SimpleNamespace(path_length=2.1, unknown_gain=100)
+    weak_longer = SimpleNamespace(path_length=3.8, unknown_gain=60)
+
+    assert explorer.preferred_horizon_pool(
+        [short, weak_longer]) == [short, weak_longer]
 
 
 def test_rolling_region_keeps_active_region_within_switch_margin():
