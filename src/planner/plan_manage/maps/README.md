@@ -38,3 +38,45 @@ Suggested fixed cases (verify coordinates visually before recording results):
 
 For each accepted case, record global path length, planning time, SCAN replan
 count, minimum inflated-obstacle clearance, collision count, and completion.
+
+## Open-RMF Airport Terminal core map
+
+`airport_terminal_core.pcd` is a wall-only conversion of the Open-RMF Airport
+Terminal L1 scene. It is intentionally separate from the quad benchmark: the
+airport spans about `282.1 x 83.4 m`, while the Explorer and SCAN data flow is
+unchanged and still reveals the truth map only through local simulated LiDAR.
+
+Build and launch it with:
+
+```bash
+cd /home/t1an/ros2_ws/scan_planner_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select scan_planner --symlink-install
+source install/setup.bash
+ros2 launch scan_planner airport_terminal_exploration.launch.py
+```
+
+The default start is RMF navigation vertex `junction_n20`, transformed to
+approximately `(8.54, 11.97, 0.30)` in the centred ROS world. Keep the original
+quad launch for regression comparisons. Source attribution and regeneration
+details are in `airport_terminal_source/README.md` and `tools/README.md`.
+
+## Open-RMF Clinic L1 core map
+
+`clinic_L1_core.pcd` contains only the structural walls of Clinic level L1.
+Level L2 is deliberately excluded so its walls cannot overlap the Explorer's
+two-dimensional occupancy grid. The centred L1 source extent is approximately
+`52.80 x 46.45 m`; the launch reserves a `58 x 52 m` map with edge margin.
+
+```bash
+cd /home/t1an/ros2_ws/scan_planner_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select scan_planner --symlink-install
+source install/setup.bash
+ros2 launch scan_planner clinic_l1_exploration.launch.py
+```
+
+The default start is RMF navigation vertex `L1_right_nurse_center`, transformed
+to approximately `(11.69, 8.50, 0.30)` in the centred ROS world. Regeneration
+and source attribution are documented in `tools/README.md` and
+`clinic_source/README.md`.
