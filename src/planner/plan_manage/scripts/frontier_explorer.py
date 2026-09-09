@@ -19,6 +19,7 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
+from scan_planner_msgs.msg import TopoGraphDelta
 
 from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
@@ -40,6 +41,9 @@ from explorer_core.path_planning import (
     validate_remaining_path,
 )
 from explorer_core.replan_control import ReplanContext, ReplanGate
+from explorer_core.sparse_routing import (
+    SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
+)
 
 
 REFERENCE_SCOPED_STATUSES = {
@@ -195,6 +199,16 @@ class FrontierExplorer(Node):
             self.declare_parameter("region_max_path_ratio", 1.5).value)
         self.region_max_detour_ratio = float(
             self.declare_parameter("region_max_detour_ratio", 1.75).value)
+        self.sparse_routing_enabled = bool(
+            self.declare_parameter("sparse_routing_enabled", True).value)
+        self.sparse_attachment_radius = float(
+            self.declare_parameter("sparse_attachment_radius", 1.5).value)
+        self.sparse_attachment_limit = int(
+            self.declare_parameter("sparse_attachment_limit", 8).value)
+        if self.sparse_attachment_radius <= 0.0:
+            raise ValueError("sparse_attachment_radius must be positive")
+        if self.sparse_attachment_limit < 1:
+            raise ValueError("sparse_attachment_limit must be at least one")
         if not (0.0 <= self.observation_prepare_ratio
                 < self.observation_done_ratio <= 1.0):
             raise ValueError(
@@ -224,6 +238,8 @@ class FrontierExplorer(Node):
         self.prepared_candidate: Optional[FrontierCandidate] = None
         self.region_edge_cache: Dict[Tuple[int, int], List[Cell]] = {}
         self.region_anchor_cells: Dict[int, Cell] = {}
+        self.sparse_router = SparseRouteGraph(
+            bucket_size=max(self.grid.resolution, 1.0))
         self.region_edge_cache_hits = 0
         self.region_edge_cache_misses = 0
         self.replacement_pending = False
@@ -266,6 +282,20 @@ class FrontierExplorer(Node):
         self.last_expanded_grid_cells = 0
         self.last_region_edge_cache_hits = 0
         self.last_region_edge_cache_misses = 0
+        self.last_sparse_candidate_ms = 0.0
+        self.last_sparse_region_ms = 0.0
+        self.last_sparse_candidate_hits = 0
+        self.last_sparse_candidate_fallbacks = 0
+        self.last_sparse_region_pair_hits = 0
+        self.last_sparse_region_pair_fallbacks = 0
+        self.sparse_candidate_queries = 0
+        self.sparse_candidate_hits = 0
+        self.sparse_candidate_fallbacks = 0
+        self.sparse_region_pair_queries = 0
+        self.sparse_region_pair_hits = 0
+        self.sparse_region_pair_fallbacks = 0
+        self.dense_final_validation_searches = 0
+        self.sparse_final_validation_failures = 0
         self.global_path_invalid_count = 0
         self.region_switches = 0
         self.goals_reached = 0
@@ -292,10 +322,16 @@ class FrontierExplorer(Node):
             Path, "planning/blocked_segment", self.blocked_segment_callback, 10)
         self.create_subscription(Bool, "simulation/collision", self.collision_callback, 10)
         self.create_subscription(Bool, "explorer/enabled", self.enabled_callback, 10)
+        self.create_subscription(
+            TopoGraphDelta, "global_representation/topology_delta",
+            self.topology_delta_callback, 10)
 
         transient_qos = QoSProfile(depth=1)
         transient_qos.reliability = ReliabilityPolicy.RELIABLE
         transient_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            TopoGraphDelta, "global_representation/topology_snapshot",
+            self.topology_snapshot_callback, transient_qos)
         self.path_pub = self.create_publisher(Path, "initial_path", 10)
         self.path_vis_pub = self.create_publisher(Path, "explorer/path", transient_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, "explorer/map", transient_qos)
@@ -314,12 +350,84 @@ class FrontierExplorer(Node):
             f"Explorer strategy={self.selection_strategy}, region_size={self.region_size:.1f} m, "
             f"observation_preplanning={self.observation_preplanning_enabled}, "
             f"observation_prepare={self.observation_prepare_ratio:.2f}, "
-            f"observation_done={self.observation_done_ratio:.2f}")
+            f"observation_done={self.observation_done_ratio:.2f}, "
+            f"sparse_routing={self.sparse_routing_enabled}")
 
     def publish_status(self, value: str):
         msg = String()
         msg.data = value
         self.status_pub.publish(msg)
+
+    @staticmethod
+    def sparse_node_from_message(message) -> SparseNode:
+        return SparseNode(
+            int(message.id),
+            (float(message.position.x), float(message.position.y)),
+            float(message.clearance))
+
+    @staticmethod
+    def sparse_edge_from_message(message) -> SparseEdge:
+        return SparseEdge(
+            int(message.id), int(message.source_id), int(message.target_id),
+            float(message.length), float(message.minimum_clearance),
+            tuple((float(point.x), float(point.y))
+                  for point in message.polyline))
+
+    def topology_delta_callback(self, msg: TopoGraphDelta):
+        """Keep a lightweight query index of the independently maintained graph."""
+        self.sparse_router.apply_delta(
+            msg.graph_revision, msg.source_map_revision,
+            [self.sparse_node_from_message(node) for node in msg.added_nodes],
+            [self.sparse_node_from_message(node) for node in msg.updated_nodes],
+            msg.removed_node_ids,
+            [self.sparse_edge_from_message(edge) for edge in msg.added_edges],
+            [self.sparse_edge_from_message(edge) for edge in msg.updated_edges],
+            msg.removed_edge_ids)
+        self.get_logger().debug(
+            f"[SPARSE_GRAPH_SYNC] revision={self.sparse_router.graph_revision} "
+            f"nodes={len(self.sparse_router.nodes)} "
+            f"edges={len(self.sparse_router.edges)}")
+
+    def topology_snapshot_callback(self, msg: TopoGraphDelta):
+        """Atomically restore a complete graph after launch races or restarts."""
+        if msg.graph_revision < self.sparse_router.graph_revision:
+            return
+        replacement = SparseRouteGraph(
+            bucket_size=max(self.grid.resolution, 1.0))
+        replacement.apply_delta(
+            msg.graph_revision, msg.source_map_revision,
+            [self.sparse_node_from_message(node) for node in msg.added_nodes],
+            [], [],
+            [self.sparse_edge_from_message(edge) for edge in msg.added_edges],
+            [], [])
+        self.sparse_router = replacement
+        self.get_logger().info(
+            f"[SPARSE_GRAPH_SNAPSHOT] revision={replacement.graph_revision} "
+            f"nodes={len(replacement.nodes)} edges={len(replacement.edges)}",
+            throttle_duration_sec=5.0)
+
+    def sparse_route_estimates(
+            self, start: Cell, targets: Sequence[Cell], inflated: Set[Cell],
+            blocked_edges: Set[DirectedEdge]
+            ) -> List[Optional[SparseRouteEstimate]]:
+        """Estimate one-to-many routes, retaining dense safety at both connectors."""
+        if (not self.sparse_routing_enabled or blocked_edges
+                or not self.sparse_router.ready or not targets):
+            return [None] * len(targets)
+
+        def connector_allowed(source: Point2, target: Point2) -> bool:
+            source_cell = self.grid.world_to_cell(*source)
+            target_cell = self.grid.world_to_cell(*target)
+            return (self.grid.in_bounds(source_cell)
+                    and self.grid.in_bounds(target_cell)
+                    and segment_known_free(
+                        self.grid, source_cell, target_cell, inflated))
+
+        return self.sparse_router.batch_estimates(
+            self.grid.cell_to_world(start),
+            [self.grid.cell_to_world(target) for target in targets],
+            self.sparse_attachment_radius, self.sparse_attachment_limit,
+            connector_allowed)
 
     def odom_callback(self, msg: Odometry):
         new_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
@@ -1043,6 +1151,12 @@ class FrontierExplorer(Node):
         self.last_expanded_grid_cells = 0
         self.last_region_edge_cache_hits = 0
         self.last_region_edge_cache_misses = 0
+        self.last_sparse_candidate_ms = 0.0
+        self.last_sparse_region_ms = 0.0
+        self.last_sparse_candidate_hits = 0
+        self.last_sparse_candidate_fallbacks = 0
+        self.last_sparse_region_pair_hits = 0
+        self.last_sparse_region_pair_fallbacks = 0
 
         partition_started = time.perf_counter()
         observations = partition_frontier_clusters(
@@ -1061,12 +1175,23 @@ class FrontierExplorer(Node):
         candidates = self.build_frontier_candidates(
             start, regions, inflated, blocked_edges, excluded_goals)
 
-        if self.selection_strategy == "greedy":
-            result = self.choose_greedy_candidate(candidates)
-        else:
-            result = self.choose_hierarchical_candidate(
-                start, regions, candidates, inflated, blocked_edges,
+        def select_candidate(options: Sequence[FrontierCandidate]):
+            if self.selection_strategy == "greedy":
+                return self.choose_greedy_candidate(options)
+            return self.choose_hierarchical_candidate(
+                start, regions, options, inflated, blocked_edges,
                 allow_region_release, allow_cross_region_preparation)
+
+        result = select_candidate(candidates)
+        while result is not None and not result.path:
+            materialized = self.materialize_sparse_candidate(
+                start, result, inflated, blocked_edges)
+            if materialized is not None:
+                result = materialized
+                break
+            candidates = [candidate for candidate in candidates
+                          if candidate is not result]
+            result = select_candidate(candidates)
 
         self.last_global_plan_ms = (
             map_preprocess_prefix_ms
@@ -1077,15 +1202,45 @@ class FrontierExplorer(Node):
             f"regions={len(regions)} candidates={len(candidates)} "
             f"map_preprocess_ms={self.last_map_preprocess_ms:.1f} "
             f"region_partition_ms={self.last_region_partition_ms:.1f} "
+            f"sparse_candidate_ms={self.last_sparse_candidate_ms:.1f} "
             f"candidate_tree_ms={self.last_candidate_tree_ms:.1f} "
+            f"sparse_region_ms={self.last_sparse_region_ms:.1f} "
             f"region_sequence_ms={self.last_region_sequence_ms:.1f} "
             f"total_ms={self.last_global_plan_ms:.1f} "
             f"candidate_tree_searches={self.last_candidate_tree_searches} "
             f"region_pair_tree_searches={self.last_region_pair_tree_searches} "
             f"region_cache_hits={self.last_region_edge_cache_hits} "
             f"region_cache_misses={self.last_region_edge_cache_misses} "
+            f"sparse_candidate_hits={self.last_sparse_candidate_hits} "
+            f"sparse_candidate_fallbacks={self.last_sparse_candidate_fallbacks} "
+            f"sparse_region_hits={self.last_sparse_region_pair_hits} "
+            f"sparse_region_fallbacks={self.last_sparse_region_pair_fallbacks} "
             f"expanded_grid_cells={self.last_expanded_grid_cells}")
         return result
+
+    def materialize_sparse_candidate(
+            self, start: Cell, candidate: FrontierCandidate,
+            inflated: Set[Cell], blocked_edges: Set[DirectedEdge]
+            ) -> Optional[FrontierCandidate]:
+        """Recover and validate only the sparse-selected route on the dense map."""
+        self.dense_final_validation_searches += 1
+        path = astar_known(
+            self.grid, start, candidate.cell, inflated, blocked_edges)
+        if not path:
+            self.sparse_final_validation_failures += 1
+            self.get_logger().warning(
+                f"[SPARSE_ROUTE_REJECTED] graph_revision="
+                f"{self.sparse_router.graph_revision} goal="
+                f"({candidate.goal[0]:.2f},{candidate.goal[1]:.2f}); "
+                "dense final validation found no route",
+                throttle_duration_sec=2.0)
+            return None
+        return FrontierCandidate(
+            candidate.region_id, candidate.cell, candidate.frontier_cell,
+            candidate.goal, path,
+            path_length_cells(path, self.grid.resolution),
+            candidate.unknown_gain, candidate.cluster_size,
+            path_turn_cost(path), candidate.observation_cells)
 
     def build_frontier_candidates(self, start: Cell,
                                   regions: Sequence[FrontierRegion],
@@ -1124,28 +1279,52 @@ class FrontierExplorer(Node):
                             region.region_id, viewpoint, frontier, goal_xy,
                             unknown_gain, len(cluster), target_cells))
 
-        # All candidate paths share one start and one planning map.  A single
-        # shortest-path tree replaces one complete A* invocation per viewpoint.
-        tree_started = time.perf_counter()
-        tree = build_shortest_path_tree(
-            self.grid, start, inflated, blocked_edges,
-            {proposal[1] for proposal in proposals})
-        self.last_candidate_tree_ms += (
-            time.perf_counter() - tree_started) * 1000.0
-        self.candidate_tree_searches += 1
-        self.last_candidate_tree_searches += 1
-        self.expanded_grid_cells += tree.expanded_cells
-        self.last_expanded_grid_cells += tree.expanded_cells
+        proposal_cells = list(dict.fromkeys(proposal[1] for proposal in proposals))
+        sparse_started = time.perf_counter()
+        sparse_estimates = self.sparse_route_estimates(
+            start, proposal_cells, inflated, blocked_edges)
+        sparse_elapsed = (time.perf_counter() - sparse_started) * 1000.0
+        self.last_sparse_candidate_ms += sparse_elapsed
+        estimate_by_cell = dict(zip(proposal_cells, sparse_estimates))
+        sparse_hits = sum(estimate is not None for estimate in sparse_estimates)
+        fallback_cells = {cell for cell, estimate in estimate_by_cell.items()
+                          if estimate is None}
+        self.sparse_candidate_queries += len(proposal_cells)
+        self.sparse_candidate_hits += sparse_hits
+        self.sparse_candidate_fallbacks += len(fallback_cells)
+        self.last_sparse_candidate_hits += sparse_hits
+        self.last_sparse_candidate_fallbacks += len(fallback_cells)
+
+        tree = ShortestPathTree(start, {}, {}, 0)
+        if fallback_cells:
+            # Sparse coverage is deliberately non-authoritative.  Missing graph
+            # attachments retain the original dense behaviour for completeness.
+            tree_started = time.perf_counter()
+            tree = build_shortest_path_tree(
+                self.grid, start, inflated, blocked_edges, fallback_cells)
+            self.last_candidate_tree_ms += (
+                time.perf_counter() - tree_started) * 1000.0
+            self.candidate_tree_searches += 1
+            self.last_candidate_tree_searches += 1
+            self.expanded_grid_cells += tree.expanded_cells
+            self.last_expanded_grid_cells += tree.expanded_cells
         records = []
         for (region_id, viewpoint, frontier, goal_xy,
              unknown_gain, cluster_size, target_cells) in proposals:
-            path = tree.path_to(viewpoint)
-            if not path:
-                continue
+            estimate = estimate_by_cell.get(viewpoint)
+            if estimate is None:
+                path = tree.path_to(viewpoint)
+                if not path:
+                    continue
+                path_length = path_length_cells(path, self.grid.resolution)
+                turn_cost = path_turn_cost(path)
+            else:
+                path = []
+                path_length = estimate.distance
+                turn_cost = estimate.turn_cost
             records.append(FrontierCandidate(
                 region_id, viewpoint, frontier, goal_xy, path,
-                path_length_cells(path, self.grid.resolution), unknown_gain,
-                cluster_size, path_turn_cost(path), target_cells))
+                path_length, unknown_gain, cluster_size, turn_cost, target_cells))
         return records
 
     @staticmethod
@@ -1336,7 +1515,8 @@ class FrontierExplorer(Node):
                              inflated: Set[Cell],
                              blocked_edges: Set[DirectedEdge]) -> List[int]:
         # Each region is represented by its cheapest currently reachable
-        # frontier entry.  Every matrix edge is an actual known-free A* route.
+        # frontier entry.  Sparse graph costs fill the matrix first; uncovered
+        # pairs retain the original known-free dense search as a fallback.
         representative_options = {
             region.region_id: self.preferred_horizon_pool(
                 by_region[region.region_id])
@@ -1373,11 +1553,33 @@ class FrontierExplorer(Node):
 
         for source in range(count):
             source_cell = representatives[source].cell
+            target_indices = [target for target in range(count)
+                              if target != source]
+            sparse_started = time.perf_counter()
+            sparse_estimates = self.sparse_route_estimates(
+                source_cell,
+                [representatives[target].cell for target in target_indices],
+                inflated, blocked_edges)
+            self.last_sparse_region_ms += (
+                time.perf_counter() - sparse_started) * 1000.0
+            sparse_by_target = dict(zip(target_indices, sparse_estimates))
+            sparse_hits = sum(
+                estimate is not None for estimate in sparse_estimates)
+            sparse_fallbacks = len(target_indices) - sparse_hits
+            self.sparse_region_pair_queries += len(target_indices)
+            self.sparse_region_pair_hits += sparse_hits
+            self.sparse_region_pair_fallbacks += sparse_fallbacks
+            self.last_sparse_region_pair_hits += sparse_hits
+            self.last_sparse_region_pair_fallbacks += sparse_fallbacks
             missing_targets: Set[Cell] = set()
             for target in range(count):
                 if source == target:
                     continue
                 target_cell = representatives[target].cell
+                sparse_estimate = sparse_by_target.get(target)
+                if sparse_estimate is not None:
+                    costs[source + 1, target + 1] = sparse_estimate.distance
+                    continue
                 edge = (regions[source].region_id, regions[target].region_id)
                 path = self.region_edge_cache.get(edge)
                 if (path is not None
@@ -1546,6 +1748,17 @@ class FrontierExplorer(Node):
             "region_edge_cache_hits": self.region_edge_cache_hits,
             "region_edge_cache_misses": self.region_edge_cache_misses,
             "expanded_grid_cells": self.expanded_grid_cells,
+            "sparse_graph_revision": self.sparse_router.graph_revision,
+            "sparse_graph_nodes": len(self.sparse_router.nodes),
+            "sparse_graph_edges": len(self.sparse_router.edges),
+            "sparse_candidate_queries": self.sparse_candidate_queries,
+            "sparse_candidate_hits": self.sparse_candidate_hits,
+            "sparse_candidate_fallbacks": self.sparse_candidate_fallbacks,
+            "sparse_region_pair_queries": self.sparse_region_pair_queries,
+            "sparse_region_pair_hits": self.sparse_region_pair_hits,
+            "sparse_region_pair_fallbacks": self.sparse_region_pair_fallbacks,
+            "dense_final_validation_searches": self.dense_final_validation_searches,
+            "sparse_final_validation_failures": self.sparse_final_validation_failures,
             "global_path_invalid_count": self.global_path_invalid_count,
             "replan_suppressed_count": self.replan_suppressed_count,
             "scan_blocked_count": self.scan_blocked_count,
@@ -1558,6 +1771,13 @@ class FrontierExplorer(Node):
             "last_region_partition_ms": self.last_region_partition_ms,
             "last_region_edge_cache_hits": self.last_region_edge_cache_hits,
             "last_region_edge_cache_misses": self.last_region_edge_cache_misses,
+            "last_sparse_candidate_ms": self.last_sparse_candidate_ms,
+            "last_sparse_region_ms": self.last_sparse_region_ms,
+            "last_sparse_candidate_hits": self.last_sparse_candidate_hits,
+            "last_sparse_candidate_fallbacks": self.last_sparse_candidate_fallbacks,
+            "last_sparse_region_pair_hits": self.last_sparse_region_pair_hits,
+            "last_sparse_region_pair_fallbacks": (
+                self.last_sparse_region_pair_fallbacks),
             "last_candidate_tree_ms": self.last_candidate_tree_ms,
             "last_region_sequence_ms": self.last_region_sequence_ms,
             "last_planning_ms": self.last_global_plan_ms,

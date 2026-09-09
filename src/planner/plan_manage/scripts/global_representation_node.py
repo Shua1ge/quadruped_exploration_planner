@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shadow-mode LocalMapPatch to persistent TopoGraphDelta pipeline."""
+"""LocalMapPatch to persistent sparse TopoGraphDelta pipeline."""
 
 import json
 import time
@@ -19,14 +19,18 @@ from explorer_core.topology import (
 
 
 class GlobalRepresentationNode(Node):
-    """Maintain a shadow global graph without influencing robot control."""
+    """Maintain and publish the sparse global graph used for route estimates."""
 
     def __init__(self):
         super().__init__("global_representation")
         self.max_oracle_queries = int(
             self.declare_parameter("max_oracle_queries", 8).value)
+        self.snapshot_period_revisions = max(1, int(
+            self.declare_parameter("snapshot_period_revisions", 10).value))
         self.global_nodes: Dict[int, TopologyNode] = {}
         self.global_edges: Dict[int, TopologyEdge] = {}
+        self.global_node_messages: Dict[int, TopoNode] = {}
+        self.global_edge_messages: Dict[int, TopoEdge] = {}
         self.graph_revision = 0
         self.last_map_revision = 0
 
@@ -38,10 +42,16 @@ class GlobalRepresentationNode(Node):
             self.patch_callback, sensor_qos)
         self.delta_pub = self.create_publisher(
             TopoGraphDelta, "global_representation/topology_delta", 10)
+        snapshot_qos = QoSProfile(depth=1)
+        snapshot_qos.reliability = ReliabilityPolicy.RELIABLE
+        snapshot_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.snapshot_pub = self.create_publisher(
+            TopoGraphDelta, "global_representation/topology_snapshot",
+            snapshot_qos)
         self.metrics_pub = self.create_publisher(
             String, "global_representation/oracle_metrics", 10)
         self.get_logger().info(
-            "Shadow global representation enabled; it does not control planning")
+            "Sparse global representation enabled for route estimation")
 
     @staticmethod
     def node_message(node: TopologyNode, patch: LocalMapPatch) -> TopoNode:
@@ -127,10 +137,20 @@ class GlobalRepresentationNode(Node):
 
         for edge_id in removed_edge_ids:
             self.global_edges.pop(edge_id, None)
+            self.global_edge_messages.pop(edge_id, None)
         for node_id in removed_node_ids:
             self.global_nodes.pop(node_id, None)
+            self.global_node_messages.pop(node_id, None)
         self.global_nodes.update(local_graph.nodes)
         self.global_edges.update(local_graph.edges)
+        local_node_messages = {
+            node_id: self.node_message(node, patch)
+            for node_id, node in local_graph.nodes.items()}
+        local_edge_messages = {
+            edge_id: self.edge_message(edge, patch)
+            for edge_id, edge in local_graph.edges.items()}
+        self.global_node_messages.update(local_node_messages)
+        self.global_edge_messages.update(local_edge_messages)
         self.graph_revision += 1
         self.last_map_revision = patch.map_revision
 
@@ -138,17 +158,26 @@ class GlobalRepresentationNode(Node):
         delta.header = patch.header
         delta.source_map_revision = patch.map_revision
         delta.graph_revision = self.graph_revision
-        delta.added_nodes = [
-            self.node_message(node, patch) for node in added_nodes.values()]
-        delta.updated_nodes = [
-            self.node_message(node, patch) for node in updated_nodes.values()]
+        delta.added_nodes = [local_node_messages[node_id]
+                             for node_id in added_nodes]
+        delta.updated_nodes = [local_node_messages[node_id]
+                               for node_id in updated_nodes]
         delta.removed_node_ids = sorted(removed_node_ids)
-        delta.added_edges = [
-            self.edge_message(edge, patch) for edge in added_edges.values()]
-        delta.updated_edges = [
-            self.edge_message(edge, patch) for edge in updated_edges.values()]
+        delta.added_edges = [local_edge_messages[edge_id]
+                             for edge_id in added_edges]
+        delta.updated_edges = [local_edge_messages[edge_id]
+                               for edge_id in updated_edges]
         delta.removed_edge_ids = sorted(removed_edge_ids)
         self.delta_pub.publish(delta)
+        if (self.graph_revision == 1
+                or self.graph_revision % self.snapshot_period_revisions == 0):
+            snapshot = TopoGraphDelta()
+            snapshot.header = patch.header
+            snapshot.source_map_revision = patch.map_revision
+            snapshot.graph_revision = self.graph_revision
+            snapshot.added_nodes = list(self.global_node_messages.values())
+            snapshot.added_edges = list(self.global_edge_messages.values())
+            self.snapshot_pub.publish(snapshot)
 
         processing_ms = (time.perf_counter() - started) * 1000.0
         dense_free = int(np.count_nonzero(occupancy == 0))

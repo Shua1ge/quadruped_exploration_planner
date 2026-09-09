@@ -587,6 +587,14 @@ def test_region_sequence_reuses_stable_region_id_edge_cache():
     explorer.last_region_pair_tree_searches = 0
     explorer.expanded_grid_cells = 0
     explorer.last_expanded_grid_cells = 0
+    explorer.sparse_routing_enabled = False
+    explorer.sparse_router = MODULE.SparseRouteGraph()
+    explorer.sparse_region_pair_queries = 0
+    explorer.sparse_region_pair_hits = 0
+    explorer.sparse_region_pair_fallbacks = 0
+    explorer.last_sparse_region_ms = 0.0
+    explorer.last_sparse_region_pair_hits = 0
+    explorer.last_sparse_region_pair_fallbacks = 0
     regions = [
         MODULE.FrontierRegion(10, [[(2, 2)]], (2.0, 2.0), {(2, 2)}),
         MODULE.FrontierRegion(20, [[(8, 2)]], (8.0, 2.0), {(8, 2)}),
@@ -613,6 +621,50 @@ def test_region_sequence_reuses_stable_region_id_edge_cache():
         explorer.grid.inflated_obstacles(0.0), set())
 
     assert explorer.region_pair_tree_searches > searches_after_first
+
+
+def test_sparse_candidate_is_materialized_by_dense_astar_before_use():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 6.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.dense_final_validation_searches = 0
+    explorer.sparse_final_validation_failures = 0
+    explorer.sparse_router = MODULE.SparseRouteGraph()
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *args, **kwargs: None)
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 2), (7, 2), (6.5, 2.5), [], 6.0, 20, 8, 0.0,
+        {(7, 2)})
+
+    materialized = explorer.materialize_sparse_candidate(
+        (1, 2), candidate, set(), set())
+
+    assert materialized is not None
+    assert materialized.path[0] == (1, 2)
+    assert materialized.path[-1] == candidate.cell
+    assert explorer.dense_final_validation_searches == 1
+    assert explorer.sparse_final_validation_failures == 0
+
+
+def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 6.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.grid.data[:, 4] = MODULE.OCCUPIED
+    explorer.dense_final_validation_searches = 0
+    explorer.sparse_final_validation_failures = 0
+    explorer.sparse_router = MODULE.SparseRouteGraph()
+    explorer.sparse_router.graph_revision = 9
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *args, **kwargs: None)
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 2), (7, 2), (6.5, 2.5), [], 6.0, 20, 8, 0.0,
+        {(7, 2)})
+
+    materialized = explorer.materialize_sparse_candidate(
+        (1, 2), candidate, explorer.grid.inflated_obstacles(0.0), set())
+
+    assert materialized is None
+    assert explorer.dense_final_validation_searches == 1
+    assert explorer.sparse_final_validation_failures == 1
 
 
 def test_region_information_efficiency_prefers_near_useful_frontier():

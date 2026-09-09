@@ -76,6 +76,9 @@ def generate_launch_description():
                 "region_max_path_ratio": 1.5,
                 "region_max_detour_ratio": 1.75,
                 "region_match_distance": 6.0,
+                "sparse_routing_enabled": True,
+                "sparse_attachment_radius": 1.5,
+                "sparse_attachment_limit": 8,
                 "region_release_updates": 3,
                 # Keep brief perception gaps from causing region thrashing,
                 # but never wait forever when no usable viewpoint remains.
@@ -106,7 +109,10 @@ def generate_launch_description():
             executable="global_representation_node.py",
             name="global_representation",
             output="screen",
-            parameters=[{"max_oracle_queries": 8}],
+            parameters=[{
+                "max_oracle_queries": 8,
+                "snapshot_period_revisions": 10,
+            }],
         ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(scan_share, "launch", "rviz.launch.py"))),

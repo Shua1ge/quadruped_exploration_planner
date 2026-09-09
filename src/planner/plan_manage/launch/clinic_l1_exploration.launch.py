@@ -97,7 +97,10 @@ def generate_launch_description():
             executable="global_representation_node.py",
             name="global_representation",
             output="screen",
-            parameters=[{"max_oracle_queries": 8}],
+            parameters=[{
+                "max_oracle_queries": 8,
+                "snapshot_period_revisions": 10,
+            }],
         ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(scan_share, "launch", "rviz.launch.py"))),
