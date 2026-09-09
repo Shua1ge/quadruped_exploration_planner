@@ -282,6 +282,28 @@ def test_region_partition_does_not_chain_into_an_oversized_region():
     assert sorted(len(region.clusters) for region in regions) == [1, 2]
 
 
+def test_region_partition_keeps_wall_separated_frontiers_apart():
+    grid = MODULE.ExplorationGrid(12.0, 10.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    grid.data[:, 5] = MODULE.OCCUPIED
+    clusters = [[(3, 4), (3, 5)], [(7, 4), (7, 5)]]
+
+    regions = MODULE.partition_frontier_clusters(
+        clusters, 10, grid, grid.inflated_obstacles(0.0))
+
+    assert len(regions) == 2
+
+
+def test_region_partition_merges_frontiers_with_short_known_free_connection():
+    grid = MODULE.ExplorationGrid(12.0, 10.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    clusters = [[(3, 4), (3, 5)], [(7, 4), (7, 5)]]
+
+    regions = MODULE.partition_frontier_clusters(clusters, 10, grid, set())
+
+    assert len(regions) == 1
+
+
 def test_committed_region_keeps_best_successor_when_region_splits():
     tracker = MODULE.PersistentRegionTracker(match_distance_cells=20.0)
     old = MODULE.FrontierRegion(
@@ -535,6 +557,62 @@ def test_failure_cooldown_expires_after_configured_map_revision():
     explorer.map_update_count = 16
     assert not explorer.is_goal_on_failure_cooldown((2.5, 3.0))
     assert explorer.goal_failure_cooldowns == {}
+
+
+def test_replan_gate_bounds_attempts_until_planning_context_changes():
+    gate = MODULE.ReplanGate(max_attempts=2)
+    context = MODULE.ReplanContext((4, 5), 10, 3, 7)
+
+    assert gate.allow(context)
+    assert gate.allow(context)
+    assert not gate.allow(context)
+    assert gate.allow(MODULE.ReplanContext((4, 5), 11, 3, 7))
+    assert gate.allow(MODULE.ReplanContext((4, 5), 11, 3, 8))
+
+
+def test_region_sequence_reuses_stable_region_id_edge_cache():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(12.0, 8.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.preferred_goal_path_length = 0.0
+    explorer.long_horizon_min_gain_ratio = 0.0
+    explorer.active_region_id = None
+    explorer.region_edge_cache = {}
+    explorer.region_anchor_cells = {}
+    explorer.region_edge_cache_hits = 0
+    explorer.region_edge_cache_misses = 0
+    explorer.last_region_edge_cache_hits = 0
+    explorer.last_region_edge_cache_misses = 0
+    explorer.region_pair_tree_searches = 0
+    explorer.last_region_pair_tree_searches = 0
+    explorer.expanded_grid_cells = 0
+    explorer.last_expanded_grid_cells = 0
+    regions = [
+        MODULE.FrontierRegion(10, [[(2, 2)]], (2.0, 2.0), {(2, 2)}),
+        MODULE.FrontierRegion(20, [[(8, 2)]], (8.0, 2.0), {(8, 2)}),
+    ]
+    candidates = {
+        10: [SimpleNamespace(cell=(2, 2), path_length=2.0,
+                             unknown_gain=10, cluster_size=3, turn_cost=0.0)],
+        20: [SimpleNamespace(cell=(8, 2), path_length=8.0,
+                             unknown_gain=10, cluster_size=3, turn_cost=0.0)],
+    }
+
+    first = explorer.plan_region_sequence((0, 2), regions, candidates, set(), set())
+    searches_after_first = explorer.region_pair_tree_searches
+    second = explorer.plan_region_sequence((0, 2), regions, candidates, set(), set())
+
+    assert first == second
+    assert searches_after_first == 2
+    assert explorer.region_pair_tree_searches == searches_after_first
+    assert explorer.region_edge_cache_hits == 2
+
+    explorer.grid.data[2, 5] = MODULE.OCCUPIED
+    explorer.plan_region_sequence(
+        (0, 2), regions, candidates,
+        explorer.grid.inflated_obstacles(0.0), set())
+
+    assert explorer.region_pair_tree_searches > searches_after_first
 
 
 def test_region_information_efficiency_prefers_near_useful_frontier():

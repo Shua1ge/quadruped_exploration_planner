@@ -58,7 +58,8 @@ def open_start_escape_corridor(
 
 def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
                 inflated: Set[Cell],
-                blocked_edges: Optional[Set[DirectedEdge]] = None) -> Optional[List[Cell]]:
+                blocked_edges: Optional[Set[DirectedEdge]] = None,
+                max_cost_cells: Optional[float] = None) -> Optional[List[Cell]]:
     if not grid.planning_free(start, inflated) or not grid.planning_free(goal, inflated):
         return None
     queue = [(0.0, 0.0, start)]
@@ -69,6 +70,8 @@ def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
     while queue:
         _, current_cost, current = heapq.heappop(queue)
         if current in closed:
+            continue
+        if max_cost_cells is not None and current_cost > max_cost_cells:
             continue
         if current == goal:
             path = [current]
@@ -88,6 +91,8 @@ def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
                     or not grid.planning_free((current[0], current[1] + dy), inflated)):
                 continue
             candidate = current_cost + step_cost
+            if max_cost_cells is not None and candidate > max_cost_cells:
+                continue
             if candidate >= costs.get(nxt, float("inf")):
                 continue
             costs[nxt] = candidate

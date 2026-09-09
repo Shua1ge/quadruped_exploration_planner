@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from .grid import Cell, ExplorationGrid, UNKNOWN
-from .path_planning import segment_known_free
+from .path_planning import astar_known, path_length_cells, segment_known_free
 
 
 def region_information_efficiency(unknown_gain: int, frontier_size: int,
@@ -193,7 +193,12 @@ class FrontierRegion:
 
 
 def partition_frontier_clusters(clusters: Sequence[Sequence[Cell]],
-                                region_size_cells: int) -> List[FrontierRegion]:
+                                region_size_cells: int,
+                                grid: Optional[ExplorationGrid] = None,
+                                inflated: Optional[Set[Cell]] = None,
+                                max_path_ratio: float = 1.5,
+                                max_detour_ratio: float = 1.75
+                                ) -> List[FrontierRegion]:
     """Group frontier clusters by spatial adjacency, not fixed map buckets.
 
     A fixed world-aligned grid can split two neighbouring frontiers merely
@@ -213,6 +218,32 @@ def partition_frontier_clusters(clusters: Sequence[Sequence[Cell]],
         (sum(cell[0] for cell in cluster) / len(cluster),
          sum(cell[1] for cell in cluster) / len(cluster))
         for cluster in nonempty]
+    representatives = [
+        min(cluster, key=lambda cell: (
+            (cell[0] - centroids[index][0]) ** 2
+            + (cell[1] - centroids[index][1]) ** 2,
+            cell[0], cell[1]))
+        for index, cluster in enumerate(nonempty)]
+
+    # A local known-free route acts as the portal test. Frontiers that are
+    # close in XY but sit across a wall or behind different entrances have
+    # no short local connection and must remain separate topology nodes.
+    path_distances: Dict[Tuple[int, int], float] = {}
+    if grid is not None:
+        obstacles = inflated or set()
+        maximum_path = link_distance * max(1.0, float(max_path_ratio))
+        for source, source_cell in enumerate(representatives):
+            for target in range(source + 1, len(representatives)):
+                euclidean = math.hypot(
+                    centroids[source][0] - centroids[target][0],
+                    centroids[source][1] - centroids[target][1])
+                if euclidean > link_distance:
+                    continue
+                path = astar_known(
+                    grid, source_cell, representatives[target], obstacles,
+                    max_cost_cells=maximum_path)
+                if path:
+                    path_distances[(source, target)] = path_length_cells(path, 1.0)
     groups: List[List[int]] = [[index] for index in range(len(nonempty))]
     while True:
         best_pair = None
@@ -225,6 +256,24 @@ def partition_frontier_clusters(clusters: Sequence[Sequence[Cell]],
                 diameter = max(pair_distances)
                 if diameter > link_distance:
                     continue
+                if grid is not None:
+                    topology_ok = True
+                    for a in groups[first]:
+                        for b in groups[second]:
+                            key = (min(a, b), max(a, b))
+                            path_distance = path_distances.get(key)
+                            euclidean = math.hypot(
+                                centroids[a][0] - centroids[b][0],
+                                centroids[a][1] - centroids[b][1])
+                            if (path_distance is None
+                                    or path_distance > link_distance * max_path_ratio
+                                    or path_distance > max(1.0, euclidean) * max_detour_ratio):
+                                topology_ok = False
+                                break
+                        if not topology_ok:
+                            break
+                    if not topology_ok:
+                        continue
                 key = (min(pair_distances), diameter, first, second)
                 if best_pair is None or key < best_pair[0]:
                     best_pair = (key, first, second)

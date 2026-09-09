@@ -39,6 +39,7 @@ from explorer_core.path_planning import (
     segment_known_free, simplify_known_path, splice_prepared_path,
     validate_remaining_path,
 )
+from explorer_core.replan_control import ReplanContext, ReplanGate
 
 
 REFERENCE_SCOPED_STATUSES = {
@@ -186,6 +187,14 @@ class FrontierExplorer(Node):
             self.declare_parameter("observation_done_updates", 3).value)
         self.min_expected_observation_cells = int(
             self.declare_parameter("min_expected_observation_cells", 8).value)
+        self.max_replans_per_context = int(
+            self.declare_parameter("max_replans_per_context", 2).value)
+        self.replan_retry_updates = max(1, int(
+            self.declare_parameter("replan_retry_updates", 10).value))
+        self.region_max_path_ratio = float(
+            self.declare_parameter("region_max_path_ratio", 1.5).value)
+        self.region_max_detour_ratio = float(
+            self.declare_parameter("region_max_detour_ratio", 1.75).value)
         if not (0.0 <= self.observation_prepare_ratio
                 < self.observation_done_ratio <= 1.0):
             raise ValueError(
@@ -197,6 +206,15 @@ class FrontierExplorer(Node):
         self.body_z = 0.3
         self.last_map_update_ns = 0
         self.map_update_count = 0
+        self.map_content_revision = 0
+        self.route_constraint_revision = 0
+        self.replan_gate = ReplanGate(self.max_replans_per_context)
+        self.replan_suppressed_count = 0
+        self.scan_blocked_count = 0
+        self.scan_reference_rejected_count = 0
+        self.goal_timeout_count = 0
+        self.no_active_goal_replan_count = 0
+        self.last_active_goal_clear_reason = "startup"
         self.active_goal: Optional[Point2] = None
         self.active_goal_cell: Optional[Cell] = None
         self.active_observation: Optional[ObservationTask] = None
@@ -204,7 +222,10 @@ class FrontierExplorer(Node):
         self.active_path_progress_index = 0
         self.last_active_path_validation_update = -1
         self.prepared_candidate: Optional[FrontierCandidate] = None
-        self.region_edge_cache: Dict[DirectedEdge, List[Cell]] = {}
+        self.region_edge_cache: Dict[Tuple[int, int], List[Cell]] = {}
+        self.region_anchor_cells: Dict[int, Cell] = {}
+        self.region_edge_cache_hits = 0
+        self.region_edge_cache_misses = 0
         self.replacement_pending = False
         self.last_preparation_attempt_update = -1
         self.last_handoff_attempt_update = -1
@@ -237,11 +258,14 @@ class FrontierExplorer(Node):
         self.region_pair_tree_searches = 0
         self.expanded_grid_cells = 0
         self.last_map_preprocess_ms = 0.0
+        self.last_region_partition_ms = 0.0
         self.last_candidate_tree_ms = 0.0
         self.last_region_sequence_ms = 0.0
         self.last_candidate_tree_searches = 0
         self.last_region_pair_tree_searches = 0
         self.last_expanded_grid_cells = 0
+        self.last_region_edge_cache_hits = 0
+        self.last_region_edge_cache_misses = 0
         self.global_path_invalid_count = 0
         self.region_switches = 0
         self.goals_reached = 0
@@ -327,6 +351,8 @@ class FrontierExplorer(Node):
                    if expiry <= now_ns]
         for edge in expired:
             del self.temporary_blocked_edges[edge]
+        if expired:
+            self.route_constraint_revision += 1
         return set(self.temporary_blocked_edges)
 
     def blocked_segment_callback(self, msg: Path):
@@ -349,6 +375,7 @@ class FrontierExplorer(Node):
         expiry_ns = (self.get_clock().now().nanoseconds
                      + int(self.blocked_edge_ttl * 1e9))
         self.temporary_blocked_edges[edge] = expiry_ns
+        self.route_constraint_revision += 1
         self.pending_blocked_edge = edge
         self.publish_status("LOCAL_BLOCKED_EDGE_RECORDED")
         self.get_logger().warning(
@@ -380,6 +407,7 @@ class FrontierExplorer(Node):
             bins = np.clip(bins, 0, self.ray_count - 1)
             np.minimum.at(nearest, bins, distances[mask])
         nearest = dilate_hit_ranges(nearest, self.hit_dilation_bins)
+        previous_grid = self.grid.data.copy()
         self.grid.integrate_ranges(
             self.position, nearest, self.mapping_range,
             no_return_range=self.no_return_range)
@@ -387,6 +415,8 @@ class FrontierExplorer(Node):
         # occupied as well so a real wall cannot disappear between ray bins.
         if np.any(mask):
             self.grid.mark_occupied_points(array[mask, :2])
+        if not np.array_equal(self.grid.data, previous_grid):
+            self.map_content_revision += 1
         self.last_map_update_ns = now_ns
         self.map_update_count += 1
         self.publish_maps()
@@ -790,6 +820,7 @@ class FrontierExplorer(Node):
                 self.replacement_pending = True
                 self.replace_unsatisfied_observation()
         elif status == "BLOCKED":
+            self.scan_blocked_count += 1
             self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
@@ -809,6 +840,7 @@ class FrontierExplorer(Node):
             self.pending_blocked_edge = None
             self.prepared_candidate = None
             self.replacement_pending = False
+            self.last_active_goal_clear_reason = "BLOCKED"
             if previous_goal is not None:
                 self.add_goal_failure_cooldown(previous_goal, "BLOCKED")
             if previous_goal is not None and self.plan_from_current_position():
@@ -816,6 +848,7 @@ class FrontierExplorer(Node):
             else:
                 self.publish_status("LOCAL_BLOCKED_WAITING_FOR_ROUTE")
         elif status in ("REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
+            self.scan_reference_rejected_count += 1
             self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
@@ -829,6 +862,7 @@ class FrontierExplorer(Node):
             self.pending_blocked_edge = None
             self.prepared_candidate = None
             self.replacement_pending = False
+            self.last_active_goal_clear_reason = status
             self.publish_status(f"RECOVER_FROM_{status}")
 
     def collision_callback(self, msg: Bool):
@@ -888,6 +922,7 @@ class FrontierExplorer(Node):
                 return
             elapsed = (self.get_clock().now().nanoseconds - self.active_since_ns) * 1e-9
             if elapsed > self.goal_timeout:
+                self.goal_timeout_count += 1
                 self.get_logger().warning("Frontier goal timed out; blacklisting it")
                 self.blacklist.append(self.active_goal)
                 self.active_goal = None
@@ -897,6 +932,7 @@ class FrontierExplorer(Node):
                 self.pending_blocked_edge = None
                 self.prepared_candidate = None
                 self.replacement_pending = False
+                self.last_active_goal_clear_reason = "GOAL_TIMEOUT"
             elif self.replacement_pending:
                 self.replace_unsatisfied_observation()
                 return
@@ -917,12 +953,29 @@ class FrontierExplorer(Node):
                     self.prepare_next_observation()
                 return
 
+        self.no_active_goal_replan_count += 1
         self.plan_from_current_position()
 
     def plan_from_current_position(
             self, excluded_goals: Sequence[Point2] = ()) -> bool:
         """Select and publish a new terminal frontier from the robot position."""
         if self.position is None:
+            return False
+
+        context = ReplanContext(
+            self.grid.world_to_cell(*self.position),
+            self.map_content_revision,
+            self.route_constraint_revision,
+            self.map_update_count // self.replan_retry_updates)
+        if not self.replan_gate.allow(context):
+            self.replan_suppressed_count += 1
+            self.publish_status("WAITING_FOR_PLANNING_INPUT_CHANGE")
+            self.get_logger().info(
+                f"[GLOBAL_REPLAN_SUPPRESSED] reason="
+                f"{self.last_active_goal_clear_reason} cell={context.robot_cell} "
+                f"map_content_revision={context.map_content_revision} "
+                f"route_constraint_revision={context.route_constraint_revision}",
+                throttle_duration_sec=2.0)
             return False
 
         preprocess_started = time.perf_counter()
@@ -988,14 +1041,20 @@ class FrontierExplorer(Node):
         self.last_candidate_tree_searches = 0
         self.last_region_pair_tree_searches = 0
         self.last_expanded_grid_cells = 0
+        self.last_region_edge_cache_hits = 0
+        self.last_region_edge_cache_misses = 0
 
         partition_started = time.perf_counter()
         observations = partition_frontier_clusters(
-            clusters, int(round(self.region_size / self.grid.resolution)))
+            clusters, int(round(self.region_size / self.grid.resolution)),
+            self.grid, inflated, self.region_max_path_ratio,
+            self.region_max_detour_ratio)
         regions = self.region_tracker.update(observations, self.active_region_id)
+        self.last_region_partition_ms = (
+            time.perf_counter() - partition_started) * 1000.0
         self.last_map_preprocess_ms = (
             map_preprocess_prefix_ms
-            + (time.perf_counter() - partition_started) * 1000.0)
+            + self.last_region_partition_ms)
         self.map_preprocess_calls += 1
         self.planning_events += 1
         self.latest_region_count = len(regions)
@@ -1017,11 +1076,14 @@ class FrontierExplorer(Node):
             f"[GLOBAL_PLAN_BASELINE] revision={self.map_update_count} "
             f"regions={len(regions)} candidates={len(candidates)} "
             f"map_preprocess_ms={self.last_map_preprocess_ms:.1f} "
+            f"region_partition_ms={self.last_region_partition_ms:.1f} "
             f"candidate_tree_ms={self.last_candidate_tree_ms:.1f} "
             f"region_sequence_ms={self.last_region_sequence_ms:.1f} "
             f"total_ms={self.last_global_plan_ms:.1f} "
             f"candidate_tree_searches={self.last_candidate_tree_searches} "
             f"region_pair_tree_searches={self.last_region_pair_tree_searches} "
+            f"region_cache_hits={self.last_region_edge_cache_hits} "
+            f"region_cache_misses={self.last_region_edge_cache_misses} "
             f"expanded_grid_cells={self.last_expanded_grid_cells}")
         return result
 
@@ -1279,12 +1341,22 @@ class FrontierExplorer(Node):
             region.region_id: self.preferred_horizon_pool(
                 by_region[region.region_id])
             for region in regions}
-        representatives = [
-            max(representative_options[region.region_id], key=lambda item: (
-                self.candidate_utility(
-                    item, representative_options[region.region_id]),
-                -item.path_length, -item.cell[0], -item.cell[1]))
-            for region in regions]
+        representatives = []
+        active_region_ids = {region.region_id for region in regions}
+        self.region_anchor_cells = {
+            region_id: cell for region_id, cell in self.region_anchor_cells.items()
+            if region_id in active_region_ids}
+        for region in regions:
+            options = representative_options[region.region_id]
+            anchor = self.region_anchor_cells.get(region.region_id)
+            representative = next(
+                (item for item in options if item.cell == anchor), None)
+            if representative is None:
+                representative = max(options, key=lambda item: (
+                    self.candidate_utility(item, options),
+                    -item.path_length, -item.cell[0], -item.cell[1]))
+            representatives.append(representative)
+            self.region_anchor_cells[region.region_id] = representative.cell
         count = len(representatives)
         costs = np.full((count + 1, count + 1), np.inf, dtype=np.float64)
         np.fill_diagonal(costs, 0.0)
@@ -1292,7 +1364,7 @@ class FrontierExplorer(Node):
             costs[0, index + 1] = representative.path_length
 
         active_cache_keys = {
-            (representatives[source].cell, representatives[target].cell)
+            (regions[source].region_id, regions[target].region_id)
             for source in range(count)
             for target in range(count) if source != target}
         self.region_edge_cache = {
@@ -1306,16 +1378,22 @@ class FrontierExplorer(Node):
                 if source == target:
                     continue
                 target_cell = representatives[target].cell
-                edge = (source_cell, target_cell)
+                edge = (regions[source].region_id, regions[target].region_id)
                 path = self.region_edge_cache.get(edge)
-                if path is not None and not adjacent_grid_path_is_valid(
-                        self.grid, path, inflated, blocked_edges):
+                if (path is not None
+                        and (path[0] != source_cell or path[-1] != target_cell
+                             or not adjacent_grid_path_is_valid(
+                                 self.grid, path, inflated, blocked_edges))):
                     del self.region_edge_cache[edge]
                     path = None
                 if path:
+                    self.region_edge_cache_hits += 1
+                    self.last_region_edge_cache_hits += 1
                     costs[source + 1, target + 1] = path_length_cells(
                         path, self.grid.resolution)
                 else:
+                    self.region_edge_cache_misses += 1
+                    self.last_region_edge_cache_misses += 1
                     missing_targets.add(target_cell)
 
             if not missing_targets:
@@ -1335,7 +1413,8 @@ class FrontierExplorer(Node):
                 path = tree.path_to(target_cell)
                 if not path:
                     continue
-                self.region_edge_cache[(source_cell, target_cell)] = path
+                edge = (regions[source].region_id, regions[target].region_id)
+                self.region_edge_cache[edge] = path
                 costs[source + 1, target + 1] = path_length_cells(
                     path, self.grid.resolution)
 
@@ -1464,9 +1543,21 @@ class FrontierExplorer(Node):
             "map_preprocess_calls": self.map_preprocess_calls,
             "candidate_tree_searches": self.candidate_tree_searches,
             "region_pair_tree_searches": self.region_pair_tree_searches,
+            "region_edge_cache_hits": self.region_edge_cache_hits,
+            "region_edge_cache_misses": self.region_edge_cache_misses,
             "expanded_grid_cells": self.expanded_grid_cells,
             "global_path_invalid_count": self.global_path_invalid_count,
+            "replan_suppressed_count": self.replan_suppressed_count,
+            "scan_blocked_count": self.scan_blocked_count,
+            "scan_reference_rejected_count": self.scan_reference_rejected_count,
+            "goal_timeout_count": self.goal_timeout_count,
+            "no_active_goal_replan_count": self.no_active_goal_replan_count,
+            "last_active_goal_clear_reason": self.last_active_goal_clear_reason,
+            "map_content_revision": self.map_content_revision,
             "last_map_preprocess_ms": self.last_map_preprocess_ms,
+            "last_region_partition_ms": self.last_region_partition_ms,
+            "last_region_edge_cache_hits": self.last_region_edge_cache_hits,
+            "last_region_edge_cache_misses": self.last_region_edge_cache_misses,
             "last_candidate_tree_ms": self.last_candidate_tree_ms,
             "last_region_sequence_ms": self.last_region_sequence_ms,
             "last_planning_ms": self.last_global_plan_ms,
