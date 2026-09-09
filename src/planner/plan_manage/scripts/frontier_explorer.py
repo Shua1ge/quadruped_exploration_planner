@@ -41,6 +41,7 @@ from explorer_core.path_planning import (
     validate_remaining_path,
 )
 from explorer_core.replan_control import ReplanContext, ReplanGate
+from explorer_core.region_commitment import ResidualCommitmentGate
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
 )
@@ -175,6 +176,18 @@ class FrontierExplorer(Node):
             self.declare_parameter("region_switch_ratio", 1.35).value)
         if self.region_switch_ratio < 1.0:
             raise ValueError("region_switch_ratio must be at least one")
+        self.region_min_remaining_cells = int(self.declare_parameter(
+            "region_min_remaining_cells", 24).value)
+        self.region_exhausted_revisions = int(self.declare_parameter(
+            "region_exhausted_revisions", 3).value)
+        self.region_stagnation_revisions = int(self.declare_parameter(
+            "region_stagnation_revisions", 20).value)
+        if self.region_min_remaining_cells < 0:
+            raise ValueError("region_min_remaining_cells must be non-negative")
+        if self.region_exhausted_revisions < 1:
+            raise ValueError("region_exhausted_revisions must be positive")
+        if self.region_stagnation_revisions < 1:
+            raise ValueError("region_stagnation_revisions must be positive")
         self.metrics_period = float(self.declare_parameter("metrics_period", 2.0).value)
         self.metrics_file = str(self.declare_parameter("metrics_file", "").value)
         self.observation_preplanning_enabled = bool(
@@ -266,6 +279,18 @@ class FrontierExplorer(Node):
         self.active_region_unreachable_since: Optional[float] = None
         self.last_region_release_evaluation_update = -1
         self.last_selected_region_id: Optional[int] = None
+        self.region_commitment_gate = ResidualCommitmentGate(
+            self.region_min_remaining_cells,
+            self.region_exhausted_revisions,
+            self.region_stagnation_revisions)
+        self.commitment_state = "UNCOMMITTED"
+        self.commitment_remaining_cells = 0
+        self.commitment_stagnant_revisions = 0
+        self.commitment_release_count = 0
+        self.commitment_switch_suppressed_count = 0
+        self.last_commitment_release_reason = "none"
+        self.last_region_switch_reason = "startup"
+        self.last_selection_reason = "startup"
         self.last_global_plan_ms = 0.0
         self.cumulative_planning_ms = 0.0
         self.planning_events = 0
@@ -600,6 +625,16 @@ class FrontierExplorer(Node):
         candidate = self.prepared_candidate
         if self.position is None or candidate is None:
             return False
+        if (self.active_region_id is not None
+                and candidate.region_id != self.active_region_id
+                and self.commitment_state == "COMMITTED"):
+            # A standby route is speculative.  It cannot become active until
+            # the normal selection pass explicitly releases the old region.
+            self.get_logger().info(
+                f"[PREPARED_HANDOFF_DEFERRED] prepared_region="
+                f"{candidate.region_id} committed_region={self.active_region_id}",
+                throttle_duration_sec=2.0)
+            return False
         if self.is_goal_on_failure_cooldown(candidate.goal):
             self.prepared_candidate = None
             return False
@@ -651,13 +686,22 @@ class FrontierExplorer(Node):
     def activate_candidate(self, path: Sequence[Cell], candidate: FrontierCandidate):
         """Publish a candidate while keeping region accounting in one place."""
         self.global_reroute_failure_streak = 0
+        previous_active_region = self.active_region_id
         if (self.last_selected_region_id is not None
                 and candidate.region_id != self.last_selected_region_id):
             self.region_switches += 1
+            self.last_region_switch_reason = self.last_selection_reason
         self.last_selected_region_id = candidate.region_id
         self.active_region_id = candidate.region_id
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since = None
+        if previous_active_region != candidate.region_id:
+            self.region_commitment_gate.reset(
+                candidate.region_id, self.map_content_revision,
+                len(candidate.observation_cells))
+        self.commitment_state = "COMMITTED"
+        self.commitment_remaining_cells = len(candidate.observation_cells)
+        self.commitment_stagnant_revisions = 0
         self.publish_path(path, candidate)
 
     def reroute_active_goal(self) -> bool:
@@ -1378,6 +1422,7 @@ class FrontierExplorer(Node):
         available = [region for region in regions if region.region_id in by_region]
         available_ids = {region.region_id for region in available}
         observed_ids = {region.region_id for region in regions}
+        self.last_selection_reason = "rolling_uncommitted"
 
         if (allow_region_release
                 and self.last_region_release_evaluation_update != self.map_update_count):
@@ -1391,6 +1436,11 @@ class FrontierExplorer(Node):
             self.active_region_missing_streak = update.missing_streak
             self.active_region_unreachable_since = update.unreachable_since
             self.last_region_release_evaluation_update = self.map_update_count
+            if update.release_reason is not None:
+                self.commitment_release_count += 1
+                self.last_commitment_release_reason = update.release_reason
+                self.commitment_state = "RELEASABLE"
+                self.region_commitment_gate.reset()
             if update.release_reason == "frontier_missing":
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
@@ -1402,6 +1452,37 @@ class FrontierExplorer(Node):
                     f"reason=persistently_unreachable timeout="
                     f"{self.region_unreachable_timeout:.1f}s; re-evaluating all "
                     "reachable regions")
+
+        if (allow_region_release and self.active_region_id is not None
+                and self.active_region_id in available_ids):
+            active_targets = {
+                cell
+                for candidate in by_region[self.active_region_id]
+                for cell in candidate.observation_cells}
+            decision = self.region_commitment_gate.evaluate(
+                self.active_region_id, self.map_content_revision,
+                len(active_targets))
+            self.commitment_remaining_cells = decision.remaining_cells
+            self.commitment_stagnant_revisions = decision.stagnant_revisions
+            if decision.release_reason is not None:
+                previous_active = self.active_region_id
+                self.active_region_id = None
+                self.active_region_missing_streak = 0
+                self.active_region_unreachable_since = None
+                self.commitment_state = "RELEASABLE"
+                self.commitment_release_count += 1
+                self.last_commitment_release_reason = decision.release_reason
+                self.last_selection_reason = decision.release_reason
+                self.get_logger().info(
+                    f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
+                    f"reason={decision.release_reason} remaining_cells="
+                    f"{decision.remaining_cells} exhausted_streak="
+                    f"{decision.exhausted_streak}/{self.region_exhausted_revisions} "
+                    f"stagnant_revisions={decision.stagnant_revisions}/"
+                    f"{self.region_stagnation_revisions}")
+                self.region_commitment_gate.reset()
+            else:
+                self.commitment_state = "COMMITTED"
 
         if (self.active_region_id is not None
                 and self.active_region_id not in available_ids):
@@ -1483,8 +1564,16 @@ class FrontierExplorer(Node):
                 candidate.unknown_gain, candidate.cluster_size,
                 candidate.path_length, candidate.turn_cost)
             for region_id, candidate in best_by_region.items()}
-        selected_region = select_rolling_region(
-            region_scores, self.active_region_id, self.region_switch_ratio)
+        if self.active_region_id in best_by_region:
+            selected_region = self.active_region_id
+            self.last_selection_reason = "residual_commitment"
+            challenger = select_rolling_region(
+                region_scores, self.active_region_id, self.region_switch_ratio)
+            if challenger is not None and challenger != self.active_region_id:
+                self.commitment_switch_suppressed_count += 1
+        else:
+            selected_region = select_rolling_region(
+                region_scores, self.active_region_id, self.region_switch_ratio)
         if selected_region is None:
             return None
 
@@ -1723,6 +1812,16 @@ class FrontierExplorer(Node):
             "total_distance_m": self.total_distance,
             "revisit_distance_m": self.revisit_distance,
             "region_switches": self.region_switches,
+            "active_region_id": (
+                self.active_region_id if self.active_region_id is not None else -1),
+            "commitment_state": self.commitment_state,
+            "commitment_remaining_cells": self.commitment_remaining_cells,
+            "commitment_stagnant_revisions": self.commitment_stagnant_revisions,
+            "commitment_release_count": self.commitment_release_count,
+            "commitment_switch_suppressed_count": (
+                self.commitment_switch_suppressed_count),
+            "last_commitment_release_reason": self.last_commitment_release_reason,
+            "last_region_switch_reason": self.last_region_switch_reason,
             "goals_reached": self.goals_reached,
             "paths_published": self.paths_published,
             "short_paths_published": self.short_paths_published,
