@@ -25,7 +25,8 @@ from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
     advance_completion_streak, advance_reroute_failure_streak, candidate_cells,
     cluster_frontiers, clustered_frontier_cells, observation_progress,
-    observation_target_cells, partition_frontier_clusters, retain_region_commitment,
+    observation_target_cells, partition_frontier_clusters,
+    partition_frontier_clusters_by_topology, retain_region_commitment,
     region_information_efficiency, safe_viewpoint_cells, select_rolling_region,
     solve_open_held_karp, update_region_commitment,
 )
@@ -300,6 +301,8 @@ class FrontierExplorer(Node):
         self.expanded_grid_cells = 0
         self.last_map_preprocess_ms = 0.0
         self.last_region_partition_ms = 0.0
+        self.last_topology_attached_clusters = 0
+        self.last_topology_unattached_clusters = 0
         self.last_candidate_tree_ms = 0.0
         self.last_region_sequence_ms = 0.0
         self.last_candidate_tree_searches = 0
@@ -1203,8 +1206,37 @@ class FrontierExplorer(Node):
         self.last_sparse_region_pair_fallbacks = 0
 
         partition_started = time.perf_counter()
-        observations = partition_frontier_clusters(
-            clusters, int(round(self.region_size / self.grid.resolution)),
+
+        def connector_allowed(source: Point2, target: Point2) -> bool:
+            source_cell = self.grid.world_to_cell(*source)
+            target_cell = self.grid.world_to_cell(*target)
+            return segment_known_free(
+                self.grid, source_cell, target_cell, inflated)
+        topology_keys = []
+        for cluster in clusters:
+            if not cluster:
+                topology_keys.append(None)
+                continue
+            centroid_x = sum(cell[0] for cell in cluster) / len(cluster)
+            centroid_y = sum(cell[1] for cell in cluster) / len(cluster)
+            representative = min(cluster, key=lambda cell: (
+                (cell[0] - centroid_x) ** 2 + (cell[1] - centroid_y) ** 2,
+                cell[0], cell[1]))
+            attachment = self.sparse_router.topology_attachment(
+                self.grid.cell_to_world(representative),
+                self.sparse_attachment_radius,
+                self.sparse_attachment_limit,
+                connector_allowed)
+            topology_keys.append(
+                (attachment.component_id, attachment.branch_id)
+                if attachment is not None else None)
+        self.last_topology_attached_clusters = sum(
+            key is not None for key in topology_keys)
+        self.last_topology_unattached_clusters = (
+            len(topology_keys) - self.last_topology_attached_clusters)
+        observations = partition_frontier_clusters_by_topology(
+            clusters, topology_keys,
+            int(round(self.region_size / self.grid.resolution)),
             self.grid, inflated, self.region_max_path_ratio,
             self.region_max_detour_ratio)
         regions = self.region_tracker.update(observations, self.active_region_id)
@@ -1868,6 +1900,10 @@ class FrontierExplorer(Node):
             "map_content_revision": self.map_content_revision,
             "last_map_preprocess_ms": self.last_map_preprocess_ms,
             "last_region_partition_ms": self.last_region_partition_ms,
+            "last_topology_attached_clusters": (
+                self.last_topology_attached_clusters),
+            "last_topology_unattached_clusters": (
+                self.last_topology_unattached_clusters),
             "last_region_edge_cache_hits": self.last_region_edge_cache_hits,
             "last_region_edge_cache_misses": self.last_region_edge_cache_misses,
             "last_sparse_candidate_ms": self.last_sparse_candidate_ms,

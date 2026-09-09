@@ -43,6 +43,15 @@ class EdgeAttachment:
     position: Point2
 
 
+@dataclass(frozen=True)
+class TopologyAttachment:
+    """Component and corridor identity for a point near the sparse graph."""
+
+    component_id: int
+    branch_id: int
+    connector_cost: float
+
+
 @dataclass
 class SparseAttachments:
     node_options: List[Attachment]
@@ -70,6 +79,8 @@ class SparseRouteGraph:
         self._sample_buckets: Dict[
             Tuple[int, int], Dict[Tuple[int, int], Tuple[Point2, float]]] = {}
         self._edge_sample_keys: Dict[int, List[Tuple[Tuple[int, int], Tuple[int, int]]]] = {}
+        self._component_ids: Dict[int, int] = {}
+        self._components_dirty = True
 
     @property
     def ready(self) -> bool:
@@ -83,6 +94,8 @@ class SparseRouteGraph:
         self._node_bucket_keys.clear()
         self._sample_buckets.clear()
         self._edge_sample_keys.clear()
+        self._component_ids.clear()
+        self._components_dirty = True
         self.graph_revision = 0
         self.source_map_revision = 0
 
@@ -103,6 +116,7 @@ class SparseRouteGraph:
         self._node_buckets.setdefault(key, {})[node.node_id] = node.position
         self._node_bucket_keys[node.node_id] = key
         self.adjacency.setdefault(node.node_id, {})
+        self._components_dirty = True
 
     def remove_node(self, node_id: int, remove_edges: bool = True):
         key = self._node_bucket_keys.pop(node_id, None)
@@ -120,6 +134,7 @@ class SparseRouteGraph:
             for edge_id, edge in list(self.edges.items()):
                 if edge.source_id == node_id or edge.target_id == node_id:
                     self.remove_edge(edge_id)
+        self._components_dirty = True
 
     def _remove_edge_samples(self, edge_id: int):
         for bucket_key, sample_key in self._edge_sample_keys.pop(edge_id, []):
@@ -143,6 +158,7 @@ class SparseRouteGraph:
         if (target_neighbours is not None
                 and target_neighbours.get(edge.source_id, (None, None))[1] == edge_id):
             target_neighbours.pop(edge.source_id, None)
+        self._components_dirty = True
 
     def upsert_edge(self, edge: SparseEdge):
         self.remove_edge(edge.edge_id)
@@ -168,6 +184,61 @@ class SparseRouteGraph:
                 point, min(max(0.0, along), edge.length))
             samples.append((bucket_key, sample_key))
         self._edge_sample_keys[edge.edge_id] = samples
+        self._components_dirty = True
+
+    def _refresh_components(self):
+        if not self._components_dirty:
+            return
+        component_ids: Dict[int, int] = {}
+        remaining = set(self.nodes)
+        while remaining:
+            seed = min(remaining)
+            stack = [seed]
+            members = set()
+            while stack:
+                current = stack.pop()
+                if current in members or current not in self.nodes:
+                    continue
+                members.add(current)
+                stack.extend(self.adjacency.get(current, {}))
+            component_id = min(members)
+            for node_id in members:
+                component_ids[node_id] = component_id
+            remaining.difference_update(members)
+        self._component_ids = component_ids
+        self._components_dirty = False
+
+    def topology_attachment(
+            self, point: Point2, radius: float, limit: int = 8,
+            connector_allowed: Optional[Callable[[Point2, Point2], bool]] = None
+            ) -> Optional[TopologyAttachment]:
+        """Attach a point to one connected component and corridor branch."""
+        if not self.ready:
+            return None
+        details = self.attachment_details(
+            point, radius, limit, connector_allowed)
+        self._refresh_components()
+        edge_options = [
+            attachment
+            for options in details.edge_options.values()
+            for attachment in options]
+        if edge_options:
+            attachment = min(edge_options, key=lambda item: (
+                item.connector_cost, item.edge_id, item.along))
+            edge = self.edges.get(attachment.edge_id)
+            if edge is not None:
+                component_id = self._component_ids.get(edge.source_id)
+                if component_id is not None:
+                    return TopologyAttachment(
+                        component_id, attachment.edge_id,
+                        attachment.connector_cost)
+        if not details.node_options:
+            return None
+        node_id, connector_cost = details.node_options[0]
+        component_id = self._component_ids.get(node_id)
+        if component_id is None:
+            return None
+        return TopologyAttachment(component_id, -node_id - 1, connector_cost)
 
     def apply_delta(self, graph_revision: int, source_map_revision: int,
                     added_nodes: Iterable[SparseNode],

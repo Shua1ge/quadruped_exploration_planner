@@ -304,6 +304,37 @@ def test_region_partition_merges_frontiers_with_short_known_free_connection():
     assert len(regions) == 1
 
 
+def test_topology_partition_keeps_different_corridor_branches_separate():
+    clusters = [[(2, 2), (2, 3)], [(4, 2), (4, 3)]]
+
+    regions = MODULE.partition_frontier_clusters_by_topology(
+        clusters, [(10, 101), (10, 202)], 10)
+
+    assert len(regions) == 2
+
+
+def test_topology_partition_merges_nearby_frontiers_on_same_branch():
+    clusters = [[(2, 2), (2, 3)], [(4, 2), (4, 3)]]
+
+    regions = MODULE.partition_frontier_clusters_by_topology(
+        clusters, [(10, 101), (10, 101)], 10)
+
+    assert len(regions) == 1
+
+
+def test_region_tracker_never_moves_an_id_across_topology_branches():
+    tracker = MODULE.PersistentRegionTracker(match_distance_cells=20.0)
+    first = MODULE.FrontierRegion(
+        -1, [[(2, 2)]], (2.0, 2.0), {(2, 2)}, (10, 101))
+    original_id = tracker.update([first])[0].region_id
+    moved = MODULE.FrontierRegion(
+        -1, [[(3, 2)]], (3.0, 2.0), {(3, 2)}, (10, 202))
+
+    updated_id = tracker.update([moved], original_id)[0].region_id
+
+    assert updated_id != original_id
+
+
 def test_committed_region_keeps_best_successor_when_region_splits():
     tracker = MODULE.PersistentRegionTracker(match_distance_cells=20.0)
     old = MODULE.FrontierRegion(

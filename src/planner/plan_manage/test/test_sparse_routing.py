@@ -61,3 +61,13 @@ def test_delta_removal_disconnects_the_route():
     result = graph.batch_estimates((0.0, 0.0), [(10.0, 0.0)], 0.2)[0]
 
     assert result is None
+
+
+def test_topology_attachment_identifies_component_and_corridor_branch():
+    graph = straight_graph()
+
+    attachment = graph.topology_attachment((4.0, 0.2), 0.5)
+
+    assert attachment is not None
+    assert attachment.component_id == 1
+    assert attachment.branch_id == 11

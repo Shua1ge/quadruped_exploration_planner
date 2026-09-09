@@ -190,6 +190,7 @@ class FrontierRegion:
     clusters: List[List[Cell]]
     centroid: Tuple[float, float]
     cells: Set[Cell]
+    topology_key: Optional[Tuple[int, int]] = None
 
 
 def partition_frontier_clusters(clusters: Sequence[Sequence[Cell]],
@@ -293,6 +294,44 @@ def partition_frontier_clusters(clusters: Sequence[Sequence[Cell]],
     return observations
 
 
+def partition_frontier_clusters_by_topology(
+        clusters: Sequence[Sequence[Cell]],
+        topology_keys: Sequence[Optional[Tuple[int, int]]],
+        region_size_cells: int, grid: Optional[ExplorationGrid] = None,
+        inflated: Optional[Set[Cell]] = None, max_path_ratio: float = 1.5,
+        max_detour_ratio: float = 1.75) -> List[FrontierRegion]:
+    """Partition attached frontiers by component/corridor before proximity.
+
+    Attached clusters never run pairwise dense A*. Unattached clusters retain
+    the conservative legacy test, so incomplete topology cannot invent a
+    connection or make an exploration target disappear.
+    """
+    if len(clusters) != len(topology_keys):
+        raise ValueError("topology_keys must correspond one-to-one with clusters")
+    keyed: Dict[Tuple[int, int], List[Sequence[Cell]]] = {}
+    fallback: List[Sequence[Cell]] = []
+    for cluster, key in zip(clusters, topology_keys):
+        if not cluster:
+            continue
+        if key is None:
+            fallback.append(cluster)
+        else:
+            keyed.setdefault(key, []).append(cluster)
+
+    observations: List[FrontierRegion] = []
+    for key in sorted(keyed):
+        for region in partition_frontier_clusters(
+                keyed[key], region_size_cells):
+            observations.append(FrontierRegion(
+                region.region_id, region.clusters, region.centroid,
+                region.cells, key))
+    if fallback:
+        observations.extend(partition_frontier_clusters(
+            fallback, region_size_cells, grid, inflated,
+            max_path_ratio, max_detour_ratio))
+    return observations
+
+
 class PersistentRegionTracker:
     """Associate dynamic frontier regions without relying on list indices."""
 
@@ -314,6 +353,13 @@ class PersistentRegionTracker:
         pairs = []
         for observation_index, observation in enumerate(observations):
             for region_id, old in previous.items():
+                if (observation.topology_key is not None
+                        and old.topology_key is not None
+                        and observation.topology_key[1] != old.topology_key[1]):
+                    # A component's canonical id may decrease as exploration
+                    # connects new graph nodes.  The corridor branch id is the
+                    # stable identity that must never cross during tracking.
+                    continue
                 distance = math.hypot(observation.centroid[0] - old.centroid[0],
                                       observation.centroid[1] - old.centroid[1])
                 if distance > self.match_distance_cells:
@@ -338,7 +384,8 @@ class PersistentRegionTracker:
                 best_id = self.next_id
                 self.next_id += 1
             assigned.append(FrontierRegion(
-                best_id, observation.clusters, observation.centroid, observation.cells))
+                best_id, observation.clusters, observation.centroid,
+                observation.cells, observation.topology_key))
         self.regions = {region.region_id: region for region in assigned}
         return sorted(assigned, key=lambda region: region.region_id)
 
