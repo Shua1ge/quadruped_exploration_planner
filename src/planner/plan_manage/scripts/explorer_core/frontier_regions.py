@@ -353,19 +353,21 @@ class PersistentRegionTracker:
         pairs = []
         for observation_index, observation in enumerate(observations):
             for region_id, old in previous.items():
+                union = observation.cells | old.cells
+                overlap = (len(observation.cells & old.cells) / len(union)
+                           if union else 0.0)
                 if (observation.topology_key is not None
                         and old.topology_key is not None
-                        and observation.topology_key[1] != old.topology_key[1]):
-                    # A component's canonical id may decrease as exploration
-                    # connects new graph nodes.  The corridor branch id is the
-                    # stable identity that must never cross during tracking.
+                        and observation.topology_key[1] != old.topology_key[1]
+                        and overlap == 0.0):
+                    # A local skeleton edge may split or move between map
+                    # revisions. Cell overlap is stronger temporal evidence
+                    # that this remains the same physical frontier.
                     continue
                 distance = math.hypot(observation.centroid[0] - old.centroid[0],
                                       observation.centroid[1] - old.centroid[1])
                 if distance > self.match_distance_cells:
                     continue
-                union = observation.cells | old.cells
-                overlap = len(observation.cells & old.cells) / len(union) if union else 0.0
                 preferred = region_id == preferred_region_id
                 pairs.append((not preferred, -overlap, distance,
                               region_id, observation_index))

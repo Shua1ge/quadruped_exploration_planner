@@ -601,6 +601,7 @@ class FrontierExplorer(Node):
             start, clusters, inflated, blocked_edges,
             excluded_goals=(self.active_goal,), allow_region_release=False,
             allow_cross_region_preparation=True,
+            update_region_prediction=not force,
             map_preprocess_prefix_ms=preprocess_ms)
         if candidate is None:
             self.publish_status("NEXT_OBSERVATION_NOT_YET_AVAILABLE")
@@ -1189,6 +1190,7 @@ class FrontierExplorer(Node):
                         excluded_goals: Sequence[Point2] = (),
                         allow_region_release: bool = True,
                         allow_cross_region_preparation: bool = False,
+                        update_region_prediction: bool = False,
                         map_preprocess_prefix_ms: float = 0.0):
         selection_started = time.perf_counter()
         self.last_candidate_tree_ms = 0.0
@@ -1219,9 +1221,13 @@ class FrontierExplorer(Node):
                 continue
             centroid_x = sum(cell[0] for cell in cluster) / len(cluster)
             centroid_y = sum(cell[1] for cell in cluster) / len(cluster)
-            representative = min(cluster, key=lambda cell: (
+            frontier = min(cluster, key=lambda cell: (
                 (cell[0] - centroid_x) ** 2 + (cell[1] - centroid_y) ** 2,
                 cell[0], cell[1]))
+            viewpoints = safe_viewpoint_cells(
+                self.grid, frontier, inflated,
+                self.viewpoint_standoff, limit=1)
+            representative = viewpoints[0] if viewpoints else frontier
             attachment = self.sparse_router.topology_attachment(
                 self.grid.cell_to_world(representative),
                 self.sparse_attachment_radius,
@@ -1256,10 +1262,12 @@ class FrontierExplorer(Node):
                 return self.choose_greedy_candidate(options)
             return self.choose_hierarchical_candidate(
                 start, regions, options, inflated, blocked_edges,
-                allow_region_release, allow_cross_region_preparation)
+                allow_region_release, allow_cross_region_preparation,
+                update_region_prediction)
 
         result = select_candidate(candidates)
         while result is not None and not result.path:
+            rejected_region_id = result.region_id
             materialized = self.materialize_sparse_candidate(
                 start, result, inflated, blocked_edges)
             if materialized is not None:
@@ -1267,6 +1275,8 @@ class FrontierExplorer(Node):
                 break
             candidates = [candidate for candidate in candidates
                           if candidate is not result]
+            self.release_dense_invalid_commitment(
+                rejected_region_id, candidates)
             result = select_candidate(candidates)
 
         self.last_global_plan_ms = (
@@ -1294,6 +1304,35 @@ class FrontierExplorer(Node):
             f"expanded_grid_cells={self.last_expanded_grid_cells}")
         return result
 
+    def release_dense_invalid_commitment(
+            self, rejected_region_id: int,
+            remaining_candidates: Sequence[FrontierCandidate]) -> bool:
+        """Release an active region only when all of its dense routes failed."""
+        if (rejected_region_id != self.active_region_id
+                or any(candidate.region_id == rejected_region_id
+                       for candidate in remaining_candidates)):
+            return False
+
+        # Sparse reachability is a proposal, not an execution guarantee.  If
+        # every proposal in this region failed dense validation, retaining the
+        # commitment would reproduce the same false-positive choice each tick.
+        self.get_logger().warning(
+            f"[REGION_COMMITMENT_RELEASED] region={rejected_region_id} "
+            "reason=dense_validation_failed; all sparse candidates failed "
+            "dense final validation")
+        self.active_region_id = None
+        self.active_region_missing_streak = 0
+        self.active_region_unreachable_since = None
+        self.commitment_state = "RELEASABLE"
+        self.commitment_release_count += 1
+        self.last_commitment_release_reason = "dense_validation_failed"
+        self.last_selection_reason = "dense_validation_failed"
+        self.region_commitment_gate.reset()
+        self.region_sequence = [
+            region_id for region_id in self.region_sequence
+            if region_id != rejected_region_id]
+        return True
+
     def materialize_sparse_candidate(
             self, start: Cell, candidate: FrontierCandidate,
             inflated: Set[Cell], blocked_edges: Set[DirectedEdge]
@@ -1304,6 +1343,8 @@ class FrontierExplorer(Node):
             self.grid, start, candidate.cell, inflated, blocked_edges)
         if not path:
             self.sparse_final_validation_failures += 1
+            self.add_goal_failure_cooldown(
+                candidate.goal, "DENSE_FINAL_VALIDATION_FAILED")
             self.get_logger().warning(
                 f"[SPARSE_ROUTE_REJECTED] graph_revision="
                 f"{self.sparse_router.graph_revision} goal="
@@ -1447,7 +1488,8 @@ class FrontierExplorer(Node):
                                       inflated: Set[Cell],
                                       blocked_edges: Set[DirectedEdge],
                                       allow_region_release: bool = True,
-                                      allow_cross_region_preparation: bool = False):
+                                      allow_cross_region_preparation: bool = False,
+                                      update_region_prediction: bool = False):
         by_region: Dict[int, List[FrontierCandidate]] = {}
         for candidate in candidates:
             by_region.setdefault(candidate.region_id, []).append(candidate)
@@ -1571,7 +1613,7 @@ class FrontierExplorer(Node):
 
         self.region_sequence, need_global_plan = retain_region_commitment(
             self.region_sequence, available_ids, self.active_region_id)
-        if need_global_plan:
+        if need_global_plan and update_region_prediction:
             sequence_started = time.perf_counter()
             self.region_sequence = self.plan_region_sequence(
                 start, available, by_region, inflated, blocked_edges)

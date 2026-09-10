@@ -335,6 +335,21 @@ def test_region_tracker_never_moves_an_id_across_topology_branches():
     assert updated_id != original_id
 
 
+def test_region_tracker_retains_id_when_cells_overlap_despite_branch_change():
+    tracker = MODULE.PersistentRegionTracker(match_distance_cells=20.0)
+    first = MODULE.FrontierRegion(
+        -1, [[(2, 2), (3, 2)]], (2.5, 2.0), {(2, 2), (3, 2)},
+        (10, 101))
+    original_id = tracker.update([first])[0].region_id
+    changed_branch = MODULE.FrontierRegion(
+        -1, [[(3, 2), (4, 2)]], (3.5, 2.0), {(3, 2), (4, 2)},
+        (10, 202))
+
+    updated_id = tracker.update([changed_branch], original_id)[0].region_id
+
+    assert updated_id == original_id
+
+
 def test_committed_region_keeps_best_successor_when_region_splits():
     tracker = MODULE.PersistentRegionTracker(match_distance_cells=20.0)
     old = MODULE.FrontierRegion(
@@ -683,6 +698,10 @@ def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
     explorer.grid.data[:, 4] = MODULE.OCCUPIED
     explorer.dense_final_validation_searches = 0
     explorer.sparse_final_validation_failures = 0
+    explorer.map_update_count = 0
+    explorer.goal_failure_cooldown_updates = 6
+    explorer.goal_failure_cooldowns = {}
+    explorer.blacklist_radius = 0.75
     explorer.sparse_router = MODULE.SparseRouteGraph()
     explorer.sparse_router.graph_revision = 9
     explorer.get_logger = lambda: SimpleNamespace(warning=lambda *args, **kwargs: None)
@@ -696,6 +715,35 @@ def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
     assert materialized is None
     assert explorer.dense_final_validation_searches == 1
     assert explorer.sparse_final_validation_failures == 1
+    assert explorer.is_goal_on_failure_cooldown(candidate.goal)
+
+
+def test_dense_failures_release_only_an_exhausted_active_region():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.active_region_id = 3
+    explorer.active_region_missing_streak = 2
+    explorer.active_region_unreachable_since = 5.0
+    explorer.commitment_state = "COMMITTED"
+    explorer.commitment_release_count = 0
+    explorer.last_commitment_release_reason = "none"
+    explorer.last_selection_reason = "residual_commitment"
+    explorer.region_sequence = [3, 7]
+    gate = SimpleNamespace(reset_calls=0)
+    gate.reset = lambda: setattr(gate, "reset_calls", gate.reset_calls + 1)
+    explorer.region_commitment_gate = gate
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *args, **kwargs: None)
+    remaining = [MODULE.FrontierCandidate(
+        7, (6, 2), (7, 2), (6.5, 2.5), [], 6.0, 20, 8, 0.0,
+        {(7, 2)})]
+
+    released = explorer.release_dense_invalid_commitment(3, remaining)
+
+    assert released
+    assert explorer.active_region_id is None
+    assert explorer.region_sequence == [7]
+    assert explorer.commitment_release_count == 1
+    assert explorer.last_commitment_release_reason == "dense_validation_failed"
+    assert gate.reset_calls == 1
 
 
 def test_region_information_efficiency_prefers_near_useful_frontier():
