@@ -720,6 +720,8 @@ def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
 
 def test_dense_failures_release_only_an_exhausted_active_region():
     explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.map_content_revision = 17
+    explorer.dense_invalid_region_revisions = {}
     explorer.active_region_id = 3
     explorer.active_region_missing_streak = 2
     explorer.active_region_unreachable_since = 5.0
@@ -736,7 +738,7 @@ def test_dense_failures_release_only_an_exhausted_active_region():
         7, (6, 2), (7, 2), (6.5, 2.5), [], 6.0, 20, 8, 0.0,
         {(7, 2)})]
 
-    released = explorer.release_dense_invalid_commitment(3, remaining)
+    released = explorer.handle_dense_invalid_region(3, remaining)
 
     assert released
     assert explorer.active_region_id is None
@@ -744,6 +746,7 @@ def test_dense_failures_release_only_an_exhausted_active_region():
     assert explorer.commitment_release_count == 1
     assert explorer.last_commitment_release_reason == "dense_validation_failed"
     assert gate.reset_calls == 1
+    assert explorer.dense_invalid_region_revisions == {3: 17}
 
 
 def test_region_information_efficiency_prefers_near_useful_frontier():
@@ -809,7 +812,7 @@ def test_cross_region_preparation_does_not_release_current_commitment():
 
 def test_handoff_activates_existing_standby_without_replanning():
     explorer = object.__new__(MODULE.FrontierExplorer)
-    explorer.activate_prepared_observation = lambda: True
+    explorer.activate_prepared_observation = lambda allow=False: True
     explorer.prepare_next_observation = lambda force=False: (_ for _ in ()).throw(
         AssertionError("existing standby must be reused"))
 
@@ -820,9 +823,41 @@ def test_handoff_forces_preparation_when_no_standby_exists():
     explorer = object.__new__(MODULE.FrontierExplorer)
     activations = iter((False, True))
     force_arguments = []
-    explorer.activate_prepared_observation = lambda: next(activations)
+    explorer.activate_prepared_observation = lambda allow=False: next(activations)
     explorer.prepare_next_observation = lambda force=False: (
         force_arguments.append(force) or True)
 
     assert explorer.activate_or_prepare_next_observation()
     assert force_arguments == [True]
+
+
+def test_completed_task_handoff_allows_commitment_transfer():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    transfer_arguments = []
+    explorer.activate_prepared_observation = lambda allow=False: (
+        transfer_arguments.append(allow) or True)
+
+    assert explorer.activate_or_prepare_next_observation(
+        allow_commitment_transfer=True)
+    assert transfer_arguments == [True]
+
+
+def test_region_prediction_signature_tracks_material_inputs():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = SimpleNamespace(resolution=0.2)
+    explorer.route_constraint_revision = 4
+    explorer.sparse_router = MODULE.SparseRouteGraph()
+    explorer.sparse_router.upsert_node(MODULE.SparseNode(1, (2.0, 3.0)))
+    explorer.sparse_router.upsert_node(MODULE.SparseNode(2, (4.0, 3.0)))
+    explorer.sparse_router.upsert_edge(MODULE.SparseEdge(
+        5, 1, 2, 2.0, 1.0, ((2.0, 3.0), (4.0, 3.0))))
+
+    baseline = explorer.build_region_prediction_signature((10, 10), {3, 7})
+
+    assert explorer.build_region_prediction_signature((11, 10), {7, 3}) == baseline
+    explorer.sparse_router.remove_edge(5)
+    explorer.sparse_router.upsert_edge(MODULE.SparseEdge(
+        9, 1, 2, 2.0, 1.0, ((2.0, 3.0), (4.0, 3.0))))
+    assert explorer.build_region_prediction_signature((10, 10), {3, 7}) == baseline
+    assert explorer.build_region_prediction_signature((15, 10), {3, 7}) != baseline
+    assert explorer.build_region_prediction_signature((10, 10), {3, 8}) != baseline
