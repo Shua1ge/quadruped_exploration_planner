@@ -43,6 +43,32 @@ def test_batch_query_returns_connected_targets_and_rejects_disconnected_one():
     assert results[1] is None
 
 
+def test_batch_diagnostics_distinguish_unattached_rejected_and_disconnected():
+    graph = straight_graph()
+    graph.upsert_node(SparseNode(3, (20.0, 0.0), 1.0))
+    graph.upsert_node(SparseNode(4, (22.0, 0.0), 1.0))
+    graph.upsert_edge(SparseEdge(
+        12, 3, 4, 2.0, 1.0,
+        ((20.0, 0.0), (21.0, 0.0), (22.0, 0.0))))
+
+    estimates, reasons = graph.batch_estimates_with_reasons(
+        (0.0, 0.0), [(7.0, 0.0), (50.0, 0.0), (20.0, 0.0)], 0.5,
+        connector_allowed=lambda source, target: source[0] != 7.0)
+
+    assert estimates == [None, None, None]
+    assert reasons == ["connector_rejected", "target_unattached", "disconnected"]
+
+
+def test_batch_diagnostics_report_start_attachment_failure():
+    graph = straight_graph()
+
+    estimates, reasons = graph.batch_estimates_with_reasons(
+        (50.0, 0.0), [(7.0, 0.0)], 0.5)
+
+    assert estimates == [None]
+    assert reasons == ["start_unattached"]
+
+
 def test_node_position_update_preserves_existing_edge_adjacency():
     graph = straight_graph()
     graph.upsert_node(SparseNode(1, (0.0, 0.1), 1.0))

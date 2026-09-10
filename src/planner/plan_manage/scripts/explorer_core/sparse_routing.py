@@ -56,6 +56,8 @@ class TopologyAttachment:
 class SparseAttachments:
     node_options: List[Attachment]
     edge_options: Dict[int, List[EdgeAttachment]]
+    nearby_count: int = 0
+    rejected_count: int = 0
 
 
 class SparseRouteGraph:
@@ -283,18 +285,29 @@ class SparseRouteGraph:
         allowed = connector_allowed or (lambda _source, _target: True)
         options: Dict[int, float] = {}
         edge_options: Dict[int, List[EdgeAttachment]] = {}
+        nearby_count = 0
+        rejected_count = 0
         for key in self._nearby_buckets(point, radius):
             for node_id, position in self._node_buckets.get(key, {}).items():
                 distance = math.hypot(position[0] - point[0],
                                       position[1] - point[1])
-                if distance <= radius and allowed(point, position):
-                    options[node_id] = min(options.get(node_id, math.inf), distance)
+                if distance > radius:
+                    continue
+                nearby_count += 1
+                if not allowed(point, position):
+                    rejected_count += 1
+                    continue
+                options[node_id] = min(options.get(node_id, math.inf), distance)
 
             for (edge_id, _), (position, along) in self._sample_buckets.get(
                     key, {}).items():
                 distance = math.hypot(position[0] - point[0],
                                       position[1] - point[1])
-                if distance > radius or not allowed(point, position):
+                if distance > radius:
+                    continue
+                nearby_count += 1
+                if not allowed(point, position):
+                    rejected_count += 1
                     continue
                 edge = self.edges.get(edge_id)
                 if edge is None:
@@ -315,7 +328,8 @@ class SparseRouteGraph:
                 attachments,
                 key=lambda item: (item.connector_cost, item.along))[
                     :max(1, int(limit))]
-        return SparseAttachments(node_options, edge_options)
+        return SparseAttachments(
+            node_options, edge_options, nearby_count, rejected_count)
 
     def attachments(
             self, point: Point2, radius: float, limit: int = 8,
@@ -331,8 +345,22 @@ class SparseRouteGraph:
             connector_allowed: Optional[Callable[[Point2, Point2], bool]] = None
             ) -> List[Optional[SparseRouteEstimate]]:
         """Run one multi-source Dijkstra and estimate routes to all targets."""
+        estimates, _ = self.batch_estimates_with_reasons(
+            start, targets, attachment_radius, attachment_limit,
+            connector_allowed)
+        return estimates
+
+    def batch_estimates_with_reasons(
+            self, start: Point2, targets: Sequence[Point2],
+            attachment_radius: float, attachment_limit: int = 8,
+            connector_allowed: Optional[
+                Callable[[Point2, Point2], bool]] = None
+            ) -> Tuple[List[Optional[SparseRouteEstimate]],
+                       List[Optional[str]]]:
+        """Estimate routes and identify why each missing route fell back."""
         if not self.ready or not targets:
-            return [None] * len(targets)
+            return ([None] * len(targets),
+                    ["start_unattached"] * len(targets))
         start_details = self.attachment_details(
             start, attachment_radius, attachment_limit, connector_allowed)
         target_details = [self.attachment_details(
@@ -341,7 +369,9 @@ class SparseRouteGraph:
         start_attachments = start_details.node_options
         target_attachments = [details.node_options for details in target_details]
         if not start_attachments:
-            return [None] * len(targets)
+            reason = ("connector_rejected"
+                      if start_details.rejected_count else "start_unattached")
+            return [None] * len(targets), [reason] * len(targets)
 
         queue = []
         costs: Dict[int, float] = {}
@@ -356,8 +386,6 @@ class SparseRouteGraph:
 
         target_nodes = {node_id for attachments in target_attachments
                         for node_id, _ in attachments}
-        if not target_nodes:
-            return [None] * len(targets)
         settled_targets = set()
         while queue:
             current_cost, current = heapq.heappop(queue)
@@ -378,8 +406,15 @@ class SparseRouteGraph:
                 heapq.heappush(queue, (candidate, neighbour))
 
         results: List[Optional[SparseRouteEstimate]] = []
+        reasons: List[Optional[str]] = []
         for target, details in zip(targets, target_details):
             attachments = details.node_options
+            if not attachments:
+                results.append(None)
+                reasons.append(
+                    "connector_rejected"
+                    if details.rejected_count else "target_unattached")
+                continue
             choices = [(costs[node_id] + connector_cost, node_id)
                        for node_id, connector_cost in attachments
                        if node_id in costs]
@@ -397,6 +432,7 @@ class SparseRouteGraph:
                 direct_choices, key=lambda item: item[0]) if direct_choices else None
             if graph_choice is None and direct_choice is None:
                 results.append(None)
+                reasons.append("disconnected")
                 continue
             if (direct_choice is not None
                     and (graph_choice is None or direct_choice[0] < graph_choice[0])):
@@ -414,6 +450,7 @@ class SparseRouteGraph:
                                     headings[:-1], headings[1:]))
                 results.append(SparseRouteEstimate(
                     total, turn_cost, edge.source_id, edge.target_id))
+                reasons.append(None)
                 continue
 
             total, target_node = graph_choice
@@ -436,4 +473,5 @@ class SparseRouteGraph:
                             for first, second in zip(headings[:-1], headings[1:]))
             results.append(SparseRouteEstimate(
                 total, turn_cost, source_node, target_node))
-        return results
+            reasons.append(None)
+        return results, reasons

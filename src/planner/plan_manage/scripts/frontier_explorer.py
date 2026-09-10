@@ -53,6 +53,11 @@ REFERENCE_SCOPED_STATUSES = {
     "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH",
 }
 
+SPARSE_MISS_REASONS = (
+    "start_unattached", "target_unattached", "disconnected",
+    "connector_rejected", "blocked_disabled",
+)
+
 
 def parse_planning_status(value: str) -> Tuple[str, Optional[int]]:
     """Decode SCAN status while retaining compatibility with plain statuses."""
@@ -324,6 +329,14 @@ class FrontierExplorer(Node):
         self.sparse_region_pair_queries = 0
         self.sparse_region_pair_hits = 0
         self.sparse_region_pair_fallbacks = 0
+        self.sparse_candidate_miss_reasons = dict.fromkeys(
+            SPARSE_MISS_REASONS, 0)
+        self.sparse_region_miss_reasons = dict.fromkeys(
+            SPARSE_MISS_REASONS, 0)
+        self.last_sparse_candidate_miss_reasons = dict.fromkeys(
+            SPARSE_MISS_REASONS, 0)
+        self.last_sparse_region_miss_reasons = dict.fromkeys(
+            SPARSE_MISS_REASONS, 0)
         self.dense_final_validation_searches = 0
         self.sparse_final_validation_failures = 0
         self.global_path_invalid_count = 0
@@ -439,11 +452,17 @@ class FrontierExplorer(Node):
     def sparse_route_estimates(
             self, start: Cell, targets: Sequence[Cell], inflated: Set[Cell],
             blocked_edges: Set[DirectedEdge]
-            ) -> List[Optional[SparseRouteEstimate]]:
+            ) -> Tuple[List[Optional[SparseRouteEstimate]],
+                       List[Optional[str]]]:
         """Estimate one-to-many routes, retaining dense safety at both connectors."""
-        if (not self.sparse_routing_enabled or blocked_edges
-                or not self.sparse_router.ready or not targets):
-            return [None] * len(targets)
+        if not targets:
+            return [], []
+        if blocked_edges:
+            return ([None] * len(targets),
+                    ["blocked_disabled"] * len(targets))
+        if not self.sparse_routing_enabled or not self.sparse_router.ready:
+            return ([None] * len(targets),
+                    ["start_unattached"] * len(targets))
 
         def connector_allowed(source: Point2, target: Point2) -> bool:
             source_cell = self.grid.world_to_cell(*source)
@@ -453,11 +472,39 @@ class FrontierExplorer(Node):
                     and segment_known_free(
                         self.grid, source_cell, target_cell, inflated))
 
-        return self.sparse_router.batch_estimates(
+        return self.sparse_router.batch_estimates_with_reasons(
             self.grid.cell_to_world(start),
             [self.grid.cell_to_world(target) for target in targets],
             self.sparse_attachment_radius, self.sparse_attachment_limit,
             connector_allowed)
+
+    @staticmethod
+    def accumulate_sparse_miss_reasons(
+            reasons: Sequence[Optional[str]], totals: Dict[str, int],
+            latest: Dict[str, int]):
+        """Accumulate one mutually exclusive reason for every sparse miss."""
+        for reason in reasons:
+            if reason is None:
+                continue
+            if reason not in totals:
+                reason = "disconnected"
+            totals[reason] += 1
+            latest[reason] += 1
+
+    def ensure_sparse_miss_counters(self):
+        """Initialize diagnostics for lightweight test and replay instances."""
+        if not hasattr(self, "sparse_candidate_miss_reasons"):
+            self.sparse_candidate_miss_reasons = dict.fromkeys(
+                SPARSE_MISS_REASONS, 0)
+        if not hasattr(self, "sparse_region_miss_reasons"):
+            self.sparse_region_miss_reasons = dict.fromkeys(
+                SPARSE_MISS_REASONS, 0)
+        if not hasattr(self, "last_sparse_candidate_miss_reasons"):
+            self.last_sparse_candidate_miss_reasons = dict.fromkeys(
+                SPARSE_MISS_REASONS, 0)
+        if not hasattr(self, "last_sparse_region_miss_reasons"):
+            self.last_sparse_region_miss_reasons = dict.fromkeys(
+                SPARSE_MISS_REASONS, 0)
 
     def odom_callback(self, msg: Odometry):
         new_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
@@ -1221,6 +1268,11 @@ class FrontierExplorer(Node):
         self.last_sparse_candidate_fallbacks = 0
         self.last_sparse_region_pair_hits = 0
         self.last_sparse_region_pair_fallbacks = 0
+        self.last_sparse_candidate_miss_reasons = dict.fromkeys(
+            SPARSE_MISS_REASONS, 0)
+        self.last_sparse_region_miss_reasons = dict.fromkeys(
+            SPARSE_MISS_REASONS, 0)
+        self.ensure_sparse_miss_counters()
 
         partition_started = time.perf_counter()
 
@@ -1314,8 +1366,11 @@ class FrontierExplorer(Node):
             f"region_cache_misses={self.last_region_edge_cache_misses} "
             f"sparse_candidate_hits={self.last_sparse_candidate_hits} "
             f"sparse_candidate_fallbacks={self.last_sparse_candidate_fallbacks} "
+            f"sparse_candidate_miss="
+            f"{self.last_sparse_candidate_miss_reasons} "
             f"sparse_region_hits={self.last_sparse_region_pair_hits} "
             f"sparse_region_fallbacks={self.last_sparse_region_pair_fallbacks} "
+            f"sparse_region_miss={self.last_sparse_region_miss_reasons} "
             f"expanded_grid_cells={self.last_expanded_grid_cells}")
         return result
 
@@ -1424,7 +1479,7 @@ class FrontierExplorer(Node):
 
         proposal_cells = list(dict.fromkeys(proposal[1] for proposal in proposals))
         sparse_started = time.perf_counter()
-        sparse_estimates = self.sparse_route_estimates(
+        sparse_estimates, sparse_miss_reasons = self.sparse_route_estimates(
             start, proposal_cells, inflated, blocked_edges)
         sparse_elapsed = (time.perf_counter() - sparse_started) * 1000.0
         self.last_sparse_candidate_ms += sparse_elapsed
@@ -1437,6 +1492,10 @@ class FrontierExplorer(Node):
         self.sparse_candidate_fallbacks += len(fallback_cells)
         self.last_sparse_candidate_hits += sparse_hits
         self.last_sparse_candidate_fallbacks += len(fallback_cells)
+        self.ensure_sparse_miss_counters()
+        self.accumulate_sparse_miss_reasons(
+            sparse_miss_reasons, self.sparse_candidate_miss_reasons,
+            self.last_sparse_candidate_miss_reasons)
 
         tree = ShortestPathTree(start, {}, {}, 0)
         if fallback_cells:
@@ -1784,7 +1843,7 @@ class FrontierExplorer(Node):
             target_indices = [target for target in range(count)
                               if target != source]
             sparse_started = time.perf_counter()
-            sparse_estimates = self.sparse_route_estimates(
+            sparse_estimates, sparse_miss_reasons = self.sparse_route_estimates(
                 source_cell,
                 [representatives[target].cell for target in target_indices],
                 inflated, blocked_edges)
@@ -1799,6 +1858,10 @@ class FrontierExplorer(Node):
             self.sparse_region_pair_fallbacks += sparse_fallbacks
             self.last_sparse_region_pair_hits += sparse_hits
             self.last_sparse_region_pair_fallbacks += sparse_fallbacks
+            self.ensure_sparse_miss_counters()
+            self.accumulate_sparse_miss_reasons(
+                sparse_miss_reasons, self.sparse_region_miss_reasons,
+                self.last_sparse_region_miss_reasons)
             missing_targets: Set[Cell] = set()
             for target in range(count):
                 if source == target:
@@ -1992,9 +2055,17 @@ class FrontierExplorer(Node):
             "sparse_candidate_queries": self.sparse_candidate_queries,
             "sparse_candidate_hits": self.sparse_candidate_hits,
             "sparse_candidate_fallbacks": self.sparse_candidate_fallbacks,
+            **{
+                f"sparse_candidate_miss_{reason}": count
+                for reason, count in self.sparse_candidate_miss_reasons.items()
+            },
             "sparse_region_pair_queries": self.sparse_region_pair_queries,
             "sparse_region_pair_hits": self.sparse_region_pair_hits,
             "sparse_region_pair_fallbacks": self.sparse_region_pair_fallbacks,
+            **{
+                f"sparse_region_miss_{reason}": count
+                for reason, count in self.sparse_region_miss_reasons.items()
+            },
             "dense_final_validation_searches": self.dense_final_validation_searches,
             "sparse_final_validation_failures": self.sparse_final_validation_failures,
             "global_path_invalid_count": self.global_path_invalid_count,
@@ -2017,9 +2088,18 @@ class FrontierExplorer(Node):
             "last_sparse_region_ms": self.last_sparse_region_ms,
             "last_sparse_candidate_hits": self.last_sparse_candidate_hits,
             "last_sparse_candidate_fallbacks": self.last_sparse_candidate_fallbacks,
+            **{
+                f"last_sparse_candidate_miss_{reason}": count
+                for reason, count
+                in self.last_sparse_candidate_miss_reasons.items()
+            },
             "last_sparse_region_pair_hits": self.last_sparse_region_pair_hits,
             "last_sparse_region_pair_fallbacks": (
                 self.last_sparse_region_pair_fallbacks),
+            **{
+                f"last_sparse_region_miss_{reason}": count
+                for reason, count in self.last_sparse_region_miss_reasons.items()
+            },
             "last_candidate_tree_ms": self.last_candidate_tree_ms,
             "last_region_sequence_ms": self.last_region_sequence_ms,
             "last_planning_ms": self.last_global_plan_ms,
