@@ -2,7 +2,7 @@
 
 import heapq
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
@@ -33,6 +33,7 @@ class SparseRouteEstimate:
     turn_cost: float
     source_node_id: int
     target_node_id: int
+    polyline: Tuple[Point2, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class EdgeAttachment:
     along: float
     connector_cost: float
     position: Point2
+    sample_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class SparseAttachments:
     edge_options: Dict[int, List[EdgeAttachment]]
     nearby_count: int = 0
     rejected_count: int = 0
+    node_paths: Dict[int, Tuple[Point2, ...]] = field(default_factory=dict)
 
 
 class SparseRouteGraph:
@@ -284,6 +287,7 @@ class SparseRouteGraph:
         radius = max(0.0, float(radius))
         allowed = connector_allowed or (lambda _source, _target: True)
         options: Dict[int, float] = {}
+        node_paths: Dict[int, Tuple[Point2, ...]] = {}
         edge_options: Dict[int, List[EdgeAttachment]] = {}
         nearby_count = 0
         rejected_count = 0
@@ -297,9 +301,11 @@ class SparseRouteGraph:
                 if not allowed(point, position):
                     rejected_count += 1
                     continue
-                options[node_id] = min(options.get(node_id, math.inf), distance)
+                if distance < options.get(node_id, math.inf):
+                    options[node_id] = distance
+                    node_paths[node_id] = (point, position)
 
-            for (edge_id, _), (position, along) in self._sample_buckets.get(
+            for (edge_id, sample_index), (position, along) in self._sample_buckets.get(
                     key, {}).items():
                 distance = math.hypot(position[0] - point[0],
                                       position[1] - point[1])
@@ -313,13 +319,18 @@ class SparseRouteGraph:
                 if edge is None:
                     continue
                 edge_options.setdefault(edge_id, []).append(EdgeAttachment(
-                    edge_id, along, distance, position))
+                    edge_id, along, distance, position, sample_index))
                 source_cost = distance + along
                 target_cost = distance + max(0.0, edge.length - along)
-                options[edge.source_id] = min(
-                    options.get(edge.source_id, math.inf), source_cost)
-                options[edge.target_id] = min(
-                    options.get(edge.target_id, math.inf), target_cost)
+                if source_cost < options.get(edge.source_id, math.inf):
+                    options[edge.source_id] = source_cost
+                    node_paths[edge.source_id] = self._join_points(
+                        (point, position),
+                        tuple(reversed(edge.polyline[:sample_index + 1])))
+                if target_cost < options.get(edge.target_id, math.inf):
+                    options[edge.target_id] = target_cost
+                    node_paths[edge.target_id] = self._join_points(
+                        (point, position), edge.polyline[sample_index:])
         node_options = sorted(
             options.items(), key=lambda item: (item[1], item[0]))[
                 :max(1, int(limit))]
@@ -328,8 +339,66 @@ class SparseRouteGraph:
                 attachments,
                 key=lambda item: (item.connector_cost, item.along))[
                     :max(1, int(limit))]
+        retained_paths = {
+            node_id: node_paths[node_id] for node_id, _ in node_options
+            if node_id in node_paths}
         return SparseAttachments(
-            node_options, edge_options, nearby_count, rejected_count)
+            node_options, edge_options, nearby_count, rejected_count,
+            retained_paths)
+
+    @staticmethod
+    def _join_points(*parts: Sequence[Point2]) -> Tuple[Point2, ...]:
+        result: List[Point2] = []
+        for part in parts:
+            for point in part:
+                if not result or point != result[-1]:
+                    result.append(point)
+        return tuple(result)
+
+    @staticmethod
+    def _turn_cost(points: Sequence[Point2]) -> float:
+        headings = [
+            math.atan2(second[1] - first[1], second[0] - first[0])
+            for first, second in zip(points[:-1], points[1:])
+            if first != second]
+        return sum(abs(math.atan2(math.sin(second - first),
+                                  math.cos(second - first)))
+                   for first, second in zip(headings[:-1], headings[1:]))
+
+    def _oriented_edge_polyline(
+            self, edge_id: int, source_id: int, target_id: int
+            ) -> Tuple[Point2, ...]:
+        edge = self.edges[edge_id]
+        if edge.source_id == source_id and edge.target_id == target_id:
+            return edge.polyline
+        return tuple(reversed(edge.polyline))
+
+    def _graph_polyline(
+            self, target_node: int,
+            parents: Dict[int, Tuple[int, int]]) -> Tuple[Point2, ...]:
+        transitions = []
+        current = target_node
+        while current in parents:
+            previous, edge_id = parents[current]
+            transitions.append((previous, current, edge_id))
+            current = previous
+        points: Tuple[Point2, ...] = ()
+        for source_id, target_id, edge_id in reversed(transitions):
+            points = self._join_points(
+                points,
+                self._oriented_edge_polyline(edge_id, source_id, target_id))
+        if not points:
+            points = (self.nodes[target_node].position,)
+        return points
+
+    def _same_edge_polyline(
+            self, first: EdgeAttachment, second: EdgeAttachment
+            ) -> Tuple[Point2, ...]:
+        edge = self.edges[first.edge_id]
+        if first.sample_index <= second.sample_index:
+            return edge.polyline[first.sample_index:second.sample_index + 1]
+        return tuple(reversed(
+            edge.polyline[second.sample_index:first.sample_index + 1]))
 
     def attachments(
             self, point: Point2, radius: float, limit: int = 8,
@@ -438,40 +507,24 @@ class SparseRouteGraph:
                     and (graph_choice is None or direct_choice[0] < graph_choice[0])):
                 total, start_edge, target_edge = direct_choice
                 edge = self.edges[start_edge.edge_id]
-                points = [start, start_edge.position,
-                          target_edge.position, target]
-                headings = [math.atan2(second[1] - first[1],
-                                       second[0] - first[0])
-                            for first, second in zip(points[:-1], points[1:])
-                            if first != second]
-                turn_cost = sum(abs(math.atan2(math.sin(second - first),
-                                               math.cos(second - first)))
-                                for first, second in zip(
-                                    headings[:-1], headings[1:]))
+                points = self._join_points(
+                    (start, start_edge.position),
+                    self._same_edge_polyline(start_edge, target_edge),
+                    (target_edge.position, target))
                 results.append(SparseRouteEstimate(
-                    total, turn_cost, edge.source_id, edge.target_id))
+                    total, self._turn_cost(points), edge.source_id,
+                    edge.target_id, points))
                 reasons.append(None)
                 continue
 
             total, target_node = graph_choice
             source_node = roots[target_node]
-            points = [target]
-            current = target_node
-            points.append(self.nodes[current].position)
-            while current in parents:
-                previous, _ = parents[current]
-                current = previous
-                points.append(self.nodes[current].position)
-            points.append(start)
-            points.reverse()
-            headings = [math.atan2(second[1] - first[1],
-                                   second[0] - first[0])
-                        for first, second in zip(points[:-1], points[1:])
-                        if first != second]
-            turn_cost = sum(abs(math.atan2(math.sin(second - first),
-                                           math.cos(second - first)))
-                            for first, second in zip(headings[:-1], headings[1:]))
+            points = self._join_points(
+                start_details.node_paths[source_node],
+                self._graph_polyline(target_node, parents),
+                tuple(reversed(details.node_paths[target_node])))
             results.append(SparseRouteEstimate(
-                total, turn_cost, source_node, target_node))
+                total, self._turn_cost(points), source_node, target_node,
+                points))
             reasons.append(None)
         return results, reasons

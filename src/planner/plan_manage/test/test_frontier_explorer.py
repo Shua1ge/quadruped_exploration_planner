@@ -691,6 +691,54 @@ def test_sparse_candidate_is_materialized_by_dense_astar_before_use():
     assert explorer.sparse_final_validation_failures == 0
 
 
+def test_sparse_candidate_reuses_valid_sparse_polyline():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 6.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.grid.data[2, 3] = MODULE.OCCUPIED
+    explorer.dense_final_validation_searches = 0
+    explorer.sparse_final_validation_failures = 0
+    explorer.sparse_router = MODULE.SparseRouteGraph()
+    route = MODULE.SparseRouteEstimate(
+        7.0, 0.0, 1, 2,
+        ((1.5, 2.5), (1.5, 3.5), (6.5, 3.5), (6.5, 2.5)))
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 2), (7, 2), (6.5, 2.5), [], 7.0, 20, 8, 0.0,
+        {(7, 2)}, route)
+
+    materialized = explorer.materialize_sparse_candidate(
+        (1, 2), candidate, explorer.grid.inflated_obstacles(0.0), set())
+
+    assert materialized is not None
+    assert materialized.path == [
+        (1, 2), (1, 3), (2, 3), (3, 3),
+        (4, 3), (5, 3), (6, 3), (6, 2)]
+
+
+def test_invalid_sparse_polyline_falls_back_to_dense_route():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 6.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.grid.data[2, 3] = MODULE.OCCUPIED
+    explorer.dense_final_validation_searches = 0
+    explorer.sparse_final_validation_failures = 0
+    explorer.sparse_router = MODULE.SparseRouteGraph()
+    route = MODULE.SparseRouteEstimate(
+        5.0, 0.0, 1, 2, ((1.5, 2.5), (6.5, 2.5)))
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 2), (7, 2), (6.5, 2.5), [], 5.0, 20, 8, 0.0,
+        {(7, 2)}, route)
+
+    materialized = explorer.materialize_sparse_candidate(
+        (1, 2), candidate, explorer.grid.inflated_obstacles(0.0), set())
+
+    assert materialized is not None
+    assert (3, 2) not in materialized.path
+    assert materialized.path[0] == (1, 2)
+    assert materialized.path[-1] == (6, 2)
+    assert explorer.sparse_final_validation_failures == 0
+
+
 def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.grid = MODULE.ExplorationGrid(8.0, 6.0, 1.0, 0.0, 0.0)

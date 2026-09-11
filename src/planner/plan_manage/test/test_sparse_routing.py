@@ -29,6 +29,49 @@ def test_mid_corridor_queries_attach_to_edge_not_only_endpoint_nodes():
 
     assert result is not None
     assert abs(result.distance - 3.4) < 1e-9
+    assert result.polyline[0] == (4.0, 0.2)
+    assert result.polyline[-1] == (7.0, -0.2)
+
+
+def test_same_edge_route_preserves_curved_corridor_polyline():
+    graph = SparseRouteGraph(bucket_size=1.0)
+    graph.upsert_node(SparseNode(1, (0.0, 0.0), 1.0))
+    graph.upsert_node(SparseNode(2, (2.0, 2.0), 1.0))
+    graph.upsert_edge(SparseEdge(
+        11, 1, 2, 4.0, 1.0,
+        ((0.0, 0.0), (0.0, 1.0), (0.0, 2.0),
+         (1.0, 2.0), (2.0, 2.0))))
+    graph.graph_revision = 1
+
+    result = graph.batch_estimates(
+        (0.1, 1.0), [(1.9, 2.0)], 0.25)[0]
+
+    assert result is not None
+    assert result.polyline == (
+        (0.1, 1.0), (0.0, 1.0), (0.0, 2.0),
+        (1.0, 2.0), (2.0, 2.0), (1.9, 2.0))
+
+
+def test_graph_route_preserves_each_edge_polyline_and_connectors():
+    graph = SparseRouteGraph(bucket_size=1.0)
+    graph.upsert_node(SparseNode(1, (0.0, 0.0), 1.0))
+    graph.upsert_node(SparseNode(2, (0.0, 2.0), 1.0))
+    graph.upsert_node(SparseNode(3, (2.0, 2.0), 1.0))
+    graph.upsert_edge(SparseEdge(
+        11, 1, 2, 2.0, 1.0,
+        ((0.0, 0.0), (0.0, 1.0), (0.0, 2.0))))
+    graph.upsert_edge(SparseEdge(
+        12, 2, 3, 2.0, 1.0,
+        ((0.0, 2.0), (1.0, 2.0), (2.0, 2.0))))
+    graph.graph_revision = 1
+
+    result = graph.batch_estimates(
+        (-0.1, 0.0), [(2.1, 2.0)], 0.25)[0]
+
+    assert result is not None
+    assert result.polyline == (
+        (-0.1, 0.0), (0.0, 0.0), (0.0, 1.0),
+        (0.0, 2.0), (1.0, 2.0), (2.0, 2.0), (2.1, 2.0))
 
 
 def test_batch_query_returns_connected_targets_and_rejects_disconnected_one():

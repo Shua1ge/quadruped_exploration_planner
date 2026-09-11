@@ -32,7 +32,7 @@ from explorer_core.frontier_regions import (
 )
 from explorer_core.grid import (
     Cell, DirectedEdge, ExplorationGrid, FREE, GRID_MOVES, OCCUPIED, Point2, UNKNOWN,
-    dilate_hit_ranges,
+    bresenham, dilate_hit_ranges,
 )
 from explorer_core.path_planning import (
     RemainingPathCheck, ShortestPathTree, adjacent_grid_path_is_valid, astar_known,
@@ -103,6 +103,7 @@ class FrontierCandidate:
     cluster_size: int
     turn_cost: float
     observation_cells: Set[Cell]
+    sparse_route: Optional[SparseRouteEstimate] = None
 
 
 @dataclass
@@ -1411,10 +1412,35 @@ class FrontierExplorer(Node):
             self, start: Cell, candidate: FrontierCandidate,
             inflated: Set[Cell], blocked_edges: Set[DirectedEdge]
             ) -> Optional[FrontierCandidate]:
-        """Recover and validate only the sparse-selected route on the dense map."""
+        """Use a safe sparse route, falling back to dense search when needed."""
         self.dense_final_validation_searches += 1
-        path = astar_known(
-            self.grid, start, candidate.cell, inflated, blocked_edges)
+        path = None
+        if candidate.sparse_route and candidate.sparse_route.polyline:
+            sparse_cells = [
+                self.grid.world_to_cell(*point)
+                for point in candidate.sparse_route.polyline]
+            if sparse_cells:
+                sparse_cells[0] = start
+                sparse_cells[-1] = candidate.cell
+                recovered: List[Cell] = []
+                for first, second in zip(sparse_cells[:-1], sparse_cells[1:]):
+                    segment = bresenham(first, second)
+                    if recovered and segment and recovered[-1] == segment[0]:
+                        segment = segment[1:]
+                    recovered.extend(segment)
+                if (len(sparse_cells) == 1
+                        and sparse_cells[0] == candidate.cell):
+                    recovered = [start]
+                if adjacent_grid_path_is_valid(
+                        self.grid, recovered, inflated, blocked_edges):
+                    path = recovered
+
+        # Sparse supplies long-range structure, but it is never authoritative
+        # over the current dense safety map.  A stale/invalid connector or
+        # corridor therefore falls back to the original complete dense search.
+        if path is None:
+            path = astar_known(
+                self.grid, start, candidate.cell, inflated, blocked_edges)
         if not path:
             self.sparse_final_validation_failures += 1
             self.add_goal_failure_cooldown(
@@ -1431,7 +1457,8 @@ class FrontierExplorer(Node):
             candidate.goal, path,
             path_length_cells(path, self.grid.resolution),
             candidate.unknown_gain, candidate.cluster_size,
-            path_turn_cost(path), candidate.observation_cells)
+            path_turn_cost(path), candidate.observation_cells,
+            candidate.sparse_route)
 
     def build_frontier_candidates(self, start: Cell,
                                   regions: Sequence[FrontierRegion],
@@ -1526,7 +1553,8 @@ class FrontierExplorer(Node):
                 turn_cost = estimate.turn_cost
             records.append(FrontierCandidate(
                 region_id, viewpoint, frontier, goal_xy, path,
-                path_length, unknown_gain, cluster_size, turn_cost, target_cells))
+                path_length, unknown_gain, cluster_size, turn_cost, target_cells,
+                estimate))
         return records
 
     @staticmethod
