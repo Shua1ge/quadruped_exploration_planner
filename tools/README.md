@@ -35,3 +35,18 @@ python3 tools/generate_rmf_building_core_pcd.py \
   --spacing 0.20 \
   --output src/planner/plan_manage/maps/clinic_L1_core.pcd
 ```
+
+## RoboTerrain Inspection planar baseline
+
+The long-range Inspection baseline is derived from the upstream COLLADA
+collision mesh. The current kinematic simulator has constant body height, so
+the converter projects steep faces into a closed planar obstacle map while
+retaining the original DAE for a later Gazebo terrain benchmark:
+
+```bash
+python3 tools/generate_collada_pcd.py --mode planar \
+  --dae src/planner/plan_manage/maps/roboterrain_inspection_source/inspection_world.dae \
+  --centre-x 1.062655 --centre-y 18.165435 \
+  --resolution 0.20 --vertical-spacing 0.20 \
+  --output src/planner/plan_manage/maps/roboterrain_inspection_planar.pcd
+```

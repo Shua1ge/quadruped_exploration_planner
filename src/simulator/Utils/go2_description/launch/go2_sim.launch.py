@@ -11,9 +11,16 @@ from launch.actions import (
 )
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (
+    Command,
+    EnvironmentVariable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
 from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -22,14 +29,21 @@ def generate_launch_description():
     # model://go2_description/..., so Gazebo must search the parent of this
     # package's share directory.  Without this, the robot is spawned but its
     # DAE visual meshes cannot be rendered.
-    resource_root = os.path.dirname(get_package_share_directory("go2_description"))
+    default_resource_root = os.path.dirname(get_package_share_directory("go2_description"))
     description_share = FindPackageShare("go2_description")
     ros_gz_share = FindPackageShare("ros_gz_sim")
     model = PathJoinSubstitution([description_share, "xacro", "robot.xacro"])
-    world = PathJoinSubstitution([description_share, "worlds", "empty.sdf"])
+    world = LaunchConfiguration("world")
+    gazebo_args = PythonExpression([
+        "'-r -s -v 3 ' if '", LaunchConfiguration("headless"),
+        "'.lower() in ('1', 'true', 'yes', 'on') else '-r -v 3 '",
+    ])
     bridge_config = PathJoinSubstitution([description_share, "config", "bridge.yaml"])
     robot_description = {
-        "robot_description": Command(["xacro ", model, " use_gazebo:=true"]),
+        "robot_description": ParameterValue(Command([
+            "xacro ", model, " use_gazebo:=true terrain_velocity_control:=",
+            LaunchConfiguration("terrain_velocity_control"),
+        ]), value_type=str),
         "use_sim_time": True,
     }
 
@@ -37,7 +51,7 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([ros_gz_share, "launch", "gz_sim.launch.py"])
         ),
-        launch_arguments={"gz_args": ["-r -v 3 ", world], "on_exit_shutdown": "true"}.items(),
+        launch_arguments={"gz_args": [gazebo_args, world], "on_exit_shutdown": "true"}.items(),
     )
     state_publisher = Node(
         package="robot_state_publisher",
@@ -53,7 +67,7 @@ def generate_launch_description():
         arguments=[
             "-topic", "robot_description",
             "-name", "go2",
-            "-allow_renaming", "true",
+            "-allow_renaming", "false",
             "-x", LaunchConfiguration("x"),
             "-y", LaunchConfiguration("y"),
             "-z", LaunchConfiguration("z"),
@@ -91,14 +105,23 @@ def generate_launch_description():
             # well, keeping this launch usable with newer Gazebo releases.
             SetEnvironmentVariable(
                 name="IGN_GAZEBO_RESOURCE_PATH",
-                value=[resource_root, os.pathsep,
+                value=[LaunchConfiguration("resource_path"), os.pathsep,
+                       default_resource_root, os.pathsep,
                        EnvironmentVariable("IGN_GAZEBO_RESOURCE_PATH", default_value="")],
             ),
             SetEnvironmentVariable(
                 name="GZ_SIM_RESOURCE_PATH",
-                value=[resource_root, os.pathsep,
+                value=[LaunchConfiguration("resource_path"), os.pathsep,
+                       default_resource_root, os.pathsep,
                        EnvironmentVariable("GZ_SIM_RESOURCE_PATH", default_value="")],
             ),
+            DeclareLaunchArgument(
+                "world",
+                default_value=PathJoinSubstitution([description_share, "worlds", "empty.sdf"]),
+            ),
+            DeclareLaunchArgument("resource_path", default_value=""),
+            DeclareLaunchArgument("terrain_velocity_control", default_value="false"),
+            DeclareLaunchArgument("headless", default_value="false"),
             DeclareLaunchArgument("x", default_value="0.0"),
             DeclareLaunchArgument("y", default_value="0.0"),
             DeclareLaunchArgument("z", default_value="0.5"),

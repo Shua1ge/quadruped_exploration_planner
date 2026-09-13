@@ -20,6 +20,8 @@ def _setup(context):
     use_pcd_map = _as_bool(LaunchConfiguration("use_pcd_map").perform(context))
     use_gpu = _as_bool(LaunchConfiguration("use_gpu").perform(context))
     use_sim_time = _as_bool(LaunchConfiguration("use_sim_time").perform(context))
+    collision_check_enable = int(
+        _as_bool(LaunchConfiguration("collision_check_enable").perform(context)))
     pcd_map_file = LaunchConfiguration("pcd_map_file").perform(context)
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     map_x = float(LaunchConfiguration("map_size_x").perform(context))
@@ -92,6 +94,7 @@ def _setup(context):
                         "map.z_size": map_z,
                         "use_global_map_topic": True,
                         "pcd_map_file": pcd_map_file,
+                        "collision_check.enable": collision_check_enable,
                     },
                 ],
                 remappings=[
@@ -137,6 +140,7 @@ def generate_launch_description():
             DeclareLaunchArgument("map_size_y", default_value="40.0"),
             DeclareLaunchArgument("map_size_z", default_value="5.0"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("collision_check_enable", default_value="true"),
             OpaqueFunction(function=_setup),
         ]
     )

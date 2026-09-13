@@ -133,6 +133,8 @@ class FrontierExplorer(Node):
         self.hit_dilation_bins = int(self.declare_parameter("hit_dilation_bins", 3).value)
         self.obstacle_min_z = float(self.declare_parameter("obstacle_min_z", 0.08).value)
         self.obstacle_max_z = float(self.declare_parameter("obstacle_max_z", 0.85).value)
+        self.obstacle_z_relative_to_body = bool(
+            self.declare_parameter("obstacle_z_relative_to_body", False).value)
         self.inflation_radius = float(self.declare_parameter("inflation_radius", 0.65).value)
         self.viewpoint_standoff = float(
             self.declare_parameter("viewpoint_standoff", 1.0).value)
@@ -582,8 +584,9 @@ class FrontierExplorer(Node):
         dx = array[:, 0] - self.position[0]
         dy = array[:, 1] - self.position[1]
         distances = np.hypot(dx, dy)
-        mask = ((array[:, 2] >= self.obstacle_min_z)
-                & (array[:, 2] <= self.obstacle_max_z)
+        z_reference = self.body_z if self.obstacle_z_relative_to_body else 0.0
+        mask = ((array[:, 2] >= z_reference + self.obstacle_min_z)
+                & (array[:, 2] <= z_reference + self.obstacle_max_z)
                 & (distances >= 0.35)
                 & (distances < self.mapping_range))
         nearest = np.full(self.ray_count, np.inf, dtype=np.float64)

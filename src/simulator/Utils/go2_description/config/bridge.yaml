@@ -33,3 +33,13 @@
   ros_type_name: ros_gz_interfaces/msg/Contacts
   gz_type_name: gz.msgs.Contacts
   direction: GZ_TO_ROS
+- ros_topic_name: /quad_0/body_pose
+  gz_topic_name: /model/go2/odometry
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+- ros_topic_name: /quad_0/cmd_vel
+  gz_topic_name: /model/go2/cmd_vel
+  ros_type_name: geometry_msgs/msg/Twist
+  gz_type_name: gz.msgs.Twist
+  direction: ROS_TO_GZ

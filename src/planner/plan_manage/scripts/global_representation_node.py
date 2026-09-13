@@ -15,7 +15,12 @@ from scan_planner_msgs.msg import (
 from std_msgs.msg import String
 
 from explorer_core.topology import (
-    TopologyEdge, TopologyGraph, TopologyNode, extract_topology, oracle_metrics)
+    TopologyEdge, TopologyGraph, TopologyNode, clearance_field,
+    extract_topology, oracle_metrics)
+from explorer_core.safe_region_graph import (
+    PersistentSafeRegionTracker, ShadowStabilityTracker,
+    extract_safe_region_graph,
+    safe_region_oracle_metrics)
 
 
 class GlobalRepresentationNode(Node):
@@ -27,6 +32,31 @@ class GlobalRepresentationNode(Node):
             self.declare_parameter("max_oracle_queries", 8).value)
         self.snapshot_period_revisions = max(1, int(
             self.declare_parameter("snapshot_period_revisions", 10).value))
+        self.safe_region_shadow_enabled = bool(self.declare_parameter(
+            "safe_region_shadow_enabled", True).value)
+        self.safe_region_tile_size = float(self.declare_parameter(
+            "safe_region_tile_size", 2.0).value)
+        self.portal_bottleneck_width = float(self.declare_parameter(
+            "portal_bottleneck_width", 1.2).value)
+        self.safe_region_update_period_revisions = max(1, int(
+            self.declare_parameter(
+                "safe_region_update_period_revisions", 10).value))
+        self.safe_region_oracle_period_revisions = max(1, int(
+            self.declare_parameter(
+                "safe_region_oracle_period_revisions", 10).value))
+        self.safe_region_identity = PersistentSafeRegionTracker()
+        self.safe_region_stability = ShadowStabilityTracker()
+        self.last_safe_oracle_metrics = {
+            "safe_region_queries": 0.0,
+            "safe_region_dense_connected": 0.0,
+            "safe_region_connectivity_recall": 1.0,
+            "safe_region_false_positive_rate": 0.0,
+            "safe_region_mean_abs_cost_error": 0.0,
+            "safe_region_max_abs_cost_error": 0.0,
+            "safe_region_oracle_ms": 0.0,
+            "safe_region_oracle_sampled": False,
+        }
+        self.last_safe_shadow_metrics = {}
         self.global_nodes: Dict[int, TopologyNode] = {}
         self.global_edges: Dict[int, TopologyEdge] = {}
         self.global_node_messages: Dict[int, TopoNode] = {}
@@ -92,12 +122,75 @@ class GlobalRepresentationNode(Node):
         started = time.perf_counter()
         occupancy = np.asarray(patch.occupancy, dtype=np.int8).reshape(
             (patch.height, patch.width))
+        shared_clearance = clearance_field(
+            occupancy == 0, float(patch.resolution))
         local_graph = extract_topology(
             occupancy, float(patch.resolution),
-            (patch.origin.x, patch.origin.y))
+            (patch.origin.x, patch.origin.y), shared_clearance)
         metrics = oracle_metrics(
             occupancy, float(patch.resolution), local_graph,
             self.max_oracle_queries)
+        sample_safe_region = (
+            self.safe_region_shadow_enabled
+            and (self.graph_revision == 0
+                 or (self.graph_revision + 1)
+                 % self.safe_region_update_period_revisions == 0))
+        if sample_safe_region:
+            safe_region_started = time.perf_counter()
+            safe_graph = extract_safe_region_graph(
+                occupancy, float(patch.resolution),
+                (patch.origin.x, patch.origin.y),
+                self.safe_region_tile_size, self.portal_bottleneck_width,
+                shared_clearance)
+            safe_graph = self.safe_region_identity.update(
+                safe_graph, (patch.origin.x, patch.origin.y),
+                float(patch.resolution))
+            safe_region_extraction_ms = (
+                time.perf_counter() - safe_region_started) * 1000.0
+            sample_oracle = (
+                self.graph_revision == 0
+                or (self.graph_revision + 1)
+                % self.safe_region_oracle_period_revisions == 0)
+            if sample_oracle:
+                safe_oracle_started = time.perf_counter()
+                self.last_safe_oracle_metrics = safe_region_oracle_metrics(
+                    occupancy, float(patch.resolution), safe_graph,
+                    self.max_oracle_queries)
+                self.last_safe_oracle_metrics.update({
+                    "safe_region_oracle_ms": (
+                        time.perf_counter() - safe_oracle_started) * 1000.0,
+                    "safe_region_oracle_sampled": True,
+                })
+            safe_metrics = dict(self.last_safe_oracle_metrics)
+            if not sample_oracle:
+                safe_metrics["safe_region_oracle_sampled"] = False
+                safe_metrics["safe_region_oracle_ms"] = 0.0
+            safe_metrics.update(self.safe_region_stability.update(safe_graph))
+            safe_metrics.update({
+                "safe_region_shadow_sampled": True,
+                "safe_region_extraction_ms": safe_region_extraction_ms,
+                "safe_regions": len(safe_graph.regions),
+                "portals": len(safe_graph.portals),
+                "bottleneck_portals": sum(
+                    portal.bottleneck for portal in safe_graph.portals.values()),
+                "safe_region_coverage": (
+                    len(safe_graph.cell_to_region) / safe_graph.free_cell_count
+                    if safe_graph.free_cell_count else 1.0),
+                "safe_region_compression_ratio": (
+                    1.0 - len(safe_graph.regions) / safe_graph.free_cell_count
+                    if safe_graph.free_cell_count else 0.0),
+            })
+            self.last_safe_shadow_metrics = dict(safe_metrics)
+            metrics.update(safe_metrics)
+        elif self.safe_region_shadow_enabled and self.last_safe_shadow_metrics:
+            safe_metrics = dict(self.last_safe_shadow_metrics)
+            safe_metrics.update({
+                "safe_region_shadow_sampled": False,
+                "safe_region_extraction_ms": 0.0,
+                "safe_region_oracle_sampled": False,
+                "safe_region_oracle_ms": 0.0,
+            })
+            metrics.update(safe_metrics)
 
         min_x, min_y = patch.origin.x, patch.origin.y
         max_x = min_x + patch.width * patch.resolution
@@ -205,6 +298,21 @@ class GlobalRepresentationNode(Node):
             f"{metrics['connectivity_recall']:.3f} cost_error="
             f"{metrics['mean_cost_error']:.3f} processing={processing_ms:.1f}ms",
             throttle_duration_sec=2.0)
+        if sample_safe_region:
+            self.get_logger().info(
+                f"[SAFE_REGION_SHADOW] map_revision={patch.map_revision} "
+                f"regions={len(safe_graph.regions)} "
+                f"portals={len(safe_graph.portals)} "
+                f"bottlenecks={safe_metrics['bottleneck_portals']} "
+                f"coverage={safe_metrics['safe_region_coverage']:.3f} "
+                f"recall={safe_metrics['safe_region_connectivity_recall']:.3f} "
+                f"false_positive="
+                f"{safe_metrics['safe_region_false_positive_rate']:.3f} "
+                f"region_retention="
+                f"{safe_metrics['safe_region_id_retention']:.3f} "
+                f"portal_retention={safe_metrics['portal_id_retention']:.3f} "
+                f"extraction={safe_region_extraction_ms:.1f}ms",
+                throttle_duration_sec=2.0)
 
 
 def main(args=None):

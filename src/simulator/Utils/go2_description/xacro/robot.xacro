@@ -4,6 +4,7 @@
 
     <xacro:arg name="DEBUG" default="false"/>
     <xacro:arg name="use_gazebo" default="true"/>
+    <xacro:arg name="terrain_velocity_control" default="false"/>
 
     <xacro:include filename="$(find go2_description)/xacro/const.xacro"/>
     <xacro:include filename="$(find go2_description)/xacro/materials.xacro"/>

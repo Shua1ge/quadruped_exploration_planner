@@ -21,6 +21,8 @@ def _setup(context):
     controllers_yaml = os.path.join(scan_share, "config", "controllers.yaml")
     is_real = _as_bool(LaunchConfiguration("is_real_world").perform(context))
     use_sim_time = _as_bool(LaunchConfiguration("use_sim_time").perform(context))
+    use_gazebo_physics = _as_bool(
+        LaunchConfiguration("use_gazebo_physics").perform(context))
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     controller_mode = LaunchConfiguration("controller_mode").perform(context)
     keypoints_file = LaunchConfiguration("keypoints_file").perform(context)
@@ -35,6 +37,18 @@ def _setup(context):
         raise RuntimeError(
             "navi_mode=2 requires keypoints_file to reference a ROS 2 parameter YAML"
         )
+    if use_gazebo_physics:
+        if is_real:
+            raise RuntimeError("use_gazebo_physics cannot be combined with is_real_world")
+        if controller_mode != "closed_loop":
+            raise RuntimeError("use_gazebo_physics requires controller_mode=closed_loop")
+        if not use_sim_time:
+            raise RuntimeError("use_gazebo_physics requires use_sim_time=true")
+        gazebo_world = LaunchConfiguration("gazebo_world").perform(context)
+        if not gazebo_world or not os.path.isfile(gazebo_world):
+            raise RuntimeError(
+                "use_gazebo_physics=true requires gazebo_world to reference an existing file"
+            )
 
     if is_real:
         body_pose = "/LIO/odom_vehicle"
@@ -84,8 +98,8 @@ def _setup(context):
             ],
         )
     ]
-    actions.append(
-        Node(
+    if not use_gazebo_physics:
+        actions.append(Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
             name="go2_robot_state_publisher",
@@ -99,8 +113,7 @@ def _setup(context):
                     )
                 },
             ],
-        )
-    )
+        ))
 
     if controller_mode == "open_loop":
         actions.append(
@@ -130,7 +143,7 @@ def _setup(context):
                 ],
             )
         )
-        if not is_real:
+        if not is_real and not use_gazebo_physics:
             actions.append(
                 Node(
                     package="scan_planner",
@@ -155,8 +168,25 @@ def _setup(context):
             )
 
     if not is_real:
-        actions.extend(
-            [
+        if use_gazebo_physics:
+            actions.append(
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(go2_share, "launch", "go2_sim.launch.py")
+                    ),
+                    launch_arguments={
+                        "world": LaunchConfiguration("gazebo_world"),
+                        "resource_path": LaunchConfiguration("gazebo_resource_path"),
+                        "terrain_velocity_control": "true",
+                        "headless": LaunchConfiguration("headless"),
+                        "x": LaunchConfiguration("init_x"),
+                        "y": LaunchConfiguration("init_y"),
+                        "z": LaunchConfiguration("init_z"),
+                    }.items(),
+                )
+            )
+        else:
+            actions.append(
                 Node(
                     package="scan_planner",
                     executable="go2_gait_publisher",
@@ -164,7 +194,9 @@ def _setup(context):
                     output="screen",
                     parameters=[controllers_yaml, common],
                     remappings=[("body_pose", body_pose)],
-                ),
+                )
+            )
+        actions.append(
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(
                         os.path.join(scan_share, "launch", "simulator.launch.py")
@@ -181,10 +213,10 @@ def _setup(context):
                             "map_size_y",
                             "map_size_z",
                             "use_sim_time",
+                            "collision_check_enable",
                         )
                     }.items(),
-                ),
-            ]
+                )
         )
     return actions
 
@@ -207,6 +239,11 @@ def generate_launch_description():
             DeclareLaunchArgument("init_y", default_value="1.0"),
             DeclareLaunchArgument("init_z", default_value="0.3"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("use_gazebo_physics", default_value="false"),
+            DeclareLaunchArgument("gazebo_world", default_value=""),
+            DeclareLaunchArgument("gazebo_resource_path", default_value=""),
+            DeclareLaunchArgument("headless", default_value="false"),
+            DeclareLaunchArgument("collision_check_enable", default_value="true"),
             OpaqueFunction(function=_setup),
         ]
     )

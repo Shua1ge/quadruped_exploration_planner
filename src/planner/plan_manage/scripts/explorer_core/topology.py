@@ -137,13 +137,19 @@ def skeleton_neighbours(cell: Cell, skeleton: Set[Cell]) -> List[Cell]:
 
 
 def extract_topology(occupancy: np.ndarray, resolution: float,
-                     origin: Tuple[float, float]) -> TopologyGraph:
+                     origin: Tuple[float, float],
+                     shared_clearance: Optional[np.ndarray] = None
+                     ) -> TopologyGraph:
     """Extract endpoints/junctions and compress degree-two skeleton chains."""
     values = np.asarray(occupancy, dtype=np.int16)
     free = values == FREE
     skeleton_mask = thin_free_space(free)
     skeleton = {(int(x), int(y)) for y, x in np.argwhere(skeleton_mask)}
-    clearance = clearance_field(free, resolution)
+    clearance = (clearance_field(free, resolution)
+                 if shared_clearance is None
+                 else np.asarray(shared_clearance, dtype=np.float64))
+    if clearance.shape != free.shape:
+        raise ValueError("shared_clearance shape must match occupancy")
     node_cells = {cell for cell in skeleton
                   if len(skeleton_neighbours(cell, skeleton)) != 2}
     if skeleton and not node_cells:

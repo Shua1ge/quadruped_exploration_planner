@@ -21,6 +21,18 @@
               name="gz_ros2_control::GazeboSimROS2ControlPlugin">
         <parameters>$(find go2_description)/config/ros2_controllers.yaml</parameters>
       </plugin>
+      <xacro:if value="$(arg terrain_velocity_control)">
+        <!-- Planning benchmark adapter: drives the Gazebo model from Twist
+             while physics still resolves gravity and terrain contacts. This
+             is not a learned or force-level quadruped locomotion controller. -->
+        <plugin filename="ignition-gazebo-velocity-control-system"
+                name="gz::sim::systems::VelocityControl"/>
+        <plugin filename="ignition-gazebo-odometry-publisher-system"
+                name="gz::sim::systems::OdometryPublisher">
+          <odom_publish_frequency>100</odom_publish_frequency>
+          <dimensions>3</dimensions>
+        </plugin>
+      </xacro:if>
     </gazebo>
 
     <gazebo reference="imu_link">
