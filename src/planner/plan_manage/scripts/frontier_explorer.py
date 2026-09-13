@@ -6,7 +6,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -117,6 +117,7 @@ class ObservationTask:
     target_cells: Set[Cell]
     frontier_cell: Optional[Cell] = None
     terminal_cells: Tuple[Cell, ...] = ()
+    attempted_terminal_cells: Set[Cell] = field(default_factory=set)
     observed_cells: int = 0
     progress: float = 0.0
     completion_streak: int = 0
@@ -150,6 +151,12 @@ class FrontierExplorer(Node):
             "terminal_switch_clearance_margin", 0.20).value)
         self.terminal_approach_length = float(self.declare_parameter(
             "terminal_approach_length", 1.5).value)
+        # A regional terminal change must produce a meaningfully different
+        # observation pose.  Derive this from the map/viewpoint geometry rather
+        # than exposing another tuning parameter.  At the default settings this
+        # is 0.60 m, safely above SCAN's 0.25 m arrival tolerance.
+        self.terminal_relocation_min_distance = max(
+            3.0 * resolution, 0.5 * self.viewpoint_standoff)
         self.min_frontier_size = int(self.declare_parameter("min_frontier_size", 6).value)
         self.min_goal_distance = float(self.declare_parameter("min_goal_distance", 2.0).value)
         self.preferred_goal_path_length = float(
@@ -887,14 +894,23 @@ class FrontierExplorer(Node):
         if inflated is None:
             return False
 
+        current = self.active_goal_cell
+        min_cells = self.terminal_relocation_min_distance / self.grid.resolution
         viable = {
             item for item in task.terminal_cells
+            if item not in task.attempted_terminal_cells
+            and (current is None or math.hypot(
+                item[0] - current[0], item[1] - current[1]) >= min_cells)
+            and math.hypot(item[0] - start[0], item[1] - start[1]) >= min_cells
             if self.grid.planning_free(item, inflated)
             and segment_known_free(
                 self.grid, item, task.frontier_cell, inflated)}
-        if force_change and self.active_goal_cell is not None:
-            viable.discard(self.active_goal_cell)
         if not viable:
+            if force_change:
+                self.get_logger().info(
+                    "[OBSERVATION_TERMINAL_EXHAUSTED] no untried terminal "
+                    f"at least {self.terminal_relocation_min_distance:.2f}m "
+                    "away; selecting another observation task")
             return False
 
         tree = build_shortest_path_tree(
@@ -931,6 +947,9 @@ class FrontierExplorer(Node):
             return False
 
         previous_goal = self.active_goal
+        # Claim the terminal before publishing.  A fast REACHED response must
+        # not be able to select the previous terminal and create an A/B loop.
+        task.attempted_terminal_cells.add(cell)
         self.publish_reference_path(simplified)
         self.active_goal_cell = cell
         self.active_goal = self.grid.cell_to_world(cell)
@@ -2207,7 +2226,8 @@ class FrontierExplorer(Node):
             target_cells=set(candidate.observation_cells),
             frontier_cell=candidate.frontier_cell,
             terminal_cells=(candidate.terminal_cells
-                            if candidate.terminal_cells else (candidate.cell,)))
+                            if candidate.terminal_cells else (candidate.cell,)),
+            attempted_terminal_cells={candidate.cell})
         self.last_terminal_candidate_count = len(
             self.active_observation.terminal_cells)
         inflated = self.grid.inflated_obstacles(self.inflation_radius)

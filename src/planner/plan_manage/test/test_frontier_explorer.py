@@ -586,12 +586,14 @@ def test_terminal_relocation_retains_observation_progress_and_commitment():
     explorer.terminal_clearance_search_radius = 2.0
     explorer.terminal_switch_clearance_margin = 0.2
     explorer.terminal_approach_length = 1.5
+    explorer.terminal_relocation_min_distance = 1.0
     explorer.active_goal_cell = (4, 5)
     explorer.active_goal = explorer.grid.cell_to_world((4, 5))
     explorer.active_region_id = 7
     explorer.active_observation = MODULE.ObservationTask(
         7, explorer.active_goal, {(9, 5), (9, 6)},
         frontier_cell=(9, 5), terminal_cells=((4, 5), (7, 5)),
+        attempted_terminal_cells={(4, 5)},
         observed_cells=1, progress=0.5, completion_streak=1)
     explorer.active_raw_path = [(2, 5), (3, 5), (4, 5)]
     explorer.map_update_count = 4
@@ -613,6 +615,32 @@ def test_terminal_relocation_retains_observation_progress_and_commitment():
     assert explorer.active_observation.progress == 0.5
     assert explorer.active_observation.completion_streak == 1
     assert explorer.terminal_relocations == 1
+    assert explorer.active_observation.attempted_terminal_cells == {(4, 5), (7, 5)}
+
+
+def test_terminal_relocation_does_not_ping_pong_between_arrival_neighbours():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(12.0, 12.0, 0.2, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.position = explorer.grid.cell_to_world((10, 10))
+    explorer.inflation_radius = 0.0
+    explorer.terminal_clearance_search_radius = 1.0
+    explorer.terminal_switch_clearance_margin = 0.2
+    explorer.terminal_approach_length = 1.5
+    explorer.terminal_relocation_min_distance = 0.6
+    explorer.active_goal_cell = (11, 10)
+    explorer.active_goal = explorer.grid.cell_to_world((11, 10))
+    explorer.active_observation = MODULE.ObservationTask(
+        7, explorer.active_goal, {(20, 10)}, frontier_cell=(20, 10),
+        terminal_cells=((10, 10), (11, 10)),
+        attempted_terminal_cells={(11, 10)})
+    explorer.current_blocked_edges = lambda: set()
+    explorer.get_logger = lambda: SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    # The only alternative is 0.20 m away: changing to it would be accepted as
+    # already reached by SCAN and then switch back on the next callback.
+    assert not explorer.relocate_active_terminal(force_change=True)
+    assert explorer.active_goal_cell == (11, 10)
 
 
 def test_reroute_failure_streak_abandons_at_configured_map_update_limit():
