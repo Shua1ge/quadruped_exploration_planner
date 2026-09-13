@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
-from .grid import Cell, ExplorationGrid, UNKNOWN
+from .grid import Cell, ExplorationGrid, FREE, OCCUPIED, UNKNOWN, bresenham
 from .path_planning import astar_known, path_length_cells, segment_known_free
 
 
@@ -71,7 +71,8 @@ def clustered_frontier_cells(clusters: Sequence[Sequence[Cell]]) -> Set[Cell]:
 
 
 def observation_target_cells(grid: ExplorationGrid, center: Cell,
-                             radius: float) -> Set[Cell]:
+                             radius: float,
+                             viewpoint: Optional[Cell] = None) -> Set[Cell]:
     """Freeze the currently unknown cells associated with an observation task.
 
     The set is deliberately captured when a task becomes active.  Recomputing
@@ -85,19 +86,58 @@ def observation_target_cells(grid: ExplorationGrid, center: Cell,
             if math.hypot(dx * grid.resolution, dy * grid.resolution) > radius:
                 continue
             cell = (center[0] + dx, center[1] + dy)
-            if grid.in_bounds(cell) and grid.value(cell) == UNKNOWN:
-                result.add(cell)
+            if not grid.in_bounds(cell) or grid.value(cell) != UNKNOWN:
+                continue
+            if viewpoint is not None and any(
+                    grid.value(ray_cell) == OCCUPIED
+                    for ray_cell in bresenham(viewpoint, cell)[1:-1]):
+                continue
+            result.add(cell)
     return result
 
 
 def observation_progress(grid: ExplorationGrid,
-                         target_cells: Set[Cell]) -> Tuple[int, int, float]:
-    """Return realised cells, expected cells and their fixed-denominator ratio."""
+                         target_cells: Set[Cell],
+                         viewpoint: Optional[Cell] = None
+                         ) -> Tuple[int, int, float]:
+    """Return resolved cells, expected cells and their fixed-denominator ratio.
+
+    A target is resolved by observing it or by observing an occupied barrier
+    between it and the fixed task viewpoint.  The latter is negative
+    information: the robot need not drive toward a wall to observe behind it.
+    """
     expected = len(target_cells)
     if expected == 0:
         return 0, 0, 1.0
-    observed = sum(1 for cell in target_cells if grid.value(cell) != UNKNOWN)
+    observed = 0
+    for cell in target_cells:
+        if grid.value(cell) != UNKNOWN:
+            observed += 1
+            continue
+        if viewpoint is not None and any(
+                grid.value(ray_cell) == OCCUPIED
+                for ray_cell in bresenham(viewpoint, cell)[1:-1]):
+            observed += 1
     return observed, expected, observed / expected
+
+
+def frontier_present_near(grid: ExplorationGrid, center: Cell,
+                          radius: float) -> bool:
+    """Return whether the task's original information boundary still exists."""
+    radius_cells = max(1, int(math.ceil(radius / grid.resolution)))
+    for dx in range(-radius_cells, radius_cells + 1):
+        for dy in range(-radius_cells, radius_cells + 1):
+            if math.hypot(dx, dy) > radius_cells:
+                continue
+            cell = (center[0] + dx, center[1] + dy)
+            if not grid.in_bounds(cell) or grid.value(cell) != FREE:
+                continue
+            neighbours = ((cell[0] - 1, cell[1]), (cell[0] + 1, cell[1]),
+                          (cell[0], cell[1] - 1), (cell[0], cell[1] + 1))
+            if any(grid.in_bounds(item) and grid.value(item) == UNKNOWN
+                   for item in neighbours):
+                return True
+    return False
 
 
 def advance_completion_streak(progress: float, done_ratio: float,

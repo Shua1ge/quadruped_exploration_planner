@@ -577,70 +577,63 @@ def test_completion_streak_requires_consecutive_updates_above_threshold():
     assert streak == 3
 
 
-def test_terminal_relocation_retains_observation_progress_and_commitment():
+def test_observation_target_excludes_unknown_cells_already_hidden_by_wall():
+    grid = MODULE.ExplorationGrid(8.0, 5.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    grid.data[2, 5] = MODULE.UNKNOWN
+    grid.data[2, 3] = MODULE.OCCUPIED
+
+    target = MODULE.observation_target_cells(
+        grid, (5, 2), radius=0.0, viewpoint=(1, 2))
+
+    assert target == set()
+
+
+def test_observation_progress_treats_new_wall_occlusion_as_resolved():
+    grid = MODULE.ExplorationGrid(8.0, 5.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    grid.data[2, 5] = MODULE.UNKNOWN
+    target = {(5, 2)}
+
+    assert MODULE.observation_progress(
+        grid, target, viewpoint=(1, 2)) == (0, 1, 0.0)
+
+    grid.data[2, 3] = MODULE.OCCUPIED
+    assert MODULE.observation_progress(
+        grid, target, viewpoint=(1, 2)) == (1, 1, 1.0)
+
+
+def test_frontier_closure_is_an_independent_observation_completion_reason():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.observation_done_updates = 3
+    task = MODULE.ObservationTask(
+        7, (1.0, 1.0), {(4, 4)}, frontier_cell=(3, 4),
+        progress=0.2, completion_streak=0, frontier_missing_streak=3,
+        completion_reason="frontier_closed")
+
+    assert explorer.observation_complete(task)
+
+
+def test_active_observation_confirms_closed_frontier_over_map_updates():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
     explorer.grid.data[:, :] = MODULE.FREE
-    explorer.position = explorer.grid.cell_to_world((2, 5))
-    explorer.inflation_radius = 0.0
-    explorer.terminal_clearance_search_radius = 2.0
-    explorer.terminal_switch_clearance_margin = 0.2
-    explorer.terminal_approach_length = 1.5
-    explorer.terminal_relocation_min_distance = 1.0
-    explorer.active_goal_cell = (4, 5)
-    explorer.active_goal = explorer.grid.cell_to_world((4, 5))
-    explorer.active_region_id = 7
+    explorer.grid.data[9, 9] = MODULE.UNKNOWN
+    explorer.active_goal_cell = (2, 2)
+    explorer.observation_done_ratio = 0.8
+    explorer.observation_done_updates = 3
     explorer.active_observation = MODULE.ObservationTask(
-        7, explorer.active_goal, {(9, 5), (9, 6)},
-        frontier_cell=(9, 5), terminal_cells=((4, 5), (7, 5)),
-        attempted_terminal_cells={(4, 5)},
-        observed_cells=1, progress=0.5, completion_streak=1)
-    explorer.active_raw_path = [(2, 5), (3, 5), (4, 5)]
-    explorer.map_update_count = 4
-    explorer.last_terminal_clearance = 0.0
-    explorer.last_approach_clearance = 0.0
-    explorer.terminal_relocations = 0
-    explorer.prepared_candidate = object()
-    explorer.last_preparation_attempt_update = 4
-    explorer.last_handoff_attempt_update = 4
-    explorer.current_blocked_edges = lambda: set()
-    explorer.publish_reference_path = lambda path: None
-    explorer.publish_goal = lambda goal: None
-    explorer.publish_status = lambda status: None
-    explorer.get_logger = lambda: SimpleNamespace(info=lambda *args, **kwargs: None)
+        7, explorer.grid.cell_to_world((2, 2)), {(9, 9)},
+        frontier_cell=(5, 5))
 
-    assert explorer.relocate_active_terminal(force_change=True)
-    assert explorer.active_goal_cell == (7, 5)
-    assert explorer.active_region_id == 7
-    assert explorer.active_observation.progress == 0.5
-    assert explorer.active_observation.completion_streak == 1
-    assert explorer.terminal_relocations == 1
-    assert explorer.active_observation.attempted_terminal_cells == {(4, 5), (7, 5)}
+    for update in (1, 2, 3):
+        explorer.map_update_count = update
+        task = explorer.evaluate_active_observation()
 
-
-def test_terminal_relocation_does_not_ping_pong_between_arrival_neighbours():
-    explorer = object.__new__(MODULE.FrontierExplorer)
-    explorer.grid = MODULE.ExplorationGrid(12.0, 12.0, 0.2, 0.0, 0.0)
-    explorer.grid.data[:, :] = MODULE.FREE
-    explorer.position = explorer.grid.cell_to_world((10, 10))
-    explorer.inflation_radius = 0.0
-    explorer.terminal_clearance_search_radius = 1.0
-    explorer.terminal_switch_clearance_margin = 0.2
-    explorer.terminal_approach_length = 1.5
-    explorer.terminal_relocation_min_distance = 0.6
-    explorer.active_goal_cell = (11, 10)
-    explorer.active_goal = explorer.grid.cell_to_world((11, 10))
-    explorer.active_observation = MODULE.ObservationTask(
-        7, explorer.active_goal, {(20, 10)}, frontier_cell=(20, 10),
-        terminal_cells=((10, 10), (11, 10)),
-        attempted_terminal_cells={(11, 10)})
-    explorer.current_blocked_edges = lambda: set()
-    explorer.get_logger = lambda: SimpleNamespace(info=lambda *args, **kwargs: None)
-
-    # The only alternative is 0.20 m away: changing to it would be accepted as
-    # already reached by SCAN and then switch back on the next callback.
-    assert not explorer.relocate_active_terminal(force_change=True)
-    assert explorer.active_goal_cell == (11, 10)
+    assert task.progress == 0.0
+    assert task.frontier_missing_streak == 3
+    assert task.completion_reason == "frontier_closed"
+    assert explorer.observation_complete(task)
 
 
 def test_reroute_failure_streak_abandons_at_configured_map_update_limit():

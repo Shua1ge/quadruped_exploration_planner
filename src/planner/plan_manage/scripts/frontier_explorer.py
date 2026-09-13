@@ -6,7 +6,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -25,7 +25,7 @@ from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
     advance_completion_streak, advance_reroute_failure_streak, candidate_cells,
     cluster_frontiers, clustered_frontier_cells, observation_progress,
-    observation_target_cells, partition_frontier_clusters,
+    observation_target_cells, frontier_present_near, partition_frontier_clusters,
     partition_frontier_clusters_by_topology, retain_region_commitment,
     region_information_efficiency, safe_viewpoint_cells, select_rolling_region,
     solve_open_held_karp, update_region_commitment,
@@ -117,10 +117,11 @@ class ObservationTask:
     target_cells: Set[Cell]
     frontier_cell: Optional[Cell] = None
     terminal_cells: Tuple[Cell, ...] = ()
-    attempted_terminal_cells: Set[Cell] = field(default_factory=set)
     observed_cells: int = 0
     progress: float = 0.0
     completion_streak: int = 0
+    frontier_missing_streak: int = 0
+    completion_reason: str = "none"
     last_evaluated_update: int = -1
     preparation_started: bool = False
 
@@ -147,16 +148,8 @@ class FrontierExplorer(Node):
             self.declare_parameter("terminal_candidate_limit", 8).value)
         self.terminal_clearance_search_radius = float(self.declare_parameter(
             "terminal_clearance_search_radius", 1.0).value)
-        self.terminal_switch_clearance_margin = float(self.declare_parameter(
-            "terminal_switch_clearance_margin", 0.20).value)
         self.terminal_approach_length = float(self.declare_parameter(
             "terminal_approach_length", 1.5).value)
-        # A regional terminal change must produce a meaningfully different
-        # observation pose.  Derive this from the map/viewpoint geometry rather
-        # than exposing another tuning parameter.  At the default settings this
-        # is 0.60 m, safely above SCAN's 0.25 m arrival tolerance.
-        self.terminal_relocation_min_distance = max(
-            3.0 * resolution, 0.5 * self.viewpoint_standoff)
         self.min_frontier_size = int(self.declare_parameter("min_frontier_size", 6).value)
         self.min_goal_distance = float(self.declare_parameter("min_goal_distance", 2.0).value)
         self.preferred_goal_path_length = float(
@@ -254,8 +247,6 @@ class FrontierExplorer(Node):
             raise ValueError("terminal_candidate_limit must be at least one")
         if self.terminal_clearance_search_radius <= 0.0:
             raise ValueError("terminal_clearance_search_radius must be positive")
-        if self.terminal_switch_clearance_margin < 0.0:
-            raise ValueError("terminal_switch_clearance_margin must be non-negative")
         if self.terminal_approach_length <= 0.0:
             raise ValueError("terminal_approach_length must be positive")
         if not (0.0 <= self.observation_prepare_ratio
@@ -646,13 +637,30 @@ class FrontierExplorer(Node):
         task = self.active_observation
         if task is None or task.last_evaluated_update == self.map_update_count:
             return task
-        observed, _, ratio = observation_progress(self.grid, task.target_cells)
+        observed, _, ratio = observation_progress(
+            self.grid, task.target_cells, self.active_goal_cell)
         task.observed_cells = observed
         task.progress = ratio
         task.last_evaluated_update = self.map_update_count
         task.completion_streak = advance_completion_streak(
             ratio, self.observation_done_ratio, task.completion_streak)
+        frontier_present = (task.frontier_cell is not None
+                            and frontier_present_near(
+                                self.grid, task.frontier_cell,
+                                2.0 * self.grid.resolution))
+        task.frontier_missing_streak = (
+            0 if frontier_present else task.frontier_missing_streak + 1)
+        if task.completion_streak >= self.observation_done_updates:
+            task.completion_reason = "visible_information_resolved"
+        elif task.frontier_missing_streak >= self.observation_done_updates:
+            task.completion_reason = "frontier_closed"
         return task
+
+    def observation_complete(self, task: Optional[ObservationTask]) -> bool:
+        """Complete on positive information or confirmed boundary closure."""
+        return bool(task is not None and (
+            task.completion_streak >= self.observation_done_updates
+            or task.frontier_missing_streak >= self.observation_done_updates))
 
     def prepare_next_observation(self, force: bool = False) -> bool:
         """Select the next information objective without publishing its path."""
@@ -741,7 +749,8 @@ class FrontierExplorer(Node):
             self.prepared_candidate = None
             return False
         target_cells = observation_target_cells(
-            self.grid, candidate.frontier_cell, self.observation_radius)
+            self.grid, candidate.frontier_cell, self.observation_radius,
+            candidate.cell)
         if (not segment_known_free(
                     self.grid, candidate.cell, candidate.frontier_cell, inflated)
                 or len(target_cells) < self.min_expected_observation_cells):
@@ -879,100 +888,6 @@ class FrontierExplorer(Node):
             ) * self.grid.resolution
         return min(self.terminal_clearance(item, inflated) for item in suffix)
 
-    def relocate_active_terminal(self, force_change: bool = False) -> bool:
-        """Move only the execution terminal while retaining the task identity."""
-        task = self.active_observation
-        if (self.position is None or task is None
-                or task.frontier_cell is None or not task.terminal_cells):
-            return False
-        inflated = self.grid.inflated_obstacles(self.inflation_radius)
-        blocked_edges = self.current_blocked_edges()
-        start = self.grid.world_to_cell(*self.position)
-        inflated = open_start_escape_corridor(
-            self.grid, start, inflated,
-            self.inflation_radius + self.grid.resolution)
-        if inflated is None:
-            return False
-
-        current = self.active_goal_cell
-        min_cells = self.terminal_relocation_min_distance / self.grid.resolution
-        viable = {
-            item for item in task.terminal_cells
-            if item not in task.attempted_terminal_cells
-            and (current is None or math.hypot(
-                item[0] - current[0], item[1] - current[1]) >= min_cells)
-            and math.hypot(item[0] - start[0], item[1] - start[1]) >= min_cells
-            if self.grid.planning_free(item, inflated)
-            and segment_known_free(
-                self.grid, item, task.frontier_cell, inflated)}
-        if not viable:
-            if force_change:
-                self.get_logger().info(
-                    "[OBSERVATION_TERMINAL_EXHAUSTED] no untried terminal "
-                    f"at least {self.terminal_relocation_min_distance:.2f}m "
-                    "away; selecting another observation task")
-            return False
-
-        tree = build_shortest_path_tree(
-            self.grid, start, inflated, blocked_edges, viable)
-        ranked = []
-        for cell in viable:
-            raw_path = tree.path_to(cell)
-            if not raw_path:
-                continue
-            simplified = simplify_known_path(
-                self.grid, raw_path, inflated, blocked_edges)
-            if not simplified or not all(
-                    segment_known_free(
-                        self.grid, a, b, inflated, blocked_edges)
-                    for a, b in zip(simplified[:-1], simplified[1:])):
-                continue
-            terminal_margin = self.terminal_clearance(cell, inflated)
-            approach_margin = self.approach_clearance(simplified, inflated)
-            bottleneck = min(terminal_margin, approach_margin)
-            ranked.append(((bottleneck, terminal_margin,
-                            -path_length_cells(raw_path, self.grid.resolution),
-                            -path_turn_cost(raw_path), -cell[0], -cell[1]),
-                           cell, raw_path, simplified,
-                           terminal_margin, approach_margin))
-        if not ranked:
-            return False
-        (_, cell, raw_path, simplified,
-         terminal_margin, approach_margin) = max(ranked)
-        if cell == self.active_goal_cell:
-            return False
-        if (not force_change and self.active_goal_cell is not None
-                and terminal_margin < self.last_terminal_clearance
-                + self.terminal_switch_clearance_margin):
-            return False
-
-        previous_goal = self.active_goal
-        # Claim the terminal before publishing.  A fast REACHED response must
-        # not be able to select the previous terminal and create an A/B loop.
-        task.attempted_terminal_cells.add(cell)
-        self.publish_reference_path(simplified)
-        self.active_goal_cell = cell
-        self.active_goal = self.grid.cell_to_world(cell)
-        task.goal = self.active_goal
-        self.active_raw_path = list(raw_path)
-        self.active_path_progress_index = 0
-        self.last_active_path_validation_update = self.map_update_count
-        self.last_terminal_clearance = terminal_margin
-        self.last_approach_clearance = approach_margin
-        self.terminal_relocations += 1
-        self.prepared_candidate = None
-        self.last_preparation_attempt_update = -1
-        self.last_handoff_attempt_update = -1
-        self.publish_goal(self.active_goal)
-        self.publish_status("OBSERVATION_TERMINAL_RELOCATED")
-        self.get_logger().info(
-            f"[OBSERVATION_TERMINAL_RELOCATED] from={previous_goal} "
-            f"to=({self.active_goal[0]:.2f},{self.active_goal[1]:.2f}) "
-            f"candidates={len(viable)} terminal_clearance="
-            f"{terminal_margin:.2f}m approach_clearance={approach_margin:.2f}m; "
-            "observation progress and region commitment retained")
-        return True
-
     def validate_and_repair_active_path(self) -> bool:
         """Validate one new map revision and atomically repair an invalid route.
 
@@ -1018,7 +933,7 @@ class FrontierExplorer(Node):
         self.global_path_invalid_count += 1
 
         started = time.perf_counter()
-        if self.reroute_active_goal() or self.relocate_active_terminal():
+        if self.reroute_active_goal():
             self.global_reroute_failure_streak = 0
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self.publish_status("GLOBAL_PATH_REROUTED_TO_SAME_OBSERVATION")
@@ -1183,21 +1098,24 @@ class FrontierExplorer(Node):
         elif status == "REACHED" and self.active_goal is not None:
             task = self.evaluate_active_observation()
             self.goals_reached += 1
-            if task is not None and task.progress >= self.observation_done_ratio:
-                if task.completion_streak >= self.observation_done_updates:
-                    self.handoff_satisfied_observation(
-                        "OBSERVATION_HANDOFF_COMPLETE_AT_VIEWPOINT")
-                else:
-                    # The ratio is monotonic, so wait briefly for the configured
-                    # number of map updates instead of misclassifying this as a
-                    # failed viewpoint just because SCAN arrived first.
-                    self.publish_status("VIEWPOINT_REACHED_WAITING_FOR_GAIN_CONFIRMATION")
+            if self.observation_complete(task):
+                self.get_logger().info(
+                    f"[OBSERVATION_COMPLETE] reason={task.completion_reason} "
+                    f"progress={task.progress:.1%} frontier_missing="
+                    f"{task.frontier_missing_streak}/"
+                    f"{self.observation_done_updates}")
+                self.handoff_satisfied_observation(
+                    "OBSERVATION_HANDOFF_COMPLETE_AT_VIEWPOINT")
+            elif (task is not None and (
+                    task.progress >= self.observation_done_ratio
+                    or task.frontier_missing_streak > 0)):
+                # Allow accepted map updates to confirm information/closure;
+                # never create another execution goal inside this task.
+                self.publish_status("VIEWPOINT_REACHED_WAITING_FOR_GAIN_CONFIRMATION")
             else:
-                # Pose arrival is not task completion.  If this viewpoint did
-                # not deliver enough information, atomically activate the
-                # prepared route before discarding any active state.
-                if self.relocate_active_terminal(force_change=True):
-                    return
+                # Pose arrival is a stable task boundary.  Insufficient gain
+                # replaces the observation task; it must not launch a chain of
+                # alternative short terminals into SCAN.
                 if not any(math.hypot(
                         self.active_goal[0] - old[0],
                         self.active_goal[1] - old[1]) < self.blacklist_radius
@@ -1217,9 +1135,6 @@ class FrontierExplorer(Node):
                     and blocked_edge in self.current_blocked_edges()
                     and self.reroute_active_goal()):
                 return
-            if self.relocate_active_terminal(force_change=True):
-                return
-
             previous_goal = self.active_goal
             self.active_goal = None
             self.active_goal_cell = None
@@ -1326,10 +1241,10 @@ class FrontierExplorer(Node):
                 return
             else:
                 task = self.evaluate_active_observation()
-                if (task is not None
-                        and task.completion_streak >= self.observation_done_updates):
+                if self.observation_complete(task):
                     self.get_logger().info(
-                        f"Observation satisfied: {task.observed_cells}/"
+                        f"Observation satisfied ({task.completion_reason}): "
+                        f"{task.observed_cells}/"
                         f"{len(task.target_cells)} cells ({task.progress:.1%}); "
                         "switching before viewpoint arrival")
                     self.handoff_satisfied_observation(
@@ -1588,6 +1503,7 @@ class FrontierExplorer(Node):
         selected_cell = candidate.cell
         selected_goal = candidate.goal
         selected_clearance = candidate.terminal_clearance
+        terminal_changed = False
         if candidate.sparse_route and candidate.sparse_route.polyline:
             sparse_cells = [
                 self.grid.world_to_cell(*point)
@@ -1628,6 +1544,7 @@ class FrontierExplorer(Node):
                     selected_goal = self.grid.cell_to_world(cell)
                     selected_clearance = self.terminal_clearance(cell, inflated)
                     path = alternative_path
+                    terminal_changed = True
                     break
         if not path:
             self.sparse_final_validation_failures += 1
@@ -1640,12 +1557,19 @@ class FrontierExplorer(Node):
                 "dense final validation found no route",
                 throttle_duration_sec=2.0)
             return None
+        observation_cells = candidate.observation_cells
+        if terminal_changed:
+            observation_cells = observation_target_cells(
+                self.grid, candidate.frontier_cell, self.observation_radius,
+                selected_cell)
+            if len(observation_cells) < self.min_expected_observation_cells:
+                return None
         return FrontierCandidate(
             candidate.region_id, selected_cell, candidate.frontier_cell,
             selected_goal, path,
             path_length_cells(path, self.grid.resolution),
             candidate.unknown_gain, candidate.cluster_size,
-            path_turn_cost(path), candidate.observation_cells,
+            path_turn_cost(path), observation_cells,
             sparse_route=candidate.sparse_route,
             terminal_cells=candidate.terminal_cells,
             terminal_clearance=selected_clearance)
@@ -1667,16 +1591,19 @@ class FrontierExplorer(Node):
             for cluster in region.clusters:
                 used_viewpoints: Set[Cell] = set()
                 for frontier in candidate_cells(cluster):
-                    target_cells = observation_target_cells(
-                        self.grid, frontier, self.observation_radius)
-                    unknown_gain = len(target_cells)
-                    if unknown_gain < self.min_expected_observation_cells:
-                        continue
                     viewpoints = safe_viewpoint_cells(
                         self.grid, frontier, inflated, self.viewpoint_standoff,
                         limit=self.terminal_candidate_limit,
                         clearance_search_radius=(
                             self.terminal_clearance_search_radius))
+                    if not viewpoints:
+                        continue
+                    target_cells = observation_target_cells(
+                        self.grid, frontier, self.observation_radius,
+                        viewpoints[0])
+                    unknown_gain = len(target_cells)
+                    if unknown_gain < self.min_expected_observation_cells:
+                        continue
                     # One frontier is one task.  Only its safest terminal enters
                     # global competition; other poses remain alternatives of
                     # the same frozen observation objective.
@@ -1760,6 +1687,11 @@ class FrontierExplorer(Node):
                     goal_xy = self.grid.cell_to_world(viewpoint)
                     terminal_clearance = self.terminal_clearance(
                         viewpoint, inflated)
+                    target_cells = observation_target_cells(
+                        self.grid, frontier, self.observation_radius, viewpoint)
+                    unknown_gain = len(target_cells)
+                    if unknown_gain < self.min_expected_observation_cells:
+                        continue
                 path_length = path_length_cells(path, self.grid.resolution)
                 turn_cost = path_turn_cost(path)
             else:
@@ -2226,8 +2158,7 @@ class FrontierExplorer(Node):
             target_cells=set(candidate.observation_cells),
             frontier_cell=candidate.frontier_cell,
             terminal_cells=(candidate.terminal_cells
-                            if candidate.terminal_cells else (candidate.cell,)),
-            attempted_terminal_cells={candidate.cell})
+                            if candidate.terminal_cells else (candidate.cell,)))
         self.last_terminal_candidate_count = len(
             self.active_observation.terminal_cells)
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
@@ -2301,6 +2232,12 @@ class FrontierExplorer(Node):
             "observation_expected_cells": (
                 len(self.active_observation.target_cells)
                 if self.active_observation else 0),
+            "observation_frontier_missing_streak": (
+                self.active_observation.frontier_missing_streak
+                if self.active_observation else 0),
+            "observation_completion_reason": (
+                self.active_observation.completion_reason
+                if self.active_observation else "none"),
             "next_observation_prepared": self.prepared_candidate is not None,
             "pipeline_latency_ewma_s": self.pipeline_latency_ewma,
             "map_updates": self.map_update_count,
