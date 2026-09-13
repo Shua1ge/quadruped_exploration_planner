@@ -111,6 +111,27 @@ def test_safe_viewpoint_respects_inflated_obstacle_clearance():
                for cell in viewpoints)
 
 
+def test_safe_viewpoint_orders_same_frontier_by_clearance_first():
+    grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.UNKNOWN
+    grid.data[1:11, 1:8] = MODULE.FREE
+    frontier = (7, 6)
+    inflated = {(5, 3), (5, 4)}
+
+    viewpoints = MODULE.safe_viewpoint_cells(
+        grid, frontier, inflated, stand_off=2.0, limit=8,
+        clearance_search_radius=4.0)
+
+    def clearance(cell):
+        return min(5.0, min(
+            math.hypot(cell[0] - obstacle[0], cell[1] - obstacle[1])
+            for obstacle in inflated))
+
+    margins = [clearance(cell) for cell in viewpoints]
+    assert len(margins) >= 2
+    assert margins == sorted(margins, reverse=True)
+
+
 def test_known_astar_never_crosses_unknown_or_corner_cuts():
     grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
     grid.data[:, :] = MODULE.UNKNOWN
@@ -554,6 +575,44 @@ def test_completion_streak_requires_consecutive_updates_above_threshold():
         streak = MODULE.advance_completion_streak(progress, 0.80, streak)
 
     assert streak == 3
+
+
+def test_terminal_relocation_retains_observation_progress_and_commitment():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.position = explorer.grid.cell_to_world((2, 5))
+    explorer.inflation_radius = 0.0
+    explorer.terminal_clearance_search_radius = 2.0
+    explorer.terminal_switch_clearance_margin = 0.2
+    explorer.terminal_approach_length = 1.5
+    explorer.active_goal_cell = (4, 5)
+    explorer.active_goal = explorer.grid.cell_to_world((4, 5))
+    explorer.active_region_id = 7
+    explorer.active_observation = MODULE.ObservationTask(
+        7, explorer.active_goal, {(9, 5), (9, 6)},
+        frontier_cell=(9, 5), terminal_cells=((4, 5), (7, 5)),
+        observed_cells=1, progress=0.5, completion_streak=1)
+    explorer.active_raw_path = [(2, 5), (3, 5), (4, 5)]
+    explorer.map_update_count = 4
+    explorer.last_terminal_clearance = 0.0
+    explorer.last_approach_clearance = 0.0
+    explorer.terminal_relocations = 0
+    explorer.prepared_candidate = object()
+    explorer.last_preparation_attempt_update = 4
+    explorer.last_handoff_attempt_update = 4
+    explorer.current_blocked_edges = lambda: set()
+    explorer.publish_reference_path = lambda path: None
+    explorer.publish_goal = lambda goal: None
+    explorer.publish_status = lambda status: None
+    explorer.get_logger = lambda: SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    assert explorer.relocate_active_terminal(force_change=True)
+    assert explorer.active_goal_cell == (7, 5)
+    assert explorer.active_region_id == 7
+    assert explorer.active_observation.progress == 0.5
+    assert explorer.active_observation.completion_streak == 1
+    assert explorer.terminal_relocations == 1
 
 
 def test_reroute_failure_streak_abandons_at_configured_map_update_limit():

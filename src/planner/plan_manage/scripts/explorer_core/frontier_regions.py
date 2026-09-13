@@ -131,7 +131,8 @@ def candidate_cells(cluster: Sequence[Cell]) -> List[Cell]:
 
 def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
                          inflated: Set[Cell], stand_off: float,
-                         limit: int = 3) -> List[Cell]:
+                         limit: int = 3,
+                         clearance_search_radius: float = 1.0) -> List[Cell]:
     """Return known-free stand-off poses that look toward a frontier.
 
     A frontier is an information boundary, not a place the robot should stand.
@@ -158,6 +159,18 @@ def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
     minimum_cells = max(1.0, desired_cells - tolerance_cells)
     maximum_cells = desired_cells + tolerance_cells
     search_cells = int(math.ceil(maximum_cells))
+    clearance_cells = max(
+        1, int(math.ceil(max(0.0, clearance_search_radius) / grid.resolution)))
+
+    def clearance(cell: Cell) -> float:
+        """Distance beyond collision inflation, capped for cheap ranking."""
+        best = float(clearance_cells + 1)
+        for ox in range(-clearance_cells, clearance_cells + 1):
+            for oy in range(-clearance_cells, clearance_cells + 1):
+                if (cell[0] + ox, cell[1] + oy) in inflated:
+                    best = min(best, math.hypot(ox, oy))
+        return best * grid.resolution
+
     ranked = []
     for dx in range(-search_cells, search_cells + 1):
         for dy in range(-search_cells, search_cells + 1):
@@ -177,7 +190,8 @@ def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
             desired_x = inward[0] * desired_cells
             desired_y = inward[1] * desired_cells
             desired_error = math.hypot(dx - desired_x, dy - desired_y)
-            ranked.append(((desired_error, abs(distance - desired_cells),
+            ranked.append(((-clearance(cell), desired_error,
+                            abs(distance - desired_cells),
                             cell[0], cell[1]), cell))
     return [item[1] for item in sorted(ranked)[:max(1, int(limit))]]
 
