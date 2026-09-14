@@ -603,15 +603,29 @@ def test_observation_progress_treats_new_wall_occlusion_as_resolved():
         grid, target, viewpoint=(1, 2)) == (1, 1, 1.0)
 
 
-def test_frontier_closure_is_an_independent_observation_completion_reason():
+def test_frontier_closure_requires_minimum_observation_evidence():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.observation_done_updates = 3
+    explorer.observation_prepare_ratio = 0.6
     task = MODULE.ObservationTask(
         7, (1.0, 1.0), {(4, 4)}, frontier_cell=(3, 4),
         progress=0.2, completion_streak=0, frontier_missing_streak=3,
-        completion_reason="frontier_closed")
+        completion_reason="none")
 
+    assert not explorer.observation_complete(task)
+
+    task.progress = 0.6
+    task.completion_reason = "frontier_closed"
     assert explorer.observation_complete(task)
+
+
+def test_frontier_cluster_tracking_tolerates_boundary_motion():
+    grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
+    grid.data[:, :] = MODULE.UNKNOWN
+    grid.data[2:9, 1:6] = MODULE.FREE
+
+    assert MODULE.frontier_cluster_present(
+        grid, {(5, 5), (6, 5)}, radius=2.0)
 
 
 def test_active_observation_confirms_closed_frontier_over_map_updates():
@@ -622,6 +636,8 @@ def test_active_observation_confirms_closed_frontier_over_map_updates():
     explorer.active_goal_cell = (2, 2)
     explorer.observation_done_ratio = 0.8
     explorer.observation_done_updates = 3
+    explorer.observation_prepare_ratio = 0.6
+    explorer.viewpoint_standoff = 1.0
     explorer.active_observation = MODULE.ObservationTask(
         7, explorer.grid.cell_to_world((2, 2)), {(9, 9)},
         frontier_cell=(5, 5))
@@ -632,8 +648,49 @@ def test_active_observation_confirms_closed_frontier_over_map_updates():
 
     assert task.progress == 0.0
     assert task.frontier_missing_streak == 3
+    assert task.completion_reason == "none"
+    assert not explorer.observation_complete(task)
+
+
+def test_active_observation_closes_after_boundary_and_evidence_agree():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.grid.data[9, 9] = MODULE.UNKNOWN
+    explorer.active_goal_cell = (2, 2)
+    explorer.observation_done_ratio = 0.8
+    explorer.observation_prepare_ratio = 0.6
+    explorer.observation_done_updates = 3
+    explorer.viewpoint_standoff = 1.0
+    target = {(x, 9) for x in range(5, 10)}
+    explorer.grid.data[9, 8] = MODULE.UNKNOWN
+    explorer.grid.data[9, 9] = MODULE.UNKNOWN
+    explorer.active_observation = MODULE.ObservationTask(
+        7, explorer.grid.cell_to_world((2, 2)), target,
+        frontier_cell=(5, 5), observed_cells=3, progress=0.6)
+
+    for update in (1, 2, 3):
+        explorer.map_update_count = update
+        task = explorer.evaluate_active_observation()
+
+    assert task.progress == 0.6
+    assert task.frontier_missing_streak == 3
     assert task.completion_reason == "frontier_closed"
     assert explorer.observation_complete(task)
+
+
+def test_completion_metrics_survive_atomic_task_replacement():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.last_observation_completion_reason = "none"
+    explorer.last_observation_completion_progress = 0.0
+    task = MODULE.ObservationTask(
+        7, (1.0, 1.0), {(4, 4)}, progress=0.75,
+        completion_reason="frontier_closed")
+
+    explorer.record_observation_completion(task)
+
+    assert explorer.last_observation_completion_reason == "frontier_closed"
+    assert explorer.last_observation_completion_progress == 0.75
 
 
 def test_reroute_failure_streak_abandons_at_configured_map_update_limit():

@@ -6,7 +6,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -25,7 +25,8 @@ from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
     advance_completion_streak, advance_reroute_failure_streak, candidate_cells,
     cluster_frontiers, clustered_frontier_cells, observation_progress,
-    observation_target_cells, frontier_present_near, partition_frontier_clusters,
+    observation_target_cells, frontier_cluster_present,
+    partition_frontier_clusters,
     partition_frontier_clusters_by_topology, retain_region_commitment,
     region_information_efficiency, safe_viewpoint_cells, select_rolling_region,
     solve_open_held_karp, update_region_commitment,
@@ -106,6 +107,7 @@ class FrontierCandidate:
     sparse_route: Optional[SparseRouteEstimate] = None
     terminal_cells: Tuple[Cell, ...] = ()
     terminal_clearance: float = 0.0
+    frontier_cluster_cells: Set[Cell] = field(default_factory=set)
 
 
 @dataclass
@@ -116,6 +118,7 @@ class ObservationTask:
     goal: Point2
     target_cells: Set[Cell]
     frontier_cell: Optional[Cell] = None
+    frontier_cluster_cells: Set[Cell] = field(default_factory=set)
     terminal_cells: Tuple[Cell, ...] = ()
     observed_cells: int = 0
     progress: float = 0.0
@@ -367,6 +370,8 @@ class FrontierExplorer(Node):
         self.short_paths_published = 0
         self.last_published_path_length = 0.0
         self.observations_satisfied = 0
+        self.last_observation_completion_reason = "none"
+        self.last_observation_completion_progress = 0.0
         self.terminal_relocations = 0
         self.last_terminal_candidate_count = 0
         self.last_terminal_clearance = 0.0
@@ -644,23 +649,39 @@ class FrontierExplorer(Node):
         task.last_evaluated_update = self.map_update_count
         task.completion_streak = advance_completion_streak(
             ratio, self.observation_done_ratio, task.completion_streak)
-        frontier_present = (task.frontier_cell is not None
-                            and frontier_present_near(
-                                self.grid, task.frontier_cell,
-                                2.0 * self.grid.resolution))
+        tracked_frontier = (task.frontier_cluster_cells
+                            or ({task.frontier_cell}
+                                if task.frontier_cell is not None else set()))
+        frontier_present = bool(
+            tracked_frontier and frontier_cluster_present(
+                self.grid, tracked_frontier,
+                max(self.viewpoint_standoff, 2.0 * self.grid.resolution)))
         task.frontier_missing_streak = (
             0 if frontier_present else task.frontier_missing_streak + 1)
         if task.completion_streak >= self.observation_done_updates:
             task.completion_reason = "visible_information_resolved"
-        elif task.frontier_missing_streak >= self.observation_done_updates:
+        elif (task.frontier_missing_streak >= self.observation_done_updates
+              and task.progress >= self.observation_prepare_ratio):
             task.completion_reason = "frontier_closed"
+        else:
+            task.completion_reason = "none"
         return task
 
     def observation_complete(self, task: Optional[ObservationTask]) -> bool:
         """Complete on positive information or confirmed boundary closure."""
         return bool(task is not None and (
             task.completion_streak >= self.observation_done_updates
-            or task.frontier_missing_streak >= self.observation_done_updates))
+            or (task.frontier_missing_streak >= self.observation_done_updates
+                and task.progress >= self.observation_prepare_ratio)))
+
+    def record_observation_completion(self, task: Optional[ObservationTask]):
+        """Freeze completion evidence before the next task replaces it."""
+        if task is None:
+            self.last_observation_completion_reason = "none"
+            self.last_observation_completion_progress = 0.0
+            return
+        self.last_observation_completion_reason = task.completion_reason
+        self.last_observation_completion_progress = task.progress
 
     def prepare_next_observation(self, force: bool = False) -> bool:
         """Select the next information objective without publishing its path."""
@@ -782,7 +803,8 @@ class FrontierExplorer(Node):
             candidate.cluster_size, path_turn_cost(path), target_cells,
             sparse_route=candidate.sparse_route,
             terminal_cells=candidate.terminal_cells,
-            terminal_clearance=candidate.terminal_clearance)
+            terminal_clearance=candidate.terminal_clearance,
+            frontier_cluster_cells=set(candidate.frontier_cluster_cells))
         self.prepared_candidate = None
         if (allow_commitment_transfer
                 and self.active_region_id is not None
@@ -995,6 +1017,7 @@ class FrontierExplorer(Node):
 
     def finish_active_observation(self, status: str):
         """Finish an information objective independently of pose arrival."""
+        self.record_observation_completion(self.active_observation)
         if self.active_goal is not None and not self.is_blacklisted(self.active_goal):
             self.completed_goals.append(self.active_goal)
         self.observations_satisfied += 1
@@ -1043,6 +1066,7 @@ class FrontierExplorer(Node):
             return False
         self.last_handoff_attempt_update = self.map_update_count
         previous_goal = self.active_goal
+        completed_task = self.active_observation
 
         switched = self.activate_or_prepare_next_observation(
             allow_commitment_transfer=True)
@@ -1053,6 +1077,7 @@ class FrontierExplorer(Node):
             if not self.is_blacklisted(previous_goal):
                 self.completed_goals.append(previous_goal)
             self.observations_satisfied += 1
+            self.record_observation_completion(completed_task)
             self.publish_status(status)
             return True
 
@@ -1572,7 +1597,8 @@ class FrontierExplorer(Node):
             path_turn_cost(path), observation_cells,
             sparse_route=candidate.sparse_route,
             terminal_cells=candidate.terminal_cells,
-            terminal_clearance=selected_clearance)
+            terminal_clearance=selected_clearance,
+            frontier_cluster_cells=set(candidate.frontier_cluster_cells))
 
     def build_frontier_candidates(self, start: Cell,
                                   regions: Sequence[FrontierRegion],
@@ -1627,7 +1653,8 @@ class FrontierExplorer(Node):
                             region.region_id, viewpoint, frontier, goal_xy,
                             unknown_gain, len(cluster), target_cells,
                             tuple(viewpoints),
-                            self.terminal_clearance(viewpoint, inflated)))
+                            self.terminal_clearance(viewpoint, inflated),
+                            set(cluster)))
 
         proposal_cells = list(dict.fromkeys(proposal[1] for proposal in proposals))
         sparse_started = time.perf_counter()
@@ -1665,7 +1692,7 @@ class FrontierExplorer(Node):
         records = []
         for (region_id, viewpoint, frontier, goal_xy,
              unknown_gain, cluster_size, target_cells, terminal_cells,
-             terminal_clearance) in proposals:
+             terminal_clearance, frontier_cluster_cells) in proposals:
             estimate = estimate_by_cell.get(viewpoint)
             if estimate is None:
                 path = tree.path_to(viewpoint)
@@ -1702,7 +1729,8 @@ class FrontierExplorer(Node):
                 region_id, viewpoint, frontier, goal_xy, path,
                 path_length, unknown_gain, cluster_size, turn_cost, target_cells,
                 sparse_route=estimate, terminal_cells=terminal_cells,
-                terminal_clearance=terminal_clearance))
+                terminal_clearance=terminal_clearance,
+                frontier_cluster_cells=frontier_cluster_cells))
         return records
 
     @staticmethod
@@ -2157,6 +2185,7 @@ class FrontierExplorer(Node):
             goal=goal_xy,
             target_cells=set(candidate.observation_cells),
             frontier_cell=candidate.frontier_cell,
+            frontier_cluster_cells=set(candidate.frontier_cluster_cells),
             terminal_cells=(candidate.terminal_cells
                             if candidate.terminal_cells else (candidate.cell,)))
         self.last_terminal_candidate_count = len(
@@ -2236,8 +2265,9 @@ class FrontierExplorer(Node):
                 self.active_observation.frontier_missing_streak
                 if self.active_observation else 0),
             "observation_completion_reason": (
-                self.active_observation.completion_reason
-                if self.active_observation else "none"),
+                self.last_observation_completion_reason),
+            "observation_completion_progress": (
+                self.last_observation_completion_progress),
             "next_observation_prepared": self.prepared_candidate is not None,
             "pipeline_latency_ewma_s": self.pipeline_latency_ewma,
             "map_updates": self.map_update_count,

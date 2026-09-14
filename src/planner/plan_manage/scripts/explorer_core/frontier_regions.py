@@ -123,7 +123,7 @@ def observation_progress(grid: ExplorationGrid,
 
 def frontier_present_near(grid: ExplorationGrid, center: Cell,
                           radius: float) -> bool:
-    """Return whether the task's original information boundary still exists."""
+    """Return whether an information boundary still exists near one cell."""
     radius_cells = max(1, int(math.ceil(radius / grid.resolution)))
     for dx in range(-radius_cells, radius_cells + 1):
         for dy in range(-radius_cells, radius_cells + 1):
@@ -138,6 +138,19 @@ def frontier_present_near(grid: ExplorationGrid, center: Cell,
                    for item in neighbours):
                 return True
     return False
+
+
+def frontier_cluster_present(grid: ExplorationGrid,
+                             original_cells: Set[Cell],
+                             radius: float) -> bool:
+    """Track a frozen Frontier cluster despite small boundary motion.
+
+    Frontier cells are observations of a moving free/unknown boundary, not
+    persistent landmarks.  Treat the task boundary as present while any part
+    of the original connected cluster still has a nearby Frontier.
+    """
+    return any(frontier_present_near(grid, cell, radius)
+               for cell in original_cells)
 
 
 def advance_completion_streak(progress: float, done_ratio: float,
