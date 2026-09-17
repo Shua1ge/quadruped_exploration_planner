@@ -58,6 +58,7 @@ install(PROGRAMS
   scripts/global_astar_planner.py
   scripts/frontier_explorer.py
   scripts/global_representation_node.py
+  scripts/sdf_map_publisher.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}
@@ -76,6 +77,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_safe_region_graph test/test_safe_region_graph.py)
   ament_add_pytest_test(test_portal_connectivity test/test_portal_connectivity.py)
   ament_add_pytest_test(test_tunnel_grid_third_slice test/test_tunnel_grid_third_slice.py)
+  ament_add_pytest_test(test_sdf_world_geometry test/test_sdf_world_geometry.py)
   ament_add_gtest(test_replan_fsm_utils test/test_replan_fsm_utils.cpp)
   if(TARGET test_replan_fsm_utils)
     target_include_directories(test_replan_fsm_utils PRIVATE include)

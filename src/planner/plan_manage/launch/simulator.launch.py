@@ -18,11 +18,13 @@ def _setup(context):
         return []
 
     use_pcd_map = _as_bool(LaunchConfiguration("use_pcd_map").perform(context))
+    use_sdf_map = _as_bool(LaunchConfiguration("use_sdf_map").perform(context))
     use_gpu = _as_bool(LaunchConfiguration("use_gpu").perform(context))
     use_sim_time = _as_bool(LaunchConfiguration("use_sim_time").perform(context))
     collision_check_enable = int(
         _as_bool(LaunchConfiguration("collision_check_enable").perform(context)))
     pcd_map_file = LaunchConfiguration("pcd_map_file").perform(context)
+    sdf_world_file = LaunchConfiguration("sdf_world_file").perform(context)
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     map_x = float(LaunchConfiguration("map_size_x").perform(context))
     map_y = float(LaunchConfiguration("map_size_y").perform(context))
@@ -33,12 +35,35 @@ def _setup(context):
         raise RuntimeError(
             "use_pcd_map=true requires pcd_map_file to reference an existing PCD file"
         )
+    if use_pcd_map and use_sdf_map:
+        raise RuntimeError("use_pcd_map and use_sdf_map are mutually exclusive")
+    if use_sdf_map and (not sdf_world_file or not os.path.isfile(sdf_world_file)):
+        raise RuntimeError(
+            "use_sdf_map=true requires sdf_world_file to reference an existing SDF file"
+        )
 
     scan_share = get_package_share_directory("scan_planner")
     simulator_yaml = os.path.join(scan_share, "config", "simulator.yaml")
     nodes = []
 
-    if use_pcd_map:
+    if use_sdf_map:
+        nodes.append(
+            Node(
+                package="scan_planner",
+                executable="sdf_map_publisher.py",
+                name="sdf_map_pub",
+                output="screen",
+                parameters=[{
+                    "use_sim_time": use_sim_time,
+                    "world_file": sdf_world_file,
+                    "frame_id": "world",
+                    "mode": LaunchConfiguration("sdf_map_mode"),
+                    "resolution": LaunchConfiguration("sdf_sample_resolution"),
+                    "recenter": LaunchConfiguration("sdf_recenter"),
+                }],
+            )
+        )
+    elif use_pcd_map:
         nodes.append(
             Node(
                 package="map_generator",
@@ -138,6 +163,11 @@ def generate_launch_description():
             DeclareLaunchArgument("use_gpu", default_value="false"),
             DeclareLaunchArgument("use_pcd_map", default_value="false"),
             DeclareLaunchArgument("pcd_map_file", default_value=""),
+            DeclareLaunchArgument("use_sdf_map", default_value="false"),
+            DeclareLaunchArgument("sdf_world_file", default_value=""),
+            DeclareLaunchArgument("sdf_map_mode", default_value="planar"),
+            DeclareLaunchArgument("sdf_sample_resolution", default_value="0.20"),
+            DeclareLaunchArgument("sdf_recenter", default_value="true"),
             DeclareLaunchArgument("map_size_x", default_value="40.0"),
             DeclareLaunchArgument("map_size_y", default_value="40.0"),
             DeclareLaunchArgument("map_size_z", default_value="5.0"),
