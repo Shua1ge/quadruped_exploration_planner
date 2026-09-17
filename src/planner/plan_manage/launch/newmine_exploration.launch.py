@@ -50,7 +50,10 @@ def generate_launch_description():
                 "use_pcd_map": "false",
                 "use_sdf_map": "true",
                 "sdf_world_file": LaunchConfiguration("world_file"),
-                "sdf_map_mode": "planar",
+                # Preserve the cave roof, ramps, and overhangs in 3-D.  A
+                # planar projection turns curved roof triangles into vertical
+                # columns and can falsely seal the staging-area entrance.
+                "sdf_map_mode": "surface",
                 "sdf_sample_resolution": LaunchConfiguration(
                     "sdf_sample_resolution"),
                 "sdf_recenter": "true",

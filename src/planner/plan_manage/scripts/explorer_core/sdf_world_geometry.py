@@ -258,7 +258,7 @@ def load_sdf_world(path: Path, spacing: float = 0.2, mode: str = "planar",
     translation = (-0.5 * (minimum[0] + maximum[0]),
                    -0.5 * (minimum[1] + maximum[1]), 0.0) if recenter else (0.0, 0.0, 0.0)
     precision = max(3, int(math.ceil(-math.log10(spacing))) + 1)
-    sampled = set()
+    sampled_voxels = set()
     occupied_xy = set()
     slope_limit = math.cos(math.radians(max_slope_degrees))
     planar = mode == "planar"
@@ -271,23 +271,35 @@ def load_sdf_world(path: Path, spacing: float = 0.2, mode: str = "planar",
                 occupied_xy.add((round((x + translation[0]) / spacing),
                                  round((y + translation[1]) / spacing)))
             else:
-                sampled.add((round(x + translation[0], precision),
-                             round(y + translation[1], precision),
-                             round(z + translation[2], precision)))
+                sampled_voxels.add((
+                    round((x + translation[0]) / spacing),
+                    round((y + translation[1]) / spacing),
+                    round((z + translation[2]) / spacing)))
     for size, matrix in boxes:
         for x, y, z in _sample_box(size, matrix, spacing, planar):
             if planar:
                 occupied_xy.add((round((x + translation[0]) / spacing),
                                  round((y + translation[1]) / spacing)))
             else:
-                sampled.add((round(x + translation[0], precision),
-                             round(y + translation[1], precision),
-                             round(z + translation[2], precision)))
+                sampled_voxels.add((
+                    round((x + translation[0]) / spacing),
+                    round((y + translation[1]) / spacing),
+                    round((z + translation[2]) / spacing)))
     if planar:
         levels = max(1, int(math.ceil(obstacle_height / vertical_spacing)))
         sampled = {
             (round(ix * spacing, precision), round(iy * spacing, precision),
              round(obstacle_height * level / levels, precision))
             for ix, iy in occupied_xy for level in range(levels + 1)}
+    else:
+        # COLLADA meshes repeat vertices across neighbouring triangles.
+        # Quantize the sampled surface onto the requested 3-D resolution so
+        # cave roofs, ramps, and overhangs keep their real height without
+        # retaining millions of almost-identical truth-map points.
+        sampled = {
+            (round(ix * spacing, precision),
+             round(iy * spacing, precision),
+             round(iz * spacing, precision))
+            for ix, iy, iz in sampled_voxels}
     return WorldPointCloud(sorted(sampled), (minimum, maximum), translation,
                            len(triangles), len(boxes))

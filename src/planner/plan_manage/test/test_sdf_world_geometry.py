@@ -44,3 +44,8 @@ def test_sdf_loader_applies_collada_units_poses_boxes_and_recentering(tmp_path):
     assert cloud.source_bounds[1] == pytest.approx((13.0, 21.0, 2.0))
     assert cloud.translation == pytest.approx((-11.5, -20.0, 0.0))
     assert cloud.points
+    assert len(cloud.points) == len(set(cloud.points))
+    assert all(
+        abs(coordinate / 0.5 - round(coordinate / 0.5)) < 1.0e-8
+        for point in cloud.points for coordinate in point)
+    assert len({point[2] for point in cloud.points}) > 1
