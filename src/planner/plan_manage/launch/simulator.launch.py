@@ -50,16 +50,23 @@ def _setup(context):
         nodes.append(
             Node(
                 package="scan_planner",
-                executable="sdf_map_publisher.py",
-                name="sdf_map_pub",
+                executable="sdf_lidar_simulator.py",
+                name="sdf_lidar_simulator",
                 output="screen",
                 parameters=[{
                     "use_sim_time": use_sim_time,
                     "world_file": sdf_world_file,
                     "frame_id": "world",
-                    "mode": LaunchConfiguration("sdf_map_mode"),
                     "resolution": LaunchConfiguration("sdf_sample_resolution"),
                     "recenter": LaunchConfiguration("sdf_recenter"),
+                    "max_range": 7.5,
+                    "horizontal_rays": 720,
+                    # Until a terrain mapper consumes ground returns, publish
+                    # the horizontal obstacle scan expected by SCAN.
+                    "vertical_layers": 1,
+                    "vertical_fov_degrees": 0.0,
+                    "sensing_rate": 10.0,
+                    "collision_check_enable": bool(collision_check_enable),
                 }],
             )
         )
@@ -102,8 +109,8 @@ def _setup(context):
             )
         )
 
-    nodes.extend(
-        [
+    if not use_sdf_map:
+        nodes.append(
             Node(
                 package="local_sensing_node",
                 executable="opengl_render_node" if use_gpu else "pcl_render_node",
@@ -133,7 +140,9 @@ def _setup(context):
                     ("dyn_cloud", "/quad_0/dyn_cloud"),
                     ("uav_cloud", "/quad_0/uav_cloud"),
                 ],
-            ),
+            )
+        )
+    nodes.append(
             Node(
                 package="odom_visualization",
                 executable="odom_visualization",
@@ -149,8 +158,7 @@ def _setup(context):
                     ("robot", "/quad_0/robot"),
                     ("height", "/quad_0/height"),
                 ],
-            ),
-        ]
+            )
     )
     return nodes
 

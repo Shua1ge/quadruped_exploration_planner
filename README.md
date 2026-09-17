@@ -95,9 +95,10 @@ ros2 launch scan_planner newmine_exploration.launch.py \
 ```
 
 `newmine_exploration.launch.py` 默认将约 150 m × 150 m 的 NewMine 几何居中到
-160 m × 160 m Explorer 栅格，并保留洞顶、坡道和悬垂结构的三维 collision
-surface，不生成或维护额外的 PCD 文件。首次启动需要约十几秒解析和采样完整
-collision mesh；日志出现 `SDF map ready` 后才开始收到点云。
+160 m × 160 m Explorer 栅格。专用 LiDAR 节点直接读取 SDF/DAE collision mesh，
+只发布机器人当前位置的射线命中，不生成 PCD，也不发布全局真值点云或启动
+Gazebo。首次启动需要约十几秒建立私有三维射线加速结构；日志出现
+`SDF mesh ready` 后才开始收到局部扫描。
 
 实际硬件部署时，激光惯导里程计（LIO）、相机和宇树（Unitree）驱动均为外部依赖，默认启动会将规划器输入映射到 `/LIO/odom_vehicle`、`/LIO/odom_imu`、`/LIO/clouds_lidar` 话题以及 RealSense 对齐深度图话题，可根据实际安装的驱动栈修改话题重映射配置。
 

@@ -59,6 +59,7 @@ install(PROGRAMS
   scripts/frontier_explorer.py
   scripts/global_representation_node.py
   scripts/sdf_map_publisher.py
+  scripts/sdf_lidar_simulator.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}

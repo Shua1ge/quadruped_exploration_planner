@@ -1,9 +1,4 @@
-"""Long-horizon exploration of NewMine without running Gazebo.
-
-The SDF collision geometry is sampled in memory by sdf_map_publisher; no PCD
-asset is generated or maintained.  The published map is recentered so the
-fixed-origin Explorer grid remains compact.
-"""
+"""Long-horizon exploration with LiDAR ray casting directly from NewMine SDF."""
 
 import os
 
@@ -50,10 +45,6 @@ def generate_launch_description():
                 "use_pcd_map": "false",
                 "use_sdf_map": "true",
                 "sdf_world_file": LaunchConfiguration("world_file"),
-                # Preserve the cave roof, ramps, and overhangs in 3-D.  A
-                # planar projection turns curved roof triangles into vertical
-                # columns and can falsely seal the staging-area entrance.
-                "sdf_map_mode": "surface",
                 "sdf_sample_resolution": LaunchConfiguration(
                     "sdf_sample_resolution"),
                 "sdf_recenter": "true",
