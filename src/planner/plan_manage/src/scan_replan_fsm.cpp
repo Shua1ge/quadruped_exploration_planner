@@ -32,6 +32,8 @@ namespace scan_planner
     need_hover_stop_ = false;
     emergency_path_pending_ = false;
     tracking_recovery_active_ = false;
+    heading_stall_handled_ = false;
+    heading_freeze_recoveries_ = 0;
     collision_segment_pending_ = false;
     replan_fail_count_ = 0;
     last_freeze_update_time_ = node_->now();
@@ -52,6 +54,10 @@ namespace scan_planner
     if (rolling_replan_max_start_error_ <= 0.0)
       throw std::runtime_error("fsm.rolling_replan_max_start_error must be positive");
     goal_tolerance_ = load_parameter<double>(node_, "fsm.goal_tolerance", 0.25);
+    heading_freeze_max_recoveries_ = load_parameter<int>(
+        node_, "fsm.heading_freeze_max_recoveries", 2);
+    if (heading_freeze_max_recoveries_ < 1)
+      throw std::runtime_error("fsm.heading_freeze_max_recoveries must be at least 1");
     enable_fail_safe_ = load_parameter<bool>(node_, "fsm.fail_safe", true);
     max_replan_fail_count_ = load_parameter<int>(node_, "fsm.max_replan_fail_count", 5);
     self_inflation_z_up_ = load_parameter<double>(node_, "grid_map.obstacles_inflation_z_up", 0.0);
@@ -78,6 +84,10 @@ namespace scan_planner
     /* initialize main modules */
     planning_callback_group_ = node_->create_callback_group(
         rclcpp::CallbackGroupType::MutuallyExclusive);
+    odom_callback_group_ = node_->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    control_feedback_callback_group_ = node_->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
     map_callback_group_ = node_->create_callback_group(
         rclcpp::CallbackGroupType::MutuallyExclusive);
     map_visualization_callback_group_ = node_->create_callback_group(
@@ -98,22 +108,33 @@ namespace scan_planner
     safety_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                              std::bind(&SCANReplanFSM::checkCollisionCallback, this),
                                              safety_callback_group_);
+    last_fsm_callback_wall_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+
     rclcpp::SubscriptionOptions planning_options;
     planning_options.callback_group = planning_callback_group_;
+    rclcpp::SubscriptionOptions odom_options;
+    odom_options.callback_group = odom_callback_group_;
     odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
         "body_pose", rclcpp::SensorDataQoS(),
-        std::bind(&SCANReplanFSM::odometryCallback, this, std::placeholders::_1),
-        planning_options);
+        std::bind(&SCANReplanFSM::safetyOdometryCallback, this, std::placeholders::_1),
+        odom_options);
     rclcpp::SubscriptionOptions safety_options;
     safety_options.callback_group = safety_callback_group_;
-    safety_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-        "body_pose", rclcpp::SensorDataQoS(),
-        std::bind(&SCANReplanFSM::safetyOdometryCallback, this, std::placeholders::_1),
-        safety_options);
-    go2_execution_frozen_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
-        "planning/go2_execution_frozen", 10,
-        std::bind(&SCANReplanFSM::go2ExecutionFrozenCallback, this, std::placeholders::_1),
-        safety_options);
+    rclcpp::SubscriptionOptions control_feedback_options;
+    control_feedback_options.callback_group = control_feedback_callback_group_;
+    execution_state_sub_ = node_->create_subscription<scan_planner_msgs::msg::ExecutionState>(
+        "planning/execution_state", rclcpp::QoS(20).reliable(),
+        std::bind(&SCANReplanFSM::executionStateCallback, this, std::placeholders::_1),
+        control_feedback_options);
+    go2_heading_stalled_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
+        "planning/go2_heading_stalled", 10,
+        std::bind(&SCANReplanFSM::go2HeadingStalledCallback, this, std::placeholders::_1),
+        control_feedback_options);
+    go2_heading_error_sub_ = node_->create_subscription<std_msgs::msg::Float64>(
+        "planning/go2_heading_error", 10,
+        std::bind(&SCANReplanFSM::go2HeadingErrorCallback, this, std::placeholders::_1),
+        control_feedback_options);
 
     bspline_pub_ = node_->create_publisher<scan_planner_msgs::msg::Bspline>("planning/bspline", 10);
     data_disp_pub_ = node_->create_publisher<scan_planner_msgs::msg::DataDisp>("planning/data_display", 100);
@@ -121,7 +142,8 @@ namespace scan_planner
         "self_inflation", rclcpp::QoS(1).reliable().transient_local());
     blocked_segment_pub_ = node_->create_publisher<nav_msgs::msg::Path>(
         "planning/blocked_segment", 10);
-    emergency_stop_pub_ = node_->create_publisher<std_msgs::msg::Bool>("planning/emergency_stop", 10);
+    execution_command_pub_ = node_->create_publisher<scan_planner_msgs::msg::ExecutionCommand>(
+        "planning/execution_command", rclcpp::QoS(20).reliable());
     status_pub_ = node_->create_publisher<std_msgs::msg::String>("planning/status", 10);
     publishStatus("IDLE");
 
@@ -470,7 +492,12 @@ namespace scan_planner
       return;
     }
     active_reference_request_id_.store(request_id);
+    completed_reference_request_id_.store(0);
+    last_wait_target_status_ns_.store(0);
     next_rolling_replan_attempt_ns_ = 0;
+    go2_heading_stalled_.store(false);
+    heading_stall_handled_ = false;
+    heading_freeze_recoveries_ = 0;
 
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
@@ -623,9 +650,46 @@ namespace scan_planner
     have_odom_ = true;
   }
 
-  void SCANReplanFSM::go2ExecutionFrozenCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
+  void SCANReplanFSM::executionStateCallback(
+      const scan_planner_msgs::msg::ExecutionState::ConstSharedPtr &msg)
   {
-    go2_execution_frozen_ = msg->data;
+    uint64_t executing_request = 0;
+    int64_t executing_trajectory = 0;
+    bool valid = false;
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      valid = execution_snapshot_.valid;
+      executing_request = execution_snapshot_.request_id;
+      executing_trajectory = execution_snapshot_.trajectory_id;
+    }
+    if (!valid || !executionStateMatchesExecution(
+            msg->request_id, msg->trajectory_id,
+            executing_request, executing_trajectory))
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "[STALE_EXECUTION_STATE_IGNORED] state_request=%llu state_trajectory=%lld executing_request=%llu executing_trajectory=%lld state=%u",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id),
+          static_cast<unsigned long long>(executing_request),
+          static_cast<long long>(executing_trajectory),
+          static_cast<unsigned int>(msg->state));
+      return;
+    }
+    go2_execution_frozen_.store(
+        msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN ||
+        msg->state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD ||
+        msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP);
+  }
+
+  void SCANReplanFSM::go2HeadingStalledCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
+  {
+    go2_heading_stalled_.store(msg->data);
+  }
+
+  void SCANReplanFSM::go2HeadingErrorCallback(const std_msgs::msg::Float64::ConstSharedPtr &msg)
+  {
+    go2_heading_error_.store(msg->data);
   }
 
   void SCANReplanFSM::publishStatus(const std::string &status)
@@ -677,11 +741,60 @@ namespace scan_planner
 
   void SCANReplanFSM::requestExecutionStop(const std::string &reason)
   {
-    std_msgs::msg::Bool msg;
-    msg.data = true;
-    emergency_stop_pub_->publish(msg);
+    scan_planner_msgs::msg::ExecutionCommand msg;
+    msg.command = scan_planner_msgs::msg::ExecutionCommand::COMMAND_HOLD;
+    msg.reason = reason;
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      if (execution_snapshot_.valid)
+      {
+        msg.request_id = execution_snapshot_.request_id;
+        msg.trajectory_id = execution_snapshot_.trajectory_id;
+      }
+      else
+      {
+        msg.request_id = active_reference_request_id_.load();
+        msg.trajectory_id = 0;
+      }
+    }
+    const int64_t now_ns = node_->now().nanoseconds();
+    bool publish_command = true;
+    {
+      std::lock_guard<std::mutex> lock(execution_command_mutex_);
+      const bool duplicate =
+          msg.request_id == last_execution_command_request_id_ &&
+          msg.trajectory_id == last_execution_command_trajectory_id_ &&
+          reason == last_execution_command_reason_ &&
+          now_ns - last_execution_command_time_ns_ < 500000000LL;
+      if (duplicate)
+        publish_command = false;
+      else
+      {
+        last_execution_command_request_id_ = msg.request_id;
+        last_execution_command_trajectory_id_ = msg.trajectory_id;
+        last_execution_command_reason_ = reason;
+        last_execution_command_time_ns_ = now_ns;
+      }
+    }
+    if (publish_command)
+    {
+      execution_command_pub_->publish(msg);
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[EXECUTION_COMMAND] command=HOLD request_id=%llu trajectory=%lld reason=%s",
+          static_cast<unsigned long long>(msg.request_id),
+          static_cast<long long>(msg.trajectory_id), reason.c_str());
+    }
     if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    {
+      if (reason == "REACHED")
+      {
+        completed_reference_request_id_.store(
+            active_reference_request_id_.load());
+        last_wait_target_status_ns_.store(0);
+      }
       publishReferenceStatus(reason);
+    }
     else
       publishStatus(reason);
   }
@@ -794,7 +907,30 @@ namespace scan_planner
 
   void SCANReplanFSM::execFSMCallback()
   {
+    last_fsm_callback_wall_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    fsm_callback_stall_reported_.store(false);
+    refreshPlanningOdomFromSafety();
+    if (have_odom_)
+    {
+      if (navi_mode_ == NAVI_MODE::MANUAL_TARGET && !rviz_height_ready_)
+      {
+        rviz_goal_height_ = odom_pos_(2);
+        rviz_height_ready_ = true;
+        RCLCPP_INFO(node_->get_logger(),
+                    "Set RViz goal height from initial body_pose z: %.3f",
+                    rviz_goal_height_);
+      }
+      publishSelfInflationMarker();
+      if (navi_mode_ == NAVI_MODE::PRESET_TARGET && !preset_started_)
+      {
+        preset_started_ = true;
+        planGlobalTrajbyGivenWps();
+      }
+    }
     updateLocalTrajTimeFreeze();
+    if (!go2_heading_stalled_.load())
+      heading_stall_handled_ = false;
 
     // A real-time veto is a latch, not a momentary warning.  The planning
     // group must not reuse the rejected reference path while the Explorer's
@@ -804,6 +940,40 @@ namespace scan_planner
       RCLCPP_INFO_THROTTLE(
           node_->get_logger(), *node_->get_clock(), 1000,
           "[SAFETY_LATCHED] waiting for a newly accepted goal/reference path");
+      return;
+    }
+
+    if (go2_heading_stalled_.load() && !heading_stall_handled_ &&
+        exec_state_ == EXEC_TRAJ && have_target_)
+    {
+      heading_stall_handled_ = true;
+      tracking_recovery_active_ = true;
+      heading_freeze_recoveries_++;
+      refreshPlanningOdomFromSafety();
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "[HEADING_FREEZE_RECOVERY] request_id=%llu attempt=%d/%d yaw_error=%.3frad; replanning from current odometry",
+          static_cast<unsigned long long>(active_reference_request_id_.load()),
+          heading_freeze_recoveries_, heading_freeze_max_recoveries_,
+          go2_heading_error_.load());
+
+      if (heading_freeze_recoveries_ <= heading_freeze_max_recoveries_)
+      {
+        next_rolling_replan_attempt_ns_ = 0;
+        changeFSMExecState(REPLAN_TRAJ, "HEADING_FREEZE_STALLED");
+      }
+      else
+      {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "[HEADING_FREEZE_ABORT] request_id=%llu recovery budget exhausted; returning BLOCKED to Explorer",
+                     static_cast<unsigned long long>(active_reference_request_id_.load()));
+        have_target_ = false;
+        reference_path_active_ = false;
+        reference_path_update_pending_ = false;
+        requestExecutionStop("BLOCKED");
+        tracking_recovery_active_ = false;
+        changeFSMExecState(WAIT_TARGET, "HEADING_FREEZE_ABORT");
+      }
       return;
     }
 
@@ -837,6 +1007,19 @@ namespace scan_planner
 
     case WAIT_TARGET:
     {
+      // REACHED is a one-shot event.  WAIT_TARGET is its durable state and is
+      // repeated at low rate so Explorer can recover a missed completion.
+      const uint64_t completed_id = completed_reference_request_id_.load();
+      if (!have_target_ && completed_id != 0)
+      {
+        const int64_t now_ns = node_->now().nanoseconds();
+        const int64_t previous_ns = last_wait_target_status_ns_.load();
+        if (previous_ns == 0 || now_ns - previous_ns >= 500000000LL)
+        {
+          last_wait_target_status_ns_.store(now_ns);
+          publishReferenceStatus("WAIT_TARGET", completed_id);
+        }
+      }
       if (!have_target_)
         return;
       else
@@ -1259,6 +1442,9 @@ namespace scan_planner
     execution_snapshot_.request_id = request_id;
     execution_snapshot_.trajectory_id = info.traj_id_;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
+    // Frozen is versioned feedback.  Never carry the previous trajectory's
+    // frozen bit across a handoff while waiting for the new state heartbeat.
+    go2_execution_frozen_.store(false);
   }
 
   void SCANReplanFSM::tripRealtimeSafety(
@@ -1430,6 +1616,17 @@ namespace scan_planner
 
   void SCANReplanFSM::checkCollisionCallback()
   {
+    const int64_t now_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t last_fsm_wall_ns = last_fsm_callback_wall_ns_.load();
+    const double fsm_gap = static_cast<double>(now_wall_ns - last_fsm_wall_ns) * 1e-9;
+    if (last_fsm_wall_ns > 0 && fsm_gap > 1.0 &&
+        !fsm_callback_stall_reported_.exchange(true))
+    {
+      RCLCPP_ERROR(node_->get_logger(),
+                   "[FSM_CALLBACK_STALLED] no FSM callback for %.2fs while safety callbacks remain alive",
+                   fsm_gap);
+    }
     checkCollisionRealtimeCallback();
   }
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)

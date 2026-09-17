@@ -65,3 +65,37 @@ def test_new_active_region_resets_previous_history():
 
     assert decision.committed
     assert decision.exhausted_streak == 1
+
+
+def test_option_exposes_initiation_duration_and_collected_reward():
+    gate = ResidualCommitmentGate(10, 3, 20)
+    gate.evaluate(("component", 4), 100, 50)
+    gate.evaluate(("component", 4), 104, 35)
+
+    state = gate.state
+
+    assert state.option_id == ("component", 4)
+    assert state.initiation_revision == 100
+    assert state.elapsed_revisions == 4
+    assert state.remaining_cells == 35
+    assert state.collected_cells == 15
+    assert state.phase == "ACTIVE"
+
+
+def test_option_terminates_only_after_persistent_bellman_advantage():
+    gate = ResidualCommitmentGate(10, 3, 20)
+    gate.evaluate(("component", 4), 100, 50)
+
+    assert gate.evaluate_opportunity(("component", 4), 101, 1.0, 1.5, 1.35) is None
+    assert gate.evaluate_opportunity(("component", 4), 102, 1.0, 1.5, 1.35) is None
+    assert gate.evaluate_opportunity(
+        ("component", 4), 103, 1.0, 1.5, 1.35) == "opportunity_dominated"
+
+
+def test_option_opportunity_decision_is_idempotent_per_revision():
+    gate = ResidualCommitmentGate(10, 2, 20)
+    gate.evaluate(4, 100, 50)
+
+    assert gate.evaluate_opportunity(4, 101, 1.0, 2.0, 1.35) is None
+    assert gate.evaluate_opportunity(4, 101, 1.0, 2.0, 1.35) is None
+    assert gate.state.opportunity_streak == 1

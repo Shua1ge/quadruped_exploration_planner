@@ -12,6 +12,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <vector>
 #include <visualization_msgs/msg/marker.hpp>
@@ -20,6 +21,8 @@
 #include <plan_env/grid_map.h>
 #include <scan_planner_msgs/msg/bspline.hpp>
 #include <scan_planner_msgs/msg/data_disp.hpp>
+#include <scan_planner_msgs/msg/execution_command.hpp>
+#include <scan_planner_msgs/msg/execution_state.hpp>
 #include <plan_manage/planner_manager.h>
 #include <plan_manage/replan_fsm_utils.h>
 #include <traj_utils/planning_visualization.h>
@@ -66,6 +69,7 @@ namespace scan_planner
     double rolling_replan_retry_period_;
     double rolling_replan_max_start_error_;
     double goal_tolerance_;
+    int heading_freeze_max_recoveries_{2};
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
@@ -77,6 +81,8 @@ namespace scan_planner
     bool preset_started_{false};
     bool rviz_height_ready_;
     std::atomic<bool> go2_execution_frozen_{false};
+    std::atomic<bool> go2_heading_stalled_{false};
+    std::atomic<double> go2_heading_error_{0.0};
     bool enable_fail_safe_, need_hover_stop_;
     FSM_EXEC_STATE exec_state_;
     int continuously_called_times_{0};
@@ -98,12 +104,16 @@ namespace scan_planner
     bool reference_path_active_{false};
     bool reference_path_update_pending_{false};
     std::atomic<uint64_t> active_reference_request_id_{0};
+    std::atomic<uint64_t> completed_reference_request_id_{0};
+    std::atomic<int64_t> last_wait_target_status_ns_{0};
     uint64_t pending_reference_request_id_{0};
     int current_wp_;
 
     bool flag_escape_emergency_;
     bool emergency_path_pending_{false};
     bool tracking_recovery_active_{false};
+    bool heading_stall_handled_{false};
+    int heading_freeze_recoveries_{0};
     bool collision_segment_pending_{false};
     Eigen::Vector3d last_collision_free_pos_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d first_collision_pos_{Eigen::Vector3d::Zero()};
@@ -119,6 +129,11 @@ namespace scan_planner
     };
     std::mutex execution_snapshot_mutex_;
     ExecutionTrajectorySnapshot execution_snapshot_;
+    std::mutex execution_command_mutex_;
+    uint64_t last_execution_command_request_id_{0};
+    int64_t last_execution_command_trajectory_id_{0};
+    int64_t last_execution_command_time_ns_{0};
+    std::string last_execution_command_reason_;
     std::mutex safety_odom_mutex_;
     Eigen::Vector3d safety_odom_pos_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d safety_odom_vel_{Eigen::Vector3d::Zero()};
@@ -126,25 +141,30 @@ namespace scan_planner
     bool safety_have_odom_{false};
     std::atomic<bool> safety_stop_active_{false};
     std::atomic<uint64_t> safety_generation_{0};
+    std::atomic<int64_t> last_fsm_callback_wall_ns_{0};
+    std::atomic<bool> fsm_callback_stall_reported_{false};
     std::chrono::steady_clock::time_point last_safety_callback_wall_{};
 
     /* ROS utils */
     rclcpp::Node *node_{nullptr};
     rclcpp::CallbackGroup::SharedPtr planning_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr odom_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr control_feedback_callback_group_;
     rclcpp::CallbackGroup::SharedPtr map_callback_group_;
     rclcpp::CallbackGroup::SharedPtr map_visualization_callback_group_;
     rclcpp::CallbackGroup::SharedPtr safety_callback_group_;
     rclcpp::TimerBase::SharedPtr exec_timer_, safety_timer_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr safety_odom_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr go2_execution_frozen_sub_;
+    rclcpp::Subscription<scan_planner_msgs::msg::ExecutionState>::SharedPtr execution_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr go2_heading_stalled_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr go2_heading_error_sub_;
     rclcpp::Publisher<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_pub_;
     rclcpp::Publisher<scan_planner_msgs::msg::DataDisp>::SharedPtr data_disp_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr self_inflation_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr blocked_segment_pub_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
+    rclcpp::Publisher<scan_planner_msgs::msg::ExecutionCommand>::SharedPtr execution_command_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
 
     /* helper functions */
@@ -193,7 +213,10 @@ namespace scan_planner
     void pathCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg);
     void odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
     void safetyOdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
-    void go2ExecutionFrozenCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
+    void executionStateCallback(
+        const scan_planner_msgs::msg::ExecutionState::ConstSharedPtr &msg);
+    void go2HeadingStalledCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
+    void go2HeadingErrorCallback(const std_msgs::msg::Float64::ConstSharedPtr &msg);
 
     bool checkCollision();
 

@@ -13,10 +13,10 @@ int main(int argc, char **argv)
   {
     scan_planner::SCANReplanFSM planner;
     planner.init(node.get());
-    // Planning, map fusion, map visualization and trajectory safety use
+    // Planning, odometry, control feedback, map work and trajectory safety use
     // separate callback groups.  Visualization must never starve sensor fusion.
     rclcpp::executors::MultiThreadedExecutor executor(
-        rclcpp::ExecutorOptions(), 4);
+        rclcpp::ExecutorOptions(), 6);
     executor.add_node(node);
     executor.spin();
   }

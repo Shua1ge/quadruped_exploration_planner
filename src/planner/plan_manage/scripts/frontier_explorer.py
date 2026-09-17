@@ -28,7 +28,8 @@ from explorer_core.frontier_regions import (
     observation_target_cells, frontier_cluster_present,
     partition_frontier_clusters,
     partition_frontier_clusters_by_topology, retain_region_commitment,
-    region_information_efficiency, safe_viewpoint_cells, select_rolling_region,
+    region_commitment_scope, region_information_efficiency,
+    safe_viewpoint_cells, select_rolling_region,
     solve_open_held_karp, update_region_commitment,
 )
 from explorer_core.grid import (
@@ -42,6 +43,7 @@ from explorer_core.path_planning import (
     segment_known_free, simplify_known_path, splice_prepared_path,
     validate_remaining_path,
 )
+from explorer_core.portal_connectivity import SafeRegionConnectivity
 from explorer_core.replan_control import ReplanContext, ReplanGate
 from explorer_core.region_commitment import ResidualCommitmentGate
 from explorer_core.sparse_routing import (
@@ -50,7 +52,7 @@ from explorer_core.sparse_routing import (
 
 
 REFERENCE_SCOPED_STATUSES = {
-    "PATH_ACCEPTED", "PATH_TRAJECTORY_READY", "REACHED", "BLOCKED",
+    "PATH_ACCEPTED", "PATH_TRAJECTORY_READY", "REACHED", "WAIT_TARGET", "BLOCKED",
     "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH",
 }
 
@@ -92,6 +94,14 @@ def planning_status_matches_request(
     return expected is not None and request_generation == expected
 
 
+def completion_status_is_new(status: str, request_generation: Optional[int],
+                             last_completed: Optional[int]) -> bool:
+    """Deduplicate the REACHED event and its repeated WAIT_TARGET state."""
+    return (status in ("REACHED", "WAIT_TARGET")
+            and request_generation is not None
+            and request_generation != last_completed)
+
+
 @dataclass
 class FrontierCandidate:
     region_id: int
@@ -108,6 +118,9 @@ class FrontierCandidate:
     terminal_cells: Tuple[Cell, ...] = ()
     terminal_clearance: float = 0.0
     frontier_cluster_cells: Set[Cell] = field(default_factory=set)
+    connectivity_gain: int = 0
+    provisional_portal: Optional[Tuple[int, int]] = None
+    commitment_scope: Optional[Tuple[str, int]] = None
 
 
 @dataclass
@@ -226,6 +239,14 @@ class FrontierExplorer(Node):
             self.declare_parameter("observation_done_ratio", 0.80).value)
         self.observation_done_updates = int(
             self.declare_parameter("observation_done_updates", 3).value)
+        # How many consecutive map updates the tracked frontier must stay absent
+        # before its disappearance counts as a confirmed closure.  Deliberately
+        # longer than observation_done_updates: this signal replaces the old
+        # "progress >= observation_prepare_ratio" floor, which could never be
+        # reached when part of the frozen target set was structurally
+        # unobservable, and deadlocked the task while SCAN held the robot.
+        self.observation_closure_updates = int(
+            self.declare_parameter("observation_closure_updates", 10).value)
         self.min_expected_observation_cells = int(
             self.declare_parameter("min_expected_observation_cells", 8).value)
         self.max_replans_per_context = int(
@@ -258,6 +279,8 @@ class FrontierExplorer(Node):
                 "observation ratios must satisfy 0 <= prepare < done <= 1")
         if self.observation_done_updates < 1:
             raise ValueError("observation_done_updates must be at least one")
+        if self.observation_closure_updates < 1:
+            raise ValueError("observation_closure_updates must be at least one")
 
         self.position: Optional[Point2] = None
         self.body_z = 0.3
@@ -270,6 +293,13 @@ class FrontierExplorer(Node):
         self.scan_blocked_count = 0
         self.scan_reference_rejected_count = 0
         self.goal_timeout_count = 0
+        # Tasks whose motion was released on arrival without the information
+        # criterion being met.  Counted separately so the "arrival-triggered"
+        # and "information-gated" termination strategies can be compared on the
+        # same run: a high count with little revisit growth favours arrival.
+        self.observation_motion_released_count = 0
+        self.last_observation_released_reason = "none"
+        self.last_observation_released_progress = 0.0
         self.no_active_goal_replan_count = 0
         self.last_active_goal_clear_reason = "startup"
         self.active_goal: Optional[Point2] = None
@@ -283,6 +313,7 @@ class FrontierExplorer(Node):
         self.region_anchor_cells: Dict[int, Cell] = {}
         self.sparse_router = SparseRouteGraph(
             bucket_size=max(self.grid.resolution, 1.0))
+        self.safe_region_connectivity = SafeRegionConnectivity()
         self.region_edge_cache_hits = 0
         self.region_edge_cache_misses = 0
         self.replacement_pending = False
@@ -293,6 +324,11 @@ class FrontierExplorer(Node):
         self.last_path_request_generation = 0
         self.pending_path_request_generation: Optional[int] = None
         self.active_path_request_generation: Optional[int] = None
+        self.last_completed_request_generation: Optional[int] = None
+        self.scan_waiting_for_target = False
+        self.pending_local_execution_finish = None
+        self.local_execution_finish_events = 0
+        self.local_execution_finish_reroutes = 0
         self.global_reroute_failure_streak = 0
         self.active_since_ns = 0
         self.blacklist: List[Point2] = []
@@ -307,10 +343,12 @@ class FrontierExplorer(Node):
         self.region_sequence: List[int] = []
         self.region_prediction_input_signature = None
         self.active_region_id: Optional[int] = None
+        self.active_commitment_scope: Optional[Tuple[str, int]] = None
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since: Optional[float] = None
         self.last_region_release_evaluation_update = -1
         self.last_selected_region_id: Optional[int] = None
+        self.last_selected_commitment_scope: Optional[Tuple[str, int]] = None
         self.region_commitment_gate = ResidualCommitmentGate(
             self.region_min_remaining_cells,
             self.region_exhausted_revisions,
@@ -392,6 +430,9 @@ class FrontierExplorer(Node):
         self.create_subscription(Odometry, "body_pose", self.odom_callback, 10)
         self.create_subscription(String, "planning/status", self.planning_status_callback, 10)
         self.create_subscription(
+            String, "planning/local_execution_event",
+            self.local_execution_event_callback, 10)
+        self.create_subscription(
             Path, "planning/blocked_segment", self.blocked_segment_callback, 10)
         self.create_subscription(Bool, "simulation/collision", self.collision_callback, 10)
         self.create_subscription(Bool, "explorer/enabled", self.enabled_callback, 10)
@@ -405,6 +446,9 @@ class FrontierExplorer(Node):
         self.create_subscription(
             TopoGraphDelta, "global_representation/topology_snapshot",
             self.topology_snapshot_callback, transient_qos)
+        self.create_subscription(
+            String, "global_representation/safe_region_snapshot",
+            self.safe_region_snapshot_callback, transient_qos)
         self.path_pub = self.create_publisher(Path, "initial_path", 10)
         self.path_vis_pub = self.create_publisher(Path, "explorer/path", transient_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, "explorer/map", transient_qos)
@@ -430,6 +474,12 @@ class FrontierExplorer(Node):
         msg = String()
         msg.data = value
         self.status_pub.publish(msg)
+
+    def safe_region_snapshot_callback(self, msg: String):
+        if not self.safe_region_connectivity.update_json(msg.data):
+            self.get_logger().warning(
+                "Rejected malformed or stale safe-region snapshot",
+                throttle_duration_sec=2.0)
 
     @staticmethod
     def sparse_node_from_message(message) -> SparseNode:
@@ -660,8 +710,11 @@ class FrontierExplorer(Node):
             0 if frontier_present else task.frontier_missing_streak + 1)
         if task.completion_streak >= self.observation_done_updates:
             task.completion_reason = "visible_information_resolved"
-        elif (task.frontier_missing_streak >= self.observation_done_updates
-              and task.progress >= self.observation_prepare_ratio):
+        elif task.frontier_missing_streak >= self.observation_closure_updates:
+            # The purpose signal alone, with no progress floor.  The task was
+            # created to resolve this frontier cluster; if it has been absent
+            # for a long confirmed run, the objective is met whether or not
+            # every neighbouring unknown cell became observable.
             task.completion_reason = "frontier_closed"
         else:
             task.completion_reason = "none"
@@ -671,8 +724,7 @@ class FrontierExplorer(Node):
         """Complete on positive information or confirmed boundary closure."""
         return bool(task is not None and (
             task.completion_streak >= self.observation_done_updates
-            or (task.frontier_missing_streak >= self.observation_done_updates
-                and task.progress >= self.observation_prepare_ratio)))
+            or task.frontier_missing_streak >= self.observation_closure_updates))
 
     def record_observation_completion(self, task: Optional[ObservationTask]):
         """Freeze completion evidence before the next task replaces it."""
@@ -732,8 +784,11 @@ class FrontierExplorer(Node):
     def activate_or_prepare_next_observation(
             self, allow_commitment_transfer: bool = False) -> bool:
         """Activate a standby route, preparing one immediately if necessary."""
+        had_standby = getattr(self, "prepared_candidate", None) is not None
         if self.activate_prepared_observation(allow_commitment_transfer):
             return True
+        if had_standby and self.prepared_candidate is not None:
+            return False
         if not self.prepare_next_observation(force=True):
             return False
         return self.activate_prepared_observation(allow_commitment_transfer)
@@ -744,16 +799,20 @@ class FrontierExplorer(Node):
         candidate = self.prepared_candidate
         if self.position is None or candidate is None:
             return False
-        if (self.active_region_id is not None
-                and candidate.region_id != self.active_region_id
-                and self.commitment_state == "COMMITTED"
-                and not allow_commitment_transfer):
+        candidate_scope = (candidate.commitment_scope
+                           or ("region", candidate.region_id))
+        active_scope = getattr(self, "active_commitment_scope", None)
+        cross_scope = (active_scope is not None
+                       and candidate_scope != active_scope)
+        if cross_scope and self.commitment_state == "COMMITTED":
             # A standby route is speculative while the old task is running.
             # A completed-task handoff may transfer commitment, but only after
             # this method has validated and spliced the replacement route.
             self.get_logger().info(
                 f"[PREPARED_HANDOFF_DEFERRED] prepared_region="
-                f"{candidate.region_id} committed_region={self.active_region_id}",
+                f"{candidate.region_id} committed_region={self.active_region_id} "
+                f"prepared_scope={candidate_scope} "
+                f"committed_scope={active_scope}",
                 throttle_duration_sec=2.0)
             return False
         if self.is_goal_on_failure_cooldown(candidate.goal):
@@ -804,11 +863,12 @@ class FrontierExplorer(Node):
             sparse_route=candidate.sparse_route,
             terminal_cells=candidate.terminal_cells,
             terminal_clearance=candidate.terminal_clearance,
-            frontier_cluster_cells=set(candidate.frontier_cluster_cells))
+            frontier_cluster_cells=set(candidate.frontier_cluster_cells),
+            connectivity_gain=candidate.connectivity_gain,
+            provisional_portal=candidate.provisional_portal,
+            commitment_scope=candidate.commitment_scope)
         self.prepared_candidate = None
-        if (allow_commitment_transfer
-                and self.active_region_id is not None
-                and refreshed.region_id != self.active_region_id):
+        if allow_commitment_transfer and cross_scope:
             self.last_selection_reason = "completed_task_handoff"
             self.get_logger().info(
                 f"[REGION_COMMITMENT_TRANSFER] from={self.active_region_id} "
@@ -819,18 +879,22 @@ class FrontierExplorer(Node):
     def activate_candidate(self, path: Sequence[Cell], candidate: FrontierCandidate):
         """Publish a candidate while keeping region accounting in one place."""
         self.global_reroute_failure_streak = 0
-        previous_active_region = self.active_region_id
-        if (self.last_selected_region_id is not None
-                and candidate.region_id != self.last_selected_region_id):
+        previous_scope = getattr(self, "active_commitment_scope", None)
+        candidate_scope = (candidate.commitment_scope
+                           or ("region", candidate.region_id))
+        last_scope = getattr(self, "last_selected_commitment_scope", None)
+        if last_scope is not None and candidate_scope != last_scope:
             self.region_switches += 1
             self.last_region_switch_reason = self.last_selection_reason
         self.last_selected_region_id = candidate.region_id
+        self.last_selected_commitment_scope = candidate_scope
         self.active_region_id = candidate.region_id
+        self.active_commitment_scope = candidate_scope
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since = None
-        if previous_active_region != candidate.region_id:
+        if previous_scope != candidate_scope:
             self.region_commitment_gate.reset(
-                candidate.region_id, self.map_content_revision,
+                candidate_scope, self.map_content_revision,
                 len(candidate.observation_cells))
         self.commitment_state = "COMMITTED"
         self.commitment_remaining_cells = len(candidate.observation_cells)
@@ -1032,6 +1096,32 @@ class FrontierExplorer(Node):
         self.pending_path_request_generation = None
         self.publish_status(status)
 
+    def terminate_region_option(self, reason: str) -> bool:
+        """Terminate the single active semi-MDP option exactly once."""
+        if self.active_commitment_scope is None and self.active_region_id is None:
+            return False
+        previous_region = self.active_region_id
+        previous_scope = self.active_commitment_scope
+        self.active_region_id = None
+        self.active_commitment_scope = None
+        self.active_region_missing_streak = 0
+        self.active_region_unreachable_since = None
+        self.commitment_state = "RELEASABLE"
+        self.commitment_release_count += 1
+        self.last_commitment_release_reason = reason
+        self.last_selection_reason = reason
+        self.region_commitment_gate.reset()
+        self.get_logger().info(
+            f"[REGION_OPTION_TERMINATED] region={previous_region} "
+            f"scope={previous_scope} reason={reason}")
+        return True
+
+    def release_commitment_for_idle_handoff(self) -> bool:
+        """Remove stale region hysteresis only after SCAN confirms it is idle."""
+        if not self.scan_waiting_for_target or self.active_region_id is None:
+            return False
+        return self.terminate_region_option("scan_wait_target")
+
     def replace_unsatisfied_observation(self) -> bool:
         """Atomically replace a reached viewpoint that delivered too little gain."""
         if self.active_goal is None:
@@ -1044,6 +1134,11 @@ class FrontierExplorer(Node):
 
         switched = self.activate_or_prepare_next_observation(
             allow_commitment_transfer=True)
+        if not switched:
+            released = self.release_commitment_for_idle_handoff()
+            if released:
+                switched = self.activate_prepared_observation(
+                    allow_commitment_transfer=True)
         if not switched:
             switched = self.plan_from_current_position(
                 excluded_goals=(previous_goal,))
@@ -1071,6 +1166,11 @@ class FrontierExplorer(Node):
         switched = self.activate_or_prepare_next_observation(
             allow_commitment_transfer=True)
         if not switched:
+            released = self.release_commitment_for_idle_handoff()
+            if released:
+                switched = self.activate_prepared_observation(
+                    allow_commitment_transfer=True)
+        if not switched:
             switched = self.plan_from_current_position(
                 excluded_goals=(previous_goal,))
         if switched:
@@ -1091,8 +1191,98 @@ class FrontierExplorer(Node):
         self.publish_status("WAITING_FOR_SAFE_HANDOFF")
         return False
 
+    @staticmethod
+    def parse_local_execution_event(value: str):
+        fields = value.split()
+        if not fields:
+            return None
+        parsed = {"event": fields[0]}
+        for field in fields[1:]:
+            if "=" not in field:
+                continue
+            key, raw = field.split("=", 1)
+            parsed[key] = raw
+        try:
+            parsed["request_id"] = int(parsed["request_id"])
+            parsed["trajectory_id"] = int(parsed["trajectory_id"])
+            parsed["terminal_error"] = float(parsed.get("terminal_error", "nan"))
+        except (KeyError, ValueError):
+            return None
+        return parsed
+
+    def local_execution_event_callback(self, msg: String):
+        """Accept only the terminal event for the currently active request.
+
+        The controller is a separate process, so this event remains observable
+        when SCAN's internal FSM timer stops being scheduled.  Processing is
+        deferred to the exploration timer to keep this callback idempotent and
+        cheap.
+        """
+        event = self.parse_local_execution_event(msg.data)
+        if (event is None or event["event"] not in (
+                "LOCAL_TRAJECTORY_FINISHED", "LOCAL_TRAJECTORY_STALLED")):
+            return
+        if event["request_id"] != self.active_path_request_generation:
+            return
+        previous = self.pending_local_execution_finish
+        if (previous is not None
+                and previous["request_id"] == event["request_id"]
+                and previous["trajectory_id"] >= event["trajectory_id"]):
+            return
+        self.pending_local_execution_finish = event
+        self.local_execution_finish_events += 1
+        self.get_logger().warning(
+            f"[LOCAL_EXECUTION_TERMINAL] event={event['event']} "
+            f"request_id={event['request_id']} "
+            f"trajectory_id={event['trajectory_id']} "
+            f"terminal_error={event['terminal_error']:.3f}m; "
+            "waiting for the coordinator to continue or complete the option")
+
+    def handle_local_execution_finish(self) -> bool:
+        event = self.pending_local_execution_finish
+        if event is None:
+            return False
+        if (event["request_id"] != self.active_path_request_generation
+                or self.active_goal is None or self.position is None):
+            self.pending_local_execution_finish = None
+            return False
+
+        # A local spline ending is not itself a global/observation completion.
+        # If the regional terminal is still far away, renew the same task with
+        # a fresh request id.  This also wakes SCAN after an internal timer
+        # chain has gone silent.
+        terminal_distance = math.hypot(
+            self.active_goal[0] - self.position[0],
+            self.active_goal[1] - self.position[1])
+        arrival_radius = max(0.30, 2.0 * self.grid.resolution)
+        self.pending_local_execution_finish = None
+        if terminal_distance > arrival_radius:
+            if self.reroute_active_goal():
+                self.local_execution_finish_reroutes += 1
+                self.publish_status("LOCAL_SEGMENT_FINISHED_CONTINUING_OPTION")
+                return True
+            self.pending_local_execution_finish = event
+            self.publish_status("LOCAL_SEGMENT_FINISHED_WAITING_FOR_ROUTE")
+            return True
+
+        # Reuse the reliable request-id completion path.  It evaluates the
+        # observation predicate before terminating the regional option.
+        reached = String()
+        reached.data = f"REACHED request_id={event['request_id']}"
+        self.planning_status_callback(reached)
+        return True
+
     def planning_status_callback(self, msg: String):
         status, request_generation = parse_planning_status(msg.data)
+        # WAIT_TARGET is a heartbeat.  Once this request has completed, later
+        # repeats only reaffirm that SCAN is idle; they must not re-run the
+        # completion transition or be reported as stale after the active task
+        # has already been handed off/cleared.
+        if (status == "WAIT_TARGET" and request_generation is not None and
+                request_generation == self.last_completed_request_generation and
+                self.active_path_request_generation in (None, request_generation)):
+            self.scan_waiting_for_target = True
+            return
         if not planning_status_matches_request(
                 status, request_generation,
                 self.pending_path_request_generation,
@@ -1116,11 +1306,20 @@ class FrontierExplorer(Node):
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
         elif status in ("RUNNING", "PATH_ACCEPTED"):
+            self.scan_waiting_for_target = False
             # A successful replacement trajectory resolves the pending local
             # failure.  Keep the short-lived edge record, but do not let it be
             # mistaken for the cause of a later unrelated BLOCKED status.
             self.pending_blocked_edge = None
-        elif status == "REACHED" and self.active_goal is not None:
+        elif status in ("REACHED", "WAIT_TARGET"):
+            self.scan_waiting_for_target = True
+            if not completion_status_is_new(
+                    status, request_generation,
+                    self.last_completed_request_generation):
+                return
+            self.last_completed_request_generation = request_generation
+            if self.active_goal is None:
+                return
             task = self.evaluate_active_observation()
             self.goals_reached += 1
             if self.observation_complete(task):
@@ -1128,25 +1327,28 @@ class FrontierExplorer(Node):
                     f"[OBSERVATION_COMPLETE] reason={task.completion_reason} "
                     f"progress={task.progress:.1%} frontier_missing="
                     f"{task.frontier_missing_streak}/"
-                    f"{self.observation_done_updates}")
+                    f"{self.observation_closure_updates}")
                 self.handoff_satisfied_observation(
                     "OBSERVATION_HANDOFF_COMPLETE_AT_VIEWPOINT")
-            elif (task is not None and (
-                    task.progress >= self.observation_done_ratio
-                    or task.frontier_missing_streak > 0)):
-                # Allow accepted map updates to confirm information/closure;
-                # never create another execution goal inside this task.
-                self.publish_status("VIEWPOINT_REACHED_WAITING_FOR_GAIN_CONFIRMATION")
             else:
-                # Pose arrival is a stable task boundary.  Insufficient gain
-                # replaces the observation task; it must not launch a chain of
-                # alternative short terminals into SCAN.
-                if not any(math.hypot(
-                        self.active_goal[0] - old[0],
-                        self.active_goal[1] - old[1]) < self.blacklist_radius
-                        for old in self.blacklist):
-                    self.blacklist.append(self.active_goal)
-                self.replacement_pending = True
+                # Arrival releases motion unconditionally.  The achieved ratio
+                # is recorded for measurement but must never gate the switch:
+                # completing a ratio that depends on the robot observing more
+                # cannot terminate while the robot is held in place.  The
+                # previous goal is excluded from the next selection through
+                # completed_goals, so this cannot bounce back to the same pose.
+                self.observation_motion_released_count += 1
+                self.last_observation_released_reason = (
+                    task.completion_reason if task is not None else "no_task")
+                self.last_observation_released_progress = (
+                    task.progress if task is not None else 0.0)
+                self.get_logger().info(
+                    f"[OBSERVATION_MOTION_RELEASED] reason="
+                    f"{self.last_observation_released_reason} progress="
+                    f"{self.last_observation_released_progress:.1%} "
+                    f"frontier_missing="
+                    f"{task.frontier_missing_streak if task is not None else 0}"
+                    f"/{self.observation_closure_updates}; switching anyway")
                 self.replace_unsatisfied_observation()
         elif status == "BLOCKED":
             self.scan_blocked_count += 1
@@ -1244,6 +1446,8 @@ class FrontierExplorer(Node):
                 f"[PATH_REQUEST_IN_FLIGHT] age={request_age:.2f}s; "
                 "waiting for SCAN before publishing another reference path",
                 throttle_duration_sec=2.0)
+            return
+        if self.handle_local_execution_finish():
             return
         if self.active_goal is not None:
             if not self.validate_and_repair_active_path():
@@ -1434,6 +1638,18 @@ class FrontierExplorer(Node):
         self.latest_region_count = len(regions)
         candidates = self.build_frontier_candidates(
             start, regions, inflated, blocked_edges, excluded_goals)
+        for candidate in candidates:
+            hypothesis = self.safe_region_connectivity.hypothesis(
+                self.grid.cell_to_world(candidate.frontier_cell))
+            if hypothesis is None:
+                continue
+            # Convert avoided travel metres to avoided dense-grid steps.  This
+            # keeps coverage information and connectivity information in the
+            # same planning-effort unit without a free weighting constant.
+            candidate.connectivity_gain = int(round(
+                hypothesis.route_savings / self.grid.resolution))
+            candidate.provisional_portal = (
+                hypothesis.source_id, hypothesis.target_id)
 
         def select_candidate(options: Sequence[FrontierCandidate]):
             if self.selection_strategy == "greedy":
@@ -1506,6 +1722,7 @@ class FrontierExplorer(Node):
             "reason=dense_validation_failed; all sparse candidates failed "
             "dense final validation")
         self.active_region_id = None
+        self.active_commitment_scope = None
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since = None
         self.commitment_state = "RELEASABLE"
@@ -1598,7 +1815,10 @@ class FrontierExplorer(Node):
             sparse_route=candidate.sparse_route,
             terminal_cells=candidate.terminal_cells,
             terminal_clearance=selected_clearance,
-            frontier_cluster_cells=set(candidate.frontier_cluster_cells))
+            frontier_cluster_cells=set(candidate.frontier_cluster_cells),
+            connectivity_gain=candidate.connectivity_gain,
+            provisional_portal=candidate.provisional_portal,
+            commitment_scope=candidate.commitment_scope)
 
     def build_frontier_candidates(self, start: Cell,
                                   regions: Sequence[FrontierRegion],
@@ -1650,13 +1870,14 @@ class FrontierExplorer(Node):
                                 or excluded):
                             continue
                         proposals.append((
-                            region.region_id, viewpoint, frontier, goal_xy,
+                            region.region_id, region_commitment_scope(region),
+                            viewpoint, frontier, goal_xy,
                             unknown_gain, len(cluster), target_cells,
                             tuple(viewpoints),
                             self.terminal_clearance(viewpoint, inflated),
                             set(cluster)))
 
-        proposal_cells = list(dict.fromkeys(proposal[1] for proposal in proposals))
+        proposal_cells = list(dict.fromkeys(proposal[2] for proposal in proposals))
         sparse_started = time.perf_counter()
         sparse_estimates, sparse_miss_reasons = self.sparse_route_estimates(
             start, proposal_cells, inflated, blocked_edges)
@@ -1690,7 +1911,7 @@ class FrontierExplorer(Node):
             self.expanded_grid_cells += tree.expanded_cells
             self.last_expanded_grid_cells += tree.expanded_cells
         records = []
-        for (region_id, viewpoint, frontier, goal_xy,
+        for (region_id, commitment_scope, viewpoint, frontier, goal_xy,
              unknown_gain, cluster_size, target_cells, terminal_cells,
              terminal_clearance, frontier_cluster_cells) in proposals:
             estimate = estimate_by_cell.get(viewpoint)
@@ -1730,17 +1951,24 @@ class FrontierExplorer(Node):
                 path_length, unknown_gain, cluster_size, turn_cost, target_cells,
                 sparse_route=estimate, terminal_cells=terminal_cells,
                 terminal_clearance=terminal_clearance,
-                frontier_cluster_cells=frontier_cluster_cells))
+                frontier_cluster_cells=frontier_cluster_cells,
+                commitment_scope=commitment_scope))
         return records
+
+    @staticmethod
+    def planning_gain(candidate) -> int:
+        return int(candidate.unknown_gain) + int(
+            getattr(candidate, "connectivity_gain", 0))
 
     @staticmethod
     def candidate_utility(candidate: FrontierCandidate,
                           options: Sequence[FrontierCandidate]) -> float:
-        max_gain = max(1, max(item.unknown_gain for item in options))
+        max_gain = max(1, max(
+            FrontierExplorer.planning_gain(item) for item in options))
         max_cluster = max(1, max(item.cluster_size for item in options))
         max_length = max(1e-6, max(item.path_length for item in options))
         max_turn = max(1e-6, max(item.turn_cost for item in options))
-        return (0.45 * candidate.unknown_gain / max_gain
+        return (0.45 * FrontierExplorer.planning_gain(candidate) / max_gain
                 + 0.20 * candidate.cluster_size / max_cluster
                 - 0.25 * candidate.path_length / max_length
                 - 0.10 * candidate.turn_cost / max_turn)
@@ -1750,12 +1978,14 @@ class FrontierExplorer(Node):
         """Prefer a useful longer observation path, retaining short fallback goals."""
         if not options:
             return []
-        best_gain = max(candidate.unknown_gain for candidate in options)
+        best_gain = max(
+            self.planning_gain(candidate)
+            for candidate in options)
         minimum_gain = best_gain * self.long_horizon_min_gain_ratio
         longer_useful = [
             candidate for candidate in options
             if candidate.path_length >= self.preferred_goal_path_length
-            and candidate.unknown_gain >= minimum_gain]
+            and self.planning_gain(candidate) >= minimum_gain]
         return longer_useful or list(options)
 
     def choose_greedy_candidate(self, candidates: Sequence[FrontierCandidate]):
@@ -1784,18 +2014,36 @@ class FrontierExplorer(Node):
             by_region.setdefault(candidate.region_id, []).append(candidate)
         available = [region for region in regions if region.region_id in by_region]
         available_ids = {region.region_id for region in available}
-        observed_ids = {region.region_id for region in regions}
+        scope_by_region = {
+            region.region_id: region_commitment_scope(region)
+            for region in regions}
+        if (getattr(self, "active_commitment_scope", None) is None
+                and self.active_region_id in scope_by_region):
+            self.active_commitment_scope = scope_by_region[self.active_region_id]
+        observed_scopes = set(scope_by_region.values())
+        available_scopes = {
+            scope_by_region[region_id] for region_id in available_ids}
         self.last_selection_reason = "rolling_uncommitted"
 
         if (allow_region_release
                 and self.last_region_release_evaluation_update != self.map_update_count):
             previous_active = self.active_region_id
+            previous_scope = self.active_commitment_scope
             update = update_region_commitment(
-                self.active_region_id, observed_ids, available_ids,
+                self.active_commitment_scope, observed_scopes, available_scopes,
                 self.active_region_missing_streak,
                 self.active_region_unreachable_since, time.monotonic(),
                 self.region_release_updates, self.region_unreachable_timeout)
-            self.active_region_id = update.active_region_id
+            self.active_commitment_scope = update.active_region_id
+            if self.active_commitment_scope is None:
+                self.active_region_id = None
+            elif self.active_region_id not in available_ids or (
+                    scope_by_region.get(self.active_region_id)
+                    != self.active_commitment_scope):
+                self.active_region_id = next((
+                    region.region_id for region in available
+                    if scope_by_region[region.region_id]
+                    == self.active_commitment_scope), self.active_region_id)
             self.active_region_missing_streak = update.missing_streak
             self.active_region_unreachable_since = update.unreachable_since
             self.last_region_release_evaluation_update = self.map_update_count
@@ -1807,29 +2055,36 @@ class FrontierExplorer(Node):
             if update.release_reason == "frontier_missing":
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
+                    f"scope={previous_scope} "
                     f"after {self.region_release_updates} map updates with no "
                     "remaining frontier cluster")
             elif update.release_reason == "persistently_unreachable":
                 self.get_logger().warning(
                     f"[REGION_COMMITMENT_RELEASED] region={previous_active} "
+                    f"scope={previous_scope} "
                     f"reason=persistently_unreachable timeout="
                     f"{self.region_unreachable_timeout:.1f}s; re-evaluating all "
                     "reachable regions")
 
-        if (allow_region_release and self.active_region_id is not None
-                and self.active_region_id in available_ids):
+        committed_ids = {
+            region_id for region_id in available_ids
+            if scope_by_region[region_id] == self.active_commitment_scope}
+        if (allow_region_release and self.active_commitment_scope is not None
+                and committed_ids):
             active_targets = {
                 cell
-                for candidate in by_region[self.active_region_id]
+                for region_id in committed_ids
+                for candidate in by_region[region_id]
                 for cell in candidate.observation_cells}
             decision = self.region_commitment_gate.evaluate(
-                self.active_region_id, self.map_content_revision,
+                self.active_commitment_scope, self.map_content_revision,
                 len(active_targets))
             self.commitment_remaining_cells = decision.remaining_cells
             self.commitment_stagnant_revisions = decision.stagnant_revisions
             if decision.release_reason is not None:
                 previous_active = self.active_region_id
                 self.active_region_id = None
+                self.active_commitment_scope = None
                 self.active_region_missing_streak = 0
                 self.active_region_unreachable_since = None
                 self.commitment_state = "RELEASABLE"
@@ -1847,8 +2102,8 @@ class FrontierExplorer(Node):
             else:
                 self.commitment_state = "COMMITTED"
 
-        if (self.active_region_id is not None
-                and self.active_region_id not in available_ids):
+        if (self.active_commitment_scope is not None
+                and self.active_commitment_scope not in available_scopes):
             if allow_cross_region_preparation and available_ids:
                 self.get_logger().info(
                     f"[CROSS_REGION_FALLBACK_PREPARATION] committed_region="
@@ -1867,10 +2122,12 @@ class FrontierExplorer(Node):
                         - self.active_region_unreachable_since)
                 self.get_logger().info(
                     f"[REGION_COMMITMENT_RETAINED] region={self.active_region_id} "
-                    f"frontier_present={self.active_region_id in observed_ids} "
+                    f"scope={self.active_commitment_scope} "
+                    f"frontier_present="
+                    f"{self.active_commitment_scope in observed_scopes} "
                     f"frontier_cells={frontier_cells} candidate_reachable=False "
                     f"other_reachable_regions="
-                    f"{len(available_ids - {self.active_region_id})} "
+                    f"{len(available_scopes - {self.active_commitment_scope})} "
                     f"unreachable_for={unreachable_duration:.1f}/"
                     f"{self.region_unreachable_timeout:.1f}s missing_frontier="
                     f"{self.active_region_missing_streak}/{self.region_release_updates}; "
@@ -1896,7 +2153,8 @@ class FrontierExplorer(Node):
             def priority(region):
                 access = min(item.path_length for item in by_region[region.region_id])
                 gain = len(region.cells)
-                committed = region.region_id == self.active_region_id
+                committed = (scope_by_region[region.region_id]
+                             == self.active_commitment_scope)
                 return (not committed, -gain, access, region.region_id)
             available = sorted(available, key=priority)[:self.max_global_regions]
 
@@ -1923,22 +2181,41 @@ class FrontierExplorer(Node):
         best_by_region = {
             region_id: max(preferred, key=lambda item: (
                 region_information_efficiency(
-                    item.unknown_gain, item.cluster_size,
+                    self.planning_gain(item),
+                    item.cluster_size,
                     item.path_length, item.turn_cost),
                 self.candidate_utility(item, preferred),
                 -item.path_length, -item.cell[0], -item.cell[1]))
             for region_id, preferred in selection_options.items() if preferred}
         region_scores = {
             region_id: region_information_efficiency(
-                candidate.unknown_gain, candidate.cluster_size,
+                self.planning_gain(candidate),
+                candidate.cluster_size,
                 candidate.path_length, candidate.turn_cost)
             for region_id, candidate in best_by_region.items()}
-        if self.active_region_id in best_by_region:
-            selected_region = self.active_region_id
+        committed_ids = {
+            region_id for region_id in best_by_region
+            if (self.active_commitment_scope is not None
+                and scope_by_region[region_id] == self.active_commitment_scope)}
+        if allow_region_release and committed_ids:
+            option_value = max(region_scores[region_id]
+                               for region_id in committed_ids)
+            alternative_value = max((
+                score for region_id, score in region_scores.items()
+                if region_id not in committed_ids), default=0.0)
+            termination = self.region_commitment_gate.evaluate_opportunity(
+                self.active_commitment_scope, self.map_content_revision,
+                option_value, alternative_value, self.region_switch_ratio)
+            if termination is not None:
+                self.terminate_region_option(termination)
+                committed_ids = set()
+        if committed_ids:
+            selected_region = max(committed_ids, key=lambda region_id: (
+                region_scores[region_id], -region_id))
             self.last_selection_reason = "residual_commitment"
             challenger = select_rolling_region(
-                region_scores, self.active_region_id, self.region_switch_ratio)
-            if challenger is not None and challenger != self.active_region_id:
+                region_scores, selected_region, self.region_switch_ratio)
+            if challenger is not None and challenger not in committed_ids:
                 self.commitment_switch_suppressed_count += 1
         else:
             selected_region = select_rolling_region(
@@ -1958,7 +2235,9 @@ class FrontierExplorer(Node):
             self.publish_region_sequence()
 
         selected = best_by_region[selected_region]
-        active_score = region_scores.get(self.active_region_id)
+        active_score = max(
+            (region_scores[region_id] for region_id in committed_ids),
+            default=None)
         self.get_logger().info(
             f"[ROLLING_REGION_CHOICE] selected={selected_region} "
             f"active={self.active_region_id} score={region_scores[selected_region]:.3f} "
@@ -2005,9 +2284,10 @@ class FrontierExplorer(Node):
                              by_region: Dict[int, List[FrontierCandidate]],
                              inflated: Set[Cell],
                              blocked_edges: Set[DirectedEdge]) -> List[int]:
-        # Each region is represented by its cheapest currently reachable
-        # frontier entry.  Sparse graph costs fill the matrix first; uncovered
-        # pairs retain the original known-free dense search as a fallback.
+        # This tour predicts later regions only.  It must not launch dense
+        # searches that delay the next executable goal.  Sparse estimates are
+        # used when available; uncovered pairs receive a conservative geometric
+        # estimate.  Every path actually published is still dense-validated.
         representative_options = {
             region.region_id: self.preferred_horizon_pool(
                 by_region[region.region_id])
@@ -2034,14 +2314,6 @@ class FrontierExplorer(Node):
         for index, representative in enumerate(representatives):
             costs[0, index + 1] = representative.path_length
 
-        active_cache_keys = {
-            (regions[source].region_id, regions[target].region_id)
-            for source in range(count)
-            for target in range(count) if source != target}
-        self.region_edge_cache = {
-            edge: path for edge, path in self.region_edge_cache.items()
-            if edge in active_cache_keys}
-
         for source in range(count):
             source_cell = representatives[source].cell
             target_indices = [target for target in range(count)
@@ -2066,59 +2338,25 @@ class FrontierExplorer(Node):
             self.accumulate_sparse_miss_reasons(
                 sparse_miss_reasons, self.sparse_region_miss_reasons,
                 self.last_sparse_region_miss_reasons)
-            missing_targets: Set[Cell] = set()
             for target in range(count):
                 if source == target:
                     continue
-                target_cell = representatives[target].cell
                 sparse_estimate = sparse_by_target.get(target)
                 if sparse_estimate is not None:
                     costs[source + 1, target + 1] = sparse_estimate.distance
                     continue
-                edge = (regions[source].region_id, regions[target].region_id)
-                path = self.region_edge_cache.get(edge)
-                if (path is not None
-                        and (path[0] != source_cell or path[-1] != target_cell
-                             or not adjacent_grid_path_is_valid(
-                                 self.grid, path, inflated, blocked_edges))):
-                    del self.region_edge_cache[edge]
-                    path = None
-                if path:
-                    self.region_edge_cache_hits += 1
-                    self.last_region_edge_cache_hits += 1
-                    costs[source + 1, target + 1] = path_length_cells(
-                        path, self.grid.resolution)
-                else:
-                    self.region_edge_cache_misses += 1
-                    self.last_region_edge_cache_misses += 1
-                    missing_targets.add(target_cell)
-
-            if not missing_targets:
-                continue
-            tree = build_shortest_path_tree(
-                self.grid, source_cell, inflated, blocked_edges, missing_targets)
-            self.region_pair_tree_searches += 1
-            self.last_region_pair_tree_searches += 1
-            self.expanded_grid_cells += tree.expanded_cells
-            self.last_expanded_grid_cells += tree.expanded_cells
-            for target in range(count):
-                if source == target:
-                    continue
                 target_cell = representatives[target].cell
-                if target_cell not in missing_targets:
-                    continue
-                path = tree.path_to(target_cell)
-                if not path:
-                    continue
-                edge = (regions[source].region_id, regions[target].region_id)
-                self.region_edge_cache[edge] = path
-                costs[source + 1, target + 1] = path_length_cells(
-                    path, self.grid.resolution)
+                grid_distance = math.hypot(
+                    source_cell[0] - target_cell[0],
+                    source_cell[1] - target_cell[1])
+                costs[source + 1, target + 1] = (
+                    1.5 * grid_distance * self.grid.resolution)
 
         forced_first = None
-        if self.active_region_id is not None:
+        if getattr(self, "active_commitment_scope", None) is not None:
             for index, region in enumerate(regions):
-                if region.region_id == self.active_region_id:
+                if (region_commitment_scope(region)
+                        == self.active_commitment_scope):
                     forced_first = index
                     break
         order = solve_open_held_karp(costs, forced_first)
@@ -2168,6 +2406,8 @@ class FrontierExplorer(Node):
         self.pending_path_publish_ns = now_ns
         self.pending_path_request_generation = request_generation
         self.active_path_request_generation = request_generation
+        self.scan_waiting_for_target = False
+        self.pending_local_execution_finish = None
 
     def publish_path(self, cells: Sequence[Cell], candidate: FrontierCandidate):
         goal_xy = candidate.goal
@@ -2213,6 +2453,8 @@ class FrontierExplorer(Node):
             f"Selected observation ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}), "
             f"region={region_id}, strategy={self.selection_strategy}; "
             f"expected_gain={len(candidate.observation_cells)}, "
+            f"connectivity_gain={candidate.connectivity_gain}, "
+            f"provisional_portal={candidate.provisional_portal}, "
             f"terminal_candidates={self.last_terminal_candidate_count}, "
             f"terminal_clearance={self.last_terminal_clearance:.2f}m, "
             f"approach_clearance={self.last_approach_clearance:.2f}m, "
@@ -2221,6 +2463,7 @@ class FrontierExplorer(Node):
     def metrics_timer(self):
         known_cells = int(np.count_nonzero(self.grid.data != UNKNOWN))
         total_cells = int(self.grid.data.size)
+        option_state = self.region_commitment_gate.state
         record = {
             "run_id": self.run_id,
             "elapsed_s": round(time.monotonic() - self.run_start_time, 3),
@@ -2241,6 +2484,9 @@ class FrontierExplorer(Node):
             "commitment_switch_suppressed_count": (
                 self.commitment_switch_suppressed_count),
             "last_commitment_release_reason": self.last_commitment_release_reason,
+            "region_option_elapsed_revisions": option_state.elapsed_revisions,
+            "region_option_collected_cells": option_state.collected_cells,
+            "region_option_opportunity_streak": option_state.opportunity_streak,
             "last_region_switch_reason": self.last_region_switch_reason,
             "goals_reached": self.goals_reached,
             "paths_published": self.paths_published,
@@ -2250,6 +2496,12 @@ class FrontierExplorer(Node):
                 if self.paths_published else 0.0),
             "last_published_path_length_m": self.last_published_path_length,
             "observations_satisfied": self.observations_satisfied,
+            "observation_motion_released_count": (
+                self.observation_motion_released_count),
+            "last_observation_released_reason": (
+                self.last_observation_released_reason),
+            "last_observation_released_progress": (
+                self.last_observation_released_progress),
             "terminal_relocations": self.terminal_relocations,
             "terminal_candidate_count": self.last_terminal_candidate_count,
             "terminal_clearance_m": self.last_terminal_clearance,
@@ -2270,6 +2522,8 @@ class FrontierExplorer(Node):
                 self.last_observation_completion_progress),
             "next_observation_prepared": self.prepared_candidate is not None,
             "pipeline_latency_ewma_s": self.pipeline_latency_ewma,
+            "local_execution_finish_events": self.local_execution_finish_events,
+            "local_execution_finish_reroutes": self.local_execution_finish_reroutes,
             "map_updates": self.map_update_count,
             "planning_events": self.planning_events,
             "map_preprocess_calls": self.map_preprocess_calls,

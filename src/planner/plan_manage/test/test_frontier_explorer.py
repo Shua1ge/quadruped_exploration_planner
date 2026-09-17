@@ -389,6 +389,19 @@ def test_committed_region_keeps_best_successor_when_region_splits():
     successor = next(region for region in updated
                      if region.region_id == original.region_id)
     assert successor.cells == large_child.cells
+    assert {region.lineage_id for region in updated} == {original.lineage_id}
+    assert len({MODULE.region_commitment_scope(region)
+                for region in updated}) == 1
+
+
+def test_topology_component_does_not_replace_persistent_lineage_scope():
+    first = MODULE.FrontierRegion(
+        3, [[(2, 2)]], (2.0, 2.0), {(2, 2)}, (7, 11), 31)
+    second = MODULE.FrontierRegion(
+        9, [[(8, 2)]], (8.0, 2.0), {(8, 2)}, (7, 42), 91)
+
+    assert MODULE.region_commitment_scope(first) == ("lineage", 31)
+    assert MODULE.region_commitment_scope(second) == ("lineage", 91)
 
 
 def test_open_held_karp_does_not_charge_return_to_start():
@@ -603,19 +616,30 @@ def test_observation_progress_treats_new_wall_occlusion_as_resolved():
         grid, target, viewpoint=(1, 2)) == (1, 1, 1.0)
 
 
-def test_frontier_closure_requires_minimum_observation_evidence():
+def test_frontier_closure_needs_confirmed_absence_not_progress():
+    """Closure is the purpose signal alone, independent of the progress ratio.
+
+    The old contract additionally demanded progress >= observation_prepare_ratio.
+    When part of the frozen target set was structurally unobservable the ratio
+    could never reach that floor, so the task never completed while SCAN held
+    the robot in place -- the observed ~100 s deadlock.  A long confirmed
+    absence of the tracked frontier must be sufficient on its own.
+    """
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.observation_done_updates = 3
+    explorer.observation_closure_updates = 10
     explorer.observation_prepare_ratio = 0.6
     task = MODULE.ObservationTask(
         7, (1.0, 1.0), {(4, 4)}, frontier_cell=(3, 4),
-        progress=0.2, completion_streak=0, frontier_missing_streak=3,
+        progress=1.0, completion_streak=0, frontier_missing_streak=9,
         completion_reason="none")
 
+    # perfect information but the absence is not yet confirmed
     assert not explorer.observation_complete(task)
 
-    task.progress = 0.6
-    task.completion_reason = "frontier_closed"
+    # confirmed absence closes the task even with zero measured progress
+    task.progress = 0.0
+    task.frontier_missing_streak = 10
     assert explorer.observation_complete(task)
 
 
@@ -636,6 +660,7 @@ def test_active_observation_confirms_closed_frontier_over_map_updates():
     explorer.active_goal_cell = (2, 2)
     explorer.observation_done_ratio = 0.8
     explorer.observation_done_updates = 3
+    explorer.observation_closure_updates = 10
     explorer.observation_prepare_ratio = 0.6
     explorer.viewpoint_standoff = 1.0
     explorer.active_observation = MODULE.ObservationTask(
@@ -648,6 +673,7 @@ def test_active_observation_confirms_closed_frontier_over_map_updates():
 
     assert task.progress == 0.0
     assert task.frontier_missing_streak == 3
+    # a few updates are not yet a confirmed closure
     assert task.completion_reason == "none"
     assert not explorer.observation_complete(task)
 
@@ -661,6 +687,7 @@ def test_active_observation_closes_after_boundary_and_evidence_agree():
     explorer.observation_done_ratio = 0.8
     explorer.observation_prepare_ratio = 0.6
     explorer.observation_done_updates = 3
+    explorer.observation_closure_updates = 10
     explorer.viewpoint_standoff = 1.0
     target = {(x, 9) for x in range(5, 10)}
     explorer.grid.data[9, 8] = MODULE.UNKNOWN
@@ -669,14 +696,50 @@ def test_active_observation_closes_after_boundary_and_evidence_agree():
         7, explorer.grid.cell_to_world((2, 2)), target,
         frontier_cell=(5, 5), observed_cells=3, progress=0.6)
 
-    for update in (1, 2, 3):
+    for update in range(1, 11):
         explorer.map_update_count = update
         task = explorer.evaluate_active_observation()
 
+    # progress stays below the retired observation_prepare_ratio floor, yet the
+    # confirmed absence alone closes the task
     assert task.progress == 0.6
-    assert task.frontier_missing_streak == 3
+    assert task.frontier_missing_streak == 10
     assert task.completion_reason == "frontier_closed"
     assert explorer.observation_complete(task)
+
+
+def test_stalled_observation_no_longer_waits_out_the_goal_timeout():
+    """Regression: an unreachable progress floor must not freeze the task.
+
+    Reproduces the field stall -- the frozen target set contains cells that are
+    not observable from any pose the robot will hold, so progress plateaus
+    below the completion ratio while the tracked frontier is long gone.
+    """
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(12.0, 12.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    # three of the five target cells stay permanently unknown: the
+    # 148/249-style plateau.  grid.data is indexed [y, x].
+    for x in (7, 8, 9):
+        explorer.grid.data[9, x] = MODULE.UNKNOWN
+    explorer.active_goal_cell = (2, 2)
+    explorer.observation_done_ratio = 0.8
+    explorer.observation_done_updates = 3
+    explorer.observation_closure_updates = 10
+    explorer.observation_prepare_ratio = 0.6
+    explorer.viewpoint_standoff = 1.0
+    target = {(x, 9) for x in range(5, 10)}
+    explorer.active_observation = MODULE.ObservationTask(
+        7, explorer.grid.cell_to_world((2, 2)), target,
+        frontier_cell=(5, 5), observed_cells=0, progress=0.4)
+
+    for update in range(1, 11):
+        explorer.map_update_count = update
+        task = explorer.evaluate_active_observation()
+
+    assert task.progress == 0.4              # stalled well below 0.6 and 0.8
+    assert task.frontier_missing_streak >= 10
+    assert explorer.observation_complete(task)  # closed on the purpose signal
 
 
 def test_completion_metrics_survive_atomic_task_replacement():
@@ -728,6 +791,67 @@ def test_ready_status_must_match_pending_not_only_active_request():
         pending_generation=None, active_generation=202)
 
 
+def test_wait_target_is_request_scoped_and_completion_is_idempotent():
+    assert MODULE.planning_status_matches_request(
+        "WAIT_TARGET", 202, pending_generation=None, active_generation=202)
+    assert not MODULE.planning_status_matches_request(
+        "WAIT_TARGET", 101, pending_generation=None, active_generation=202)
+    assert MODULE.completion_status_is_new("REACHED", 202, None)
+    assert not MODULE.completion_status_is_new("WAIT_TARGET", 202, 202)
+
+
+def test_local_execution_event_requires_version_and_terminal_error():
+    event = MODULE.FrontierExplorer.parse_local_execution_event(
+        "LOCAL_TRAJECTORY_FINISHED request_id=202 trajectory_id=17 "
+        "terminal_error=0.042")
+
+    assert event == {
+        "event": "LOCAL_TRAJECTORY_FINISHED",
+        "request_id": 202,
+        "trajectory_id": 17,
+        "terminal_error": 0.042,
+    }
+    assert MODULE.FrontierExplorer.parse_local_execution_event(
+        "LOCAL_TRAJECTORY_FINISHED request_id=202") is None
+
+
+def test_idle_handoff_releases_only_stale_region_commitment():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.scan_waiting_for_target = True
+    explorer.active_region_id = 8
+    explorer.active_commitment_scope = ("component", 3)
+    explorer.active_region_missing_streak = 2
+    explorer.active_region_unreachable_since = 4.0
+    explorer.commitment_state = "COMMITTED"
+    explorer.commitment_release_count = 3
+    explorer.last_commitment_release_reason = "none"
+    explorer.last_selection_reason = "residual_commitment"
+    gate = SimpleNamespace(reset_calls=0)
+    gate.reset = lambda: setattr(gate, "reset_calls", gate.reset_calls + 1)
+    explorer.region_commitment_gate = gate
+    explorer.get_logger = lambda: SimpleNamespace(
+        info=lambda *args, **kwargs: None)
+
+    assert explorer.release_commitment_for_idle_handoff()
+    assert explorer.active_region_id is None
+    assert explorer.active_commitment_scope is None
+    assert explorer.commitment_state == "RELEASABLE"
+    assert explorer.commitment_release_count == 4
+    assert explorer.last_commitment_release_reason == "scan_wait_target"
+    assert explorer.last_selection_reason == "scan_wait_target"
+    assert gate.reset_calls == 1
+    assert not explorer.release_commitment_for_idle_handoff()
+
+
+def test_running_scan_does_not_release_region_commitment():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.scan_waiting_for_target = False
+    explorer.active_region_id = 8
+
+    assert not explorer.release_commitment_for_idle_handoff()
+    assert explorer.active_region_id == 8
+
+
 def test_failure_cooldown_expires_after_configured_map_revision():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.blacklist_radius = 1.5
@@ -753,7 +877,7 @@ def test_replan_gate_bounds_attempts_until_planning_context_changes():
     assert gate.allow(MODULE.ReplanContext((4, 5), 11, 3, 8))
 
 
-def test_region_sequence_reuses_stable_region_id_edge_cache():
+def test_region_sequence_prediction_never_runs_dense_pair_searches():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.grid = MODULE.ExplorationGrid(12.0, 8.0, 1.0, 0.0, 0.0)
     explorer.grid.data[:, :] = MODULE.FREE
@@ -794,16 +918,16 @@ def test_region_sequence_reuses_stable_region_id_edge_cache():
     second = explorer.plan_region_sequence((0, 2), regions, candidates, set(), set())
 
     assert first == second
-    assert searches_after_first == 2
+    assert searches_after_first == 0
     assert explorer.region_pair_tree_searches == searches_after_first
-    assert explorer.region_edge_cache_hits == 2
+    assert explorer.region_edge_cache_hits == 0
 
     explorer.grid.data[2, 5] = MODULE.OCCUPIED
     explorer.plan_region_sequence(
         (0, 2), regions, candidates,
         explorer.grid.inflated_obstacles(0.0), set())
 
-    assert explorer.region_pair_tree_searches > searches_after_first
+    assert explorer.region_pair_tree_searches == searches_after_first
 
 
 def test_sparse_candidate_is_materialized_by_dense_astar_before_use():
@@ -1014,6 +1138,21 @@ def test_handoff_forces_preparation_when_no_standby_exists():
 
     assert explorer.activate_or_prepare_next_observation()
     assert force_arguments == [True]
+
+
+def test_deferred_cross_scope_standby_is_not_replanned_before_release():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.prepared_candidate = object()
+    activation_arguments = []
+    explorer.activate_prepared_observation = lambda allow=False: (
+        activation_arguments.append(allow) or False)
+    explorer.prepare_next_observation = lambda force=False: (_ for _ in ()).throw(
+        AssertionError("deferred standby must survive until commitment release"))
+
+    assert not explorer.activate_or_prepare_next_observation(
+        allow_commitment_transfer=True)
+    assert activation_arguments == [True]
+    assert explorer.prepared_candidate is not None
 
 
 def test_completed_task_handoff_allows_commitment_transfer():

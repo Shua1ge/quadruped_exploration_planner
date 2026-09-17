@@ -10,7 +10,11 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <scan_planner_msgs/msg/bspline.hpp>
+#include <scan_planner_msgs/msg/execution_command.hpp>
+#include <scan_planner_msgs/msg/execution_state.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.hpp>
 
@@ -26,6 +30,8 @@ public:
   {
     time_forward_ = declare_parameter<double>("time_forward", 0.8);
     heading_error_threshold_ = declare_parameter<double>("heading_error_threshold", 0.8);
+    heading_stall_timeout_ = declare_parameter<double>("heading_stall_timeout", 3.0);
+    heading_progress_epsilon_ = declare_parameter<double>("heading_progress_epsilon", 0.05);
     kp_pos_ = declare_parameter<double>("kp_pos", 0.8);
     kp_yaw_ = declare_parameter<double>("kp_yaw", 1.5);
     max_vx_ = declare_parameter<double>("max_vx", 0.75);
@@ -36,7 +42,8 @@ public:
     handoff_sample_dt_ = declare_parameter<double>("handoff_sample_dt", 0.02);
     max_handoff_error_ = declare_parameter<double>("max_handoff_error", 0.30);
     if (handoff_search_time_ < 0.0 || handoff_sample_dt_ <= 0.0 ||
-        max_handoff_error_ <= 0.0)
+        max_handoff_error_ <= 0.0 || heading_stall_timeout_ <= 0.0 ||
+        heading_progress_epsilon_ <= 0.0)
       throw std::runtime_error(
           "handoff parameters must have a non-negative search time and positive sample interval/error limit");
 
@@ -47,10 +54,15 @@ public:
         "body_pose", rclcpp::SensorDataQoS(),
         std::bind(&ClosedLoopController::odomCallback, this, std::placeholders::_1));
     cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 20);
-    execution_frozen_pub_ = create_publisher<std_msgs::msg::Bool>("planning/go2_execution_frozen", 10);
-    emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
-        "planning/emergency_stop", 10,
-        std::bind(&ClosedLoopController::emergencyStopCallback, this, std::placeholders::_1));
+    execution_state_pub_ = create_publisher<scan_planner_msgs::msg::ExecutionState>(
+        "planning/execution_state", rclcpp::QoS(20).reliable());
+    heading_error_pub_ = create_publisher<std_msgs::msg::Float64>("planning/go2_heading_error", 10);
+    heading_stalled_pub_ = create_publisher<std_msgs::msg::Bool>("planning/go2_heading_stalled", 10);
+    execution_event_pub_ = create_publisher<std_msgs::msg::String>(
+        "planning/local_execution_event", rclcpp::QoS(10).reliable());
+    execution_command_sub_ = create_subscription<scan_planner_msgs::msg::ExecutionCommand>(
+        "planning/execution_command", rclcpp::QoS(20).reliable(),
+        std::bind(&ClosedLoopController::executionCommandCallback, this, std::placeholders::_1));
     simulation_collision_sub_ = create_subscription<std_msgs::msg::Bool>(
         "simulation/collision", 10,
         std::bind(&ClosedLoopController::simulationCollisionCallback, this, std::placeholders::_1));
@@ -93,11 +105,57 @@ private:
     cmd_vel_pub_->publish(cmd);
   }
 
-  void publishExecutionFrozen(bool frozen)
+  void publishExecutionState(
+      uint8_t state, const std::string &reason = "",
+      double terminal_error = std::numeric_limits<double>::quiet_NaN(),
+      bool force = false)
+  {
+    const auto current_time = now();
+    if (!force && state == last_execution_state_ &&
+        (current_time - last_execution_state_publish_time_).seconds() < 0.1)
+      return;
+    scan_planner_msgs::msg::ExecutionState msg;
+    msg.request_id = active_request_id_;
+    msg.trajectory_id = traj_id_;
+    msg.state = state;
+    msg.execution_time = exec_time_;
+    msg.duration = traj_duration_;
+    msg.terminal_error = terminal_error;
+    msg.reason = reason;
+    execution_state_pub_->publish(msg);
+    last_execution_state_ = state;
+    last_execution_state_publish_time_ = current_time;
+  }
+
+  void publishHeadingStalled(bool stalled)
   {
     std_msgs::msg::Bool msg;
-    msg.data = frozen;
-    execution_frozen_pub_->publish(msg);
+    msg.data = stalled;
+    heading_stalled_pub_->publish(msg);
+  }
+
+  void publishExecutionEvent(const char *event, double terminal_error)
+  {
+    std_msgs::msg::String msg;
+    msg.data = std::string(event) +
+        " request_id=" + std::to_string(active_request_id_) +
+        " trajectory_id=" + std::to_string(traj_id_) +
+        " terminal_error=" + std::to_string(terminal_error);
+    execution_event_pub_->publish(msg);
+  }
+
+  void resetHeadingFreezeState(bool publish_clear = true)
+  {
+    const bool had_freeze_state = heading_frozen_ || heading_stall_reported_;
+    if (heading_frozen_)
+      RCLCPP_INFO(get_logger(), "[HEADING_FREEZE_EXIT] request_id=%llu trajectory=%lld",
+                  static_cast<unsigned long long>(active_request_id_),
+                  static_cast<long long>(traj_id_));
+    heading_frozen_ = false;
+    heading_stall_reported_ = false;
+    heading_best_error_ = std::numeric_limits<double>::infinity();
+    if (publish_clear && had_freeze_state)
+      publishHeadingStalled(false);
   }
 
   void bsplineCallback(const scan_planner_msgs::msg::Bspline::ConstSharedPtr msg)
@@ -135,9 +193,22 @@ private:
       control_points.push_back(points.col(column));
     if (trajectorySamplesAreStationary(control_points, 1e-4))
     {
-      emergency_stop_ = true;
+      active_request_id_ = msg->request_id;
+      traj_id_ = msg->traj_id;
+      soft_hold_ = true;
+      soft_hold_request_id_ = msg->request_id;
+      soft_hold_trajectory_id_ = msg->traj_id;
+      soft_hold_reason_ = "STATIONARY_HOLD_TRAJECTORY";
+      // This is still an execution version.  Remember it so an older spline or
+      // command from the same request cannot become current again.
+      receive_traj_ = true;
+      resetHeadingFreezeState();
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
+          soft_hold_reason_, std::numeric_limits<double>::quiet_NaN(), true);
       RCLCPP_INFO(get_logger(),
-                  "[EMERGENCY_HOLD_TRAJECTORY_IGNORED] trajectory=%lld; keeping cmd_vel stopped instead of tracking an old stop position",
+                  "[VERSIONED_HOLD_TRAJECTORY] request_id=%llu trajectory=%lld; holding without tracking an old stop position",
+                  static_cast<unsigned long long>(msg->request_id),
                   static_cast<long long>(msg->traj_id));
       return;
     }
@@ -181,9 +252,28 @@ private:
     exec_time_ = matched_time;
     last_update_time_ = now();
     receive_traj_ = true;
-    // A planner-requested stop may be cleared by a replacement trajectory, but a
-    // physical simulation collision stays latched for the lifetime of this run.
-    emergency_stop_ = simulation_collision_latched_;
+    terminal_event_reported_ = false;
+    terminal_best_error_ = std::numeric_limits<double>::infinity();
+    terminal_last_progress_time_ = now();
+    resetHeadingFreezeState();
+    if (soft_hold_ && trajectorySupersedesExecutionCommand(
+            msg->request_id, msg->traj_id,
+            soft_hold_request_id_, soft_hold_trajectory_id_))
+    {
+      RCLCPP_INFO(
+          get_logger(),
+          "[VERSIONED_HOLD_RELEASED] hold_request=%llu hold_trajectory=%lld replacement_request=%llu replacement_trajectory=%lld",
+          static_cast<unsigned long long>(soft_hold_request_id_),
+          static_cast<long long>(soft_hold_trajectory_id_),
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->traj_id));
+      soft_hold_ = false;
+      soft_hold_reason_.clear();
+    }
+    publishExecutionState(
+        soft_hold_ ? scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD
+                   : scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
+        soft_hold_ ? soft_hold_reason_ : "", 0.0, true);
     RCLCPP_INFO(get_logger(),
                 "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm",
                 static_cast<unsigned long long>(active_request_id_),
@@ -191,10 +281,53 @@ private:
                 start_error, matched_error);
   }
 
-  void emergencyStopCallback(const std_msgs::msg::Bool::ConstSharedPtr msg)
+  void executionCommandCallback(
+      const scan_planner_msgs::msg::ExecutionCommand::ConstSharedPtr msg)
   {
-    if (msg->data)
-      emergency_stop_ = true;
+    if (!executionCommandTargetsCurrentOrNewer(
+            msg->request_id, msg->trajectory_id,
+            active_request_id_, receive_traj_ ? traj_id_ : 0))
+    {
+      RCLCPP_WARN(
+          get_logger(),
+          "[STALE_EXECUTION_COMMAND_IGNORED] command=%u request_id=%llu trajectory=%lld active_request_id=%llu active_trajectory=%lld reason=%s",
+          static_cast<unsigned int>(msg->command),
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id),
+          static_cast<unsigned long long>(active_request_id_),
+          static_cast<long long>(traj_id_), msg->reason.c_str());
+      return;
+    }
+    if (msg->command == scan_planner_msgs::msg::ExecutionCommand::COMMAND_HOLD)
+    {
+      soft_hold_ = true;
+      soft_hold_request_id_ = msg->request_id;
+      soft_hold_trajectory_id_ = msg->trajectory_id;
+      soft_hold_reason_ = msg->reason;
+      resetHeadingFreezeState();
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
+          soft_hold_reason_, std::numeric_limits<double>::quiet_NaN(), true);
+      RCLCPP_INFO(
+          get_logger(),
+          "[EXECUTION_HOLD_ACCEPTED] request_id=%llu trajectory=%lld reason=%s",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id), msg->reason.c_str());
+    }
+    else if (msg->command == scan_planner_msgs::msg::ExecutionCommand::COMMAND_RESUME &&
+             soft_hold_ && executionCommandTargetsCurrentOrNewer(
+                 msg->request_id, msg->trajectory_id,
+                 soft_hold_request_id_, soft_hold_trajectory_id_))
+    {
+      soft_hold_ = false;
+      soft_hold_reason_.clear();
+      last_update_time_ = now();
+      RCLCPP_INFO(
+          get_logger(),
+          "[EXECUTION_RESUME_ACCEPTED] request_id=%llu trajectory=%lld",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id));
+    }
   }
 
   void simulationCollisionCallback(const std_msgs::msg::Bool::ConstSharedPtr msg)
@@ -202,7 +335,9 @@ private:
     if (msg->data)
     {
       simulation_collision_latched_ = true;
-      emergency_stop_ = true;
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP,
+          "SIMULATION_COLLISION", std::numeric_limits<double>::quiet_NaN(), true);
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
                             "Simulation collision guard stopped the robot");
     }
@@ -217,16 +352,30 @@ private:
 
   void cmdCallback()
   {
-    if (emergency_stop_)
+    if (simulation_collision_latched_)
     {
-      publishExecutionFrozen(true);
+      resetHeadingFreezeState();
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP,
+          "SIMULATION_COLLISION");
+      publishStop();
+      return;
+    }
+
+    if (soft_hold_)
+    {
+      resetHeadingFreezeState();
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
+          soft_hold_reason_);
       publishStop();
       return;
     }
 
     if (!receive_traj_ || !have_odom_)
     {
-      publishExecutionFrozen(false);
+      resetHeadingFreezeState();
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_IDLE);
       publishStop();
       return;
     }
@@ -236,16 +385,58 @@ private:
     const double t_eval = std::min(exec_time_, traj_duration_);
     Eigen::Vector3d pos_des = traj_[0].evaluateDeBoorT(t_eval);
     const double yaw_error = normalizeAngle(estimateDesiredYaw(t_eval, pos_des) - odom_yaw_);
+    std_msgs::msg::Float64 heading_error_msg;
+    heading_error_msg.data = yaw_error;
+    heading_error_pub_->publish(heading_error_msg);
     const double yaw_command = std::clamp(kp_yaw_ * yaw_error, -max_vyaw_, max_vyaw_);
     if (std::abs(yaw_error) > heading_error_threshold_)
     {
-      publishExecutionFrozen(true);
+      const double abs_error = std::abs(yaw_error);
+      if (!heading_frozen_)
+      {
+        heading_frozen_ = true;
+        heading_stall_reported_ = false;
+        heading_best_error_ = abs_error;
+        heading_freeze_started_ = current_time;
+        heading_last_progress_ = current_time;
+        RCLCPP_WARN(get_logger(),
+                    "[HEADING_FREEZE_ENTER] request_id=%llu trajectory=%lld error=%.3frad threshold=%.3frad",
+                    static_cast<unsigned long long>(active_request_id_),
+                    static_cast<long long>(traj_id_), abs_error,
+                    heading_error_threshold_);
+      }
+      else if (abs_error + heading_progress_epsilon_ < heading_best_error_)
+      {
+        heading_best_error_ = abs_error;
+        heading_last_progress_ = current_time;
+      }
+
+      const double frozen_for = (current_time - heading_freeze_started_).seconds();
+      const double stalled_for = (current_time - heading_last_progress_).seconds();
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "[HEADING_FREEZE_ACTIVE] request_id=%llu error=%.3frad best=%.3frad frozen=%.2fs no_progress=%.2fs",
+          static_cast<unsigned long long>(active_request_id_), abs_error,
+          heading_best_error_, frozen_for, stalled_for);
+      if (!heading_stall_reported_ && stalled_for >= heading_stall_timeout_)
+      {
+        heading_stall_reported_ = true;
+        publishHeadingStalled(true);
+        RCLCPP_ERROR(get_logger(),
+                     "[HEADING_FREEZE_STALLED] request_id=%llu trajectory=%lld error=%.3frad best=%.3frad no_progress=%.2fs",
+                     static_cast<unsigned long long>(active_request_id_),
+                     static_cast<long long>(traj_id_), abs_error,
+                     heading_best_error_, stalled_for);
+      }
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN,
+          heading_stall_reported_ ? "HEADING_STALLED" : "HEADING_ALIGNMENT");
       publishStop(yaw_command);
       last_update_time_ = current_time;
       return;
     }
 
-    publishExecutionFrozen(false);
+    resetHeadingFreezeState();
     exec_time_ = std::min(traj_duration_, exec_time_ + dt);
     last_update_time_ = current_time;
     pos_des = traj_[0].evaluateDeBoorT(exec_time_);
@@ -260,22 +451,81 @@ private:
     command.linear.x = std::clamp(c * vel_world.x() + s * vel_world.y(), -max_vx_, max_vx_);
     command.linear.y = std::clamp(-s * vel_world.x() + c * vel_world.y(), -max_vy_, max_vy_);
     command.angular.z = yaw_command;
-    if (exec_time_ >= traj_duration_ && pos_error.norm() < finish_dist_)
+    const double terminal_error = pos_error.norm();
+    if (exec_time_ >= traj_duration_ && terminal_error < finish_dist_)
+    {
       command = geometry_msgs::msg::Twist();
+      publishExecutionState(
+          scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
+          "TERMINAL_REACHED", terminal_error);
+      if (!terminal_event_reported_)
+      {
+        terminal_event_reported_ = true;
+        publishExecutionEvent("LOCAL_TRAJECTORY_FINISHED", terminal_error);
+        RCLCPP_INFO(get_logger(),
+                    "[LOCAL_TRAJECTORY_FINISHED] request_id=%llu trajectory=%lld terminal_error=%.3fm",
+                    static_cast<unsigned long long>(active_request_id_),
+                    static_cast<long long>(traj_id_), terminal_error);
+      }
+    }
+    else if (exec_time_ >= traj_duration_)
+    {
+      if (terminal_error + 0.02 < terminal_best_error_)
+      {
+        terminal_best_error_ = terminal_error;
+        terminal_last_progress_time_ = current_time;
+      }
+      const double no_progress =
+          (current_time - terminal_last_progress_time_).seconds();
+      if (!terminal_event_reported_ &&
+          no_progress >= std::max(1.0, time_forward_))
+      {
+        terminal_event_reported_ = true;
+        publishExecutionState(
+            scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+            "TERMINAL_NO_PROGRESS", terminal_error, true);
+        publishExecutionEvent("LOCAL_TRAJECTORY_STALLED", terminal_error);
+        RCLCPP_ERROR(get_logger(),
+                     "[LOCAL_TRAJECTORY_STALLED] request_id=%llu trajectory=%lld terminal_error=%.3fm no_progress=%.2fs",
+                     static_cast<unsigned long long>(active_request_id_),
+                     static_cast<long long>(traj_id_), terminal_error,
+                     no_progress);
+      }
+      else if (terminal_event_reported_)
+      {
+        publishExecutionState(
+            scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+            "TERMINAL_NO_PROGRESS", terminal_error);
+      }
+      else
+      {
+        publishExecutionState(
+            scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
+            "TERMINAL_CONVERGING", terminal_error);
+      }
+    }
+    else
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING);
     cmd_vel_pub_->publish(command);
   }
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr execution_frozen_pub_;
+  rclcpp::Publisher<scan_planner_msgs::msg::ExecutionState>::SharedPtr execution_state_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_error_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr heading_stalled_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_event_pub_;
   rclcpp::Subscription<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
+  rclcpp::Subscription<scan_planner_msgs::msg::ExecutionCommand>::SharedPtr execution_command_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr simulation_collision_sub_;
   rclcpp::TimerBase::SharedPtr cmd_timer_;
   bool receive_traj_{false};
   bool have_odom_{false};
-  bool emergency_stop_{false};
   bool simulation_collision_latched_{false};
+  bool soft_hold_{false};
+  std::uint64_t soft_hold_request_id_{0};
+  std::int64_t soft_hold_trajectory_id_{0};
+  std::string soft_hold_reason_;
   std::vector<UniformBspline> traj_;
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
@@ -284,7 +534,18 @@ private:
   double odom_yaw_{0.0};
   double exec_time_{0.0};
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time heading_freeze_started_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time heading_last_progress_{0, 0, RCL_ROS_TIME};
+  bool heading_frozen_{false};
+  bool heading_stall_reported_{false};
+  bool terminal_event_reported_{false};
+  double terminal_best_error_{std::numeric_limits<double>::infinity()};
+  rclcpp::Time terminal_last_progress_time_{0, 0, RCL_ROS_TIME};
+  uint8_t last_execution_state_{std::numeric_limits<uint8_t>::max()};
+  rclcpp::Time last_execution_state_publish_time_{0, 0, RCL_ROS_TIME};
+  double heading_best_error_{std::numeric_limits<double>::infinity()};
   double time_forward_, heading_error_threshold_, kp_pos_, kp_yaw_;
+  double heading_stall_timeout_, heading_progress_epsilon_;
   double max_vx_, max_vy_, max_vyaw_, finish_dist_;
   double handoff_search_time_, handoff_sample_dt_, max_handoff_error_;
 };

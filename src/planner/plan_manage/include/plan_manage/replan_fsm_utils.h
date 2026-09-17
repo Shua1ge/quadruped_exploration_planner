@@ -196,6 +196,36 @@ inline bool shouldAcceptTrajectoryVersion(
   return true;
 }
 
+inline bool executionCommandTargetsCurrentOrNewer(
+    uint64_t command_request, int64_t command_trajectory,
+    uint64_t active_request, int64_t active_trajectory)
+{
+  if (command_request < active_request)
+    return false;
+  if (command_request == active_request &&
+      command_trajectory < active_trajectory)
+    return false;
+  return true;
+}
+
+inline bool trajectorySupersedesExecutionCommand(
+    uint64_t trajectory_request, int64_t trajectory_id,
+    uint64_t command_request, int64_t command_trajectory)
+{
+  if (trajectory_request > command_request)
+    return true;
+  return trajectory_request == command_request &&
+         trajectory_id > command_trajectory;
+}
+
+inline bool executionStateMatchesExecution(
+    uint64_t state_request, int64_t state_trajectory,
+    uint64_t executing_request, int64_t executing_trajectory)
+{
+  return state_request == executing_request &&
+         state_trajectory == executing_trajectory;
+}
+
 inline bool safetyResultMatchesExecution(
     uint64_t checked_request, int64_t checked_trajectory,
     uint64_t executing_request, int64_t executing_trajectory)

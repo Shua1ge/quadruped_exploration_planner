@@ -2,6 +2,7 @@
 """LocalMapPatch to persistent sparse TopoGraphDelta pipeline."""
 
 import json
+import math
 import time
 from typing import Dict
 
@@ -57,6 +58,8 @@ class GlobalRepresentationNode(Node):
             "safe_region_oracle_sampled": False,
         }
         self.last_safe_shadow_metrics = {}
+        self.global_safe_regions = {}
+        self.global_safe_portals = {}
         self.global_nodes: Dict[int, TopologyNode] = {}
         self.global_edges: Dict[int, TopologyEdge] = {}
         self.global_node_messages: Dict[int, TopoNode] = {}
@@ -78,6 +81,8 @@ class GlobalRepresentationNode(Node):
         self.snapshot_pub = self.create_publisher(
             TopoGraphDelta, "global_representation/topology_snapshot",
             snapshot_qos)
+        self.safe_region_pub = self.create_publisher(
+            String, "global_representation/safe_region_snapshot", snapshot_qos)
         self.metrics_pub = self.create_publisher(
             String, "global_representation/oracle_metrics", 10)
         self.get_logger().info(
@@ -182,6 +187,34 @@ class GlobalRepresentationNode(Node):
             })
             self.last_safe_shadow_metrics = dict(safe_metrics)
             metrics.update(safe_metrics)
+            for region in safe_graph.regions.values():
+                x = patch.origin.x + (region.anchor[0] + 0.5) * patch.resolution
+                y = patch.origin.y + (region.anchor[1] + 0.5) * patch.resolution
+                self.global_safe_regions[int(region.region_id)] = {
+                    "id": int(region.region_id), "x": x, "y": y,
+                    "area": float(region.area)}
+            for portal in safe_graph.portals.values():
+                source = safe_graph.regions[portal.source_id].anchor
+                target = safe_graph.regions[portal.target_id].anchor
+                self.global_safe_portals[int(portal.portal_id)] = {
+                    "id": int(portal.portal_id),
+                    "source": int(portal.source_id),
+                    "target": int(portal.target_id),
+                    "length": max(float(patch.resolution), math.hypot(
+                        target[0] - source[0], target[1] - source[1])
+                        * float(patch.resolution)),
+                    "width": float(portal.width),
+                    "bottleneck": bool(portal.bottleneck)}
+            safe_snapshot = {
+                "map_revision": int(patch.map_revision),
+                "regions": list(self.global_safe_regions.values()),
+                "portals": [item for item in self.global_safe_portals.values()
+                            if item["source"] in self.global_safe_regions
+                            and item["target"] in self.global_safe_regions],
+            }
+            safe_msg = String()
+            safe_msg.data = json.dumps(safe_snapshot, separators=(",", ":"))
+            self.safe_region_pub.publish(safe_msg)
         elif self.safe_region_shadow_enabled and self.last_safe_shadow_metrics:
             safe_metrics = dict(self.last_safe_shadow_metrics)
             safe_metrics.update({

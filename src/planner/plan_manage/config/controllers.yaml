@@ -3,6 +3,10 @@ closed_loop_controller:
     use_sim_time: false
     time_forward: 0.8
     heading_error_threshold: 0.8
+    # Freeze trajectory time while turning, but report a stall if the error
+    # fails to improve so SCAN can regenerate the local segment.
+    heading_stall_timeout: 3.0
+    heading_progress_epsilon: 0.05
     kp_pos: 0.8
     kp_yaw: 1.5
     max_vx: 0.75

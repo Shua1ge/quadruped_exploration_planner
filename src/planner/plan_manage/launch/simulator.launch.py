@@ -27,6 +27,7 @@ def _setup(context):
     map_x = float(LaunchConfiguration("map_size_x").perform(context))
     map_y = float(LaunchConfiguration("map_size_y").perform(context))
     map_z = float(LaunchConfiguration("map_size_z").perform(context))
+    lidar_pitch = float(LaunchConfiguration("lidar_pitch").perform(context))
 
     if use_pcd_map and (not pcd_map_file or not os.path.isfile(pcd_map_file)):
         raise RuntimeError(
@@ -94,6 +95,7 @@ def _setup(context):
                         "map.z_size": map_z,
                         "use_global_map_topic": True,
                         "pcd_map_file": pcd_map_file,
+                        "lidar_pitch": lidar_pitch,
                         "collision_check.enable": collision_check_enable,
                     },
                 ],
@@ -141,6 +143,7 @@ def generate_launch_description():
             DeclareLaunchArgument("map_size_z", default_value="5.0"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("collision_check_enable", default_value="true"),
+            DeclareLaunchArgument("lidar_pitch", default_value="0.0"),
             OpaqueFunction(function=_setup),
         ]
     )

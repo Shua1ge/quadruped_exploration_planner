@@ -3,7 +3,7 @@
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -258,6 +258,27 @@ class FrontierRegion:
     centroid: Tuple[float, float]
     cells: Set[Cell]
     topology_key: Optional[Tuple[int, int]] = None
+    lineage_id: Optional[int] = None
+
+
+def region_commitment_scope(region: FrontierRegion) -> Tuple[str, int]:
+    """Return a stable commitment identity across Frontier re-partitioning.
+
+    The sparse graph component ID is deliberately *not* used here.  Sparse
+    nodes are rebuilt as the observed map grows and a component is currently
+    named after its minimum node ID, so that value is only meaningful within
+    one graph revision.  Treating it as a persistent identity makes an
+    unchanged region appear to cross components on every rebuild.
+
+    Frontier lineage is maintained explicitly across updates and inherited by
+    children when a region splits.  It is therefore the safe commitment key.
+    Topology components remain useful for current-revision reachability, but
+    must not become commitment identities until they have their own persistent
+    tracker.
+    """
+    lineage = (region.lineage_id
+               if region.lineage_id is not None else region.region_id)
+    return ("lineage", int(lineage))
 
 
 def partition_frontier_clusters(clusters: Sequence[Sequence[Cell]],
@@ -452,24 +473,49 @@ class PersistentRegionTracker:
             if best_id is None:
                 best_id = self.next_id
                 self.next_id += 1
+            old_match = previous.get(best_id)
+            lineage_id = (old_match.lineage_id
+                          if old_match is not None
+                          and old_match.lineage_id is not None
+                          else best_id)
+            if old_match is None:
+                # When one old region splits, only one child may keep its
+                # unique region ID, but nearby siblings inherit the same
+                # commitment lineage instead of appearing as a new area.
+                lineage_candidates = []
+                for old in previous.values():
+                    distance = math.hypot(
+                        observation.centroid[0] - old.centroid[0],
+                        observation.centroid[1] - old.centroid[1])
+                    if distance > self.match_distance_cells:
+                        continue
+                    union = observation.cells | old.cells
+                    overlap = (len(observation.cells & old.cells) / len(union)
+                               if union else 0.0)
+                    lineage_candidates.append((
+                        -overlap, distance, old.region_id,
+                        old.lineage_id if old.lineage_id is not None
+                        else old.region_id))
+                if lineage_candidates:
+                    lineage_id = min(lineage_candidates)[-1]
             assigned.append(FrontierRegion(
                 best_id, observation.clusters, observation.centroid,
-                observation.cells, observation.topology_key))
+                observation.cells, observation.topology_key, lineage_id))
         self.regions = {region.region_id: region for region in assigned}
         return sorted(assigned, key=lambda region: region.region_id)
 
 
 @dataclass
 class RegionCommitmentUpdate:
-    active_region_id: Optional[int]
+    active_region_id: Optional[Hashable]
     missing_streak: int
     unreachable_since: Optional[float]
     release_reason: Optional[str] = None
 
 
 def update_region_commitment(
-        active_region_id: Optional[int], observed_region_ids: Set[int],
-        candidate_region_ids: Set[int], missing_streak: int,
+        active_region_id: Optional[Hashable], observed_region_ids: Set[Hashable],
+        candidate_region_ids: Set[Hashable], missing_streak: int,
         unreachable_since: Optional[float], now: float,
         missing_release_updates: int,
         unreachable_timeout: float) -> RegionCommitmentUpdate:

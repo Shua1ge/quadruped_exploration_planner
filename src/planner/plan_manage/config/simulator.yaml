@@ -37,7 +37,13 @@ pcl_render_node:
     vertical_fov: 90.0
     min_raylength: 1.0
     downsample_res: 0.1
-    lidar_pitch: 45.0
+    # Ray span is vertical_fov (+8 deg margin) centred on the pitch axis, so
+    # coverage is [pitch-half, pitch+half] measured downward from the horizon.
+    # 45.0 (the old quadrotor depth-camera value) reaches only 4 deg above the
+    # horizon, which makes a ceiling taller than ~2.5 m unobservable. 0.0 scans
+    # ~49 deg up and ~49 deg down, so a closed tunnel is actually sensed.
+    # Overridable at launch: lidar_pitch:=45.0 restores the historical behaviour.
+    lidar_pitch: 0.0
     is_360lidar: 1
     use_minicf_pattern: 1
     use_avia_pattern: 0

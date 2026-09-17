@@ -214,6 +214,7 @@ def _setup(context):
                             "map_size_z",
                             "use_sim_time",
                             "collision_check_enable",
+                            "lidar_pitch",
                         )
                     }.items(),
                 )
@@ -244,6 +245,7 @@ def generate_launch_description():
             DeclareLaunchArgument("gazebo_resource_path", default_value=""),
             DeclareLaunchArgument("headless", default_value="false"),
             DeclareLaunchArgument("collision_check_enable", default_value="true"),
+            DeclareLaunchArgument("lidar_pitch", default_value="0.0"),
             OpaqueFunction(function=_setup),
         ]
     )

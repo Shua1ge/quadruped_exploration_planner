@@ -50,3 +50,39 @@ python3 tools/generate_collada_pcd.py --mode planar \
   --resolution 0.20 --vertical-spacing 0.20 \
   --output src/planner/plan_manage/maps/roboterrain_inspection_planar.pcd
 ```
+
+## SubT mine cropper
+
+`tools/crop_subt_mine.py` cuts a window out of a SubT mine OBJ and emits the
+same five artefacts the other scenes use. It exists because the scripts that
+produced `mine_edgar`, `mine_mbplanner`, `tunnel_trim`, `cave_trim` and
+`urban_trim` are no longer in the repository — only their products and metadata
+survived.
+
+It handles the two things a flat-scene converter gets wrong on real mines:
+
+- **Sloped floor.** `scene_planar.pcd` is the obstacle surface whose height
+  above the *local* floor is inside the robot waist band (default 0.08..0.85 m),
+  not an absolute Z slice. A per-XY floor height model is built from the
+  near-horizontal faces, and points farther than `--max-floor-dist` from any
+  real floor sample are dropped rather than measured against a floor borrowed
+  from the far side of a wall.
+- **Ceilings.** Only walls with |n_z| < 0.6 count as obstacles; ceiling face
+  centroids would otherwise cover the whole tunnel footprint and seal every
+  passage.
+
+It also bakes the Edgar authoring transform (centimetres, 90 deg roll), anchors
+Z so the spawn floor is 0, and recentres the window on the world origin because
+`ExplorationGrid` has no origin parameter and is hard-centred.
+
+```bash
+python3 tools/crop_subt_mine.py \
+  --source ~/.ignition/fuel/fuel.gazebosim.org/openrobotics/models/edgar/3/meshes/edgar.obj \
+  --name mine_edgar_200 --window -195 -13 200 --z-range -31 -4 \
+  --resolution 0.2 --robot-radius 0.55 \
+  --output-dir src/planner/plan_manage/maps/cropped_scenes/mine_edgar_200
+```
+
+See `maps/cropped_scenes/mine_edgar_200/README.md` for the scene this produced
+and the Explorer/SCAN parameter overrides narrow mine passages require.
+

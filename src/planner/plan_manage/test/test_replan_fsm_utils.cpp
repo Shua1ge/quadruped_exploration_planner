@@ -155,4 +155,27 @@ TEST(TrajectoryVersion, SafetyResultFollowsExecutedTrajectoryNotNewestReference)
   EXPECT_FALSE(safetyResultMatchesExecution(11, 30, 11, 31));
 }
 
+TEST(ExecutionProtocol, RejectsLateHoldAfterNewTrajectoryWasAccepted)
+{
+  EXPECT_FALSE(executionCommandTargetsCurrentOrNewer(10, 30, 11, 31));
+  EXPECT_FALSE(executionCommandTargetsCurrentOrNewer(11, 30, 11, 31));
+  EXPECT_TRUE(executionCommandTargetsCurrentOrNewer(11, 31, 11, 31));
+  EXPECT_TRUE(executionCommandTargetsCurrentOrNewer(12, 0, 11, 31));
+}
+
+TEST(ExecutionProtocol, NewTrajectoryReleasesOnlyAnOlderHold)
+{
+  EXPECT_TRUE(trajectorySupersedesExecutionCommand(11, 32, 11, 31));
+  EXPECT_TRUE(trajectorySupersedesExecutionCommand(12, 1, 11, 31));
+  EXPECT_FALSE(trajectorySupersedesExecutionCommand(11, 31, 11, 31));
+  EXPECT_FALSE(trajectorySupersedesExecutionCommand(10, 99, 11, 31));
+}
+
+TEST(ExecutionProtocol, FrozenFeedbackMustMatchExactExecution)
+{
+  EXPECT_TRUE(executionStateMatchesExecution(11, 31, 11, 31));
+  EXPECT_FALSE(executionStateMatchesExecution(10, 31, 11, 31));
+  EXPECT_FALSE(executionStateMatchesExecution(11, 30, 11, 31));
+}
+
 } // namespace scan_planner

@@ -13,6 +13,7 @@ scan_planner_node:
     fsm.rolling_replan_retry_period: 0.25
     fsm.rolling_replan_max_start_error: 0.30
     fsm.goal_tolerance: 0.25
+    fsm.heading_freeze_max_recoveries: 2
     fsm.fail_safe: true
     fsm.max_replan_fail_count: 5
 

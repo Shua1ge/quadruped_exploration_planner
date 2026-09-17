@@ -10,6 +10,8 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Bspline.msg"
   "msg/DataDisp.msg"
+  "msg/ExecutionCommand.msg"
+  "msg/ExecutionState.msg"
   "msg/LocalMapPatch.msg"
   "msg/TopoNode.msg"
   "msg/TopoEdge.msg"

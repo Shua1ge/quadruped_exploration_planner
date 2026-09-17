@@ -102,7 +102,7 @@ scan_planner_node:
     fsm.waypoints: [0.0, 0.0, 0.3, 5.0, 1.0, 0.3]
 ```
 
-自定义消息类型为 `scan_planner_msgs/msg/Bspline` 和 `scan_planner_msgs/msg/DataDisp`。规划器相关话题均为相对话题，支持重映射，核心输出话题包括 `planning/bspline`、`planning/data_display` 和 `planning/go2_execution_frozen`。
+自定义消息类型包括 `scan_planner_msgs/msg/Bspline`、`ExecutionCommand`、`ExecutionState` 和 `DataDisp`。规划器相关话题均为相对话题，支持重映射。SCAN 与控制器通过 `planning/bspline`、`planning/execution_command` 和 `planning/execution_state` 交换带 `request_id + trajectory_id` 的版本化执行信息；物理碰撞仍通过独立的安全链路触发不可自动解除的硬急停。
 
 关键点记录器现在是原生的 `rclpy` 可执行程序：
 

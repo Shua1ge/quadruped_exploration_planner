@@ -1,5 +1,15 @@
 # 区域承诺原子接管设计方案
 
+> **状态（2026-09-13）：设计提案，未按原文实现，部分已被取代。**
+> 本文写于稀疏拓扑系列改造之前，其中引用的行号已失效。
+> 文中"改进 2：区域级 Dense 失败反馈"以不同形式落地为 `frontier_explorer.py` 的
+> `dense_invalid_region_revisions`（按 map revision 记录区域稠密不可达并在承诺区域上触发释放，
+> `handle_dense_invalid_region`）；"改进 3：ATSP 缓存"落地为预测签名
+> `build_region_prediction_signature`。核心的 `HANDOFF_ELIGIBLE` 状态机**未实现**——
+> 实际方案是 `ResidualCommitmentGate`（残值承诺门，`explorer_core/region_commitment.py`）
+> 加上任务完成时的 `allow_commitment_transfer` 交接路径。
+> 当前真实机制见 `docs/PROJECT_HANDOFF_ZH.md` §5.4/§5.5。本文仅作设计历史保留。
+
 ## 问题定义
 
 当前 `activate_prepared_observation()` 在第 632-641 行硬性阻止跨区域切换：
