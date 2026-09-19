@@ -1,10 +1,17 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <xacro:macro name="go2_control_joint" params="name initial:=0.0">
+  <xacro:macro name="go2_control_joint" params="name initial:=0.0 effort_limit:=33.5">
     <joint name="${name}">
       <command_interface name="position">
         <param name="min">-3.14</param>
         <param name="max">3.14</param>
+      </command_interface>
+      <!-- A locomotion policy is trained against torque-limited joint PD.  The
+           position interface cannot express that: gz_ros2_control turns a
+           position command into a velocity servo with one fixed gain. -->
+      <command_interface name="effort">
+        <param name="min">-${effort_limit}</param>
+        <param name="max">${effort_limit}</param>
       </command_interface>
       <state_interface name="position">
         <param name="initial_value">${initial}</param>

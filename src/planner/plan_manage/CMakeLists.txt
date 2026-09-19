@@ -23,6 +23,8 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(traj_utils REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(ignition-transport11 REQUIRED)
+find_package(ignition-msgs8 REQUIRED)
 
 set(scan_planner_dependencies
   ament_index_cpp bspline_opt geometry_msgs nav_msgs path_searching plan_env
@@ -46,9 +48,18 @@ foreach(target open_loop_controller closed_loop_controller go2_kinematic_sim go2
   target_link_libraries(${target} Eigen3::Eigen)
 endforeach()
 
+# Planar cmd_vel adapter node for Gazebo ApplyLinkWrench
+add_executable(planar_cmd_vel_adapter src/planar_cmd_vel_adapter.cpp)
+target_include_directories(planar_cmd_vel_adapter PRIVATE include)
+ament_target_dependencies(planar_cmd_vel_adapter
+  geometry_msgs nav_msgs rclcpp)
+target_link_libraries(planar_cmd_vel_adapter
+  ignition-transport11::ignition-transport11
+  ignition-msgs8::ignition-msgs8)
+
 install(TARGETS
   scan_planner_node open_loop_controller closed_loop_controller
-  go2_kinematic_sim go2_gait_publisher
+  go2_kinematic_sim go2_gait_publisher planar_cmd_vel_adapter
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY launch config maps DESTINATION share/${PROJECT_NAME} OPTIONAL)
@@ -60,6 +71,8 @@ install(PROGRAMS
   scripts/global_representation_node.py
   scripts/sdf_map_publisher.py
   scripts/sdf_lidar_simulator.py
+  scripts/go2_tf_bridge.py
+  scripts/go2_policy_node.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}

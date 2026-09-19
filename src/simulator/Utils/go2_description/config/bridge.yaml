@@ -43,3 +43,8 @@
   ros_type_name: geometry_msgs/msg/Twist
   gz_type_name: gz.msgs.Twist
   direction: ROS_TO_GZ
+- ros_topic_name: /quad_0/cloud
+  gz_topic_name: /quad_0/lidar/points
+  ros_type_name: sensor_msgs/msg/PointCloud2
+  gz_type_name: gz.msgs.PointCloudPacked
+  direction: GZ_TO_ROS

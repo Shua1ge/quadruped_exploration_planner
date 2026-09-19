@@ -666,6 +666,11 @@ namespace scan_planner
             msg->request_id, msg->trajectory_id,
             executing_request, executing_trajectory))
     {
+      // The controller publishes its idle snapshot before SCAN has accepted a
+      // reference.  It carries no command and is not a stale execution fault.
+      if (!valid && msg->request_id == 0 && msg->trajectory_id == 0 &&
+          msg->state == scan_planner_msgs::msg::ExecutionState::STATE_IDLE)
+        return;
       RCLCPP_WARN_THROTTLE(
           node_->get_logger(), *node_->get_clock(), 1000,
           "[STALE_EXECUTION_STATE_IGNORED] state_request=%llu state_trajectory=%lld executing_request=%llu executing_trajectory=%lld state=%u",

@@ -17,6 +17,36 @@ void load_parameter(rclcpp::Node *node, const std::string &name, T &value, const
 }
 }  // namespace
 
+bool plan_env::pointInsideDoubleCylinder(
+    const Eigen::Vector3d& point, const Eigen::Vector3d& center,
+    const Eigen::Quaterniond& orientation, double radius, double offset,
+    double z_down, double z_up)
+{
+  const Eigen::Vector3d relative = point - center;
+  if (relative.z() < -z_down || relative.z() > z_up)
+    return false;
+
+  const Eigen::Vector3d heading = orientation * Eigen::Vector3d::UnitX();
+  Eigen::Vector2d heading_xy = heading.head<2>();
+  if (heading_xy.squaredNorm() < 1e-8)
+    heading_xy = Eigen::Vector2d::UnitX();
+  else
+    heading_xy.normalize();
+
+  const Eigen::Vector2d point_xy = point.head<2>();
+  const Eigen::Vector2d center_xy = center.head<2>();
+  const Eigen::Vector2d front = center_xy + offset * heading_xy;
+  const Eigen::Vector2d rear = center_xy - offset * heading_xy;
+  const double radius_squared = radius * radius;
+  return (point_xy - front).squaredNorm() <= radius_squared ||
+         (point_xy - rear).squaredNorm() <= radius_squared;
+}
+
+int plan_env::endpointObservation(bool self_filter_enabled, bool inside_self_filter)
+{
+  return self_filter_enabled && inside_self_filter ? 0 : 1;
+}
+
 thread_local const GridMap* GridMap::tls_snapshot_owner_ = nullptr;
 thread_local GridMap::InflatedOccupancySnapshotPtr GridMap::tls_snapshot_ = nullptr;
 
@@ -119,6 +149,16 @@ void GridMap::initMap(
   load_parameter(node_, "grid_map.obstacles_inflation_z_down", mp_.obstacles_inflation_z_down, -1.0);
   load_parameter(node_, "grid_map.double_cylinder_radius", mp_.double_cylinder_radius_, -1.0);
   load_parameter(node_, "grid_map.double_cylinder_offset", mp_.double_cylinder_offset_, 0.0);
+  load_parameter(node_, "grid_map.self_filter_enabled", mp_.self_filter_enabled_, true);
+  load_parameter(node_, "grid_map.self_filter_z_down", mp_.self_filter_z_down_, 0.45);
+  load_parameter(node_, "grid_map.self_filter_z_up", mp_.self_filter_z_up_, 0.20);
+  if (mp_.self_filter_enabled_ &&
+      (mp_.double_cylinder_radius_ <= 0.0 || mp_.double_cylinder_offset_ < 0.0 ||
+       mp_.self_filter_z_down_ < 0.0 || mp_.self_filter_z_up_ < 0.0))
+  {
+    throw std::invalid_argument(
+        "grid_map self-filter requires a positive radius and non-negative offsets and z bounds");
+  }
   load_parameter(node_, "grid_map.map_sliding_en", mp_.map_sliding_en_, true);
   load_parameter(node_, "grid_map.map_sliding_thresh", mp_.map_sliding_thresh_, mp_.resolution_);
 
@@ -641,6 +681,16 @@ void GridMap::projectDepthImage()
   }
 }
 
+bool GridMap::isInsideSelfFilter(const Eigen::Vector3d& point) const
+{
+  if (!mp_.self_filter_enabled_)
+    return false;
+
+  return plan_env::pointInsideDoubleCylinder(
+      point, md_.ray_pos_, md_.ray_q_, mp_.double_cylinder_radius_,
+      mp_.double_cylinder_offset_, mp_.self_filter_z_down_, mp_.self_filter_z_up_);
+}
+
 void GridMap::raycastProcess()
 {
   // if (md_.proj_points_.size() == 0)
@@ -695,7 +745,9 @@ void GridMap::raycastProcess()
       }
       else
       {
-        vox_idx = setCacheOccupancy(pt_w, 1);
+        const bool inside_self_filter = isInsideSelfFilter(pt_w);
+        vox_idx = setCacheOccupancy(
+            pt_w, plan_env::endpointObservation(mp_.self_filter_enabled_, inside_self_filter));
       }
     }
 

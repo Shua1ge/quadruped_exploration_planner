@@ -65,10 +65,18 @@ def _setup(context):
         }
     else:
         body_pose = "/quad_0/body_pose"
-        sensor_pose = "/quad_0/camera_pose" if sensor_type == "depth" else "/quad_0/lidar_pose"
+        if use_gazebo_physics and sensor_type == "lidar":
+            # Gazebo publishes the lidar cloud in the robot-mounted sensor
+            # frame.  The lidar is rigidly mounted close to the trunk origin,
+            # so the bridged model odometry supplies the ray origin and
+            # orientation used to project it into world coordinates.
+            sensor_pose = body_pose
+        else:
+            sensor_pose = ("/quad_0/camera_pose" if sensor_type == "depth"
+                           else "/quad_0/lidar_pose")
         cloud = "/quad_0/cloud"
         depth = "/quad_0/depth"
-        cloud_is_world = True
+        cloud_is_world = not use_gazebo_physics
         need_extrinsic = False
         intrinsics = {}
 
@@ -177,7 +185,7 @@ def _setup(context):
                     launch_arguments={
                         "world": LaunchConfiguration("gazebo_world"),
                         "resource_path": LaunchConfiguration("gazebo_resource_path"),
-                        "terrain_velocity_control": "true",
+                        "terrain_velocity_control": "true",  # Keep for OdometryPublisher, VelocityControl not used
                         "headless": LaunchConfiguration("headless"),
                         "x": LaunchConfiguration("init_x"),
                         "y": LaunchConfiguration("init_y"),
@@ -185,6 +193,75 @@ def _setup(context):
                     }.items(),
                 )
             )
+            # Add planar cmd_vel adapter for Gazebo physics
+            # Extract world name from SDF file path
+            gazebo_world_path = LaunchConfiguration("gazebo_world").perform(context)
+            world_name = "virtual_stix_geometry"  # NewMine test.sdf default
+            if "empty" in gazebo_world_path or "apply_link_wrench" in gazebo_world_path:
+                world_name = "apply_link_wrench"
+            
+            # Add TF bridge to connect Go2 TF tree for RViz
+            actions.append(
+                Node(
+                    package="scan_planner",
+                    executable="go2_tf_bridge.py",
+                    name="go2_tf_bridge",
+                    output="screen",
+                    parameters=[common],
+                )
+            )
+            
+            # Add GO2 RL Policy Node (Parkour MoE ONNX)
+            actions.append(
+                Node(
+                    package="scan_planner",
+                    executable="go2_onnx_policy_node.py",
+                    name="go2_onnx_policy_node",
+                    output="screen",
+                    parameters=[
+                        common,
+                        {
+                            "model_path": "/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx",
+                        },
+                    ],
+                )
+            )
+            
+            # The motion layer is now the RL policy driving joint positions
+            if _as_bool(LaunchConfiguration("wrench_actuator").perform(context)):
+                actions.append(
+                    Node(
+                        package="scan_planner",
+                        executable="planar_cmd_vel_adapter",
+                        name="planar_cmd_vel_adapter",
+                        output="screen",
+                        parameters=[
+                            common,
+                            {
+                                "world_name": world_name,
+                                "model_name": "go2",
+                                "link_name": "base",
+                                "cmd_timeout": 0.5,
+                                "kp_linear": 150.0,
+                                "kd_linear": 30.0,
+                                "kp_angular": 20.0,
+                                "kd_angular": 5.0,
+                                "max_force": 200.0,
+                                "max_torque": 30.0,
+                            },
+                        ],
+                        remappings=[
+                            ("cmd_vel", "/quad_0/cmd_vel"),
+                            ("body_pose", body_pose),
+                        ],
+                    )
+                )
+            
+            # Leg animation disabled: go2_gait_publisher publishes JointState
+            # (sensor feedback) but Gazebo expects JointTrajectory (commands).
+            # VelocityControl provides stable base motion without leg dynamics.
+            # To enable proper leg control, replace VelocityControl with
+            # effort controllers + go2_policy_node (RL-based locomotion).
         else:
             actions.append(
                 Node(
@@ -196,7 +273,8 @@ def _setup(context):
                     remappings=[("body_pose", body_pose)],
                 )
             )
-        actions.append(
+        if not use_gazebo_physics:
+            actions.append(
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(
                         os.path.join(scan_share, "launch", "simulator.launch.py")
@@ -223,7 +301,7 @@ def _setup(context):
                         )
                     }.items(),
                 )
-        )
+            )
     return actions
 
 
@@ -251,6 +329,7 @@ def generate_launch_description():
             DeclareLaunchArgument("init_z", default_value="0.3"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("use_gazebo_physics", default_value="false"),
+            DeclareLaunchArgument("wrench_actuator", default_value="false"),
             DeclareLaunchArgument("gazebo_world", default_value=""),
             DeclareLaunchArgument("gazebo_resource_path", default_value=""),
             DeclareLaunchArgument("headless", default_value="false"),

@@ -1,13 +1,17 @@
 """Spawn Go2 in Gazebo Fortress with gz_ros2_control."""
 
 import os
+import xml.etree.ElementTree as ET
 
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
+    LogInfo,
     RegisterEventHandler,
     SetEnvironmentVariable,
+    TimerAction,
 )
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -24,6 +28,58 @@ from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
+def _world_name(world_file):
+    root = ET.parse(world_file).getroot()
+    world = root if root.tag == "world" else root.find("world")
+    if world is None or not world.get("name"):
+        raise RuntimeError(f"No named <world> element in {world_file}")
+    return world.get("name")
+
+
+def _world_control(world_file, request):
+    return ExecuteProcess(
+        cmd=[
+            "ign", "service",
+            "-s", f"/world/{_world_name(world_file)}/control",
+            "--reqtype", "ignition.msgs.WorldControl",
+            "--reptype", "ignition.msgs.Boolean",
+            "--timeout", "5000",
+            "--req", request,
+        ],
+        output="screen",
+    )
+
+
+def _resume_after_controller(event, context):
+    # Physics never paused, so no need to resume
+    if event.returncode != 0:
+        return [LogInfo(msg="Controllers failed to activate")]
+    return [LogInfo(msg="Controllers activated successfully")]
+
+def _start_trajectory_after_broadcaster(event, _context, trajectory_controller):
+    if event.returncode != 0:
+        return [LogInfo(msg=(
+            "joint_state_broadcaster failed to configure; Gazebo remains paused."
+        ))]
+    return [trajectory_controller]
+
+
+def _activate_controllers_after_load(event, context, activate_controllers):
+    if event.returncode != 0:
+        return [LogInfo(msg=(
+            "joint_trajectory_controller failed to configure; Gazebo remains paused."
+        ))]
+
+    world_file = LaunchConfiguration("world").perform(context)
+    return [
+        activate_controllers,
+        TimerAction(
+            period=0.5,
+            actions=[_world_control(world_file, "pause: true multi_step: 100")],
+        ),
+    ]
+
+
 def generate_launch_description():
     # xacro package:// URIs are converted by Gazebo to
     # model://go2_description/..., so Gazebo must search the parent of this
@@ -35,14 +91,15 @@ def generate_launch_description():
     model = PathJoinSubstitution([description_share, "xacro", "robot.xacro"])
     world = LaunchConfiguration("world")
     gazebo_args = PythonExpression([
-        "'-r -s -v 3 ' if '", LaunchConfiguration("headless"),
-        "'.lower() in ('1', 'true', 'yes', 'on') else '-r -v 3 '",
+        "'-s -v 3 ' if '", LaunchConfiguration("headless"),
+        "'.lower() in ('1', 'true', 'yes', 'on') else '-v 3 '",
     ])
     bridge_config = PathJoinSubstitution([description_share, "config", "bridge.yaml"])
     robot_description = {
         "robot_description": ParameterValue(Command([
-            "xacro ", model, " use_gazebo:=true terrain_velocity_control:=",
-            LaunchConfiguration("terrain_velocity_control"),
+            "xacro ", model, 
+            " use_gazebo:=true",
+            " terrain_velocity_control:=true",  # Keep OdometryPublisher enabled
         ]), value_type=str),
         "use_sim_time": True,
     }
@@ -73,22 +130,68 @@ def generate_launch_description():
             "-z", LaunchConfiguration("z"),
         ],
     )
+    # The legs are unactuated until these controllers are active, and an
+    # unactuated Go2 folds onto the ground within a few seconds -- it cannot
+    # stand back up afterwards, which then breaks local planning
+    # (the low body marks its own pose as occupied).  Waiting for the
+    # controller manager instead of failing its first service call keeps this
+    # window short.
     joint_state_broadcaster = Node(
         package="controller_manager",
         executable="spawner",
-        arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
+        arguments=[
+            "joint_state_broadcaster",
+            "--controller-manager", "/controller_manager",
+            "--controller-manager-timeout", "60",
+            "--switch-timeout", "60",
+            "--inactive",
+        ],
         output="screen",
     )
     trajectory_controller = Node(
         package="controller_manager",
         executable="spawner",
-        arguments=["joint_trajectory_controller", "--controller-manager", "/controller_manager"],
+        arguments=[
+            "joint_trajectory_controller",
+            "--controller-manager", "/controller_manager",
+            "--controller-manager-timeout", "60",
+            "--switch-timeout", "60",
+            "--inactive",
+        ],
+        output="screen",
+    )
+    activate_controllers = ExecuteProcess(
+        cmd=[
+            "ros2", "control", "switch_controllers",
+            "--activate", "joint_state_broadcaster", "joint_trajectory_controller",
+            "--strict", "--activate-asap",
+        ],
         output="screen",
     )
     start_controllers = RegisterEventHandler(
         OnProcessExit(
             target_action=spawn,
-            on_exit=[joint_state_broadcaster, trajectory_controller],
+            on_exit=[joint_state_broadcaster],
+        )
+    )
+    start_trajectory_controller = RegisterEventHandler(
+        OnProcessExit(
+            target_action=joint_state_broadcaster,
+            on_exit=lambda event, context: _start_trajectory_after_broadcaster(
+                event, context, trajectory_controller),
+        )
+    )
+    activate_after_load = RegisterEventHandler(
+        OnProcessExit(
+            target_action=trajectory_controller,
+            on_exit=lambda event, context: _activate_controllers_after_load(
+                event, context, activate_controllers),
+        )
+    )
+    resume_physics = RegisterEventHandler(
+        OnProcessExit(
+            target_action=activate_controllers,
+            on_exit=_resume_after_controller,
         )
     )
     bridge = Node(
@@ -130,5 +233,8 @@ def generate_launch_description():
             bridge,
             spawn,
             start_controllers,
+            start_trajectory_controller,
+            activate_after_load,
+            resume_physics,
         ]
     )

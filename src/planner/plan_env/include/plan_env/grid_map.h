@@ -39,6 +39,16 @@
 #define logit(x) (log((x) / (1 - (x))))
 
 using namespace std;
+
+namespace plan_env
+{
+bool pointInsideDoubleCylinder(
+    const Eigen::Vector3d& point, const Eigen::Vector3d& center,
+    const Eigen::Quaterniond& orientation, double radius, double offset,
+    double z_down, double z_up);
+int endpointObservation(bool self_filter_enabled, bool inside_self_filter);
+}
+
 // voxel hashing
 template <typename T>
 struct matrix_hash {
@@ -66,6 +76,8 @@ struct MappingParameters {
   double resolution_, resolution_inv_;
   double obstacles_inflation_z_up, obstacles_inflation_z_down;
   double double_cylinder_radius_, double_cylinder_offset_;
+  bool self_filter_enabled_;
+  double self_filter_z_down_, self_filter_z_up_;
   bool map_sliding_en_;
   double map_sliding_thresh_;
   int map_sliding_thresh_vox_;
@@ -253,6 +265,7 @@ private:
   // main update process
   void projectDepthImage();
   void raycastProcess();
+  bool isInsideSelfFilter(const Eigen::Vector3d& point) const;
 
   inline void inflatePoint(const Eigen::Vector3i& pt, int inf_step_xy, int inf_step_z_up, int inf_step_z_down, vector<Eigen::Vector3i>& pts);
   inline int getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer);

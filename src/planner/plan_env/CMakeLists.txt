@@ -42,4 +42,13 @@ ament_export_targets(export_plan_env HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   cv_bridge Eigen3 geometry_msgs message_filters nav_msgs pcl_conversions
   rclcpp scan_planner_msgs sensor_msgs tf2 tf2_ros visualization_msgs)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_self_filter test/test_self_filter.cpp)
+  if(TARGET test_self_filter)
+    target_link_libraries(test_self_filter plan_env Eigen3::Eigen)
+  endif()
+endif()
+
 ament_package()

@@ -21,17 +21,22 @@
               name="gz_ros2_control::GazeboSimROS2ControlPlugin">
         <parameters>$(find go2_description)/config/ros2_controllers.yaml</parameters>
       </plugin>
+      
+      <!-- Always publish odometry, regardless of control mode -->
+      <plugin filename="ignition-gazebo-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_publish_frequency>100</odom_publish_frequency>
+        <dimensions>3</dimensions>
+      </plugin>
+      
       <xacro:if value="$(arg terrain_velocity_control)">
-        <!-- Planning benchmark adapter: drives the Gazebo model from Twist
-             while physics still resolves gravity and terrain contacts. This
-             is not a learned or force-level quadruped locomotion controller. -->
+        <!-- Velocity-level base: gz subscribes to /model/go2/cmd_vel and drives
+             the model at the commanded velocity, which is what the cmd_vel-level
+             closed_loop_controller expects.  A force-based base (ApplyLinkWrench
+             plus planar_cmd_vel_adapter) has no stable operating point on this
+             robot: sliding needs more force than the stance can resist tipping. -->
         <plugin filename="ignition-gazebo-velocity-control-system"
                 name="gz::sim::systems::VelocityControl"/>
-        <plugin filename="ignition-gazebo-odometry-publisher-system"
-                name="gz::sim::systems::OdometryPublisher">
-          <odom_publish_frequency>100</odom_publish_frequency>
-          <dimensions>3</dimensions>
-        </plugin>
       </xacro:if>
     </gazebo>
 
@@ -41,6 +46,36 @@
         <update_rate>200</update_rate>
         <topic>/go2/imu</topic>
         <imu/>
+      </sensor>
+    </gazebo>
+
+    <gazebo reference="lidar_link">
+      <sensor name="exploration_lidar" type="gpu_lidar">
+        <topic>/quad_0/lidar/points</topic>
+        <update_rate>10</update_rate>
+        <lidar>
+          <scan>
+            <horizontal>
+              <samples>720</samples>
+              <resolution>1</resolution>
+              <min_angle>-3.14159265359</min_angle>
+              <max_angle>3.14159265359</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>1</samples>
+              <resolution>1</resolution>
+              <min_angle>0</min_angle>
+              <max_angle>0</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>0.20</min>
+            <max>7.50</max>
+            <resolution>0.01</resolution>
+          </range>
+        </lidar>
+        <alwaysOn>1</alwaysOn>
+        <visualize>true</visualize>
       </sensor>
     </gazebo>
 

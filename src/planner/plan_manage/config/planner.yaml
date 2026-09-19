@@ -30,6 +30,9 @@ scan_planner_node:
     # radius, with a small allowance for voxelization and tracking error.
     grid_map.double_cylinder_radius: 0.35
     grid_map.double_cylinder_offset: 0.18
+    grid_map.self_filter_enabled: true
+    grid_map.self_filter_z_down: 0.45
+    grid_map.self_filter_z_up: 0.20
     grid_map.body_height: 0.4
     grid_map.obstacles_inflation_z_up: 0.1
     grid_map.obstacles_inflation_z_down: 0.4

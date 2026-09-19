@@ -1,21 +1,71 @@
-"""Long-horizon exploration with LiDAR ray casting directly from NewMine SDF."""
+"""Long-horizon exploration in the native NewMine Gazebo world."""
 
 import os
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import UnlessCondition
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
-MAP_SIZE = 160.0
-# NewMine source bounds centre at approximately (61.045, 62.160).  The default
-# source-frame staging pose is (0, 0), hence this recentered spawn.
-DEFAULT_INIT_X = -61.045
-DEFAULT_INIT_Y = -62.160
+MAP_SIZE = 280.0
+# Gazebo loads the original world coordinate system.  The staging platform and
+# cave entrance are authored around the NewMine world origin.
+DEFAULT_INIT_X = 0.0
+DEFAULT_INIT_Y = 0.0
+
+
+def _reject_existing_simulation(_context):
+    """Reject both live and half-dead Gazebo runs before spawning a robot.
+
+    A Gazebo server may survive its parent launch process while its clock bridge
+    has already exited.  Checking only /clock misses that state and a later
+    launch then inserts a second Go2 into the orphaned world.
+    """
+    import rclpy
+    from rclpy.executors import SingleThreadedExecutor
+
+    ros_context = rclpy.Context()
+    # Launch arguments (for example ``headless:=true``) are not ROS remaps.
+    # Do not let rclpy parse the parent launch process arguments here.
+    rclpy.init(args=[], context=ros_context)
+    node = rclpy.create_node(
+        f"newmine_launch_preflight_{os.getpid()}", context=ros_context)
+    executor = SingleThreadedExecutor(context=ros_context)
+    executor.add_node(node)
+    try:
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.1)
+        clock_publishers = node.count_publishers("/clock")
+        graph_nodes = {name for name, _namespace in node.get_node_names_and_namespaces()}
+        stale_sim_nodes = sorted(
+            graph_nodes.intersection({
+                "go2_gz_bridge",
+                "gz_ros2_control",
+                "controller_manager",
+            }))
+        if clock_publishers or stale_sim_nodes:
+            details = []
+            if clock_publishers:
+                details.append(f"/clock has {clock_publishers} publisher(s)")
+            if stale_sim_nodes:
+                details.append("existing simulation nodes: " + ", ".join(stale_sim_nodes))
+            raise RuntimeError(
+                "NewMine launch refused: " + "; ".join(details) + ". Stop the "
+                "previous Gazebo/ROS launch completely before starting a new run. "
+                "A stale Gazebo server can retain the old Go2 even after its clock "
+                "bridge exits, causing go2/go2_0 and duplicate controllers.")
+    finally:
+        executor.remove_node(node)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown(context=ros_context)
+    return []
 
 
 def generate_launch_description():
@@ -26,14 +76,16 @@ def generate_launch_description():
             default_value="/home/t1an/ros2_ws/mine_tunnel_world/worlds/NewMine.sdf"),
         DeclareLaunchArgument("use_gpu", default_value="true"),
         DeclareLaunchArgument("headless", default_value="false"),
+        DeclareLaunchArgument("show_rviz", default_value="true"),
         DeclareLaunchArgument("auto_start", default_value="true"),
         DeclareLaunchArgument("selection_strategy", default_value="hierarchical"),
         DeclareLaunchArgument(
             "metrics_file", default_value="/tmp/newmine_long_horizon_01.csv"),
         DeclareLaunchArgument("init_x", default_value=str(DEFAULT_INIT_X)),
         DeclareLaunchArgument("init_y", default_value=str(DEFAULT_INIT_Y)),
-        DeclareLaunchArgument("init_z", default_value="0.3"),
+        DeclareLaunchArgument("init_z", default_value="0.45"),
         DeclareLaunchArgument("sdf_sample_resolution", default_value="0.20"),
+        OpaqueFunction(function=_reject_existing_simulation),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(scan_share, "launch", "run.launch.py")),
@@ -43,19 +95,19 @@ def generate_launch_description():
                 "controller_mode": "closed_loop",
                 "use_gpu": LaunchConfiguration("use_gpu"),
                 "use_pcd_map": "false",
-                "use_sdf_map": "true",
-                "sdf_world_file": LaunchConfiguration("world_file"),
-                "sdf_sample_resolution": LaunchConfiguration(
-                    "sdf_sample_resolution"),
-                "sdf_recenter": "true",
+                "use_sdf_map": "false",
                 "map_size_x": str(MAP_SIZE),
                 "map_size_y": str(MAP_SIZE),
                 "map_size_z": "10.0",
                 "init_x": LaunchConfiguration("init_x"),
                 "init_y": LaunchConfiguration("init_y"),
                 "init_z": LaunchConfiguration("init_z"),
-                "use_sim_time": "false",
-                "collision_check_enable": "true",
+                "use_sim_time": "true",
+                "use_gazebo_physics": "true",
+                "gazebo_world": LaunchConfiguration("world_file"),
+                "gazebo_resource_path": "/home/t1an/ros2_ws/mine_tunnel_world/models",
+                "headless": LaunchConfiguration("headless"),
+                "collision_check_enable": "false",
             }.items()),
         Node(
             package="scan_planner",
@@ -75,10 +127,17 @@ def generate_launch_description():
                 "hit_dilation_bins": 3,
                 "obstacle_min_z": 0.08,
                 "obstacle_max_z": 0.85,
-                "inflation_radius": 0.65,
-                "viewpoint_standoff": 1.0,
-                "min_frontier_size": 6,
-                "min_goal_distance": 2.0,
+                "obstacle_z_relative_to_body": True,
+                "cloud_is_world": False,
+                # NewMine contains 2.9--3.0 m portals and short blind bends.
+                # Keep the physical margin conservative for a Go2 footprint,
+                # but allow rolling observation poses inside the portal.  The
+                # flat-world 0.65/1.0/2.0 defaults otherwise extract a valid
+                # frontier here and then reject every possible viewpoint.
+                "inflation_radius": 0.45,
+                "viewpoint_standoff": 0.60,
+                "min_frontier_size": 4,
+                "min_goal_distance": 0.80,
                 "preferred_goal_path_length": 3.5,
                 "long_horizon_min_gain_ratio": 0.65,
                 "blacklist_radius": 1.5,
@@ -104,9 +163,10 @@ def generate_launch_description():
                 "observation_done_ratio": 0.80,
                 "observation_done_updates": 3,
                 "observation_closure_updates": 10,
-                "min_expected_observation_cells": 8,
+                "min_expected_observation_cells": 4,
                 "planning_period": 0.25,
                 "frame_id": "world",
+                "use_sim_time": True,
             }],
             remappings=[
                 ("cloud", "/quad_0/cloud"),
@@ -121,11 +181,12 @@ def generate_launch_description():
             name="global_representation",
             output="screen",
             parameters=[{
+                "use_sim_time": True,
                 "max_oracle_queries": 8,
                 "snapshot_period_revisions": 10,
             }]),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(scan_share, "launch", "rviz.launch.py")),
-            condition=UnlessCondition(LaunchConfiguration("headless"))),
+            condition=IfCondition(LaunchConfiguration("show_rviz"))),
     ])

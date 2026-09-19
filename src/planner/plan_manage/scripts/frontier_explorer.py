@@ -157,6 +157,8 @@ class FrontierExplorer(Node):
         self.obstacle_max_z = float(self.declare_parameter("obstacle_max_z", 0.85).value)
         self.obstacle_z_relative_to_body = bool(
             self.declare_parameter("obstacle_z_relative_to_body", False).value)
+        self.cloud_is_world = bool(
+            self.declare_parameter("cloud_is_world", True).value)
         self.inflation_radius = float(self.declare_parameter("inflation_radius", 0.65).value)
         self.viewpoint_standoff = float(
             self.declare_parameter("viewpoint_standoff", 1.0).value)
@@ -284,6 +286,7 @@ class FrontierExplorer(Node):
 
         self.position: Optional[Point2] = None
         self.body_z = 0.3
+        self.body_yaw = 0.0
         self.last_map_update_ns = 0
         self.map_update_count = 0
         self.map_content_revision = 0
@@ -609,6 +612,12 @@ class FrontierExplorer(Node):
         self.last_metric_position = new_position
         self.position = new_position
         self.body_z = msg.pose.pose.position.z
+        orientation = msg.pose.pose.orientation
+        self.body_yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z
+                   + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y * orientation.y
+                         + orientation.z * orientation.z))
 
     def current_blocked_edges(self) -> Set[DirectedEdge]:
         now_ns = self.get_clock().now().nanoseconds
@@ -653,11 +662,41 @@ class FrontierExplorer(Node):
         now_ns = self.get_clock().now().nanoseconds
         if now_ns - self.last_map_update_ns < int(self.map_update_period * 1e9):
             return
-        points = point_cloud2.read_points_numpy(
-            msg, field_names=("x", "y", "z"), skip_nans=True)
+        xyz_fields = tuple(
+            field for field in msg.fields if field.name in ("x", "y", "z"))
+        uniform_xyz = (len(xyz_fields) == 3
+                       and len({field.datatype for field in xyz_fields}) == 1
+                       and len({field.datatype for field in msg.fields}) == 1)
+        if uniform_xyz:
+            points = point_cloud2.read_points_numpy(
+                msg, field_names=("x", "y", "z"), skip_nans=True)
+            array = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        else:
+            # Gazebo PointCloudPacked adds heterogeneous metadata fields.  The
+            # ROS helper's NumPy fast path rejects the complete schema even
+            # when only x/y/z are requested, so select those structured fields
+            # explicitly before forming an ordinary XYZ matrix.
+            points = point_cloud2.read_points(
+                msg, field_names=("x", "y", "z"), skip_nans=True)
+            if points.size == 0:
+                return
+            array = np.column_stack(
+                (points["x"], points["y"], points["z"])).astype(
+                    np.float64, copy=False)
         if points.size == 0:
             return
-        array = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        if not self.cloud_is_world:
+            cos_yaw = math.cos(self.body_yaw)
+            sin_yaw = math.sin(self.body_yaw)
+            local_x = array[:, 0].copy()
+            local_y = array[:, 1].copy()
+            # Match the fixed lidar_joint transform in the Gazebo GO2 model.
+            local_x += 0.10
+            array[:, 0] = (self.position[0] + cos_yaw * local_x
+                           - sin_yaw * local_y)
+            array[:, 1] = (self.position[1] + sin_yaw * local_x
+                           + cos_yaw * local_y)
+            array[:, 2] += self.body_z + 0.12
         dx = array[:, 0] - self.position[0]
         dy = array[:, 1] - self.position[1]
         distances = np.hypot(dx, dy)
