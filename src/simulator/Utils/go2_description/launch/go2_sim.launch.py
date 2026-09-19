@@ -117,19 +117,22 @@ def generate_launch_description():
         output="screen",
         parameters=[robot_description],
     )
-    spawn = Node(
-        package="ros_gz_sim",
-        executable="create",
-        output="screen",
-        arguments=[
-            "-topic", "robot_description",
-            "-name", "go2",
-            "-allow_renaming", "false",
-            "-x", LaunchConfiguration("x"),
-            "-y", LaunchConfiguration("y"),
-            "-z", LaunchConfiguration("z"),
-        ],
-    )
+    # Spawn robot - DISABLED: GO2 is now defined directly in test_with_go2.sdf
+    # This avoids sensor initialization timing issues with dynamic spawn
+    spawn = None
+    # spawn = Node(
+    #     package="ros_gz_sim",
+    #     executable="create",
+    #     output="screen",
+    #     arguments=[
+    #         "-topic", "robot_description",
+    #         "-name", "go2",
+    #         "-allow_renaming", "false",
+    #         "-x", LaunchConfiguration("x"),
+    #         "-y", LaunchConfiguration("y"),
+    #         "-z", LaunchConfiguration("z"),
+    #     ],
+    # )
     # The legs are unactuated until these controllers are active, and an
     # unactuated Go2 folds onto the ground within a few seconds -- it cannot
     # stand back up afterwards, which then breaks local planning
@@ -168,10 +171,11 @@ def generate_launch_description():
         ],
         output="screen",
     )
+    # Start controllers after bridge is ready (GO2 now in SDF, not after spawn)
     start_controllers = RegisterEventHandler(
         OnProcessExit(
-            target_action=spawn,
-            on_exit=[joint_state_broadcaster],
+            target_action=bridge,
+            on_exit=joint_state_broadcaster,
         )
     )
     start_trajectory_controller = RegisterEventHandler(
@@ -231,7 +235,7 @@ def generate_launch_description():
             gazebo,
             state_publisher,
             bridge,
-            spawn,
+            # spawn,  # DISABLED: GO2 now defined in test_with_go2.sdf
             start_controllers,
             start_trajectory_controller,
             activate_after_load,
