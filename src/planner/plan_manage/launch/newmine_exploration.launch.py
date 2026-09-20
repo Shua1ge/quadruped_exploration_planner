@@ -19,13 +19,23 @@ DEFAULT_INIT_X = 0.0
 DEFAULT_INIT_Y = 0.0
 
 
-def _reject_existing_simulation(_context):
-    """Reject both live and half-dead Gazebo runs before spawning a robot.
+def _reject_existing_simulation(context):
+    """Validate the selected mode and reject stale Gazebo processes."""
+    enabled = lambda name: LaunchConfiguration(name).perform(context).lower() in (
+        "1", "true", "yes", "on")
+    use_gazebo_physics = enabled("use_gazebo_physics")
+    use_sdf_map = enabled("use_sdf_map")
+    if enabled("use_pcd_map"):
+        raise RuntimeError(
+            "NewMine exploration does not accept a PCD truth map; use_pcd_map must be false")
+    if use_gazebo_physics and use_sdf_map:
+        raise RuntimeError(
+            "Gazebo physics and private SDF raycasting are mutually exclusive")
+    if not use_gazebo_physics and not use_sdf_map:
+        raise RuntimeError("Lightweight exploration requires use_sdf_map=true")
+    if not use_gazebo_physics:
+        return []
 
-    A Gazebo server may survive its parent launch process while its clock bridge
-    has already exited.  Checking only /clock misses that state and a later
-    launch then inserts a second Go2 into the orphaned world.
-    """
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
 
@@ -82,9 +92,8 @@ def generate_launch_description():
         DeclareLaunchArgument("sdf_world_file", default_value=""),
         DeclareLaunchArgument("sdf_map_mode", default_value="surface"),
         DeclareLaunchArgument("sdf_sample_resolution", default_value="0.20"),
-        DeclareLaunchArgument("sdf_recenter", default_value="true"),
-        DeclareLaunchArgument("publish_sdf_global_cloud", default_value="true"),
-        DeclareLaunchArgument("cloud_is_world", default_value="false"),
+        DeclareLaunchArgument("sdf_recenter", default_value="false"),
+        DeclareLaunchArgument("publish_sdf_global_cloud", default_value="false"),
         DeclareLaunchArgument("collision_check_enable", default_value="false"),
         DeclareLaunchArgument("headless", default_value="false"),
         DeclareLaunchArgument("show_rviz", default_value="true"),
@@ -142,7 +151,10 @@ def generate_launch_description():
                 "obstacle_min_z": 0.08,
                 "obstacle_max_z": 0.85,
                 "obstacle_z_relative_to_body": True,
-                "cloud_is_world": LaunchConfiguration("cloud_is_world"),
+                "cloud_is_world": PythonExpression([
+                    "'", LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() != 'true'",
+                ]),
                 # NewMine contains 2.9--3.0 m portals and short blind bends.
                 # Keep the physical margin conservative for a Go2 footprint,
                 # but allow rolling observation poses inside the portal.  The

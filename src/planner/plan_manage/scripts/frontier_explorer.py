@@ -12,6 +12,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Point, PoseStamped
+from map_msgs.msg import OccupancyGridUpdate
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -290,6 +291,8 @@ class FrontierExplorer(Node):
         self.last_map_update_ns = 0
         self.map_update_count = 0
         self.map_content_revision = 0
+        self.map_published = False
+        self.changed_cells: Set[Cell] = set()
         self.route_constraint_revision = 0
         self.replan_gate = ReplanGate(self.max_replans_per_context)
         self.replan_suppressed_count = 0
@@ -455,6 +458,8 @@ class FrontierExplorer(Node):
         self.path_pub = self.create_publisher(Path, "initial_path", 10)
         self.path_vis_pub = self.create_publisher(Path, "explorer/path", transient_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, "explorer/map", transient_qos)
+        self.map_updates_pub = self.create_publisher(
+            OccupancyGridUpdate, "map_updates", transient_qos)
         self.planning_map_pub = self.create_publisher(
             OccupancyGrid, "explorer/planning_map", transient_qos)
         self.frontier_pub = self.create_publisher(Marker, "explorer/frontiers", transient_qos)
@@ -720,7 +725,10 @@ class FrontierExplorer(Node):
         # occupied as well so a real wall cannot disappear between ray bins.
         if np.any(mask):
             self.grid.mark_occupied_points(array[mask, :2])
-        if not np.array_equal(self.grid.data, previous_grid):
+        changed_mask = self.grid.data != previous_grid
+        if np.any(changed_mask):
+            ys, xs = np.where(changed_mask)
+            self.changed_cells.update(zip(xs.tolist(), ys.tolist()))
             self.map_content_revision += 1
         self.last_map_update_ns = now_ns
         self.map_update_count += 1
@@ -2666,8 +2674,28 @@ class FrontierExplorer(Node):
         return msg
 
     def publish_maps(self):
-        self.map_pub.publish(self.occupancy_message(False))
+        if not self.changed_cells:
+            return
+        if not self.map_published:
+            self.map_pub.publish(self.occupancy_message(False))
+        else:
+            xs = [cell[0] for cell in self.changed_cells]
+            ys = [cell[1] for cell in self.changed_cells]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            update = OccupancyGridUpdate()
+            update.header.stamp = self.get_clock().now().to_msg()
+            update.header.frame_id = self.frame_id
+            update.x = min_x
+            update.y = min_y
+            update.width = max_x - min_x + 1
+            update.height = max_y - min_y + 1
+            update.data = self.grid.data[
+                min_y:max_y + 1, min_x:max_x + 1].reshape(-1).astype(int).tolist()
+            self.map_updates_pub.publish(update)
         self.planning_map_pub.publish(self.occupancy_message(True))
+        self.changed_cells.clear()
+        self.map_published = True
 
     def publish_frontiers(self, cells: Iterable[Cell]):
         marker = Marker()

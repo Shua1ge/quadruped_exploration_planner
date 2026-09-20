@@ -12,6 +12,8 @@ find_package(bspline_opt REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(map_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(path_searching REQUIRED)
 find_package(plan_env REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -27,9 +29,9 @@ find_package(ignition-transport11 REQUIRED)
 find_package(ignition-msgs8 REQUIRED)
 
 set(scan_planner_dependencies
-  ament_index_cpp bspline_opt geometry_msgs nav_msgs path_searching plan_env
+  ament_index_cpp bspline_opt geometry_msgs map_msgs nav_msgs path_searching plan_env
   rclcpp scan_planner_msgs sensor_msgs std_msgs tf2 tf2_geometry_msgs tf2_ros
-  traj_utils visualization_msgs)
+  trajectory_msgs traj_utils visualization_msgs)
 
 add_executable(scan_planner_node
   src/scan_planner_node.cpp
@@ -73,6 +75,7 @@ install(PROGRAMS
   scripts/sdf_lidar_simulator.py
   scripts/go2_tf_bridge.py
   scripts/go2_policy_node.py
+  scripts/go2_onnx_policy_node.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}

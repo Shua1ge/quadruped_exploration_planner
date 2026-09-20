@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+from builtin_interfaces.msg import Time
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -54,6 +55,31 @@ def test_original_obstacle_points_are_always_inserted():
     grid.mark_occupied_points([[1.03, -0.97], [1.06, -0.92]])
 
     assert grid.value(grid.world_to_cell(1.03, -0.97)) == MODULE.OCCUPIED
+
+
+def test_incremental_map_update_uses_changed_cell_bounds():
+    node = object.__new__(MODULE.FrontierExplorer)
+    node.grid = MODULE.ExplorationGrid(4.0, 4.0, 1.0, 0.0, 0.0)
+    node.grid.data[1, 2] = MODULE.FREE
+    node.grid.data[3, 3] = MODULE.OCCUPIED
+    node.changed_cells = {(2, 1), (3, 3)}
+    node.map_published = True
+    node.frame_id = "world"
+    published = []
+    node.map_updates_pub = SimpleNamespace(publish=published.append)
+    node.map_pub = SimpleNamespace(publish=lambda _: None)
+    node.planning_map_pub = SimpleNamespace(publish=lambda _: None)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time()))
+    node.occupancy_message = lambda planning=False: SimpleNamespace()
+
+    MODULE.FrontierExplorer.publish_maps(node)
+
+    assert len(published) == 1
+    update = published[0]
+    assert (update.x, update.y, update.width, update.height) == (2, 1, 2, 3)
+    assert list(update.data) == [0, -1, -1, -1, -1, 100]
+    assert node.changed_cells == set()
 
 
 def test_frontiers_separate_known_free_from_unknown():

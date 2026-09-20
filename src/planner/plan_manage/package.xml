@@ -13,6 +13,8 @@
   <depend>eigen</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>map_msgs</depend>
+  <depend>trajectory_msgs</depend>
   <depend>path_searching</depend>
   <depend>plan_env</depend>
   <depend>rclcpp</depend>
