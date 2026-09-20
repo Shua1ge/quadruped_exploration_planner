@@ -117,22 +117,19 @@ def generate_launch_description():
         output="screen",
         parameters=[robot_description],
     )
-    # Spawn robot - DISABLED: GO2 is now defined directly in test_with_go2.sdf
-    # This avoids sensor initialization timing issues with dynamic spawn
-    spawn = None
-    # spawn = Node(
-    #     package="ros_gz_sim",
-    #     executable="create",
-    #     output="screen",
-    #     arguments=[
-    #         "-topic", "robot_description",
-    #         "-name", "go2",
-    #         "-allow_renaming", "false",
-    #         "-x", LaunchConfiguration("x"),
-    #         "-y", LaunchConfiguration("y"),
-    #         "-z", LaunchConfiguration("z"),
-    #     ],
-    # )
+    spawn = Node(
+        package="ros_gz_sim",
+        executable="create",
+        output="screen",
+        arguments=[
+            "-topic", "robot_description",
+            "-name", "go2",
+            "-allow_renaming", "false",
+            "-x", LaunchConfiguration("x"),
+            "-y", LaunchConfiguration("y"),
+            "-z", LaunchConfiguration("z"),
+        ],
+    )
     # The legs are unactuated until these controllers are active, and an
     # unactuated Go2 folds onto the ground within a few seconds -- it cannot
     # stand back up afterwards, which then breaks local planning
@@ -171,11 +168,10 @@ def generate_launch_description():
         ],
         output="screen",
     )
-    # Start controllers after bridge is ready (GO2 now in SDF, not after spawn)
     start_controllers = RegisterEventHandler(
         OnProcessExit(
-            target_action=bridge,
-            on_exit=joint_state_broadcaster,
+            target_action=spawn,
+            on_exit=[joint_state_broadcaster],
         )
     )
     start_trajectory_controller = RegisterEventHandler(
@@ -208,6 +204,17 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            # Declare resource_path FIRST before it's referenced
+            DeclareLaunchArgument("resource_path", default_value=""),
+            DeclareLaunchArgument(
+                "world",
+                default_value=PathJoinSubstitution([description_share, "worlds", "empty.sdf"]),
+            ),
+            DeclareLaunchArgument("terrain_velocity_control", default_value="false"),
+            DeclareLaunchArgument("headless", default_value="false"),
+            DeclareLaunchArgument("x", default_value="0.0"),
+            DeclareLaunchArgument("y", default_value="0.0"),
+            DeclareLaunchArgument("z", default_value="0.5"),
             # Fortress uses IGN_GAZEBO_RESOURCE_PATH.  Set the newer alias as
             # well, keeping this launch usable with newer Gazebo releases.
             SetEnvironmentVariable(
@@ -216,26 +223,10 @@ def generate_launch_description():
                        default_resource_root, os.pathsep,
                        EnvironmentVariable("IGN_GAZEBO_RESOURCE_PATH", default_value="")],
             ),
-            SetEnvironmentVariable(
-                name="GZ_SIM_RESOURCE_PATH",
-                value=[LaunchConfiguration("resource_path"), os.pathsep,
-                       default_resource_root, os.pathsep,
-                       EnvironmentVariable("GZ_SIM_RESOURCE_PATH", default_value="")],
-            ),
-            DeclareLaunchArgument(
-                "world",
-                default_value=PathJoinSubstitution([description_share, "worlds", "empty.sdf"]),
-            ),
-            DeclareLaunchArgument("resource_path", default_value=""),
-            DeclareLaunchArgument("terrain_velocity_control", default_value="false"),
-            DeclareLaunchArgument("headless", default_value="false"),
-            DeclareLaunchArgument("x", default_value="0.0"),
-            DeclareLaunchArgument("y", default_value="0.0"),
-            DeclareLaunchArgument("z", default_value="0.5"),
             gazebo,
             state_publisher,
             bridge,
-            # spawn,  # DISABLED: GO2 now defined in test_with_go2.sdf
+            spawn,
             start_controllers,
             start_trajectory_controller,
             activate_after_load,
