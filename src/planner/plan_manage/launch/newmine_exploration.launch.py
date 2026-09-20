@@ -6,9 +6,9 @@ import time
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -75,6 +75,17 @@ def generate_launch_description():
             "world_file",
             default_value="/home/t1an/ros2_ws/mine_tunnel_world/worlds/NewMine.sdf"),
         DeclareLaunchArgument("use_gpu", default_value="true"),
+        DeclareLaunchArgument("use_gazebo_physics", default_value="true"),
+        DeclareLaunchArgument("use_sim_time", default_value="true"),
+        DeclareLaunchArgument("use_pcd_map", default_value="false"),
+        DeclareLaunchArgument("use_sdf_map", default_value="false"),
+        DeclareLaunchArgument("sdf_world_file", default_value=""),
+        DeclareLaunchArgument("sdf_map_mode", default_value="surface"),
+        DeclareLaunchArgument("sdf_sample_resolution", default_value="0.20"),
+        DeclareLaunchArgument("sdf_recenter", default_value="true"),
+        DeclareLaunchArgument("publish_sdf_global_cloud", default_value="true"),
+        DeclareLaunchArgument("cloud_is_world", default_value="false"),
+        DeclareLaunchArgument("collision_check_enable", default_value="false"),
         DeclareLaunchArgument("headless", default_value="false"),
         DeclareLaunchArgument("show_rviz", default_value="true"),
         DeclareLaunchArgument("auto_start", default_value="true"),
@@ -84,7 +95,6 @@ def generate_launch_description():
         DeclareLaunchArgument("init_x", default_value=str(DEFAULT_INIT_X)),
         DeclareLaunchArgument("init_y", default_value=str(DEFAULT_INIT_Y)),
         DeclareLaunchArgument("init_z", default_value="0.45"),
-        DeclareLaunchArgument("sdf_sample_resolution", default_value="0.20"),
         OpaqueFunction(function=_reject_existing_simulation),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -94,20 +104,24 @@ def generate_launch_description():
                 "sensor_type": "lidar",
                 "controller_mode": "closed_loop",
                 "use_gpu": LaunchConfiguration("use_gpu"),
-                "use_pcd_map": "false",
-                "use_sdf_map": "false",
+                "use_pcd_map": LaunchConfiguration("use_pcd_map"),
+                "use_sdf_map": LaunchConfiguration("use_sdf_map"),
+                "sdf_world_file": LaunchConfiguration("sdf_world_file"),
+                "sdf_map_mode": LaunchConfiguration("sdf_map_mode"),
+                "sdf_sample_resolution": LaunchConfiguration("sdf_sample_resolution"),
+                "sdf_recenter": LaunchConfiguration("sdf_recenter"),
                 "map_size_x": str(MAP_SIZE),
                 "map_size_y": str(MAP_SIZE),
                 "map_size_z": "10.0",
                 "init_x": LaunchConfiguration("init_x"),
                 "init_y": LaunchConfiguration("init_y"),
                 "init_z": LaunchConfiguration("init_z"),
-                "use_sim_time": "true",
-                "use_gazebo_physics": "true",
+                "use_sim_time": LaunchConfiguration("use_sim_time"),
+                "use_gazebo_physics": LaunchConfiguration("use_gazebo_physics"),
                 "gazebo_world": LaunchConfiguration("world_file"),
                 "gazebo_resource_path": "/home/t1an/ros2_ws/mine_tunnel_world/models",
                 "headless": LaunchConfiguration("headless"),
-                "collision_check_enable": "false",
+                "collision_check_enable": LaunchConfiguration("collision_check_enable"),
             }.items()),
         Node(
             package="scan_planner",
@@ -128,7 +142,7 @@ def generate_launch_description():
                 "obstacle_min_z": 0.08,
                 "obstacle_max_z": 0.85,
                 "obstacle_z_relative_to_body": True,
-                "cloud_is_world": False,
+                "cloud_is_world": LaunchConfiguration("cloud_is_world"),
                 # NewMine contains 2.9--3.0 m portals and short blind bends.
                 # Keep the physical margin conservative for a Go2 footprint,
                 # but allow rolling observation poses inside the portal.  The
@@ -166,7 +180,7 @@ def generate_launch_description():
                 "min_expected_observation_cells": 4,
                 "planning_period": 0.25,
                 "frame_id": "world",
-                "use_sim_time": True,
+                "use_sim_time": LaunchConfiguration("use_sim_time"),
             }],
             remappings=[
                 ("cloud", "/quad_0/cloud"),
@@ -181,12 +195,36 @@ def generate_launch_description():
             name="global_representation",
             output="screen",
             parameters=[{
-                "use_sim_time": True,
+                "use_sim_time": LaunchConfiguration("use_sim_time"),
                 "max_oracle_queries": 8,
                 "snapshot_period_revisions": 10,
+            }]),
+        Node(
+            package="scan_planner",
+            executable="sdf_map_publisher.py",
+            name="sdf_map_publisher",
+            output="screen",
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration("use_gazebo_physics"),
+                "'.lower() == 'false' and '",
+                LaunchConfiguration("use_sdf_map"),
+                "'.lower() == 'true' and '",
+                LaunchConfiguration("publish_sdf_global_cloud"),
+                "'.lower() == 'true'",
+            ])),
+            parameters=[{
+                "use_sim_time": LaunchConfiguration("use_sim_time"),
+                "world_file": LaunchConfiguration("sdf_world_file"),
+                "frame_id": "world",
+                "mode": LaunchConfiguration("sdf_map_mode"),
+                "resolution": LaunchConfiguration("sdf_sample_resolution"),
+                "recenter": LaunchConfiguration("sdf_recenter"),
             }]),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(scan_share, "launch", "rviz.launch.py")),
-            condition=IfCondition(LaunchConfiguration("show_rviz"))),
+            condition=IfCondition(LaunchConfiguration("show_rviz")),
+            launch_arguments={
+                "use_sim_time": LaunchConfiguration("use_sim_time"),
+            }.items()),
     ])
