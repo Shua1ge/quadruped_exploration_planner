@@ -112,6 +112,8 @@ def generate_launch_description():
             parameters=[{
                 "max_oracle_queries": 8,
                 "snapshot_period_revisions": 10,
+                "blocked_confirmation_patches": 3,
+                "min_free_cells_for_destructive_update": 16,
             }],
         ),
         IncludeLaunchDescription(

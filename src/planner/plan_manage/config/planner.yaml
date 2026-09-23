@@ -88,7 +88,12 @@ scan_planner_node:
     grid_map.local_patch_enabled: true
     grid_map.local_patch_period: 0.5
     grid_map.local_patch_resolution: 0.2
+    # Absolute fallback used only before the first valid body_pose. During
+    # normal operation the gravity-aligned patch follows a filtered body z.
     grid_map.local_patch_z: 0.3
+    grid_map.local_patch_follow_body_z: true
+    grid_map.local_patch_z_filter_tau: 0.75
+    grid_map.local_patch_z_max_rate: 0.5
 
     manager.max_vel: 0.75
     manager.max_acc: 0.5

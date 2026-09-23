@@ -22,6 +22,8 @@ from explorer_core.safe_region_graph import (
     PersistentSafeRegionTracker, ShadowStabilityTracker,
     extract_safe_region_graph,
     safe_region_oracle_metrics)
+from explorer_core.topology_persistence import (
+    ExplicitBlockageTracker, node_world_xy, occupancy_at_world)
 
 
 class GlobalRepresentationNode(Node):
@@ -45,6 +47,12 @@ class GlobalRepresentationNode(Node):
         self.safe_region_oracle_period_revisions = max(1, int(
             self.declare_parameter(
                 "safe_region_oracle_period_revisions", 10).value))
+        self.blocked_confirmation_patches = max(1, int(
+            self.declare_parameter(
+                "blocked_confirmation_patches", 3).value))
+        self.min_free_cells_for_destructive_update = max(1, int(
+            self.declare_parameter(
+                "min_free_cells_for_destructive_update", 16).value))
         self.safe_region_identity = PersistentSafeRegionTracker()
         self.safe_region_stability = ShadowStabilityTracker()
         self.last_safe_oracle_metrics = {
@@ -64,6 +72,10 @@ class GlobalRepresentationNode(Node):
         self.global_edges: Dict[int, TopologyEdge] = {}
         self.global_node_messages: Dict[int, TopoNode] = {}
         self.global_edge_messages: Dict[int, TopoEdge] = {}
+        self.node_blockage = ExplicitBlockageTracker(
+            self.blocked_confirmation_patches)
+        self.edge_blockage = ExplicitBlockageTracker(
+            self.blocked_confirmation_patches)
         self.graph_revision = 0
         self.last_map_revision = 0
 
@@ -127,6 +139,9 @@ class GlobalRepresentationNode(Node):
         started = time.perf_counter()
         occupancy = np.asarray(patch.occupancy, dtype=np.int8).reshape(
             (patch.height, patch.width))
+        dense_free = int(np.count_nonzero(occupancy == 0))
+        destructive_updates_allowed = (
+            dense_free >= self.min_free_cells_for_destructive_update)
         shared_clearance = clearance_field(
             occupancy == 0, float(patch.resolution))
         local_graph = extract_topology(
@@ -230,24 +245,37 @@ class GlobalRepresentationNode(Node):
         max_y = min_y + patch.height * patch.resolution
 
         def node_id_inside(node_id: int) -> bool:
-            x = (node_id >> 32) & 0xFFFFFFFF
-            y = node_id & 0xFFFFFFFF
-            x = x - (1 << 32) if x & (1 << 31) else x
-            y = y - (1 << 32) if y & (1 << 31) else y
-            world_x = x * patch.resolution
-            world_y = y * patch.resolution
+            world_x, world_y = node_world_xy(
+                node_id, float(patch.resolution))
             return min_x <= world_x < max_x and min_y <= world_y < max_y
 
-        removed_node_ids = {
-            node_id for node_id in self.global_nodes
-            if node_id_inside(node_id) and node_id not in local_graph.nodes}
-        removed_edge_ids = {
-            edge_id for edge_id, edge in self.global_edges.items()
-            if edge_id not in local_graph.edges and
-            (edge.source_id in removed_node_ids or
-             edge.target_id in removed_node_ids or
-             (node_id_inside(edge.source_id) and
-              node_id_inside(edge.target_id)))}
+        patch_origin = (float(patch.origin.x), float(patch.origin.y))
+        removed_node_ids = set()
+        for node_id in self.global_nodes:
+            if not node_id_inside(node_id):
+                continue
+            state = occupancy_at_world(
+                occupancy, patch_origin, float(patch.resolution),
+                node_world_xy(node_id, float(patch.resolution)))
+            if self.node_blockage.observe(
+                    node_id, node_id in local_graph.nodes, [state],
+                    destructive_updates_allowed):
+                removed_node_ids.add(node_id)
+
+        removed_edge_ids = set()
+        for edge_id, edge in self.global_edges.items():
+            message = self.global_edge_messages.get(edge_id)
+            states = [] if message is None else [
+                occupancy_at_world(
+                    occupancy, patch_origin, float(patch.resolution),
+                    (point.x, point.y))
+                for point in message.polyline]
+            if (edge.source_id in removed_node_ids or
+                    edge.target_id in removed_node_ids or
+                    self.edge_blockage.observe(
+                        edge_id, edge_id in local_graph.edges, states,
+                        destructive_updates_allowed)):
+                removed_edge_ids.add(edge_id)
         added_nodes = {
             node_id: node for node_id, node in local_graph.nodes.items()
             if node_id not in self.global_nodes}
@@ -267,6 +295,8 @@ class GlobalRepresentationNode(Node):
         for node_id in removed_node_ids:
             self.global_nodes.pop(node_id, None)
             self.global_node_messages.pop(node_id, None)
+        self.node_blockage.forget(tuple(removed_node_ids))
+        self.edge_blockage.forget(tuple(removed_edge_ids))
         self.global_nodes.update(local_graph.nodes)
         self.global_edges.update(local_graph.edges)
         local_node_messages = {
@@ -306,7 +336,6 @@ class GlobalRepresentationNode(Node):
             self.snapshot_pub.publish(snapshot)
 
         processing_ms = (time.perf_counter() - started) * 1000.0
-        dense_free = int(np.count_nonzero(occupancy == 0))
         metrics.update({
             "map_revision": int(patch.map_revision),
             "graph_revision": self.graph_revision,
@@ -318,12 +347,20 @@ class GlobalRepresentationNode(Node):
             "local_edges": len(local_graph.edges),
             "global_nodes": len(self.global_nodes),
             "global_edges": len(self.global_edges),
+            "destructive_updates_allowed": destructive_updates_allowed,
+            "pending_node_blockages": self.node_blockage.pending,
+            "pending_edge_blockages": self.edge_blockage.pending,
             "node_compression_ratio": (
                 1.0 - len(local_graph.nodes) / dense_free if dense_free else 0.0),
         })
         metrics_msg = String()
         metrics_msg.data = json.dumps(metrics, separators=(",", ":"))
         self.metrics_pub.publish(metrics_msg)
+        if not destructive_updates_allowed:
+            self.get_logger().warning(
+                f"[LOCAL_PATCH_INVALID] map_revision={patch.map_revision} "
+                f"dense_free={dense_free}; preserving persistent topology",
+                throttle_duration_sec=2.0)
         self.get_logger().info(
             f"[TOPOLOGY_SHADOW] map_revision={patch.map_revision} "
             f"dense={dense_free} nodes={len(local_graph.nodes)} "

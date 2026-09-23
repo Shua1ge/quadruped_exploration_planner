@@ -67,6 +67,10 @@ PoseLookupResult lookupTimedPose(
     int64_t max_interpolation_gap_ns, int64_t max_nearest_age_ns,
     TimedPose& result);
 
+double updateHeightReference(double current, double measurement,
+                             double dt_seconds, double filter_tau_seconds,
+                             double max_rate);
+
 bool pointInsideDoubleCylinder(
     const Eigen::Vector3d& point, const Eigen::Vector3d& center,
     const Eigen::Quaterniond& orientation, double radius, double offset,
@@ -353,6 +357,12 @@ private:
   double local_patch_period_{0.5};
   double local_patch_resolution_{0.2};
   double local_patch_z_{0.3};
+  bool local_patch_follow_body_z_{true};
+  double local_patch_z_filter_tau_{0.75};
+  double local_patch_z_max_rate_{0.5};
+  bool local_patch_reference_z_initialized_{false};
+  double local_patch_reference_z_{0.3};
+  int64_t local_patch_reference_stamp_ns_{0};
   uint64_t last_local_patch_revision_{0};
   std::chrono::steady_clock::time_point last_local_patch_time_{};
 

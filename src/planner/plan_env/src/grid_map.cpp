@@ -70,6 +70,20 @@ plan_env::PoseLookupResult plan_env::lookupTimedPose(
   return PoseLookupResult::INTERPOLATED;
 }
 
+double plan_env::updateHeightReference(
+    double current, double measurement, double dt_seconds,
+    double filter_tau_seconds, double max_rate)
+{
+  if (!std::isfinite(measurement) || dt_seconds <= 0.0 ||
+      filter_tau_seconds <= 0.0 || max_rate <= 0.0)
+    return current;
+
+  const double alpha = 1.0 - std::exp(-dt_seconds / filter_tau_seconds);
+  const double filtered_step = alpha * (measurement - current);
+  const double max_step = max_rate * dt_seconds;
+  return current + std::clamp(filtered_step, -max_step, max_step);
+}
+
 bool plan_env::pointInsideDoubleCylinder(
     const Eigen::Vector3d& point, const Eigen::Vector3d& center,
     const Eigen::Quaterniond& orientation, double radius, double offset,
@@ -243,9 +257,16 @@ void GridMap::initMap(
   load_parameter(node_, "grid_map.local_patch_period", local_patch_period_, 0.5);
   load_parameter(node_, "grid_map.local_patch_resolution", local_patch_resolution_, 0.2);
   load_parameter(node_, "grid_map.local_patch_z", local_patch_z_, mp_.ground_height_ + 0.3);
+  load_parameter(node_, "grid_map.local_patch_follow_body_z", local_patch_follow_body_z_, true);
+  load_parameter(node_, "grid_map.local_patch_z_filter_tau", local_patch_z_filter_tau_, 0.75);
+  load_parameter(node_, "grid_map.local_patch_z_max_rate", local_patch_z_max_rate_, 0.5);
   if (local_patch_period_ <= 0.0 || local_patch_resolution_ < mp_.resolution_)
     throw std::invalid_argument(
         "grid_map local patch period must be positive and resolution must not be finer than the voxel map");
+  if (local_patch_z_filter_tau_ <= 0.0 || local_patch_z_max_rate_ <= 0.0)
+    throw std::invalid_argument(
+        "grid_map local patch height filter parameters must be positive");
+  local_patch_reference_z_ = local_patch_z_;
 
   load_parameter(node_, "grid_map.sensor_type", mp_.sensor_type_, string("lidar"));
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
@@ -285,6 +306,12 @@ void GridMap::initMap(
       mp_.need_extrinsic_ ? "true" : "false", lidar_x, lidar_y, lidar_z,
       mp_.pose_history_seconds_, mp_.max_interpolation_gap_seconds_,
       mp_.max_nearest_pose_age_seconds_);
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "[LOCAL_PATCH_CONTRACT] follow_body_z=%s fallback_z=%.3f filter_tau=%.3fs "
+      "max_z_rate=%.3fm/s",
+      local_patch_follow_body_z_ ? "true" : "false", local_patch_z_,
+      local_patch_z_filter_tau_, local_patch_z_max_rate_);
 
   mp_.depth_extrinsic_ <<
       0.0,  0.707107, 0.707107, -0.15170,
@@ -1098,7 +1125,11 @@ bool GridMap::buildLocalMapPatchLocked(
   patch.resolution = static_cast<float>(local_patch_resolution_);
   patch.origin.x = origin_x;
   patch.origin.y = origin_y;
-  patch.origin.z = local_patch_z_;
+  const double reference_z =
+      local_patch_follow_body_z_ && local_patch_reference_z_initialized_
+          ? local_patch_reference_z_
+          : local_patch_z_;
+  patch.origin.z = reference_z;
   patch.width = static_cast<uint32_t>(
       std::ceil((max_x - origin_x) / local_patch_resolution_));
   patch.height = static_cast<uint32_t>(
@@ -1106,7 +1137,7 @@ bool GridMap::buildLocalMapPatchLocked(
   patch.occupancy.assign(static_cast<size_t>(patch.width) * patch.height, -1);
 
   const int z =
-      static_cast<int>(std::floor(local_patch_z_ * mp_.resolution_inv_));
+      static_cast<int>(std::floor(reference_z * mp_.resolution_inv_));
   if (z >= mp_.map_bound_min_idx_(2) && z <= mp_.map_bound_max_idx_(2))
   {
     auto address = [this, z](int x, int y) {
@@ -1280,6 +1311,29 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstShared
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   const geometry_msgs::msg::Point &pos = pose->pose.pose.position;
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
+  if (!local_patch_follow_body_z_ || !std::isfinite(pos.z) ||
+      !locomotionReady())
+    return;
+
+  int64_t stamp_ns = rclcpp::Time(pose->header.stamp).nanoseconds();
+  if (stamp_ns <= 0)
+    stamp_ns = node_->now().nanoseconds();
+  if (!local_patch_reference_z_initialized_)
+  {
+    local_patch_reference_z_ = pos.z;
+    local_patch_reference_stamp_ns_ = stamp_ns;
+    local_patch_reference_z_initialized_ = true;
+    return;
+  }
+  if (stamp_ns <= local_patch_reference_stamp_ns_)
+    return;
+
+  const double dt_seconds = std::min(
+      0.5, static_cast<double>(stamp_ns - local_patch_reference_stamp_ns_) * 1e-9);
+  local_patch_reference_z_ = plan_env::updateHeightReference(
+      local_patch_reference_z_, pos.z, dt_seconds,
+      local_patch_z_filter_tau_, local_patch_z_max_rate_);
+  local_patch_reference_stamp_ns_ = stamp_ns;
 }
 
 void GridMap::locomotionStateCallback(

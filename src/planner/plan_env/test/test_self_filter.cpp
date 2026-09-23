@@ -113,4 +113,24 @@ TEST(TimedPoseLookup, AcceptsBoundedNearestAndExactPose)
                 history, 1010000000LL, 50000000LL, 20000000LL, result),
             plan_env::PoseLookupResult::NEAREST);
 }
+
+TEST(LocalPatchHeightReference, RejectsSingleFrameVerticalJump)
+{
+  const double updated = plan_env::updateHeightReference(
+      0.3, 0.9, 0.02, 0.75, 0.5);
+
+  EXPECT_GT(updated, 0.3);
+  EXPECT_LE(updated, 0.31);
+}
+
+TEST(LocalPatchHeightReference, FollowsSustainedSlopeWithinRateLimit)
+{
+  double reference = 0.3;
+  for (int step = 0; step < 100; ++step)
+    reference = plan_env::updateHeightReference(
+        reference, 0.8, 0.02, 0.5, 0.5);
+
+  EXPECT_GT(reference, 0.75);
+  EXPECT_LT(reference, 0.81);
+}
 }  // namespace
