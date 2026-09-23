@@ -9,4 +9,9 @@ foreach(directory config dae launch meshes urdf xacro worlds)
   endif()
 endforeach()
 
+install(PROGRAMS
+  scripts/activate_controllers_while_stepping.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

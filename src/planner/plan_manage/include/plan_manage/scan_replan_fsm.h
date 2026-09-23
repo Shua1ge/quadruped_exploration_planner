@@ -68,12 +68,15 @@ namespace scan_planner
     double emergency_time_;
     double rolling_replan_retry_period_;
     double rolling_replan_max_start_error_;
+    double predictive_replan_reaction_time_{0.25};
+    double predictive_hard_stop_min_time_{0.35};
     double goal_tolerance_;
     int heading_freeze_max_recoveries_{2};
     double rviz_goal_height_;
     double self_inflation_z_up_, self_inflation_z_down_;
     double self_double_cylinder_radius_, self_double_cylinder_offset_;
     double body_height_;
+    bool live_body_height_{true};
     std::string self_inflation_frame_id_;
 
     /* planning data */
@@ -141,6 +144,7 @@ namespace scan_planner
     bool safety_have_odom_{false};
     std::atomic<bool> safety_stop_active_{false};
     std::atomic<uint64_t> safety_generation_{0};
+    std::atomic<bool> predictive_replan_requested_{false};
     std::atomic<int64_t> last_fsm_callback_wall_ns_{0};
     std::atomic<bool> fsm_callback_stall_reported_{false};
     std::chrono::steady_clock::time_point last_safety_callback_wall_{};

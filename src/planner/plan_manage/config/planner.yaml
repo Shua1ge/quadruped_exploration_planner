@@ -12,6 +12,10 @@ scan_planner_node:
     fsm.emergency_time: 1.0
     fsm.rolling_replan_retry_period: 0.25
     fsm.rolling_replan_max_start_error: 0.30
+    # A future collision first requests a rolling A* + B-spline replacement.
+    # HOLD is reserved for the dynamic stopping horizon.
+    fsm.predictive_replan_reaction_time: 0.25
+    fsm.predictive_hard_stop_min_time: 0.35
     fsm.goal_tolerance: 0.25
     fsm.heading_freeze_max_recoveries: 2
     fsm.fail_safe: true
@@ -34,6 +38,13 @@ scan_planner_node:
     grid_map.self_filter_z_down: 0.45
     grid_map.self_filter_z_up: 0.20
     grid_map.body_height: 0.4
+    # The reference path from Explorer is 2D: it runs A* in the plane and
+    # writes z = 0.0, so the path z carries no terrain height.  A fixed
+    # body_height offset is only correct on flat ground; with the robot on a
+    # ledge the trajectory ends up inside the terrain and every replan
+    # collides at t = 0.  Tracking the live odometry height is correct on
+    # flat ground and on ledges alike.  Set false to restore the fixed offset.
+    grid_map.live_body_height: true
     grid_map.obstacles_inflation_z_up: 0.1
     grid_map.obstacles_inflation_z_down: 0.4
     grid_map.frame_id: world
@@ -42,6 +53,17 @@ scan_planner_node:
     grid_map.sensor_type: lidar
     grid_map.cloud_is_world: true
     grid_map.need_extrinsic: false
+    grid_map.pose_history_seconds: 0.50
+    grid_map.max_interpolation_gap: 0.05
+    grid_map.max_nearest_pose_age: 0.02
+    # Default real-robot IMU/lidar deployment transform. Gazebo overrides
+    # these from run.launch.py with the robot.xacro lidar_joint transform.
+    grid_map.lidar_extrinsic_x: -0.011
+    grid_map.lidar_extrinsic_y: -0.02329
+    grid_map.lidar_extrinsic_z: 0.04412
+    grid_map.lidar_extrinsic_roll: 0.0
+    grid_map.lidar_extrinsic_pitch: 0.0
+    grid_map.lidar_extrinsic_yaw: 0.0
 
     grid_map.cx: 321.04638671875
     grid_map.cy: 243.44969177246094
@@ -79,7 +101,7 @@ scan_planner_node:
     optimization.lambda_collision: 1.0
     optimization.lambda_feasibility: 0.1
     optimization.lambda_fitness: 1.0
-    optimization.dist0: 0.35
+    optimization.dist0: 0.10
     optimization.max_vel: 0.75
     optimization.max_acc: 0.5
     optimization.order: 3

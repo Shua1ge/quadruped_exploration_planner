@@ -179,6 +179,55 @@ inline bool shouldReuseCurrentTrajectorySuffix(
          tracking_error <= maximum_tracking_error;
 }
 
+inline bool shouldTriggerRollingReplan(
+    double planned_progress, double odometry_progress,
+    double progress_threshold)
+{
+  return std::isfinite(planned_progress) &&
+         std::isfinite(odometry_progress) &&
+         progress_threshold >= 0.0 &&
+         planned_progress >= progress_threshold &&
+         odometry_progress >= progress_threshold;
+}
+
+inline double predictiveHardStopTime(
+    double speed, double maximum_deceleration,
+    double reaction_time, double minimum_horizon)
+{
+  if (!std::isfinite(speed) || !std::isfinite(maximum_deceleration) ||
+      !std::isfinite(reaction_time) || !std::isfinite(minimum_horizon) ||
+      maximum_deceleration <= 0.0)
+    return std::numeric_limits<double>::infinity();
+  return std::max(std::max(0.0, minimum_horizon),
+                  std::max(0.0, reaction_time) +
+                      std::max(0.0, speed) / maximum_deceleration);
+}
+
+inline bool predictiveCollisionRequiresHardStop(
+    double time_to_hit, double speed, double maximum_deceleration,
+    double reaction_time, double minimum_horizon)
+{
+  return !std::isfinite(time_to_hit) || time_to_hit <= predictiveHardStopTime(
+      speed, maximum_deceleration, reaction_time, minimum_horizon);
+}
+
+inline Eigen::Vector3d projectForwardVelocityToPath(
+    const Eigen::Vector3d &velocity,
+    const Eigen::Vector3d &path_tangent)
+{
+  Eigen::Vector3d projected = Eigen::Vector3d::Zero();
+  const Eigen::Vector2d tangent_xy = path_tangent.head<2>();
+  const double tangent_norm = tangent_xy.norm();
+  if (tangent_norm < 1e-6)
+    return projected;
+
+  const Eigen::Vector2d unit_tangent = tangent_xy / tangent_norm;
+  const double forward_speed =
+      std::max(0.0, velocity.head<2>().dot(unit_tangent));
+  projected.head<2>() = forward_speed * unit_tangent;
+  return projected;
+}
+
 inline bool sampledSuffixIsReusable(size_t sample_count, double arc_length)
 {
   return sample_count >= 2 && std::isfinite(arc_length) && arc_length > 1e-4;

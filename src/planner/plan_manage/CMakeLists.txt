@@ -75,7 +75,8 @@ install(PROGRAMS
   scripts/sdf_lidar_simulator.py
   scripts/go2_tf_bridge.py
   scripts/go2_policy_node.py
-  scripts/go2_onnx_policy_node.py
+  scripts/go2_locomotion_supervisor.py
+  scripts/go2_locomotion_logic.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}
@@ -95,6 +96,13 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_portal_connectivity test/test_portal_connectivity.py)
   ament_add_pytest_test(test_tunnel_grid_third_slice test/test_tunnel_grid_third_slice.py)
   ament_add_pytest_test(test_sdf_world_geometry test/test_sdf_world_geometry.py)
+  # The locomotion supervisor regression test uses unittest instead of pytest:
+  # pytest cannot start in this workspace (broken anyio plugin), so a pytest
+  # target here would silently never run.
+  find_package(PythonInterp REQUIRED)
+  add_test(NAME test_locomotion_supervisor
+    COMMAND ${PYTHON_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/test_locomotion_supervisor.py)
   ament_add_gtest(test_replan_fsm_utils test/test_replan_fsm_utils.cpp)
   if(TARGET test_replan_fsm_utils)
     target_include_directories(test_replan_fsm_utils PRIVATE include)

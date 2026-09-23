@@ -56,8 +56,14 @@
     <xacro:property name="calf_rotor_offset_z" value="0.0"/>
 
     <!-- joint limits -->
-    <xacro:property name="damping" value="0.0"/>
-    <xacro:property name="friction" value="0.0"/>
+    <!-- The trained deployment contract puts all damping in the policy's PD
+         loop (kd=1.0), so at damping="0.0" a fast transient has no passive
+         damping anywhere: the legs ring and a joint pins at its velocity
+         limit.  These are a robustness floor, not a match to the trained
+         plant: raise damping to test the insufficient-damping hypothesis, and
+         restore 0.0 / 0.0 to run the exact trained plant. -->
+    <xacro:property name="damping" value="0.5"/>
+    <xacro:property name="friction" value="0.05"/>
     <xacro:property name="hip_position_max" value="1.0472"/>
     <xacro:property name="hip_position_min" value="-1.0472"/>
     <xacro:property name="hip_velocity_max" value="30.1"/>

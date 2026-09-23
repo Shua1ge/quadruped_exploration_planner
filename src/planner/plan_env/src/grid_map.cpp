@@ -17,6 +17,59 @@ void load_parameter(rclcpp::Node *node, const std::string &name, T &value, const
 }
 }  // namespace
 
+plan_env::PoseLookupResult plan_env::lookupTimedPose(
+    const std::deque<TimedPose>& history, int64_t stamp_ns,
+    int64_t max_interpolation_gap_ns, int64_t max_nearest_age_ns,
+    TimedPose& result)
+{
+  if (history.empty())
+    return PoseLookupResult::EMPTY;
+
+  const auto after = std::lower_bound(
+      history.begin(), history.end(), stamp_ns,
+      [](const TimedPose& pose, int64_t stamp) {
+        return pose.stamp_ns < stamp;
+      });
+  if (after != history.end() && after->stamp_ns == stamp_ns)
+  {
+    result = *after;
+    return PoseLookupResult::EXACT;
+  }
+  if (after == history.begin())
+  {
+    if (after->stamp_ns - stamp_ns <= max_nearest_age_ns)
+    {
+      result = *after;
+      result.stamp_ns = stamp_ns;
+      return PoseLookupResult::NEAREST;
+    }
+    return PoseLookupResult::TOO_OLD;
+  }
+  if (after == history.end())
+  {
+    const TimedPose& nearest = history.back();
+    if (stamp_ns - nearest.stamp_ns <= max_nearest_age_ns)
+    {
+      result = nearest;
+      result.stamp_ns = stamp_ns;
+      return PoseLookupResult::NEAREST;
+    }
+    return PoseLookupResult::TOO_NEW;
+  }
+
+  const TimedPose& before = *std::prev(after);
+  const int64_t gap_ns = after->stamp_ns - before.stamp_ns;
+  if (gap_ns <= 0 || gap_ns > max_interpolation_gap_ns)
+    return PoseLookupResult::GAP_TOO_LARGE;
+
+  const double alpha = static_cast<double>(stamp_ns - before.stamp_ns) /
+                       static_cast<double>(gap_ns);
+  result.stamp_ns = stamp_ns;
+  result.position = before.position + alpha * (after->position - before.position);
+  result.orientation = before.orientation.slerp(alpha, after->orientation).normalized();
+  return PoseLookupResult::INTERPOLATED;
+}
+
 bool plan_env::pointInsideDoubleCylinder(
     const Eigen::Vector3d& point, const Eigen::Vector3d& center,
     const Eigen::Quaterniond& orientation, double radius, double offset,
@@ -198,11 +251,40 @@ void GridMap::initMap(
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
   load_parameter(node_, "grid_map.need_extrinsic", mp_.need_extrinsic_, true);
 
-  mp_.lidar_extrinsic_ <<
-      1.0, 0.0, 0.0, -0.01100,
-      0.0, 1.0, 0.0, -0.02329,
-      0.0, 0.0, 1.0,  0.04412,
-      0.0, 0.0, 0.0,  1.00000;
+  load_parameter(node_, "grid_map.pose_history_seconds", mp_.pose_history_seconds_, 0.5);
+  load_parameter(node_, "grid_map.max_interpolation_gap", mp_.max_interpolation_gap_seconds_, 0.05);
+  load_parameter(node_, "grid_map.max_nearest_pose_age", mp_.max_nearest_pose_age_seconds_, 0.02);
+  if (mp_.pose_history_seconds_ <= 0.0 || mp_.max_interpolation_gap_seconds_ <= 0.0 ||
+      mp_.max_nearest_pose_age_seconds_ < 0.0)
+    throw std::invalid_argument("grid_map pose history timing parameters are invalid");
+
+  double lidar_x = -0.01100;
+  double lidar_y = -0.02329;
+  double lidar_z = 0.04412;
+  double lidar_roll = 0.0;
+  double lidar_pitch = 0.0;
+  double lidar_yaw = 0.0;
+  load_parameter(node_, "grid_map.lidar_extrinsic_x", lidar_x, lidar_x);
+  load_parameter(node_, "grid_map.lidar_extrinsic_y", lidar_y, lidar_y);
+  load_parameter(node_, "grid_map.lidar_extrinsic_z", lidar_z, lidar_z);
+  load_parameter(node_, "grid_map.lidar_extrinsic_roll", lidar_roll, lidar_roll);
+  load_parameter(node_, "grid_map.lidar_extrinsic_pitch", lidar_pitch, lidar_pitch);
+  load_parameter(node_, "grid_map.lidar_extrinsic_yaw", lidar_yaw, lidar_yaw);
+
+  mp_.lidar_extrinsic_.setIdentity();
+  mp_.lidar_extrinsic_.block<3, 3>(0, 0) =
+      (Eigen::AngleAxisd(lidar_yaw, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(lidar_pitch, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(lidar_roll, Eigen::Vector3d::UnitX())).toRotationMatrix();
+  mp_.lidar_extrinsic_.block<3, 1>(0, 3) = Eigen::Vector3d(lidar_x, lidar_y, lidar_z);
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "[SENSOR_CONTRACT] cloud_is_world=%s need_extrinsic=%s lidar_xyz=(%.3f,%.3f,%.3f) "
+      "pose_history=%.3fs interpolation_gap=%.3fs nearest_age=%.3fs",
+      mp_.cloud_is_world_ ? "true" : "false",
+      mp_.need_extrinsic_ ? "true" : "false", lidar_x, lidar_y, lidar_z,
+      mp_.pose_history_seconds_, mp_.max_interpolation_gap_seconds_,
+      mp_.max_nearest_pose_age_seconds_);
 
   mp_.depth_extrinsic_ <<
       0.0,  0.707107, 0.707107, -0.15170,
@@ -297,6 +379,9 @@ void GridMap::initMap(
       "body_pose", rclcpp::SensorDataQoS(),
       std::bind(&GridMap::slidingMapFrameCallback, this, std::placeholders::_1),
       body_pose_options);
+  locomotion_state_sub_ = node_->create_subscription<scan_planner_msgs::msg::LocomotionState>(
+      "/robot/locomotion_state", rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&GridMap::locomotionStateCallback, this, std::placeholders::_1));
 
   occ_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                         std::bind(&GridMap::updateOccupancyCallback, this),
@@ -1145,7 +1230,33 @@ void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &
   }
   ray_q.normalize();
 
-  Eigen::Vector3d ray_pos(sensor_pose.position.x, sensor_pose.position.y, sensor_pose.position.z);
+  const int64_t stamp_ns = rclcpp::Time(pose_msg->header.stamp).nanoseconds();
+  if (stamp_ns <= 0)
+  {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                         "[GridMap] dropping sensor_pose with a zero timestamp");
+    return;
+  }
+
+  const Eigen::Vector3d body_pos(
+      sensor_pose.position.x, sensor_pose.position.y, sensor_pose.position.z);
+  const plan_env::TimedPose timed_pose{stamp_ns, body_pos, ray_q};
+  const auto insertion = std::lower_bound(
+      lidar_pose_history_.begin(), lidar_pose_history_.end(), stamp_ns,
+      [](const plan_env::TimedPose& pose, int64_t stamp) {
+        return pose.stamp_ns < stamp;
+      });
+  if (insertion != lidar_pose_history_.end() && insertion->stamp_ns == stamp_ns)
+    *insertion = timed_pose;
+  else
+    lidar_pose_history_.insert(insertion, timed_pose);
+  const int64_t oldest_allowed = stamp_ns - static_cast<int64_t>(
+      mp_.pose_history_seconds_ * 1e9);
+  while (!lidar_pose_history_.empty() &&
+         lidar_pose_history_.front().stamp_ns < oldest_allowed)
+    lidar_pose_history_.pop_front();
+
+  Eigen::Vector3d ray_pos = body_pos;
   if (mp_.need_extrinsic_)
   {
     const Eigen::Matrix3d pose_r = ray_q.toRotationMatrix();
@@ -1171,8 +1282,24 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstShared
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
 }
 
+void GridMap::locomotionStateCallback(
+    const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr &msg)
+{
+  perception_pose_valid_.store(msg->perception_pose_valid);
+  locomotion_state_stamp_ns_.store(node_->now().nanoseconds());
+}
+
+bool GridMap::locomotionReady() const
+{
+  const int64_t stamp = locomotion_state_stamp_ns_.load();
+  return stamp > 0 && perception_pose_valid_.load() &&
+         (node_->now().nanoseconds() - stamp) <= 500000000LL;
+}
+
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &img)
 {
+  if (!locomotionReady())
+    return;
   const auto callback_started = std::chrono::steady_clock::now();
   map_update_requested_.store(true);
   if (mp_.sensor_type_ != "lidar")
@@ -1188,19 +1315,51 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     return;
   }
 
-  Eigen::Vector3d ray_pos;
-  Eigen::Quaterniond ray_q;
+  const int64_t cloud_stamp_ns = rclcpp::Time(img->header.stamp).nanoseconds();
+  if (cloud_stamp_ns <= 0)
+  {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                         "[GridMap] dropping lidar cloud with a zero timestamp");
+    return;
+  }
+
+  plan_env::TimedPose pose_at_scan;
+  plan_env::PoseLookupResult pose_result;
+  size_t pose_history_size = 0;
   {
     std::shared_lock<std::shared_mutex> lock(map_mutex_);
-    if (!md_.has_ray_pose_)
-    {
-      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                           "[GridMap] no sensor_pose received for lidar cloud update");
-      return;
-    }
-    ray_pos = md_.ray_pos_;
-    ray_q = md_.ray_q_;
+    pose_history_size = lidar_pose_history_.size();
+    pose_result = plan_env::lookupTimedPose(
+        lidar_pose_history_, cloud_stamp_ns,
+        static_cast<int64_t>(mp_.max_interpolation_gap_seconds_ * 1e9),
+        static_cast<int64_t>(mp_.max_nearest_pose_age_seconds_ * 1e9),
+        pose_at_scan);
   }
+  if (pose_result != plan_env::PoseLookupResult::EXACT &&
+      pose_result != plan_env::PoseLookupResult::INTERPOLATED &&
+      pose_result != plan_env::PoseLookupResult::NEAREST)
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 1000,
+        "[GridMap] dropping lidar cloud without a time-aligned pose (result=%d)",
+        static_cast<int>(pose_result));
+    return;
+  }
+
+  Eigen::Vector3d ray_pos = pose_at_scan.position;
+  Eigen::Quaterniond ray_q = pose_at_scan.orientation;
+  if (mp_.need_extrinsic_)
+  {
+    const Eigen::Matrix3d body_r = ray_q.toRotationMatrix();
+    ray_pos += body_r * mp_.lidar_extrinsic_.block<3, 1>(0, 3);
+    ray_q = Eigen::Quaterniond(
+        body_r * mp_.lidar_extrinsic_.block<3, 3>(0, 0)).normalized();
+  }
+  RCLCPP_INFO_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 2000,
+      "[CLOUD_POSE_SYNC] mode=%d stamp_ns=%ld history=%zu lidar_origin=(%.3f,%.3f,%.3f)",
+      static_cast<int>(pose_result), static_cast<long>(cloud_stamp_ns),
+      pose_history_size, ray_pos.x(), ray_pos.y(), ray_pos.z());
 
   const Eigen::Matrix3d sensor_r = ray_q.toRotationMatrix();
   if (!std::isfinite(ray_pos.x()) || !std::isfinite(ray_pos.y()) || !std::isfinite(ray_pos.z()))

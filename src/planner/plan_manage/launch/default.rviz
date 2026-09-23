@@ -226,14 +226,14 @@ Visualization Manager:
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
-      Color: 25; 255; 0
+      Color: 0; 255; 80
       Enabled: true
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
       Line Style: Lines
-      Line Width: 0.029999999329447746
-      Name: Robot Path
+      Line Width: 0.12
+      Name: Executed Path
       Offset:
         X: 0
         Y: 0
@@ -443,8 +443,8 @@ Visualization Manager:
       Head Length: 0.2
       Length: 0.3
       Line Style: Lines
-      Line Width: 0.06
-      Name: Explorer Path
+      Line Width: 0.10
+      Name: Planned Explorer Path
       Offset: {X: 0, Y: 0, Z: 0.06}
       Pose Color: 255; 170; 0
       Pose Style: None
@@ -484,7 +484,7 @@ Visualization Manager:
         Value: /explorer/goal
       Value: true
     - Class: rviz_default_plugins/TF
-      Enabled: false
+      Enabled: true
       Frame Timeout: 15
       Frames:
         All Enabled: true
@@ -670,23 +670,23 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 31.07322120666504
+      Distance: 10
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -4.47959041595459
-        Y: 1.29607355594635
-        Z: -8.791008949279785
+        X: 0
+        Y: 0
+        Z: 0
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.0549992322921753
-      Target Frame: <Fixed Frame>
+      Pitch: 0.9
+      Target Frame: go2/base_footprint
       Value: Orbit (rviz_default_plugins)
       Yaw: 2.970010995864868
     Saved: ~

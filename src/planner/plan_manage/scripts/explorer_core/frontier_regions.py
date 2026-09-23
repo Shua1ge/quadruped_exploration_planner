@@ -185,7 +185,10 @@ def candidate_cells(cluster: Sequence[Cell]) -> List[Cell]:
 def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
                          inflated: Set[Cell], stand_off: float,
                          limit: int = 3,
-                         clearance_search_radius: float = 1.0) -> List[Cell]:
+                         clearance_search_radius: float = 1.0,
+                         relaxation: float = 0.0,
+                         footprint_radius: float = 0.0,
+                         footprint_offset: float = 0.0) -> List[Cell]:
     """Return known-free stand-off poses that look toward a frontier.
 
     A frontier is an information boundary, not a place the robot should stand.
@@ -211,7 +214,7 @@ def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
     tolerance_cells = max(2.0, 0.4 / grid.resolution)
     minimum_cells = max(1.0, desired_cells - tolerance_cells)
     maximum_cells = desired_cells + tolerance_cells
-    search_cells = int(math.ceil(maximum_cells))
+    relaxation_cells = maximum_cells + max(0.0, relaxation) / grid.resolution
     clearance_cells = max(
         1, int(math.ceil(max(0.0, clearance_search_radius) / grid.resolution)))
 
@@ -224,29 +227,91 @@ def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
                     best = min(best, math.hypot(ox, oy))
         return best * grid.resolution
 
-    ranked = []
-    for dx in range(-search_cells, search_cells + 1):
-        for dy in range(-search_cells, search_cells + 1):
-            distance = math.hypot(dx, dy)
-            if not minimum_cells <= distance <= maximum_cells:
-                continue
-            cell = (frontier[0] + dx, frontier[1] + dy)
-            if not grid.planning_free(cell, inflated):
-                continue
-            # Require the pose to lie on the known side of the boundary and
-            # retain a known-free line of sight to the observed frontier.
-            inward_progress = dx * inward[0] + dy * inward[1]
-            if inward_progress <= 0.25 * distance:
-                continue
-            if not segment_known_free(grid, cell, frontier, inflated):
-                continue
-            desired_x = inward[0] * desired_cells
-            desired_y = inward[1] * desired_cells
-            desired_error = math.hypot(dx - desired_x, dy - desired_y)
-            ranked.append(((-clearance(cell), desired_error,
-                            abs(distance - desired_cells),
-                            cell[0], cell[1]), cell))
-    return [item[1] for item in sorted(ranked)[:max(1, int(limit))]]
+    def scan(minimum: float, maximum: float) -> List[Cell]:
+        search = int(math.ceil(maximum))
+        ranked = []
+        for dx in range(-search, search + 1):
+            for dy in range(-search, search + 1):
+                distance = math.hypot(dx, dy)
+                if not minimum <= distance <= maximum:
+                    continue
+                cell = (frontier[0] + dx, frontier[1] + dy)
+                if not grid.planning_free(cell, inflated):
+                    continue
+                viewpoint_yaw = math.atan2(
+                    frontier[1] - cell[1], frontier[0] - cell[0])
+                if not double_cylinder_footprint_free(
+                        grid, cell, viewpoint_yaw, inflated,
+                        footprint_radius, footprint_offset):
+                    continue
+                # Require the pose to lie on the known side of the boundary and
+                # retain a known-free line of sight to the observed frontier.
+                inward_progress = dx * inward[0] + dy * inward[1]
+                if inward_progress <= 0.25 * distance:
+                    continue
+                if not segment_known_free(grid, cell, frontier, inflated):
+                    continue
+                desired_x = inward[0] * desired_cells
+                desired_y = inward[1] * desired_cells
+                desired_error = math.hypot(dx - desired_x, dy - desired_y)
+                ranked.append(((-clearance(cell), desired_error,
+                                abs(distance - desired_cells),
+                                cell[0], cell[1]), cell))
+        return [item[1] for item in sorted(ranked)[:max(1, int(limit))]]
+
+    viewpoints = scan(minimum_cells, maximum_cells)
+    if not viewpoints and relaxation_cells > maximum_cells:
+        # A pose nearer or farther than the nominal stand-off still resolves the
+        # same unknown region, so widening the annulus beats discarding the
+        # frontier outright.  Ranking keeps preferring the nominal stand-off.
+        # planning_free and the known-free line of sight stay hard requirements:
+        # a pose outside the inflated map would only yield a goal the planner
+        # cannot reach.
+        viewpoints = scan(1.0, relaxation_cells)
+    return viewpoints
+
+
+def double_cylinder_footprint_free(
+        grid: ExplorationGrid, center: Cell, yaw: float,
+        inflated: Set[Cell], radius: float, offset: float) -> bool:
+    """Check two yawed disc centres on a map already inflated by ``radius``."""
+    if radius <= 0.0:
+        return grid.planning_free(center, inflated)
+    offset_cells = max(0.0, offset) / grid.resolution
+    heading_x = math.cos(yaw)
+    heading_y = math.sin(yaw)
+    for direction in (-1.0, 1.0):
+        disc_x = center[0] + direction * offset_cells * heading_x
+        disc_y = center[1] + direction * offset_cells * heading_y
+        disc_cell = (int(round(disc_x)), int(round(disc_y)))
+        if not grid.planning_free(disc_cell, inflated):
+            return False
+    return True
+
+
+def double_cylinder_path_free(
+        grid: ExplorationGrid, path: Sequence[Cell], terminal: Cell,
+        frontier: Cell, inflated: Set[Cell], radius: float,
+        offset: float) -> bool:
+    """Validate a path with the footprint oriented along its local tangent."""
+    if not path:
+        return False
+    for index, cell in enumerate(path):
+        if index + 1 < len(path):
+            target = path[index + 1]
+        elif cell == terminal:
+            target = frontier
+        elif index > 0:
+            target = cell
+            cell = path[index - 1]
+        else:
+            target = frontier
+        yaw = math.atan2(target[1] - cell[1], target[0] - cell[0])
+        check_cell = path[index]
+        if not double_cylinder_footprint_free(
+                grid, check_cell, yaw, inflated, radius, offset):
+            return False
+    return True
 
 
 @dataclass

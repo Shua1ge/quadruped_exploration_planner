@@ -44,7 +44,11 @@
   gz_type_name: gz.msgs.Twist
   direction: ROS_TO_GZ
 - ros_topic_name: /quad_0/cloud
-  gz_topic_name: /quad_0/lidar/points
+  # A gpu_lidar publishes LaserScan on its configured topic and appends
+  # "/points" for the PointCloudPacked stream.  The sensor topic is already
+  # /quad_0/lidar/points, so the actual point cloud lives on the doubled
+  # /quad_0/lidar/points/points name.
+  gz_topic_name: /quad_0/lidar/points/points
   ros_type_name: sensor_msgs/msg/PointCloud2
   gz_type_name: gz.msgs.PointCloudPacked
   direction: GZ_TO_ROS

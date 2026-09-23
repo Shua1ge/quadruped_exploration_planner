@@ -99,6 +99,10 @@ def generate_launch_description():
         DeclareLaunchArgument("show_rviz", default_value="true"),
         DeclareLaunchArgument("auto_start", default_value="true"),
         DeclareLaunchArgument("selection_strategy", default_value="hierarchical"),
+        DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
+        # "policy" lets the zero-command ONNX policy perform the lying-to-stand;
+        # "deterministic" keeps the time-scheduled PREPOSE/STAND interpolation.
+        DeclareLaunchArgument("getup_mode", default_value="policy"),
         DeclareLaunchArgument(
             "metrics_file", default_value="/tmp/newmine_long_horizon_01.csv"),
         DeclareLaunchArgument("init_x", default_value=str(DEFAULT_INIT_X)),
@@ -112,6 +116,8 @@ def generate_launch_description():
                 "navi_mode": "3",
                 "sensor_type": "lidar",
                 "controller_mode": "closed_loop",
+                "locomotion_mode": LaunchConfiguration("locomotion_mode"),
+                "getup_mode": LaunchConfiguration("getup_mode"),
                 "use_gpu": LaunchConfiguration("use_gpu"),
                 "use_pcd_map": LaunchConfiguration("use_pcd_map"),
                 "use_sdf_map": LaunchConfiguration("use_sdf_map"),
@@ -155,14 +161,33 @@ def generate_launch_description():
                     "'", LaunchConfiguration("use_gazebo_physics"),
                     "'.lower() != 'true'",
                 ]),
+                # Shared with run.launch.py / GridMap and robot.xacro.
+                "lidar_extrinsic_x": 0.10,
+                "lidar_extrinsic_y": 0.0,
+                "lidar_extrinsic_z": 0.12,
                 # NewMine contains 2.9--3.0 m portals and short blind bends.
                 # Keep the physical margin conservative for a Go2 footprint,
                 # but allow rolling observation poses inside the portal.  The
                 # flat-world 0.65/1.0/2.0 defaults otherwise extract a valid
                 # frontier here and then reject every possible viewpoint.
-                "inflation_radius": 0.45,
+                # Must not drop below grid_map.double_cylinder_radius (0.35, see
+                # planner.yaml): an explorer that inflates less than the planner
+                # would select goals the planner then rejects as collisions.
+                "inflation_radius": 0.35,
+                "footprint_radius": 0.35,
+                "footprint_offset": 0.18,
                 "viewpoint_standoff": 0.60,
-                "min_frontier_size": 4,
+                # Extra annulus width, tried only when the nominal stand-off
+                # yields no pose at all.  Discarding the frontier instead is
+                # what stalls exploration inside the 2.8 m tunnels.
+                "viewpoint_relaxation": 1.0,
+                # At 0.20 m resolution the footprint inflation can
+                # leave a real narrow-tunnel frontier only two cells wide.  A
+                # threshold of four erased the sole forward frontier while
+                # coverage was still 0.21%.  Keep singleton noise excluded;
+                # reachability, clearance, gain, and final path validation
+                # still guard every two-cell candidate.
+                "min_frontier_size": 2,
                 "min_goal_distance": 0.80,
                 "preferred_goal_path_length": 3.5,
                 "long_horizon_min_gain_ratio": 0.65,
@@ -199,6 +224,7 @@ def generate_launch_description():
                 ("body_pose", "/quad_0/body_pose"),
                 ("initial_path", "/initial_path"),
                 ("planning/status", "/planning/status"),
+                ("planning/local_execution_event", "/planning/local_execution_event"),
                 ("simulation/collision", "/simulation/collision"),
             ]),
         Node(

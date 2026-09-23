@@ -25,6 +25,16 @@ class Go2TFBridge(Node):
         t1.transform.translation.z = 0.0
         t1.transform.rotation.w = 1.0
         transforms.append(t1)
+
+        lidar = TransformStamped()
+        lidar.header.stamp = self.get_clock().now().to_msg()
+        lidar.header.frame_id = 'base'
+        lidar.child_frame_id = 'go2/base/exploration_lidar'
+        lidar.transform.translation.x = 0.10
+        lidar.transform.translation.y = 0.0
+        lidar.transform.translation.z = 0.12
+        lidar.transform.rotation.w = 1.0
+        transforms.append(lidar)
         
         # Connect world to go2/odom (fixed at origin for now)
         t2 = TransformStamped()
@@ -38,7 +48,9 @@ class Go2TFBridge(Node):
         transforms.append(t2)
         
         self.static_broadcaster.sendTransform(transforms)
-        self.get_logger().info('Published static TF: world→go2/odom and go2/base_footprint→base')
+        self.get_logger().info(
+            'Published static TF: world→go2/odom, go2/base_footprint→base, '
+            'base→go2/base/exploration_lidar')
 
 
 def main(args=None):

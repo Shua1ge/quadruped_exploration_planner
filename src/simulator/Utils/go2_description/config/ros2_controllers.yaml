@@ -1,6 +1,8 @@
 controller_manager:
   ros__parameters:
-    update_rate: 200
+    # The Parkour MoE deployment recomputes joint PD at the 2 ms simulation
+    # step.  ONNX remains at 50 Hz (ten controller updates per policy action).
+    update_rate: 500
     use_sim_time: true
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster

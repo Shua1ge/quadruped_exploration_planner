@@ -1,5 +1,6 @@
 """Occupancy-grid construction primitives for frontier exploration."""
 
+import bisect
 import math
 from typing import List, Optional, Sequence, Set, Tuple
 
@@ -8,6 +9,7 @@ import numpy as np
 Cell = Tuple[int, int]
 Point2 = Tuple[float, float]
 DirectedEdge = Tuple[Cell, Cell]
+PoseSample = Tuple[int, float, float, float, float]
 UNKNOWN = -1
 FREE = 0
 OCCUPIED = 100
@@ -16,6 +18,37 @@ GRID_MOVES = (
     (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
     (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
 )
+
+def interpolate_planar_pose(history: Sequence[PoseSample], stamp_ns: int,
+                             max_age_ns: int) -> Optional[Tuple[float, float, float, float]]:
+    """Interpolate x/y/yaw at a sensor timestamp from an ordered pose history."""
+    if not history:
+        return None
+    times = [sample[0] for sample in history]
+    if stamp_ns < times[0] or stamp_ns > times[-1]:
+        nearest_age = min(abs(stamp_ns - times[0]), abs(stamp_ns - times[-1]))
+        if nearest_age > max_age_ns:
+            return None
+        sample = history[0] if stamp_ns < times[0] else history[-1]
+        return sample[1], sample[2], sample[3], sample[4]
+    index = bisect.bisect_left(times, stamp_ns)
+    if index == 0:
+        sample = history[0]
+        return sample[1], sample[2], sample[3], sample[4]
+    if index == len(history):
+        sample = history[-1]
+        return sample[1], sample[2], sample[3], sample[4]
+    before, after = history[index - 1], history[index]
+    span = max(1, after[0] - before[0])
+    ratio = min(1.0, max(0.0, (stamp_ns - before[0]) / span))
+    yaw_delta = (after[3] - before[3] + math.pi) % (2.0 * math.pi) - math.pi
+    return (
+        before[1] + ratio * (after[1] - before[1]),
+        before[2] + ratio * (after[2] - before[2]),
+        before[3] + ratio * yaw_delta,
+        before[4] + ratio * (after[4] - before[4]),
+    )
+
 
 def dilate_hit_ranges(ranges: Sequence[float], bins: int) -> np.ndarray:
     """Conservatively widen finite returns in bearing space.
@@ -64,6 +97,14 @@ class ExplorationGrid:
         self.origin_x = -0.5 * size_x if origin_x is None else float(origin_x)
         self.origin_y = -0.5 * size_y if origin_y is None else float(origin_y)
         self.data = np.full((self.height, self.width), UNKNOWN, dtype=np.int8)
+        # Occupancy is derived from bounded temporal evidence rather than being
+        # sticky forever after one point-cloud hit.  A single hit remains
+        # immediately useful to the planner, while repeated misses can revoke
+        # a transient or time-misaligned wall return.
+        self.evidence = np.zeros((self.height, self.width), dtype=np.int16)
+        self.occupied_threshold = 1
+        self.free_threshold = -1
+        self.evidence_limit = 32
 
     def in_bounds(self, cell: Cell) -> bool:
         return 0 <= cell[0] < self.width and 0 <= cell[1] < self.height
@@ -80,6 +121,21 @@ class ExplorationGrid:
         if not self.in_bounds(cell):
             return OCCUPIED
         return int(self.data[cell[1], cell[0]])
+
+    def _apply_evidence(self, free_cells: Set[Cell], occupied_cells: Set[Cell]):
+        """Apply one scan's evidence with hysteresis and reversible occupancy."""
+        for x, y in free_cells - occupied_cells:
+            evidence = int(self.evidence[y, x]) - 1
+            self.evidence[y, x] = max(-self.evidence_limit, evidence)
+            if self.evidence[y, x] <= self.free_threshold:
+                self.data[y, x] = FREE
+            elif self.evidence[y, x] < self.occupied_threshold:
+                self.data[y, x] = UNKNOWN
+        for x, y in occupied_cells:
+            evidence = int(self.evidence[y, x]) + 1
+            self.evidence[y, x] = min(self.evidence_limit, evidence)
+            if self.evidence[y, x] >= self.occupied_threshold:
+                self.data[y, x] = OCCUPIED
 
     def integrate_ranges(self, position: Point2, ranges: Sequence[float],
                          max_range: float, min_range: float = 0.35,
@@ -110,28 +166,30 @@ class ExplorationGrid:
             else:
                 free_cells.update(line)
 
-        for x, y in free_cells - occupied_cells:
-            if self.data[y, x] != OCCUPIED:
-                self.data[y, x] = FREE
-        for x, y in occupied_cells:
-            self.data[y, x] = OCCUPIED
+        self._apply_evidence(free_cells, occupied_cells)
 
         seed_radius = max(1, int(math.ceil(0.35 / self.resolution)))
         for dx in range(-seed_radius, seed_radius + 1):
             for dy in range(-seed_radius, seed_radius + 1):
                 cell = (origin[0] + dx, origin[1] + dy)
                 if self.in_bounds(cell) and math.hypot(dx, dy) <= seed_radius:
+                    self.evidence[cell[1], cell[0]] = min(
+                        self.evidence[cell[1], cell[0]], self.free_threshold)
                     self.data[cell[1], cell[0]] = FREE
 
     def mark_occupied_points(self, points_xy: np.ndarray):
-        """Insert every observed obstacle point; occupied evidence is sticky."""
+        """Add one hit of evidence per raw endpoint; never latch occupancy directly."""
         points = np.asarray(points_xy, dtype=np.float64).reshape((-1, 2))
         if points.size == 0:
             return
         xs = np.floor((points[:, 0] - self.origin_x) / self.resolution).astype(int)
         ys = np.floor((points[:, 1] - self.origin_y) / self.resolution).astype(int)
         valid = ((xs >= 0) & (xs < self.width) & (ys >= 0) & (ys < self.height))
-        self.data[ys[valid], xs[valid]] = OCCUPIED
+        for x, y in zip(xs[valid].tolist(), ys[valid].tolist()):
+            evidence = min(self.evidence_limit, int(self.evidence[y, x]) + 1)
+            self.evidence[y, x] = evidence
+            if evidence >= self.occupied_threshold:
+                self.data[y, x] = OCCUPIED
 
     def inflated_obstacles(self, radius: float) -> Set[Cell]:
         radius_cells = int(math.ceil(radius / self.resolution))

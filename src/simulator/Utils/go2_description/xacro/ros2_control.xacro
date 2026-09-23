@@ -25,18 +25,18 @@
       <hardware>
         <plugin>gz_ros2_control/GazeboSimSystem</plugin>
       </hardware>
-      <xacro:go2_control_joint name="FL_hip_joint"/>
-      <xacro:go2_control_joint name="FL_thigh_joint" initial="0.8"/>
-      <xacro:go2_control_joint name="FL_calf_joint" initial="-1.5"/>
-      <xacro:go2_control_joint name="FR_hip_joint"/>
-      <xacro:go2_control_joint name="FR_thigh_joint" initial="0.8"/>
-      <xacro:go2_control_joint name="FR_calf_joint" initial="-1.5"/>
-      <xacro:go2_control_joint name="RL_hip_joint"/>
-      <xacro:go2_control_joint name="RL_thigh_joint" initial="0.8"/>
-      <xacro:go2_control_joint name="RL_calf_joint" initial="-1.5"/>
-      <xacro:go2_control_joint name="RR_hip_joint"/>
-      <xacro:go2_control_joint name="RR_thigh_joint" initial="0.8"/>
-      <xacro:go2_control_joint name="RR_calf_joint" initial="-1.5"/>
+      <xacro:go2_control_joint name="FL_hip_joint" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="FL_thigh_joint" initial="0.8" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="FL_calf_joint" initial="-1.5" effort_limit="35.55"/>
+      <xacro:go2_control_joint name="FR_hip_joint" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="FR_thigh_joint" initial="0.8" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="FR_calf_joint" initial="-1.5" effort_limit="35.55"/>
+      <xacro:go2_control_joint name="RL_hip_joint" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="RL_thigh_joint" initial="0.8" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="RL_calf_joint" initial="-1.5" effort_limit="35.55"/>
+      <xacro:go2_control_joint name="RR_hip_joint" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="RR_thigh_joint" initial="0.8" effort_limit="23.7"/>
+      <xacro:go2_control_joint name="RR_calf_joint" initial="-1.5" effort_limit="35.55"/>
     </ros2_control>
   </xacro:macro>
 </robot>

@@ -53,6 +53,13 @@ namespace scan_planner
         node_, "fsm.rolling_replan_max_start_error", 0.30);
     if (rolling_replan_max_start_error_ <= 0.0)
       throw std::runtime_error("fsm.rolling_replan_max_start_error must be positive");
+    predictive_replan_reaction_time_ = load_parameter<double>(
+        node_, "fsm.predictive_replan_reaction_time", 0.25);
+    predictive_hard_stop_min_time_ = load_parameter<double>(
+        node_, "fsm.predictive_hard_stop_min_time", 0.35);
+    if (predictive_replan_reaction_time_ < 0.0 ||
+        predictive_hard_stop_min_time_ < 0.0)
+      throw std::runtime_error("predictive collision timing parameters must be non-negative");
     goal_tolerance_ = load_parameter<double>(node_, "fsm.goal_tolerance", 0.25);
     heading_freeze_max_recoveries_ = load_parameter<int>(
         node_, "fsm.heading_freeze_max_recoveries", 2);
@@ -65,6 +72,7 @@ namespace scan_planner
     self_double_cylinder_radius_ = load_parameter<double>(node_, "grid_map.double_cylinder_radius", 0.0);
     self_double_cylinder_offset_ = load_parameter<double>(node_, "grid_map.double_cylinder_offset", 0.0);
     body_height_ = load_parameter<double>(node_, "grid_map.body_height", 0.4);
+    live_body_height_ = load_parameter<bool>(node_, "grid_map.live_body_height", true);
     self_inflation_frame_id_ = load_parameter<std::string>(node_, "grid_map.frame_id", "world");
 
     if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
@@ -507,7 +515,13 @@ namespace scan_planner
       Eigen::Vector3d wp;
       wp(0) = pose_stamped.pose.position.x;
       wp(1) = pose_stamped.pose.position.y;
-      wp(2) = pose_stamped.pose.position.z + body_height_; // Adjust for body height
+      // Explorer publishes a 2D path with z = 0.0, so its z carries no terrain
+      // height.  A fixed body_height offset only holds on flat ground; on a
+      // ledge the trajectory lands inside the terrain and every replan
+      // collides at t = 0.  Track the live body height instead.
+      wp(2) = live_body_height_
+                  ? odom_pos_.z()
+                  : pose_stamped.pose.position.z + body_height_;
       if (waypoints.empty() || (wp - waypoints.back()).norm() > 1e-3)
         waypoints.push_back(wp);
     }
@@ -552,6 +566,7 @@ namespace scan_planner
 
     if (success)
     {
+      predictive_replan_requested_.store(false);
       if (safety_stop_active_.exchange(false))
         RCLCPP_INFO(node_->get_logger(),
                     "[SAFETY_RELEASE] source=new_reference_path; planning may resume");
@@ -948,6 +963,24 @@ namespace scan_planner
       return;
     }
 
+    // A collision still outside the dynamic stopping horizon is a planning
+    // request, not a terminal failure.  Replan from current odometry while the
+    // validated prefix remains executable; the safety timer will escalate to
+    // a hard HOLD if the obstacle enters the stopping horizon first.
+    if (predictive_replan_requested_.load() && exec_state_ == EXEC_TRAJ &&
+        have_target_ &&
+        (next_rolling_replan_attempt_ns_ == 0 ||
+         node_->now().nanoseconds() >= next_rolling_replan_attempt_ns_))
+    {
+      refreshPlanningOdomFromSafety();
+      next_rolling_replan_attempt_ns_ = 0;
+      changeFSMExecState(REPLAN_TRAJ, "PREDICTIVE_COLLISION");
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 500,
+          "[PREDICTIVE_COLLISION_REPLAN] replanning from current odometry before the stopping horizon");
+      return;
+    }
+
     if (go2_heading_stalled_.load() && !heading_stall_handled_ &&
         exec_state_ == EXEC_TRAJ && have_target_)
     {
@@ -1051,6 +1084,7 @@ namespace scan_planner
       bool success = callReboundReplan(true, flag_random_poly_init);
       if (success)
       {
+        predictive_replan_requested_.store(false);
         next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
@@ -1080,6 +1114,7 @@ namespace scan_planner
 
       if (planFromCurrentTraj())
       {
+        predictive_replan_requested_.store(false);
         next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
@@ -1216,13 +1251,20 @@ namespace scan_planner
         // cout << "near end" << endl;
         return;
       }
-      else if ((info->start_pos_ - pos).norm() < replan_thresh_)
-      {
-        // cout << "near start" << endl;
-        return;
-      }
       else
       {
+        const double planned_progress =
+            (info->start_pos_.head<2>() - pos.head<2>()).norm();
+        const double odometry_progress =
+            (info->start_pos_.head<2>() - odom_pos_.head<2>()).norm();
+        if (!shouldTriggerRollingReplan(
+                planned_progress, odometry_progress, replan_thresh_))
+          return;
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[ROLLING_REPLAN_TRIGGER] planned_progress=%.2fm odometry_progress=%.2fm threshold=%.2fm",
+            planned_progress, odometry_progress, replan_thresh_);
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
       break;
@@ -1313,25 +1355,34 @@ namespace scan_planner
         : std::numeric_limits<double>::infinity();
     const bool reuse_suffix = shouldReuseCurrentTrajectorySuffix(
         reference_path_update_pending_, trajectory_valid, remaining_time,
-        tracking_error, rolling_replan_max_start_error_);
+        tracking_error, rolling_replan_max_start_error_) &&
+        !predictive_replan_requested_.load();
 
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
     start_pt_ = odom_pos_;
-    if (reference_path_active_)
+    if (trajectory_valid)
     {
-      // A replacement global path may turn away from the previous local
-      // trajectory.  Inherit the measured motion only in the new path
-      // direction; carrying the old desired velocity creates a large entry
-      // arc before collision optimization begins.
-      start_vel_ = odom_vel_;
-      start_acc_.setZero();
-      alignStartStateToReferencePath();
+      // A rolling replacement must preserve the command state of the
+      // trajectory currently being executed.  Quadruped odometry velocity
+      // oscillates over every gait cycle and can be momentarily zero or
+      // backwards even during steady forward motion; sampling that single
+      // frame made every replacement spline restart from rest.
+      start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
+      start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
     }
     else
     {
-      start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
-      start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+      start_vel_ = odom_vel_;
+      start_acc_.setZero();
+    }
+    if (reference_path_active_)
+    {
+      // A replacement global path may turn away from the previous local
+      // trajectory.  Preserve the previous desired speed only in the new path
+      // direction; carrying its lateral component creates a large entry arc
+      // before collision optimization begins.
+      alignStartStateToReferencePath();
     }
 
     const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
@@ -1386,23 +1437,31 @@ namespace scan_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
+    LocalTrajData *info = &planner_manager_->local_data_;
+    if (info->start_time_.seconds() < 1e-5 || info->duration_ <= 1e-5)
+    {
+      if (reference_path_active_)
+        alignStartStateToReferencePath();
+      return;
+    }
+
+    const double raw_t_cur = (node_->now() - info->start_time_).seconds();
+    if (raw_t_cur < -1e-3 || raw_t_cur > info->duration_ + 0.2)
+    {
+      if (reference_path_active_)
+        alignStartStateToReferencePath();
+      return;
+    }
+
+    const double t_cur = std::min(std::max(raw_t_cur, 0.0), info->duration_);
+    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
+    start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+
     if (reference_path_active_)
     {
       alignStartStateToReferencePath();
       return;
     }
-
-    LocalTrajData *info = &planner_manager_->local_data_;
-    if (info->start_time_.seconds() < 1e-5 || info->duration_ <= 1e-5)
-      return;
-
-    const double raw_t_cur = (node_->now() - info->start_time_).seconds();
-    if (raw_t_cur < -1e-3 || raw_t_cur > info->duration_ + 0.2)
-      return;
-
-    const double t_cur = std::min(std::max(raw_t_cur, 0.0), info->duration_);
-    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
-    start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
 
     const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
     if (to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
@@ -1430,10 +1489,7 @@ namespace scan_planner
       return;
     }
 
-    tangent /= tangent_norm;
-    const double forward_speed = std::max(0.0, start_vel_.head<2>().dot(tangent));
-    start_vel_.head<2>() = forward_speed * tangent;
-    start_vel_(2) = 0.0;
+    start_vel_ = projectForwardVelocityToPath(start_vel_, entry.tangent);
     start_acc_.setZero();
   }
 
@@ -1483,6 +1539,7 @@ namespace scan_planner
     if (!safety_stop_active_.compare_exchange_strong(expected, true))
       return;
 
+    predictive_replan_requested_.store(false);
     safety_generation_.fetch_add(1);
     requestExecutionStop(reason);
     if (!last_free || !first_blocked)
@@ -1608,11 +1665,37 @@ namespace scan_planner
           std::min(t + time_step, trajectory.duration));
       if (map->getInflateOccupancy(pos, segment_yaw(pos, next)) != 0)
       {
-        tripRealtimeSafety("BLOCKED", &last_free, &pos,
-                           trajectory.request_id, trajectory.trajectory_id);
-        RCLCPP_WARN(node_->get_logger(),
-                    "[REALTIME_SAFETY_STOP] reason=trajectory_blocked time_to_hit=%.2fs hit=(%.2f,%.2f) map_age=%.1fms",
-                    std::max(0.0, t - t_cur), pos.x(), pos.y(), map_age * 1000.0);
+        const double time_to_hit = std::max(0.0, t - t_cur);
+        double speed = 0.0;
+        {
+          std::lock_guard<std::mutex> lock(safety_odom_mutex_);
+          speed = safety_odom_vel_.head<2>().norm();
+        }
+        const double max_deceleration = std::max(
+            1e-3, planner_manager_->pp_.max_acc_);
+        const double hard_stop_time = predictiveHardStopTime(
+            speed, max_deceleration, predictive_replan_reaction_time_,
+            predictive_hard_stop_min_time_);
+        if (predictiveCollisionRequiresHardStop(
+                time_to_hit, speed, max_deceleration,
+                predictive_replan_reaction_time_,
+                predictive_hard_stop_min_time_))
+        {
+          tripRealtimeSafety("BLOCKED", &last_free, &pos,
+                             trajectory.request_id, trajectory.trajectory_id);
+          RCLCPP_WARN(node_->get_logger(),
+                      "[REALTIME_SAFETY_STOP] reason=trajectory_blocked time_to_hit=%.2fs hard_stop_time=%.2fs speed=%.2fm/s hit=(%.2f,%.2f) map_age=%.1fms",
+                      time_to_hit, hard_stop_time, speed, pos.x(), pos.y(),
+                      map_age * 1000.0);
+        }
+        else
+        {
+          predictive_replan_requested_.store(true);
+          RCLCPP_WARN_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 500,
+              "[PREDICTIVE_COLLISION_WARNING] time_to_hit=%.2fs hard_stop_time=%.2fs speed=%.2fm/s hit=(%.2f,%.2f); requesting rolling replan",
+              time_to_hit, hard_stop_time, speed, pos.x(), pos.y());
+        }
         return;
       }
       last_free = pos;

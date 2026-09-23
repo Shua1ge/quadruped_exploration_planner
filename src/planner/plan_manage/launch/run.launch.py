@@ -25,12 +25,15 @@ def _setup(context):
         LaunchConfiguration("use_gazebo_physics").perform(context))
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     controller_mode = LaunchConfiguration("controller_mode").perform(context)
+    locomotion_mode = LaunchConfiguration("locomotion_mode").perform(context)
     keypoints_file = LaunchConfiguration("keypoints_file").perform(context)
     navi_mode = int(LaunchConfiguration("navi_mode").perform(context))
     if sensor_type not in ("lidar", "depth"):
         raise RuntimeError("sensor_type must be 'lidar' or 'depth'")
     if controller_mode not in ("open_loop", "closed_loop"):
         raise RuntimeError("controller_mode must be 'open_loop' or 'closed_loop'")
+    if locomotion_mode not in ("planning_kinematic", "rl_effort"):
+        raise RuntimeError("locomotion_mode must be 'planning_kinematic' or 'rl_effort'")
     if navi_mode not in (1, 2, 3):
         raise RuntimeError("navi_mode must be 1, 2, or 3")
     if navi_mode == 2 and (not keypoints_file or not os.path.isfile(keypoints_file)):
@@ -50,6 +53,7 @@ def _setup(context):
                 "use_gazebo_physics=true requires gazebo_world to reference an existing file"
             )
 
+    lidar_extrinsic = {}
     if is_real:
         body_pose = "/LIO/odom_vehicle"
         sensor_pose = "/LIO/odom_imu"
@@ -71,13 +75,23 @@ def _setup(context):
             # so the bridged model odometry supplies the ray origin and
             # orientation used to project it into world coordinates.
             sensor_pose = body_pose
+            need_extrinsic = True
+            lidar_extrinsic = {
+                "grid_map.lidar_extrinsic_x": 0.10,
+                "grid_map.lidar_extrinsic_y": 0.0,
+                "grid_map.lidar_extrinsic_z": 0.12,
+                "grid_map.lidar_extrinsic_roll": 0.0,
+                "grid_map.lidar_extrinsic_pitch": 0.0,
+                "grid_map.lidar_extrinsic_yaw": 0.0,
+            }
         else:
             sensor_pose = ("/quad_0/camera_pose" if sensor_type == "depth"
                            else "/quad_0/lidar_pose")
         cloud = "/quad_0/cloud"
         depth = "/quad_0/depth"
         cloud_is_world = not use_gazebo_physics
-        need_extrinsic = False
+        if not (use_gazebo_physics and sensor_type == "lidar"):
+            need_extrinsic = False
         intrinsics = {}
 
     common = {"use_sim_time": use_sim_time}
@@ -88,6 +102,7 @@ def _setup(context):
         "grid_map.sensor_type": sensor_type,
         "grid_map.cloud_is_world": cloud_is_world,
         "grid_map.need_extrinsic": need_extrinsic,
+        **lidar_extrinsic,
     }
     actions = [
         Node(
@@ -147,7 +162,7 @@ def _setup(context):
                 parameters=[controllers_yaml, common],
                 remappings=[
                     ("body_pose", body_pose),
-                    ("cmd_vel", "/cmd_vel" if is_real else "/quad_0/cmd_vel"),
+                    ("cmd_vel", "/planning/cmd_vel_raw"),
                 ],
             )
         )
@@ -185,7 +200,9 @@ def _setup(context):
                     launch_arguments={
                         "world": LaunchConfiguration("gazebo_world"),
                         "resource_path": LaunchConfiguration("gazebo_resource_path"),
-                        "terrain_velocity_control": "true",  # Keep for OdometryPublisher, VelocityControl not used
+                        "terrain_velocity_control": (
+                            "true" if locomotion_mode == "planning_kinematic" else "false"),
+                        "locomotion_mode": locomotion_mode,
                         "headless": LaunchConfiguration("headless"),
                         "x": LaunchConfiguration("init_x"),
                         "y": LaunchConfiguration("init_y"),
@@ -211,23 +228,45 @@ def _setup(context):
                 )
             )
             
-            # Add GO2 RL Policy Node (Parkour MoE ONNX)
             actions.append(
                 Node(
                     package="scan_planner",
-                    executable="go2_onnx_policy_node.py",
-                    name="go2_onnx_policy_node",
+                    executable="go2_locomotion_supervisor.py",
+                    name="go2_locomotion_supervisor",
                     output="screen",
                     parameters=[
                         common,
                         {
+                            "locomotion_mode": locomotion_mode,
+                            "getup_mode": LaunchConfiguration("getup_mode"),
                             "model_path": "/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx",
                         },
                     ],
+                    remappings=[("body_pose", body_pose)],
                 )
             )
-            
-            # The motion layer is now the RL policy driving joint positions
+            actions.append(
+                Node(
+                    package="odom_visualization",
+                    executable="odom_visualization",
+                    name="odom_visualization",
+                    output="screen",
+                    parameters=[common, {
+                        "frame_id": "world",
+                        "child_frame_id": "go2/base_footprint",
+                        "publish_tf": False,
+                    }],
+                    remappings=[
+                        ("body_pose", body_pose),
+                        ("pose", "/quad_0/pose"),
+                        ("path", "/quad_0/path"),
+                        ("velocity", "/quad_0/velocity"),
+                        ("trajectory", "/quad_0/trajectory"),
+                        ("robot", "/quad_0/robot"),
+                        ("height", "/quad_0/height"),
+                    ],
+                )
+            )
             if _as_bool(LaunchConfiguration("wrench_actuator").perform(context)):
                 actions.append(
                     Node(
@@ -312,6 +351,8 @@ def generate_launch_description():
             DeclareLaunchArgument("navi_mode", default_value="1"),
             DeclareLaunchArgument("sensor_type", default_value="lidar"),
             DeclareLaunchArgument("controller_mode", default_value="closed_loop"),
+            DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
+            DeclareLaunchArgument("getup_mode", default_value="policy"),
             DeclareLaunchArgument("keypoints_file", default_value=""),
             DeclareLaunchArgument("use_gpu", default_value="false"),
             DeclareLaunchArgument("use_pcd_map", default_value="false"),

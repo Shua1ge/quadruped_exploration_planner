@@ -5,6 +5,11 @@
     <xacro:arg name="DEBUG" default="false"/>
     <xacro:arg name="use_gazebo" default="true"/>
     <xacro:arg name="terrain_velocity_control" default="false"/>
+    <!-- Lock the 12 leg joints at the nominal stance and drop every leg
+         controller.  Used by the kinematic proxy mode, where the trunk is held
+         rigidly at the spawn height by the model itself: leg dynamics must not
+         decide the body height, because the local map trusts the LiDAR pose. -->
+    <xacro:arg name="lock_legs" default="false"/>
 
     <xacro:include filename="$(find go2_description)/xacro/const.xacro"/>
     <xacro:include filename="$(find go2_description)/xacro/materials.xacro"/>
@@ -151,13 +156,23 @@
         </collision>
     </link>
 -->
-    <xacro:leg name="FR" mirror="-1" mirror_dae= "False" front_hind="1"  front_hind_dae="True"  />
-    <xacro:leg name="FL" mirror="1"  mirror_dae="True"   front_hind="1"  front_hind_dae="True"  />
-    <xacro:leg name="RR" mirror="-1" mirror_dae="False"  front_hind="-1" front_hind_dae="False" />
-    <xacro:leg name="RL" mirror="1"  mirror_dae="True"   front_hind="-1" front_hind_dae="False" />
+    <!-- Stance angles matching DEFAULT_DOF_POS in the locomotion supervisor:
+         hip 0.1 (mirrored per side), thigh 0.8 front / 1.0 rear, calf -1.5. -->
+    <xacro:leg name="FR" mirror="-1" mirror_dae= "False" front_hind="1"  front_hind_dae="True"
+               lock_legs="$(arg lock_legs)" hip_lock="${-0.1}" thigh_lock="0.8" calf_lock="-1.5" />
+    <xacro:leg name="FL" mirror="1"  mirror_dae="True"   front_hind="1"  front_hind_dae="True"
+               lock_legs="$(arg lock_legs)" hip_lock="${0.1}" thigh_lock="0.8" calf_lock="-1.5" />
+    <xacro:leg name="RR" mirror="-1" mirror_dae="False"  front_hind="-1" front_hind_dae="False"
+               lock_legs="$(arg lock_legs)" hip_lock="${-0.1}" thigh_lock="1.0" calf_lock="-1.5" />
+    <xacro:leg name="RL" mirror="1"  mirror_dae="True"   front_hind="-1" front_hind_dae="False"
+               lock_legs="$(arg lock_legs)" hip_lock="${0.1}" thigh_lock="1.0" calf_lock="-1.5" />
 
     <xacro:if value="$(arg use_gazebo)">
-        <xacro:go2_ros2_control/>
+        <!-- With fixed legs there is nothing for ros2_control to command, so no
+             hardware interface and no controller_manager are created. -->
+        <xacro:unless value="$(arg lock_legs)">
+            <xacro:go2_ros2_control/>
+        </xacro:unless>
         <xacro:go2_gazebo/>
     </xacro:if>
 </robot>

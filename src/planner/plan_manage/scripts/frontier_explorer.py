@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -20,7 +21,7 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
-from scan_planner_msgs.msg import TopoGraphDelta
+from scan_planner_msgs.msg import LocomotionState, TopoGraphDelta
 
 from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
@@ -30,12 +31,13 @@ from explorer_core.frontier_regions import (
     partition_frontier_clusters,
     partition_frontier_clusters_by_topology, retain_region_commitment,
     region_commitment_scope, region_information_efficiency,
+    double_cylinder_footprint_free, double_cylinder_path_free,
     safe_viewpoint_cells, select_rolling_region,
     solve_open_held_karp, update_region_commitment,
 )
 from explorer_core.grid import (
     Cell, DirectedEdge, ExplorationGrid, FREE, GRID_MOVES, OCCUPIED, Point2, UNKNOWN,
-    bresenham, dilate_hit_ranges,
+    PoseSample, bresenham, dilate_hit_ranges, interpolate_planar_pose,
 )
 from explorer_core.path_planning import (
     RemainingPathCheck, ShortestPathTree, adjacent_grid_path_is_valid, astar_known,
@@ -160,9 +162,28 @@ class FrontierExplorer(Node):
             self.declare_parameter("obstacle_z_relative_to_body", False).value)
         self.cloud_is_world = bool(
             self.declare_parameter("cloud_is_world", True).value)
+        self.lidar_extrinsic_x = float(
+            self.declare_parameter("lidar_extrinsic_x", 0.0).value)
+        self.lidar_extrinsic_y = float(
+            self.declare_parameter("lidar_extrinsic_y", 0.0).value)
+        self.lidar_extrinsic_z = float(
+            self.declare_parameter("lidar_extrinsic_z", 0.0).value)
         self.inflation_radius = float(self.declare_parameter("inflation_radius", 0.65).value)
+        self.footprint_radius = float(
+            self.declare_parameter("footprint_radius", 0.35).value)
+        self.footprint_offset = float(
+            self.declare_parameter("footprint_offset", 0.18).value)
+        self.get_logger().info(
+            "[SENSOR_CONTRACT] "
+            f"cloud_is_world={self.cloud_is_world} "
+            f"lidar_xyz=({self.lidar_extrinsic_x:.3f},"
+            f"{self.lidar_extrinsic_y:.3f},{self.lidar_extrinsic_z:.3f}) "
+            f"footprint_radius={self.footprint_radius:.3f} "
+            f"footprint_offset={self.footprint_offset:.3f}")
         self.viewpoint_standoff = float(
             self.declare_parameter("viewpoint_standoff", 1.0).value)
+        self.viewpoint_relaxation = float(self.declare_parameter(
+            "viewpoint_relaxation", 0.0).value)
         self.terminal_candidate_limit = int(
             self.declare_parameter("terminal_candidate_limit", 8).value)
         self.terminal_clearance_search_radius = float(self.declare_parameter(
@@ -288,7 +309,13 @@ class FrontierExplorer(Node):
         self.position: Optional[Point2] = None
         self.body_z = 0.3
         self.body_yaw = 0.0
+        # Map throttling and timestamped pose lookup are independent concerns.
+        # Keep an explicit initial value so the first accepted cloud cannot
+        # read this member before cloud_callback() has assigned it.
         self.last_map_update_ns = 0
+        self.pose_history = deque(maxlen=200)
+        self.pose_history_max_age_ns = int(
+            float(self.declare_parameter("pose_history_max_age", 0.20).value) * 1e9)
         self.map_update_count = 0
         self.map_content_revision = 0
         self.map_published = False
@@ -429,6 +456,19 @@ class FrontierExplorer(Node):
         self.run_id = str(time.time_ns())
         self.latest_frontier_count = 0
         self.latest_region_count = 0
+        self.locomotion_actuation_ready = False
+        self.perception_pose_valid = False
+        self.locomotion_epoch = 0
+        self.locomotion_reason = ""
+        self.map_fusion_started = False
+        self.last_locomotion_state_ns = 0
+        self.last_task_clock_ns = self.get_clock().now().nanoseconds
+        self.healthy_task_elapsed = 0.0
+        self.unreachable_context = None
+        self.last_candidate_rejections = dict.fromkeys((
+            "no_safe_viewpoint", "insufficient_gain", "too_close",
+            "blacklisted", "cooldown", "excluded", "astar_unreachable",
+            "final_validation_failed", "accepted"), 0)
 
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -442,6 +482,12 @@ class FrontierExplorer(Node):
             Path, "planning/blocked_segment", self.blocked_segment_callback, 10)
         self.create_subscription(Bool, "simulation/collision", self.collision_callback, 10)
         self.create_subscription(Bool, "explorer/enabled", self.enabled_callback, 10)
+        locomotion_qos = QoSProfile(depth=1)
+        locomotion_qos.reliability = ReliabilityPolicy.RELIABLE
+        locomotion_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            LocomotionState, "/robot/locomotion_state",
+            self.locomotion_state_callback, locomotion_qos)
         self.create_subscription(
             TopoGraphDelta, "global_representation/topology_delta",
             self.topology_delta_callback, 10)
@@ -477,6 +523,54 @@ class FrontierExplorer(Node):
             f"observation_prepare={self.observation_prepare_ratio:.2f}, "
             f"observation_done={self.observation_done_ratio:.2f}, "
             f"sparse_routing={self.sparse_routing_enabled}")
+
+    def locomotion_state_callback(self, msg: LocomotionState):
+        self.locomotion_actuation_ready = msg.actuation_ready
+        self.perception_pose_valid = msg.perception_pose_valid
+        self.locomotion_epoch = msg.epoch
+        self.locomotion_reason = msg.reason
+        self.last_locomotion_state_ns = self.get_clock().now().nanoseconds
+
+    def locomotion_ready(self) -> bool:
+        return (self.locomotion_actuation_ready
+                and self.last_locomotion_state_ns > 0
+                and (self.get_clock().now().nanoseconds
+                     - self.last_locomotion_state_ns) <= 500000000)
+
+    def map_fusion_allowed(self) -> bool:
+        """Whether a scan may be integrated into the occupancy grid.
+
+        Only map fusion is gated here, never motion.  A scan taken while the
+        robot is still lying, is getting up, or has lost its body pose gets
+        projected through a planar pose that does not describe it, and because
+        a ray endpoint is only ever added as occupied evidence, a single such
+        scan can seal free space around the robot permanently.  Without this
+        gate the grid is built from the first frame that has odometry -- several
+        seconds before the stance exists.
+
+        ``perception_pose_valid`` is the supervisor's map-fusion contract.
+        ``actuation_ready`` answers a different question (may motion commands be
+        accepted) and is only equal to it by accident in the current supervisor.
+        """
+        if self.last_locomotion_state_ns == 0:
+            return False
+        if (self.get_clock().now().nanoseconds
+                - self.last_locomotion_state_ns) > 500000000:
+            return False
+        return self.perception_pose_valid
+
+    def report_fusion_blocked(self):
+        if (self.last_locomotion_state_ns == 0
+                or (self.get_clock().now().nanoseconds
+                    - self.last_locomotion_state_ns) > 500000000):
+            detail = "no fresh /robot/locomotion_state"
+        else:
+            detail = (f"perception_pose_valid=false "
+                      f"(supervisor reason={self.locomotion_reason})")
+        self.get_logger().info(
+            f"[MAP_FUSION_GATED] occupancy integration paused: {detail}; "
+            "scans taken through an unverified stance would seal free space",
+            throttle_duration_sec=5.0)
 
     def publish_status(self, value: str):
         msg = String()
@@ -623,6 +717,19 @@ class FrontierExplorer(Node):
                    + orientation.x * orientation.y),
             1.0 - 2.0 * (orientation.y * orientation.y
                          + orientation.z * orientation.z))
+        stamp = msg.header.stamp
+        stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        if stamp_ns > 0:
+            sample = (stamp_ns, new_position[0], new_position[1],
+                      self.body_yaw, self.body_z)
+            if not self.pose_history or stamp_ns >= self.pose_history[-1][0]:
+                self.pose_history.append(sample)
+            else:
+                ordered = list(self.pose_history)
+                ordered.append(sample)
+                ordered.sort(key=lambda item: item[0])
+                self.pose_history = deque(ordered[-self.pose_history.maxlen:],
+                                          maxlen=self.pose_history.maxlen)
 
     def current_blocked_edges(self) -> Set[DirectedEdge]:
         now_ns = self.get_clock().now().nanoseconds
@@ -664,6 +771,15 @@ class FrontierExplorer(Node):
     def cloud_callback(self, msg: PointCloud2):
         if self.position is None:
             return
+        if not self.map_fusion_allowed():
+            self.report_fusion_blocked()
+            return
+        if not self.map_fusion_started:
+            self.map_fusion_started = True
+            self.get_logger().info(
+                "[MAP_FUSION_STARTED] perception pose is valid; occupancy "
+                "integration begins now, so the grid holds only scans taken "
+                "from a verified stance")
         now_ns = self.get_clock().now().nanoseconds
         if now_ns - self.last_map_update_ns < int(self.map_update_period * 1e9):
             return
@@ -690,22 +806,33 @@ class FrontierExplorer(Node):
                     np.float64, copy=False)
         if points.size == 0:
             return
+        msg_stamp = msg.header.stamp
+        cloud_stamp_ns = int(msg_stamp.sec) * 1_000_000_000 + int(msg_stamp.nanosec)
+        pose_at_scan = interpolate_planar_pose(
+            self.pose_history, cloud_stamp_ns, self.pose_history_max_age_ns)
+        if pose_at_scan is None:
+            self.get_logger().warning(
+                "Dropping cloud without a pose at its timestamp",
+                throttle_duration_sec=2.0)
+            return
+        scan_x, scan_y, scan_yaw, scan_z = pose_at_scan
         if not self.cloud_is_world:
-            cos_yaw = math.cos(self.body_yaw)
-            sin_yaw = math.sin(self.body_yaw)
+            cos_yaw = math.cos(scan_yaw)
+            sin_yaw = math.sin(scan_yaw)
             local_x = array[:, 0].copy()
             local_y = array[:, 1].copy()
-            # Match the fixed lidar_joint transform in the Gazebo GO2 model.
-            local_x += 0.10
-            array[:, 0] = (self.position[0] + cos_yaw * local_x
+            # Use the same body->lidar translation contract as GridMap.
+            local_x += self.lidar_extrinsic_x
+            local_y += self.lidar_extrinsic_y
+            array[:, 0] = (scan_x + cos_yaw * local_x
                            - sin_yaw * local_y)
-            array[:, 1] = (self.position[1] + sin_yaw * local_x
+            array[:, 1] = (scan_y + sin_yaw * local_x
                            + cos_yaw * local_y)
-            array[:, 2] += self.body_z + 0.12
-        dx = array[:, 0] - self.position[0]
-        dy = array[:, 1] - self.position[1]
+            array[:, 2] += scan_z + self.lidar_extrinsic_z
+        dx = array[:, 0] - scan_x
+        dy = array[:, 1] - scan_y
         distances = np.hypot(dx, dy)
-        z_reference = self.body_z if self.obstacle_z_relative_to_body else 0.0
+        z_reference = scan_z if self.obstacle_z_relative_to_body else 0.0
         mask = ((array[:, 2] >= z_reference + self.obstacle_min_z)
                 & (array[:, 2] <= z_reference + self.obstacle_max_z)
                 & (distances >= 0.35)
@@ -719,12 +846,8 @@ class FrontierExplorer(Node):
         nearest = dilate_hit_ranges(nearest, self.hit_dilation_bins)
         previous_grid = self.grid.data.copy()
         self.grid.integrate_ranges(
-            self.position, nearest, self.mapping_range,
+            (scan_x, scan_y), nearest, self.mapping_range,
             no_return_range=self.no_return_range)
-        # Ray endpoints are quantised by bearing; insert the original points as
-        # occupied as well so a real wall cannot disappear between ray bins.
-        if np.any(mask):
-            self.grid.mark_occupied_points(array[mask, :2])
         changed_mask = self.grid.data != previous_grid
         if np.any(changed_mask):
             ys, xs = np.where(changed_mask)
@@ -981,6 +1104,7 @@ class FrontierExplorer(Node):
         self.last_preparation_attempt_update = -1
         self.last_handoff_attempt_update = -1
         self.active_since_ns = self.get_clock().now().nanoseconds
+        self.healthy_task_elapsed = 0.0
         self.publish_status("ACTIVE_GOAL_REROUTED")
         self.get_logger().info(
             f"Rerouted active observation to ({self.active_goal[0]:.2f}, "
@@ -1484,6 +1608,14 @@ class FrontierExplorer(Node):
             for goal, release in self.goal_failure_cooldowns.items())
 
     def exploration_timer(self):
+        now_ns = self.get_clock().now().nanoseconds
+        dt = max(0.0, (now_ns - self.last_task_clock_ns) * 1e-9)
+        self.last_task_clock_ns = now_ns
+        if not self.locomotion_ready():
+            self.publish_status("PAUSED_ROBOT_UNHEALTHY")
+            return
+        if (self.active_goal is not None and not self.scan_waiting_for_target):
+            self.healthy_task_elapsed += dt
         if not self.auto_start or self.position is None or self.map_update_count < 2:
             return
         if self.pending_path_publish_ns:
@@ -1499,7 +1631,7 @@ class FrontierExplorer(Node):
         if self.active_goal is not None:
             if not self.validate_and_repair_active_path():
                 return
-            elapsed = (self.get_clock().now().nanoseconds - self.active_since_ns) * 1e-9
+            elapsed = self.healthy_task_elapsed
             if elapsed > self.goal_timeout:
                 self.goal_timeout_count += 1
                 self.get_logger().warning("Frontier goal timed out; blacklisting it")
@@ -1546,6 +1678,20 @@ class FrontierExplorer(Node):
             self.map_content_revision,
             self.route_constraint_revision,
             self.map_update_count // self.replan_retry_updates)
+        frontier_signature = (self.latest_frontier_count, self.map_content_revision)
+        unreachable_key = (
+            context.robot_cell, context.map_content_revision,
+            context.route_constraint_revision, self.locomotion_epoch,
+            frontier_signature)
+        # Diagnostic memo only.  Retry cadence stays owned by ReplanGate, whose
+        # context carries a retry bucket that advances with map_update_count.  A
+        # robot that is healthy but stationary cannot change map_content_revision,
+        # so suppressing on this latch alone would block every retry and idle
+        # forever instead of reporting a stall.
+        if self.unreachable_context == unreachable_key:
+            self.publish_status("FRONTIERS_PRESENT_BUT_UNREACHABLE")
+        else:
+            self.unreachable_context = None
         if not self.replan_gate.allow(context):
             self.replan_suppressed_count += 1
             self.publish_status("WAITING_FOR_PLANNING_INPUT_CHANGE")
@@ -1556,6 +1702,7 @@ class FrontierExplorer(Node):
                 f"route_constraint_revision={context.route_constraint_revision}",
                 throttle_duration_sec=2.0)
             return False
+        self.unreachable_context = None
 
         preprocess_started = time.perf_counter()
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
@@ -1585,7 +1732,12 @@ class FrontierExplorer(Node):
             map_preprocess_prefix_ms=preprocess_ms)
         if best is None:
             status = ("EXPLORATION_COMPLETE" if not filtered_frontiers
-                      else "NO_REACHABLE_FRONTIER")
+                      else "FRONTIERS_PRESENT_BUT_UNREACHABLE")
+            if filtered_frontiers:
+                self.unreachable_context = (
+                    context.robot_cell, context.map_content_revision,
+                    context.route_constraint_revision, self.locomotion_epoch,
+                    (len(filtered_frontiers), self.map_content_revision))
             self.publish_status(status)
             self.get_logger().info(
                 f"{status}: {len(filtered_frontiers)} usable frontier cells",
@@ -1655,7 +1807,10 @@ class FrontierExplorer(Node):
             viewpoints = safe_viewpoint_cells(
                 self.grid, frontier, inflated,
                 self.viewpoint_standoff, limit=1,
-                clearance_search_radius=self.terminal_clearance_search_radius)
+                clearance_search_radius=self.terminal_clearance_search_radius,
+                relaxation=self.viewpoint_relaxation,
+                footprint_radius=self.footprint_radius,
+                footprint_offset=self.footprint_offset)
             representative = viewpoints[0] if viewpoints else frontier
             attachment = self.sparse_router.topology_attachment(
                 self.grid.cell_to_world(representative),
@@ -1846,6 +2001,17 @@ class FrontierExplorer(Node):
                 "dense final validation found no route",
                 throttle_duration_sec=2.0)
             return None
+        if not double_cylinder_path_free(
+                self.grid, path, selected_cell, candidate.frontier_cell,
+                inflated, getattr(self, "footprint_radius", 0.0),
+                getattr(self, "footprint_offset", 0.0)):
+            self.last_candidate_rejections["final_validation_failed"] += 1
+            self.sparse_final_validation_failures += 1
+            self.get_logger().warning(
+                "[FOOTPRINT_PATH_REJECTED] dense path is point-free but the "
+                "yawed double-cylinder footprint intersects the planning map",
+                throttle_duration_sec=2.0)
+            return None
         observation_cells = candidate.observation_cells
         if terminal_changed:
             observation_cells = observation_target_cells(
@@ -1872,6 +2038,8 @@ class FrontierExplorer(Node):
                                   inflated: Set[Cell],
                                   blocked_edges: Set[DirectedEdge],
                                   excluded_goals: Sequence[Point2] = ()) -> List[FrontierCandidate]:
+        rejected = dict.fromkeys(self.last_candidate_rejections, 0)
+        self.last_candidate_rejections = rejected
         self.dense_invalid_region_revisions = {
             region_id: revision
             for region_id, revision in self.dense_invalid_region_revisions.items()
@@ -1888,14 +2056,19 @@ class FrontierExplorer(Node):
                         self.grid, frontier, inflated, self.viewpoint_standoff,
                         limit=self.terminal_candidate_limit,
                         clearance_search_radius=(
-                            self.terminal_clearance_search_radius))
+                            self.terminal_clearance_search_radius),
+                        relaxation=self.viewpoint_relaxation,
+                        footprint_radius=self.footprint_radius,
+                        footprint_offset=self.footprint_offset)
                     if not viewpoints:
+                        rejected["no_safe_viewpoint"] += 1
                         continue
                     target_cells = observation_target_cells(
                         self.grid, frontier, self.observation_radius,
                         viewpoints[0])
                     unknown_gain = len(target_cells)
                     if unknown_gain < self.min_expected_observation_cells:
+                        rejected["insufficient_gain"] += 1
                         continue
                     # One frontier is one task.  Only its safest terminal enters
                     # global competition; other poses remain alternatives of
@@ -1911,10 +2084,17 @@ class FrontierExplorer(Node):
                         excluded = any(
                             math.hypot(goal_xy[0] - point[0], goal_xy[1] - point[1])
                             < self.blacklist_radius for point in excluded_goals)
-                        if (direct_distance < self.min_goal_distance
-                                or self.is_blacklisted(goal_xy)
-                                or self.is_goal_on_failure_cooldown(goal_xy)
-                                or excluded):
+                        if direct_distance < self.min_goal_distance:
+                            rejected["too_close"] += 1
+                            continue
+                        if self.is_blacklisted(goal_xy):
+                            rejected["blacklisted"] += 1
+                            continue
+                        if self.is_goal_on_failure_cooldown(goal_xy):
+                            rejected["cooldown"] += 1
+                            continue
+                        if excluded:
+                            rejected["excluded"] += 1
                             continue
                         proposals.append((
                             region.region_id, region_commitment_scope(region),
@@ -1977,6 +2157,7 @@ class FrontierExplorer(Node):
                             replacement = (cell, alternative_path)
                             break
                     if replacement is None:
+                        rejected["astar_unreachable"] += 1
                         continue
                     viewpoint, path = replacement
                     goal_xy = self.grid.cell_to_world(viewpoint)
@@ -2000,6 +2181,10 @@ class FrontierExplorer(Node):
                 terminal_clearance=terminal_clearance,
                 frontier_cluster_cells=frontier_cluster_cells,
                 commitment_scope=commitment_scope))
+            rejected["accepted"] += 1
+        self.get_logger().info(
+            f"[FRONTIER_CANDIDATE_SUMMARY] {rejected}",
+            throttle_duration_sec=2.0)
         return records
 
     @staticmethod
@@ -2257,8 +2442,20 @@ class FrontierExplorer(Node):
                 self.terminate_region_option(termination)
                 committed_ids = set()
         if committed_ids:
-            selected_region = max(committed_ids, key=lambda region_id: (
-                region_scores[region_id], -region_id))
+            # Retain the incumbent with the same hysteresis the uncommitted
+            # branch uses.  One lineage can own several regions after a split,
+            # and then committed_ids covers all of them: taking a plain argmax
+            # here bypassed switch_ratio entirely and let the goal oscillate
+            # between regions as their scores wobbled across map updates.
+            incumbent = self.active_region_id
+            if incumbent not in committed_ids:
+                incumbent = max(committed_ids, key=lambda region_id: (
+                    region_scores[region_id], -region_id))
+            selected_region = select_rolling_region(
+                region_scores, incumbent, self.region_switch_ratio)
+            if selected_region is None or selected_region not in committed_ids:
+                selected_region = max(committed_ids, key=lambda region_id: (
+                    region_scores[region_id], -region_id))
             self.last_selection_reason = "residual_commitment"
             challenger = select_rolling_region(
                 region_scores, selected_region, self.region_switch_ratio)
@@ -2486,6 +2683,7 @@ class FrontierExplorer(Node):
         self.last_preparation_attempt_update = -1
         self.last_handoff_attempt_update = -1
         self.active_since_ns = self.get_clock().now().nanoseconds
+        self.healthy_task_elapsed = 0.0
         self.publish_goal(goal_xy)
         self.publish_status("PATH_PUBLISHED")
         world_points = [self.grid.cell_to_world(cell) for cell in cells]
@@ -2518,6 +2716,13 @@ class FrontierExplorer(Node):
             "coverage": known_cells / total_cells if total_cells else 0.0,
             "known_cells": known_cells,
             "frontier_cells": self.latest_frontier_count,
+            "locomotion_epoch": self.locomotion_epoch,
+            "locomotion_ready": self.locomotion_ready(),
+            "unreachable_context_latched": self.unreachable_context is not None,
+            **{
+                f"candidate_rejected_{reason}": count
+                for reason, count in self.last_candidate_rejections.items()
+            },
             "regions": self.latest_region_count,
             "total_distance_m": self.total_distance,
             "revisit_distance_m": self.revisit_distance,

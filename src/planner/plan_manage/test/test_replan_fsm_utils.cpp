@@ -138,6 +138,36 @@ TEST(RollingTrajectoryReuse, RejectsDegenerateSampledSuffix)
   EXPECT_TRUE(sampledSuffixIsReusable(4, 0.25));
 }
 
+TEST(RollingReplanTrigger, RequiresPhysicalProgressAsWellAsPlannedProgress)
+{
+  EXPECT_FALSE(shouldTriggerRollingReplan(1.10, 0.08, 1.0));
+  EXPECT_FALSE(shouldTriggerRollingReplan(0.90, 1.10, 1.0));
+  EXPECT_TRUE(shouldTriggerRollingReplan(1.10, 1.00, 1.0));
+}
+
+TEST(PredictiveCollision, ReplansBeforeDynamicStoppingHorizon)
+{
+  EXPECT_NEAR(predictiveHardStopTime(0.75, 0.5, 0.25, 0.35), 1.75, 1e-9);
+  EXPECT_FALSE(predictiveCollisionRequiresHardStop(
+      2.0, 0.75, 0.5, 0.25, 0.35));
+  EXPECT_TRUE(predictiveCollisionRequiresHardStop(
+      1.7, 0.75, 0.5, 0.25, 0.35));
+  EXPECT_NEAR(predictiveHardStopTime(0.0, 0.5, 0.10, 0.35), 0.35, 1e-9);
+}
+
+TEST(RollingReplanStartVelocity, PreservesOnlyForwardPathComponent)
+{
+  const Eigen::Vector3d projected = projectForwardVelocityToPath(
+      Eigen::Vector3d(0.6, 0.2, 0.1), Eigen::Vector3d(1.0, 0.0, 0.0));
+  EXPECT_NEAR(projected.x(), 0.6, 1e-9);
+  EXPECT_NEAR(projected.y(), 0.0, 1e-9);
+  EXPECT_NEAR(projected.z(), 0.0, 1e-9);
+
+  const Eigen::Vector3d backwards = projectForwardVelocityToPath(
+      Eigen::Vector3d(-0.4, 0.0, 0.0), Eigen::Vector3d(1.0, 0.0, 0.0));
+  EXPECT_NEAR(backwards.norm(), 0.0, 1e-9);
+}
+
 TEST(TrajectoryVersion, RejectsLateRequestAndDuplicateTrajectory)
 {
   EXPECT_TRUE(shouldAcceptTrajectoryVersion(

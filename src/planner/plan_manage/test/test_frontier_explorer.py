@@ -16,6 +16,47 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_pose_interpolation_uses_sensor_timestamp_not_latest_pose():
+    history = [
+        (1_000_000_000, 0.0, 0.0, 0.0, 0.3),
+        (1_100_000_000, 1.0, 0.0, math.pi / 2.0, 0.5),
+    ]
+    pose = MODULE.interpolate_planar_pose(
+        history, 1_050_000_000, 200_000_000)
+    assert pose is not None
+    x, y, yaw, z = pose
+    assert math.isclose(x, 0.5)
+    assert math.isclose(y, 0.0)
+    assert math.isclose(yaw, math.pi / 4.0)
+    assert math.isclose(z, 0.4)
+
+
+def test_pose_interpolation_rejects_stale_cloud_pose():
+    history = [(1_000_000_000, 0.0, 0.0, 0.0, 0.3)]
+    assert MODULE.interpolate_planar_pose(
+        history, 1_500_000_000, 100_000_000) is None
+
+
+def test_transient_hit_is_reversible_after_free_ray_evidence():
+    grid = MODULE.ExplorationGrid(10.0, 10.0, 0.2)
+    hit = [math.inf] * 360
+    hit[180] = 1.0
+    angle = -math.pi + (180 + 0.5) * (2.0 * math.pi / 360.0)
+    target = grid.world_to_cell(math.cos(angle), math.sin(angle))
+    grid.integrate_ranges((0.0, 0.0), hit, 3.0)
+    assert grid.value(target) == MODULE.OCCUPIED
+
+    miss = [math.inf] * 360
+    for _ in range(3):
+        grid.integrate_ranges((0.0, 0.0), miss, 3.0, no_return_range=3.0)
+    assert grid.value(target) == MODULE.FREE
+
+
+def test_frontier_explorer_declares_map_update_throttle_state():
+    source = (ROOT / "scripts" / "frontier_explorer.py").read_text()
+    assert "self.last_map_update_ns = 0" in source
+
+
 def test_ray_integration_preserves_unknown_and_marks_hit():
     grid = MODULE.ExplorationGrid(20.0, 20.0, 0.5)
     ranges = [math.inf] * 72
@@ -156,6 +197,39 @@ def test_safe_viewpoint_orders_same_frontier_by_clearance_first():
     margins = [clearance(cell) for cell in viewpoints]
     assert len(margins) >= 2
     assert margins == sorted(margins, reverse=True)
+
+
+def test_double_cylinder_footprint_rotates_with_viewpoint_yaw():
+    grid = MODULE.ExplorationGrid(20.0, 20.0, 0.2, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    center = (50, 50)
+    obstacle = (51, 50)
+    inflated = {obstacle}
+
+    assert not MODULE.double_cylinder_footprint_free(
+        grid, center, 0.0, inflated, radius=0.35, offset=0.18)
+    assert MODULE.double_cylinder_footprint_free(
+        grid, center, math.pi / 2.0, inflated, radius=0.35, offset=0.18)
+
+
+def test_safe_viewpoint_outputs_only_capsule_valid_poses():
+    grid = MODULE.ExplorationGrid(12.0, 12.0, 0.2, 0.0, 0.0)
+    grid.data[:, :] = MODULE.UNKNOWN
+    grid.data[10:50, 10:50] = MODULE.FREE
+    frontier = (40, 30)
+    grid.data[30, 41] = MODULE.UNKNOWN
+    point_only = MODULE.safe_viewpoint_cells(
+        grid, frontier, inflated={(36, 30)}, stand_off=0.6,
+        limit=8, footprint_radius=0.0, footprint_offset=0.0)
+    capsule = MODULE.safe_viewpoint_cells(
+        grid, frontier, inflated={(36, 30)}, stand_off=0.6,
+        limit=8, footprint_radius=0.35, footprint_offset=0.18)
+
+    assert point_only
+    assert all(MODULE.double_cylinder_footprint_free(
+        grid, cell, math.atan2(frontier[1] - cell[1], frontier[0] - cell[0]),
+        {(36, 30)}, 0.35, 0.18) for cell in capsule)
+    assert capsule
 
 
 def test_known_astar_never_crosses_unknown_or_corner_cuts():

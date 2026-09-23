@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ExecutionCommand.msg"
   "msg/ExecutionState.msg"
   "msg/LocalMapPatch.msg"
+  "msg/LocomotionState.msg"
   "msg/TopoNode.msg"
   "msg/TopoEdge.msg"
   "msg/TopoGraphDelta.msg"

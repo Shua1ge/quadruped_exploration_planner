@@ -12,6 +12,7 @@
 #include <scan_planner_msgs/msg/bspline.hpp>
 #include <scan_planner_msgs/msg/execution_command.hpp>
 #include <scan_planner_msgs/msg/execution_state.hpp>
+#include <scan_planner_msgs/msg/locomotion_state.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -63,6 +64,9 @@ public:
     execution_command_sub_ = create_subscription<scan_planner_msgs::msg::ExecutionCommand>(
         "planning/execution_command", rclcpp::QoS(20).reliable(),
         std::bind(&ClosedLoopController::executionCommandCallback, this, std::placeholders::_1));
+    locomotion_state_sub_ = create_subscription<scan_planner_msgs::msg::LocomotionState>(
+        "/robot/locomotion_state", rclcpp::QoS(1).reliable().transient_local(),
+        std::bind(&ClosedLoopController::locomotionStateCallback, this, std::placeholders::_1));
     simulation_collision_sub_ = create_subscription<std_msgs::msg::Bool>(
         "simulation/collision", 10,
         std::bind(&ClosedLoopController::simulationCollisionCallback, this, std::placeholders::_1));
@@ -330,6 +334,20 @@ private:
     }
   }
 
+  void locomotionStateCallback(
+      const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr msg)
+  {
+    locomotion_actuation_ready_ = msg->actuation_ready;
+    last_locomotion_state_time_ = now();
+  }
+
+  bool locomotionReady(const rclcpp::Time &current_time) const
+  {
+    return locomotion_actuation_ready_ &&
+           last_locomotion_state_time_.nanoseconds() > 0 &&
+           (current_time - last_locomotion_state_time_).seconds() <= 0.5;
+  }
+
   void simulationCollisionCallback(const std_msgs::msg::Bool::ConstSharedPtr msg)
   {
     if (msg->data)
@@ -352,6 +370,13 @@ private:
 
   void cmdCallback()
   {
+    const auto current_time = now();
+    if (!locomotionReady(current_time))
+    {
+      last_update_time_ = current_time;
+      publishStop();
+      return;
+    }
     if (simulation_collision_latched_)
     {
       resetHeadingFreezeState();
@@ -379,7 +404,6 @@ private:
       publishStop();
       return;
     }
-    const auto current_time = now();
     double dt = (current_time - last_update_time_).seconds();
     if (dt < 0.0 || dt > 0.2) dt = 0.0;
     const double t_eval = std::min(exec_time_, traj_duration_);
@@ -517,6 +541,7 @@ private:
   rclcpp::Subscription<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<scan_planner_msgs::msg::ExecutionCommand>::SharedPtr execution_command_sub_;
+  rclcpp::Subscription<scan_planner_msgs::msg::LocomotionState>::SharedPtr locomotion_state_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr simulation_collision_sub_;
   rclcpp::TimerBase::SharedPtr cmd_timer_;
   bool receive_traj_{false};
@@ -534,6 +559,8 @@ private:
   double odom_yaw_{0.0};
   double exec_time_{0.0};
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_locomotion_state_time_{0, 0, RCL_ROS_TIME};
+  bool locomotion_actuation_ready_{false};
   rclcpp::Time heading_freeze_started_{0, 0, RCL_ROS_TIME};
   rclcpp::Time heading_last_progress_{0, 0, RCL_ROS_TIME};
   bool heading_frozen_{false};

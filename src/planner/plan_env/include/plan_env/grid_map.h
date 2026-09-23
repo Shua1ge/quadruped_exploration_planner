@@ -14,6 +14,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <shared_mutex>
 #include <rmw/qos_profiles.h>
@@ -22,6 +23,7 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <scan_planner_msgs/msg/local_map_patch.hpp>
+#include <scan_planner_msgs/msg/locomotion_state.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -42,6 +44,29 @@ using namespace std;
 
 namespace plan_env
 {
+struct TimedPose
+{
+  int64_t stamp_ns{0};
+  Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond orientation{Eigen::Quaterniond::Identity()};
+};
+
+enum class PoseLookupResult
+{
+  EXACT,
+  INTERPOLATED,
+  NEAREST,
+  TOO_OLD,
+  TOO_NEW,
+  GAP_TOO_LARGE,
+  EMPTY
+};
+
+PoseLookupResult lookupTimedPose(
+    const std::deque<TimedPose>& history, int64_t stamp_ns,
+    int64_t max_interpolation_gap_ns, int64_t max_nearest_age_ns,
+    TimedPose& result);
+
 bool pointInsideDoubleCylinder(
     const Eigen::Vector3d& point, const Eigen::Vector3d& center,
     const Eigen::Quaterniond& orientation, double radius, double offset,
@@ -108,6 +133,9 @@ struct MappingParameters {
   bool need_extrinsic_;
   Eigen::Matrix4d lidar_extrinsic_;
   Eigen::Matrix4d depth_extrinsic_;
+  double pose_history_seconds_;
+  double max_interpolation_gap_seconds_;
+  double max_nearest_pose_age_seconds_;
 
   /* active mapping */
   double unknown_flag_;
@@ -244,6 +272,9 @@ private:
   std::atomic<uint64_t> map_revision_{0};
   std::atomic<int64_t> last_map_update_ns_{0};
   std::atomic<bool> map_update_requested_{false};
+  std::atomic<bool> perception_pose_valid_{false};
+  std::atomic<int64_t> locomotion_state_stamp_ns_{0};
+  std::deque<plan_env::TimedPose> lidar_pose_history_;
   mutable InflatedOccupancySnapshotPtr latest_inflated_snapshot_;
   static thread_local const GridMap* tls_snapshot_owner_;
   static thread_local InflatedOccupancySnapshotPtr tls_snapshot_;
@@ -254,6 +285,9 @@ private:
   void sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& img);
+  void locomotionStateCallback(
+      const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr& msg);
+  bool locomotionReady() const;
 
   // update occupancy by raycasting
   void updateOccupancyCallback();
@@ -306,6 +340,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lidar_pose_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sliding_map_frame_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Subscription<scan_planner_msgs::msg::LocomotionState>::SharedPtr locomotion_state_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr sliding_map_bbox_pub_;
