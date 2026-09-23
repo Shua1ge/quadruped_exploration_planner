@@ -1,11 +1,3 @@
-<div align="center">
-  <h1>SCAN-Planner ROS 2</h1>
-  <h2>面向路线引导四足长程导航的空间碰撞感知局部规划器</h2>
-  <a href="https://arxiv.org/abs/2606.19555"><img alt="论文" src="https://img.shields.io/badge/论文-arXiv-b31b1b?logo=arxiv&logoColor=white"/></a>
-  <a href="https://www.bilibili.com/video/BV15a7P6UEXb/"><img alt="视频" src="https://img.shields.io/badge/视频-Bilibili-FB7299?logo=bilibili&logoColor=white"/></a>
-  <a href="https://wuyi2121.github.io/SCAN-Planner/"><img alt="项目主页" src="https://img.shields.io/badge/项目主页-Website-4A90E2?logo=googlechrome&logoColor=white"/></a>
-</div>
-
 # Quadruped Exploration Planner
 
 A hierarchical exploration and navigation framework for quadruped robots in large-scale unknown environments.
