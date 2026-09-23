@@ -24,3 +24,9 @@ An efficient hierarchical navigation framework for quadruped robots.
 
 
 ## 🏗️ Architecture
+
+## 🔮 Future Work
+
+- 🧠 Long-horizon navigation memory
+- 🤖 Learning-based local planner
+- 🚀 Efficient embedded deployment
