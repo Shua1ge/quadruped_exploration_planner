@@ -202,6 +202,27 @@ class GlobalRepresentationNode(Node):
             })
             self.last_safe_shadow_metrics = dict(safe_metrics)
             metrics.update(safe_metrics)
+            patch_min_x = float(patch.origin.x)
+            patch_min_y = float(patch.origin.y)
+            patch_max_x = patch_min_x + patch.width * patch.resolution
+            patch_max_y = patch_min_y + patch.height * patch.resolution
+            current_safe_ids = set(safe_graph.regions)
+            previously_local_ids = {
+                region_id
+                for region_id, item in self.global_safe_regions.items()
+                if (patch_min_x <= item["x"] < patch_max_x
+                    and patch_min_y <= item["y"] < patch_max_y)}
+            touched_safe_ids = previously_local_ids | current_safe_ids
+            for region_id in previously_local_ids - current_safe_ids:
+                del self.global_safe_regions[region_id]
+            # Rebuild every portal incident to the observed patch.  UNKNOWN
+            # outside the patch remains non-destructive, while an explicitly
+            # re-observed split/closure cannot leave a stale option edge.
+            self.global_safe_portals = {
+                portal_id: item
+                for portal_id, item in self.global_safe_portals.items()
+                if (item["source"] not in touched_safe_ids
+                    and item["target"] not in touched_safe_ids)}
             for region in safe_graph.regions.values():
                 x = patch.origin.x + (region.anchor[0] + 0.5) * patch.resolution
                 y = patch.origin.y + (region.anchor[1] + 0.5) * patch.resolution

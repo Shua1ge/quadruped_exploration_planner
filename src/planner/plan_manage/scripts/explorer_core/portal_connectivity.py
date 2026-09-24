@@ -4,7 +4,7 @@ import heapq
 import json
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 
 Point2 = Tuple[float, float]
@@ -26,12 +26,36 @@ class ProvisionalPortal:
 
 
 class SafeRegionConnectivity:
-    """A compact snapshot; hypotheses value tasks but never add route edges."""
+    """A compact persistent safe-region snapshot for option attachment."""
 
     def __init__(self):
         self.map_revision = 0
         self.regions: Dict[int, RegionView] = {}
         self.adjacency: Dict[int, Dict[int, float]] = {}
+
+    def region_for_point(
+            self, point: Point2, maximum_distance: float,
+            connector_allowed: Optional[Callable[[Point2, Point2], bool]] = None
+            ) -> Optional[int]:
+        """Attach a point only to a nearby anchor with a known-free connector.
+
+        The snapshot deliberately stays compact and publishes anchors rather
+        than every member cell.  Explorer therefore validates the attachment
+        in its own current grid; a Euclidean-near anchor behind a wall cannot
+        become an option identity.
+        """
+        candidates = sorted(
+            ((math.hypot(region.anchor[0] - point[0],
+                         region.anchor[1] - point[1]), region.region_id,
+              region.anchor)
+             for region in self.regions.values()),
+            key=lambda item: (item[0], item[1]))
+        for distance, region_id, anchor in candidates:
+            if distance > maximum_distance:
+                break
+            if connector_allowed is None or connector_allowed(point, anchor):
+                return region_id
+        return None
 
     def update_json(self, value: str) -> bool:
         try:

@@ -161,10 +161,24 @@ def generate_launch_description():
                     "'", LaunchConfiguration("use_gazebo_physics"),
                     "'.lower() != 'true'",
                 ]),
+                "cloud_frame_id": PythonExpression([
+                    "'go2/base/exploration_lidar' if '",
+                    LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() == 'true' else 'world'",
+                ]),
+                "need_extrinsic": PythonExpression([
+                    "'", LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() == 'true'",
+                ]),
+                "max_interpolation_gap": 0.05,
+                "max_nearest_pose_age": 0.02,
                 # Shared with run.launch.py / GridMap and robot.xacro.
                 "lidar_extrinsic_x": 0.10,
                 "lidar_extrinsic_y": 0.0,
                 "lidar_extrinsic_z": 0.12,
+                "lidar_extrinsic_roll": 0.0,
+                "lidar_extrinsic_pitch": 0.0,
+                "lidar_extrinsic_yaw": 0.0,
                 # NewMine contains 2.9--3.0 m portals and short blind bends.
                 # Keep the physical margin conservative for a Go2 footprint,
                 # but allow rolling observation poses inside the portal.  The
@@ -204,6 +218,7 @@ def generate_launch_description():
                 "sparse_routing_enabled": True,
                 "sparse_attachment_radius": 1.5,
                 "sparse_attachment_limit": 8,
+                "safe_region_attachment_radius": 3.0,
                 "region_release_updates": 3,
                 "region_unreachable_timeout": 5.0,
                 "max_global_regions": 12,

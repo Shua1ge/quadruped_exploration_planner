@@ -9,7 +9,8 @@ import numpy as np
 Cell = Tuple[int, int]
 Point2 = Tuple[float, float]
 DirectedEdge = Tuple[Cell, Cell]
-PoseSample = Tuple[int, float, float, float, float]
+# timestamp, body position xyz, body quaternion xyzw
+PoseSample = Tuple[int, float, float, float, float, float, float, float]
 UNKNOWN = -1
 FREE = 0
 OCCUPIED = 100
@@ -19,35 +20,97 @@ GRID_MOVES = (
     (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
 )
 
-def interpolate_planar_pose(history: Sequence[PoseSample], stamp_ns: int,
-                             max_age_ns: int) -> Optional[Tuple[float, float, float, float]]:
-    """Interpolate x/y/yaw at a sensor timestamp from an ordered pose history."""
+def _normalized_quaternion(values: Sequence[float]) -> Optional[np.ndarray]:
+    quaternion = np.asarray(values, dtype=np.float64)
+    norm = float(np.linalg.norm(quaternion))
+    if not math.isfinite(norm) or norm < 1e-12:
+        return None
+    return quaternion / norm
+
+
+def slerp_quaternion(before: Sequence[float], after: Sequence[float],
+                     ratio: float) -> Optional[np.ndarray]:
+    """Interpolate xyzw quaternions along the shortest unit-sphere arc."""
+    first = _normalized_quaternion(before)
+    second = _normalized_quaternion(after)
+    if first is None or second is None:
+        return None
+    dot = float(np.dot(first, second))
+    if dot < 0.0:
+        second = -second
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    alpha = min(1.0, max(0.0, float(ratio)))
+    if dot > 0.9995:
+        return _normalized_quaternion(first + alpha * (second - first))
+    angle = math.acos(dot)
+    sine = math.sin(angle)
+    if abs(sine) < 1e-12:
+        return first
+    return ((math.sin((1.0 - alpha) * angle) / sine) * first
+            + (math.sin(alpha * angle) / sine) * second)
+
+
+def quaternion_rotation_matrix(quaternion: Sequence[float]) -> Optional[np.ndarray]:
+    """Return the 3-D rotation matrix for an xyzw quaternion."""
+    normalized = _normalized_quaternion(quaternion)
+    if normalized is None:
+        return None
+    x, y, z, w = normalized
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
+         2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z),
+         2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
+         1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def rpy_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Return Rz(yaw) * Ry(pitch) * Rx(roll), matching GridMap."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ], dtype=np.float64)
+
+
+def interpolate_se3_pose(
+        history: Sequence[PoseSample], stamp_ns: int,
+        max_interpolation_gap_ns: int,
+        max_nearest_age_ns: int) -> Optional[Tuple[float, float, float,
+                                                   float, float, float, float]]:
+    """Match GridMap's timestamp lookup and interpolate full body SE(3)."""
     if not history:
         return None
     times = [sample[0] for sample in history]
-    if stamp_ns < times[0] or stamp_ns > times[-1]:
-        nearest_age = min(abs(stamp_ns - times[0]), abs(stamp_ns - times[-1]))
-        if nearest_age > max_age_ns:
-            return None
-        sample = history[0] if stamp_ns < times[0] else history[-1]
-        return sample[1], sample[2], sample[3], sample[4]
     index = bisect.bisect_left(times, stamp_ns)
+    if index < len(history) and history[index][0] == stamp_ns:
+        return history[index][1:]
     if index == 0:
-        sample = history[0]
-        return sample[1], sample[2], sample[3], sample[4]
+        if history[0][0] - stamp_ns > max_nearest_age_ns:
+            return None
+        return history[0][1:]
     if index == len(history):
-        sample = history[-1]
-        return sample[1], sample[2], sample[3], sample[4]
+        if stamp_ns - history[-1][0] > max_nearest_age_ns:
+            return None
+        return history[-1][1:]
     before, after = history[index - 1], history[index]
-    span = max(1, after[0] - before[0])
+    span = after[0] - before[0]
+    if span <= 0 or span > max_interpolation_gap_ns:
+        return None
     ratio = min(1.0, max(0.0, (stamp_ns - before[0]) / span))
-    yaw_delta = (after[3] - before[3] + math.pi) % (2.0 * math.pi) - math.pi
-    return (
-        before[1] + ratio * (after[1] - before[1]),
-        before[2] + ratio * (after[2] - before[2]),
-        before[3] + ratio * yaw_delta,
-        before[4] + ratio * (after[4] - before[4]),
-    )
+    orientation = slerp_quaternion(before[4:8], after[4:8], ratio)
+    if orientation is None:
+        return None
+    position = tuple(
+        before[axis] + ratio * (after[axis] - before[axis])
+        for axis in range(1, 4))
+    return position + tuple(float(value) for value in orientation)
 
 
 def dilate_hit_ranges(ranges: Sequence[float], bins: int) -> np.ndarray:

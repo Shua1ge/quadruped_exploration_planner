@@ -54,3 +54,15 @@ def test_malformed_or_older_snapshot_does_not_replace_state():
     assert not graph.update_json(json.dumps({
         "map_revision": 6, "regions": [], "portals": []}))
     assert set(graph.regions) == {1, 2, 3}
+
+
+def test_region_attachment_requires_nearby_known_free_connector():
+    graph = SafeRegionConnectivity()
+    assert graph.update_json(snapshot())
+
+    assert graph.region_for_point(
+        (0.2, 0.0), 2.0, lambda _source, _target: True) == 1
+    assert graph.region_for_point(
+        (0.2, 0.0), 2.0, lambda _source, _target: False) is None
+    assert graph.region_for_point(
+        (20.0, 20.0), 2.0, lambda _source, _target: True) is None

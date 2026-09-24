@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import math
 import pathlib
 import sys
@@ -18,23 +19,58 @@ SPEC.loader.exec_module(MODULE)
 
 def test_pose_interpolation_uses_sensor_timestamp_not_latest_pose():
     history = [
-        (1_000_000_000, 0.0, 0.0, 0.0, 0.3),
-        (1_100_000_000, 1.0, 0.0, math.pi / 2.0, 0.5),
+        (1_000_000_000, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0),
+        (1_100_000_000, 1.0, 0.0, 0.5, 0.0, 0.0,
+         math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)),
     ]
-    pose = MODULE.interpolate_planar_pose(
-        history, 1_050_000_000, 200_000_000)
+    pose = MODULE.interpolate_se3_pose(
+        history, 1_050_000_000, 200_000_000, 20_000_000)
     assert pose is not None
-    x, y, yaw, z = pose
+    x, y, z, qx, qy, qz, qw = pose
     assert math.isclose(x, 0.5)
     assert math.isclose(y, 0.0)
-    assert math.isclose(yaw, math.pi / 4.0)
     assert math.isclose(z, 0.4)
+    rotation = MODULE.quaternion_rotation_matrix((qx, qy, qz, qw))
+    direction = rotation @ np.array([1.0, 0.0, 0.0])
+    assert np.allclose(direction[:2], [math.sqrt(0.5), math.sqrt(0.5)])
 
 
 def test_pose_interpolation_rejects_stale_cloud_pose():
-    history = [(1_000_000_000, 0.0, 0.0, 0.0, 0.3)]
-    assert MODULE.interpolate_planar_pose(
-        history, 1_500_000_000, 100_000_000) is None
+    history = [(1_000_000_000, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0)]
+    assert MODULE.interpolate_se3_pose(
+        history, 1_500_000_000, 50_000_000, 100_000_000) is None
+
+
+def test_full_orientation_projects_tilted_lidar_point_in_3d():
+    half_pitch = math.pi / 4.0
+    rotation = MODULE.quaternion_rotation_matrix(
+        (0.0, math.sin(half_pitch), 0.0, math.cos(half_pitch)))
+
+    projected = rotation @ np.array([1.0, 0.0, 0.0])
+
+    assert np.allclose(projected, [0.0, 0.0, -1.0], atol=1e-9)
+
+
+def test_safe_region_scope_requires_explorer_known_free_attachment():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(10.0, 10.0, 1.0)
+    explorer.grid.data.fill(MODULE.FREE)
+    explorer.safe_region_attachment_radius = 3.0
+    explorer.safe_region_connectivity = MODULE.SafeRegionConnectivity()
+    cell = explorer.grid.world_to_cell(0.0, 0.0)
+    anchor = explorer.grid.cell_to_world(cell)
+    assert explorer.safe_region_connectivity.update_json(json.dumps({
+        "map_revision": 1,
+        "regions": [{"id": 77, "x": anchor[0], "y": anchor[1]}],
+        "portals": [],
+    }))
+    candidate = MODULE.FrontierCandidate(
+        4, cell, cell, anchor, [cell], 0.0, 8, 4, 0.0, {cell},
+        commitment_scope=("lineage", 4))
+
+    explorer.attach_safe_region_commitment_scopes([candidate], set())
+
+    assert candidate.commitment_scope == ("safe_region", 77)
 
 
 def test_transient_hit_is_reversible_after_free_ray_evidence():

@@ -29,7 +29,6 @@ class RegionOptionState:
     elapsed_revisions: int
     remaining_cells: int
     collected_cells: int
-    opportunity_streak: int
     phase: str
 
 
@@ -37,10 +36,10 @@ class ResidualCommitmentGate:
     """Semi-MDP option with an analytic, idempotent termination policy.
 
     Initiation binds the option to a stable connectivity scope.  Map-content
-    revisions are the decision epochs.  The option terminates when its reward
-    source is exhausted/stagnant or when a persistently better alternative
-    exceeds the existing switching hysteresis.  Re-evaluating one revision is
-    idempotent.
+    revisions are the decision epochs.  The option terminates only when its
+    frozen reward source is exhausted or stagnant.  Alternative regions remain
+    useful for preparation, but their noisy one-step scores cannot terminate an
+    active option.  Re-evaluating one revision is idempotent.
     """
 
     def __init__(self, minimum_remaining_cells: int,
@@ -71,8 +70,6 @@ class ResidualCommitmentGate:
         self.progress_revision = map_revision
         self.progress_reference = remaining_cells
         self.exhausted_streak = 0
-        self.opportunity_streak = 0
-        self.opportunity_revision = -1
         self.cached_decision: Optional[ResidualCommitmentDecision] = None
 
     @property
@@ -83,7 +80,6 @@ class ResidualCommitmentGate:
             self.region_id, self.initiation_revision,
             max(0, self.last_revision - self.initiation_revision),
             remaining, max(0, initial - remaining),
-            self.opportunity_streak,
             "UNCOMMITTED" if self.region_id is None else "ACTIVE")
 
     def evaluate(self, region_id: Hashable, map_revision: int,
@@ -125,26 +121,6 @@ class ResidualCommitmentGate:
         self.last_revision = map_revision
         self.cached_decision = decision
         return decision
-
-    def evaluate_opportunity(self, region_id: Hashable, map_revision: int,
-                             current_value: float, alternative_value: float,
-                             switch_ratio: float) -> Optional[str]:
-        """Return ``opportunity_dominated`` after persistent Bellman advantage.
-
-        For an option o, continue while Q(s,o) is at least the best competing
-        one-step value after switching cost.  ``switch_ratio`` is the existing
-        hysteresis and therefore introduces no additional tuning parameter.
-        """
-        if region_id != self.region_id or map_revision == self.opportunity_revision:
-            return None
-        self.opportunity_revision = map_revision
-        dominated = (alternative_value > 0.0 and
-                     alternative_value > max(0.0, current_value) * switch_ratio)
-        self.opportunity_streak = self.opportunity_streak + 1 if dominated else 0
-        if self.opportunity_streak >= self.exhausted_revisions:
-            return "opportunity_dominated"
-        return None
-
 
 # Scientific name used by new code; the old name remains a compatibility alias
 # for launch files and tests written before the option formalisation.

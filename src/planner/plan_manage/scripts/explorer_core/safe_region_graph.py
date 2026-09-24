@@ -1,8 +1,8 @@
 """Planning-preserving safe-region graph extracted from a local 2D patch.
 
-This module is deliberately independent from frontier selection and route
-execution.  It provides a shadow representation that can be compared with the
-existing skeleton graph before either planner consumes it.
+This module is independent from route execution.  Its persistent IDs may be
+used as exploration-option identities only after Explorer validates a
+known-free connector from a candidate to the published region anchor.
 """
 
 import heapq

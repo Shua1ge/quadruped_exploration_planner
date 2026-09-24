@@ -82,20 +82,8 @@ def test_option_exposes_initiation_duration_and_collected_reward():
     assert state.phase == "ACTIVE"
 
 
-def test_option_terminates_only_after_persistent_bellman_advantage():
+def test_alternative_scores_are_not_part_of_option_termination_contract():
     gate = ResidualCommitmentGate(10, 3, 20)
-    gate.evaluate(("component", 4), 100, 50)
 
-    assert gate.evaluate_opportunity(("component", 4), 101, 1.0, 1.5, 1.35) is None
-    assert gate.evaluate_opportunity(("component", 4), 102, 1.0, 1.5, 1.35) is None
-    assert gate.evaluate_opportunity(
-        ("component", 4), 103, 1.0, 1.5, 1.35) == "opportunity_dominated"
-
-
-def test_option_opportunity_decision_is_idempotent_per_revision():
-    gate = ResidualCommitmentGate(10, 2, 20)
-    gate.evaluate(4, 100, 50)
-
-    assert gate.evaluate_opportunity(4, 101, 1.0, 2.0, 1.35) is None
-    assert gate.evaluate_opportunity(4, 101, 1.0, 2.0, 1.35) is None
-    assert gate.state.opportunity_streak == 1
+    assert not hasattr(gate, "evaluate_opportunity")
+    assert gate.evaluate(("safe_region", 4), 100, 50).committed

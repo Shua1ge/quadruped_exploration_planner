@@ -38,7 +38,8 @@ from explorer_core.frontier_regions import (
 )
 from explorer_core.grid import (
     Cell, DirectedEdge, ExplorationGrid, FREE, GRID_MOVES, OCCUPIED, Point2, UNKNOWN,
-    PoseSample, bresenham, dilate_hit_ranges, interpolate_planar_pose,
+    PoseSample, bresenham, dilate_hit_ranges, interpolate_se3_pose,
+    quaternion_rotation_matrix, rpy_rotation_matrix,
 )
 from explorer_core.path_planning import (
     RemainingPathCheck, ShortestPathTree, adjacent_grid_path_is_valid, astar_known,
@@ -125,6 +126,7 @@ class FrontierCandidate:
     connectivity_gain: int = 0
     provisional_portal: Optional[Tuple[int, int]] = None
     commitment_scope: Optional[Tuple[str, int]] = None
+    option_target_cells: Set[Cell] = field(default_factory=set)
 
 
 @dataclass
@@ -163,12 +165,28 @@ class FrontierExplorer(Node):
             self.declare_parameter("obstacle_z_relative_to_body", False).value)
         self.cloud_is_world = bool(
             self.declare_parameter("cloud_is_world", True).value)
+        self.cloud_frame_id = str(
+            self.declare_parameter("cloud_frame_id", "world").value)
+        self.need_extrinsic = bool(
+            self.declare_parameter("need_extrinsic", False).value)
         self.lidar_extrinsic_x = float(
             self.declare_parameter("lidar_extrinsic_x", 0.0).value)
         self.lidar_extrinsic_y = float(
             self.declare_parameter("lidar_extrinsic_y", 0.0).value)
         self.lidar_extrinsic_z = float(
             self.declare_parameter("lidar_extrinsic_z", 0.0).value)
+        self.lidar_extrinsic_roll = float(
+            self.declare_parameter("lidar_extrinsic_roll", 0.0).value)
+        self.lidar_extrinsic_pitch = float(
+            self.declare_parameter("lidar_extrinsic_pitch", 0.0).value)
+        self.lidar_extrinsic_yaw = float(
+            self.declare_parameter("lidar_extrinsic_yaw", 0.0).value)
+        self.lidar_extrinsic_rotation = rpy_rotation_matrix(
+            self.lidar_extrinsic_roll, self.lidar_extrinsic_pitch,
+            self.lidar_extrinsic_yaw)
+        self.lidar_extrinsic_translation = np.array([
+            self.lidar_extrinsic_x, self.lidar_extrinsic_y,
+            self.lidar_extrinsic_z], dtype=np.float64)
         self.inflation_radius = float(self.declare_parameter("inflation_radius", 0.65).value)
         self.footprint_radius = float(
             self.declare_parameter("footprint_radius", 0.35).value)
@@ -177,6 +195,8 @@ class FrontierExplorer(Node):
         self.get_logger().info(
             "[SENSOR_CONTRACT] "
             f"cloud_is_world={self.cloud_is_world} "
+            f"cloud_frame={self.cloud_frame_id} "
+            f"need_extrinsic={self.need_extrinsic} "
             f"lidar_xyz=({self.lidar_extrinsic_x:.3f},"
             f"{self.lidar_extrinsic_y:.3f},{self.lidar_extrinsic_z:.3f}) "
             f"footprint_radius={self.footprint_radius:.3f} "
@@ -288,10 +308,14 @@ class FrontierExplorer(Node):
             self.declare_parameter("sparse_attachment_radius", 1.5).value)
         self.sparse_attachment_limit = int(
             self.declare_parameter("sparse_attachment_limit", 8).value)
+        self.safe_region_attachment_radius = float(self.declare_parameter(
+            "safe_region_attachment_radius", 3.0).value)
         if self.sparse_attachment_radius <= 0.0:
             raise ValueError("sparse_attachment_radius must be positive")
         if self.sparse_attachment_limit < 1:
             raise ValueError("sparse_attachment_limit must be at least one")
+        if self.safe_region_attachment_radius <= 0.0:
+            raise ValueError("safe_region_attachment_radius must be positive")
         if self.terminal_candidate_limit < 1:
             raise ValueError("terminal_candidate_limit must be at least one")
         if self.terminal_clearance_search_radius <= 0.0:
@@ -315,8 +339,12 @@ class FrontierExplorer(Node):
         # read this member before cloud_callback() has assigned it.
         self.last_map_update_ns = 0
         self.pose_history = deque(maxlen=200)
-        self.pose_history_max_age_ns = int(
-            float(self.declare_parameter("pose_history_max_age", 0.20).value) * 1e9)
+        self.max_interpolation_gap_ns = int(float(self.declare_parameter(
+            "max_interpolation_gap", 0.05).value) * 1e9)
+        self.max_nearest_pose_age_ns = int(float(self.declare_parameter(
+            "max_nearest_pose_age", 0.02).value) * 1e9)
+        if self.max_interpolation_gap_ns <= 0 or self.max_nearest_pose_age_ns < 0:
+            raise ValueError("pose history timing parameters are invalid")
         self.stall_detection_seconds = float(self.declare_parameter(
             "stall_detection_seconds", 30.0).value)
         self.map_update_count = 0
@@ -380,6 +408,7 @@ class FrontierExplorer(Node):
         self.region_prediction_input_signature = None
         self.active_region_id: Optional[int] = None
         self.active_commitment_scope: Optional[Tuple[str, int]] = None
+        self.commitment_target_cells: Set[Cell] = set()
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since: Optional[float] = None
         self.last_region_release_evaluation_update = -1
@@ -603,6 +632,32 @@ class FrontierExplorer(Node):
                 "Rejected malformed or stale safe-region snapshot",
                 throttle_duration_sec=2.0)
 
+    def attach_safe_region_commitment_scopes(
+            self, candidates: Sequence[FrontierCandidate],
+            inflated: Set[Cell]) -> None:
+        """Promote only unambiguous, known-free safe-region attachments."""
+        by_region: Dict[int, List[FrontierCandidate]] = {}
+        for candidate in candidates:
+            by_region.setdefault(candidate.region_id, []).append(candidate)
+
+        def connector_allowed(source: Point2, target: Point2) -> bool:
+            return segment_known_free(
+                self.grid, self.grid.world_to_cell(*source),
+                self.grid.world_to_cell(*target), inflated)
+
+        for options in by_region.values():
+            attachments = [
+                self.safe_region_connectivity.region_for_point(
+                    self.grid.cell_to_world(candidate.cell),
+                    self.safe_region_attachment_radius, connector_allowed)
+                for candidate in options]
+            attached = {value for value in attachments if value is not None}
+            if len(attached) != 1 or any(value is None for value in attachments):
+                continue
+            scope = ("safe_region", int(next(iter(attached))))
+            for candidate in options:
+                candidate.commitment_scope = scope
+
     @staticmethod
     def sparse_node_from_message(message) -> SparseNode:
         return SparseNode(
@@ -740,8 +795,17 @@ class FrontierExplorer(Node):
         stamp = msg.header.stamp
         stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
         if stamp_ns > 0:
-            sample = (stamp_ns, new_position[0], new_position[1],
-                      self.body_yaw, self.body_z)
+            quaternion = np.array([
+                orientation.x, orientation.y, orientation.z, orientation.w],
+                dtype=np.float64)
+            quaternion_norm = float(np.linalg.norm(quaternion))
+            if not math.isfinite(quaternion_norm) or quaternion_norm < 1e-12:
+                return
+            quaternion /= quaternion_norm
+            sample: PoseSample = (
+                stamp_ns, new_position[0], new_position[1], self.body_z,
+                float(quaternion[0]), float(quaternion[1]),
+                float(quaternion[2]), float(quaternion[3]))
             if not self.pose_history or stamp_ns >= self.pose_history[-1][0]:
                 self.pose_history.append(sample)
             else:
@@ -791,6 +855,12 @@ class FrontierExplorer(Node):
     def cloud_callback(self, msg: PointCloud2):
         if self.position is None:
             return
+        if msg.header.frame_id != self.cloud_frame_id:
+            self.get_logger().error(
+                f"[SENSOR_CONTRACT_VIOLATION] dropping cloud in frame "
+                f"'{msg.header.frame_id}', expected '{self.cloud_frame_id}'",
+                throttle_duration_sec=2.0)
+            return
         if not self.map_fusion_allowed():
             self.report_fusion_blocked()
             return
@@ -828,29 +898,38 @@ class FrontierExplorer(Node):
             return
         msg_stamp = msg.header.stamp
         cloud_stamp_ns = int(msg_stamp.sec) * 1_000_000_000 + int(msg_stamp.nanosec)
-        pose_at_scan = interpolate_planar_pose(
-            self.pose_history, cloud_stamp_ns, self.pose_history_max_age_ns)
+        pose_at_scan = interpolate_se3_pose(
+            self.pose_history, cloud_stamp_ns,
+            self.max_interpolation_gap_ns, self.max_nearest_pose_age_ns)
         if pose_at_scan is None:
             self.get_logger().warning(
                 "Dropping cloud without a pose at its timestamp",
                 throttle_duration_sec=2.0)
             return
-        scan_x, scan_y, scan_yaw, scan_z = pose_at_scan
+        scan_x, scan_y, scan_z, qx, qy, qz, qw = pose_at_scan
+        body_rotation = quaternion_rotation_matrix((qx, qy, qz, qw))
+        if body_rotation is None:
+            self.get_logger().warning(
+                "Dropping cloud with an invalid interpolated orientation",
+                throttle_duration_sec=2.0)
+            return
+        sensor_rotation = body_rotation
+        sensor_position = np.array(
+            [scan_x, scan_y, scan_z], dtype=np.float64)
+        if self.need_extrinsic:
+            sensor_position += body_rotation @ self.lidar_extrinsic_translation
+            sensor_rotation = body_rotation @ self.lidar_extrinsic_rotation
+        if (not np.all(np.isfinite(sensor_position))
+                or not np.all(np.isfinite(sensor_rotation))):
+            self.get_logger().warning(
+                "Dropping cloud with a non-finite time-aligned sensor pose",
+                throttle_duration_sec=2.0)
+            return
         if not self.cloud_is_world:
-            cos_yaw = math.cos(scan_yaw)
-            sin_yaw = math.sin(scan_yaw)
-            local_x = array[:, 0].copy()
-            local_y = array[:, 1].copy()
-            # Use the same body->lidar translation contract as GridMap.
-            local_x += self.lidar_extrinsic_x
-            local_y += self.lidar_extrinsic_y
-            array[:, 0] = (scan_x + cos_yaw * local_x
-                           - sin_yaw * local_y)
-            array[:, 1] = (scan_y + sin_yaw * local_x
-                           + cos_yaw * local_y)
-            array[:, 2] += scan_z + self.lidar_extrinsic_z
-        dx = array[:, 0] - scan_x
-        dy = array[:, 1] - scan_y
+            array = array @ sensor_rotation.T + sensor_position
+        ray_x, ray_y = sensor_position[:2]
+        dx = array[:, 0] - ray_x
+        dy = array[:, 1] - ray_y
         distances = np.hypot(dx, dy)
         z_reference = scan_z if self.obstacle_z_relative_to_body else 0.0
         mask = ((array[:, 2] >= z_reference + self.obstacle_min_z)
@@ -866,7 +945,7 @@ class FrontierExplorer(Node):
         nearest = dilate_hit_ranges(nearest, self.hit_dilation_bins)
         previous_grid = self.grid.data.copy()
         self.grid.integrate_ranges(
-            (scan_x, scan_y), nearest, self.mapping_range,
+            (float(ray_x), float(ray_y)), nearest, self.mapping_range,
             no_return_range=self.no_return_range)
         changed_mask = self.grid.data != previous_grid
         if np.any(changed_mask):
@@ -1056,7 +1135,8 @@ class FrontierExplorer(Node):
             frontier_cluster_cells=set(candidate.frontier_cluster_cells),
             connectivity_gain=candidate.connectivity_gain,
             provisional_portal=candidate.provisional_portal,
-            commitment_scope=candidate.commitment_scope)
+            commitment_scope=candidate.commitment_scope,
+            option_target_cells=set(candidate.option_target_cells))
         self.prepared_candidate = None
         if allow_commitment_transfer and cross_scope:
             self.last_selection_reason = "completed_task_handoff"
@@ -1083,11 +1163,18 @@ class FrontierExplorer(Node):
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since = None
         if previous_scope != candidate_scope:
+            self.commitment_target_cells = set(
+                candidate.option_target_cells or candidate.observation_cells)
+            remaining = sum(
+                self.grid.value(cell) == UNKNOWN
+                for cell in self.commitment_target_cells)
             self.region_commitment_gate.reset(
                 candidate_scope, self.map_content_revision,
-                len(candidate.observation_cells))
+                remaining)
         self.commitment_state = "COMMITTED"
-        self.commitment_remaining_cells = len(candidate.observation_cells)
+        self.commitment_remaining_cells = sum(
+            self.grid.value(cell) == UNKNOWN
+            for cell in self.commitment_target_cells)
         self.commitment_stagnant_revisions = 0
         self.publish_path(path, candidate)
 
@@ -1295,6 +1382,7 @@ class FrontierExplorer(Node):
         previous_scope = self.active_commitment_scope
         self.active_region_id = None
         self.active_commitment_scope = None
+        self.commitment_target_cells = set()
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since = None
         self.commitment_state = "RELEASABLE"
@@ -1860,6 +1948,7 @@ class FrontierExplorer(Node):
         self.latest_region_count = len(regions)
         candidates = self.build_frontier_candidates(
             start, regions, inflated, blocked_edges, excluded_goals)
+        self.attach_safe_region_commitment_scopes(candidates, inflated)
         for candidate in candidates:
             hypothesis = self.safe_region_connectivity.hypothesis(
                 self.grid.cell_to_world(candidate.frontier_cell))
@@ -1945,6 +2034,7 @@ class FrontierExplorer(Node):
             "dense final validation")
         self.active_region_id = None
         self.active_commitment_scope = None
+        self.commitment_target_cells = set()
         self.active_region_missing_streak = 0
         self.active_region_unreachable_since = None
         self.commitment_state = "RELEASABLE"
@@ -2051,7 +2141,8 @@ class FrontierExplorer(Node):
             frontier_cluster_cells=set(candidate.frontier_cluster_cells),
             connectivity_gain=candidate.connectivity_gain,
             provisional_portal=candidate.provisional_portal,
-            commitment_scope=candidate.commitment_scope)
+            commitment_scope=candidate.commitment_scope,
+            option_target_cells=set(candidate.option_target_cells))
 
     def build_frontier_candidates(self, start: Cell,
                                   regions: Sequence[FrontierRegion],
@@ -2251,7 +2342,13 @@ class FrontierExplorer(Node):
                 best = (key, candidate)
         if best is None:
             return None
-        return best[1]
+        selected = best[1]
+        selected.option_target_cells = {
+            cell
+            for candidate in candidates
+            if candidate.commitment_scope == selected.commitment_scope
+            for cell in candidate.observation_cells}
+        return selected
 
     def choose_hierarchical_candidate(self, start: Cell,
                                       regions: Sequence[FrontierRegion],
@@ -2266,13 +2363,25 @@ class FrontierExplorer(Node):
             by_region.setdefault(candidate.region_id, []).append(candidate)
         available = [region for region in regions if region.region_id in by_region]
         available_ids = {region.region_id for region in available}
-        scope_by_region = {
+        fallback_scope_by_region = {
             region.region_id: region_commitment_scope(region)
             for region in regions}
+        scope_by_region = {}
+        for region in regions:
+            scopes = {
+                candidate.commitment_scope
+                for candidate in by_region.get(region.region_id, [])
+                if candidate.commitment_scope is not None}
+            scope_by_region[region.region_id] = (
+                next(iter(scopes)) if len(scopes) == 1
+                else fallback_scope_by_region[region.region_id])
         if (getattr(self, "active_commitment_scope", None) is None
                 and self.active_region_id in scope_by_region):
             self.active_commitment_scope = scope_by_region[self.active_region_id]
         observed_scopes = set(scope_by_region.values())
+        observed_scopes.update(
+            ("safe_region", int(region_id))
+            for region_id in self.safe_region_connectivity.regions)
         available_scopes = {
             scope_by_region[region_id] for region_id in available_ids}
         self.last_selection_reason = "rolling_uncommitted"
@@ -2300,6 +2409,7 @@ class FrontierExplorer(Node):
             self.active_region_unreachable_since = update.unreachable_since
             self.last_region_release_evaluation_update = self.map_update_count
             if update.release_reason is not None:
+                self.commitment_target_cells = set()
                 self.commitment_release_count += 1
                 self.last_commitment_release_reason = update.release_reason
                 self.commitment_state = "RELEASABLE"
@@ -2323,20 +2433,25 @@ class FrontierExplorer(Node):
             if scope_by_region[region_id] == self.active_commitment_scope}
         if (allow_region_release and self.active_commitment_scope is not None
                 and committed_ids):
-            active_targets = {
-                cell
-                for region_id in committed_ids
-                for candidate in by_region[region_id]
-                for cell in candidate.observation_cells}
+            if not self.commitment_target_cells:
+                self.commitment_target_cells = {
+                    cell
+                    for region_id in committed_ids
+                    for candidate in by_region[region_id]
+                    for cell in candidate.observation_cells}
+            remaining_cells = sum(
+                self.grid.value(cell) == UNKNOWN
+                for cell in self.commitment_target_cells)
             decision = self.region_commitment_gate.evaluate(
                 self.active_commitment_scope, self.map_content_revision,
-                len(active_targets))
+                remaining_cells)
             self.commitment_remaining_cells = decision.remaining_cells
             self.commitment_stagnant_revisions = decision.stagnant_revisions
             if decision.release_reason is not None:
                 previous_active = self.active_region_id
                 self.active_region_id = None
                 self.active_commitment_scope = None
+                self.commitment_target_cells = set()
                 self.active_region_missing_streak = 0
                 self.active_region_unreachable_since = None
                 self.commitment_state = "RELEASABLE"
@@ -2449,31 +2564,15 @@ class FrontierExplorer(Node):
             region_id for region_id in best_by_region
             if (self.active_commitment_scope is not None
                 and scope_by_region[region_id] == self.active_commitment_scope)}
-        if allow_region_release and committed_ids:
-            option_value = max(region_scores[region_id]
-                               for region_id in committed_ids)
-            alternative_value = max((
-                score for region_id, score in region_scores.items()
-                if region_id not in committed_ids), default=0.0)
-            termination = self.region_commitment_gate.evaluate_opportunity(
-                self.active_commitment_scope, self.map_content_revision,
-                option_value, alternative_value, self.region_switch_ratio)
-            if termination is not None:
-                self.terminate_region_option(termination)
-                committed_ids = set()
         if committed_ids:
-            # Retain the incumbent with the same hysteresis the uncommitted
-            # branch uses.  One lineage can own several regions after a split,
-            # and then committed_ids covers all of them: taking a plain argmax
-            # here bypassed switch_ratio entirely and let the goal oscillate
-            # between regions as their scores wobbled across map updates.
+            # A committed option keeps its current child while that child has a
+            # reachable terminal.  Frontier score jitter may rank another child
+            # higher, but it cannot steer the robot back and forth inside one
+            # persistent safe region or terminate the option.
             incumbent = self.active_region_id
-            if incumbent not in committed_ids:
-                incumbent = max(committed_ids, key=lambda region_id: (
-                    region_scores[region_id], -region_id))
-            selected_region = select_rolling_region(
-                region_scores, incumbent, self.region_switch_ratio)
-            if selected_region is None or selected_region not in committed_ids:
+            if incumbent in committed_ids:
+                selected_region = incumbent
+            else:
                 selected_region = max(committed_ids, key=lambda region_id: (
                     region_scores[region_id], -region_id))
             self.last_selection_reason = "residual_commitment"
@@ -2499,6 +2598,14 @@ class FrontierExplorer(Node):
             self.publish_region_sequence()
 
         selected = best_by_region[selected_region]
+        selected_scope = (selected.commitment_scope
+                          or scope_by_region[selected_region])
+        selected.option_target_cells = {
+            cell
+            for candidate in candidates
+            if (candidate.commitment_scope
+                or scope_by_region[candidate.region_id]) == selected_scope
+            for cell in candidate.observation_cells}
         active_score = max(
             (region_scores[region_id] for region_id in committed_ids),
             default=None)
@@ -2619,8 +2726,11 @@ class FrontierExplorer(Node):
         forced_first = None
         if getattr(self, "active_commitment_scope", None) is not None:
             for index, region in enumerate(regions):
-                if (region_commitment_scope(region)
-                        == self.active_commitment_scope):
+                if any(
+                        (candidate.commitment_scope
+                         or region_commitment_scope(region))
+                        == self.active_commitment_scope
+                        for candidate in by_region[region.region_id]):
                     forced_first = index
                     break
         order = solve_open_held_karp(costs, forced_first)
@@ -2717,6 +2827,8 @@ class FrontierExplorer(Node):
         self.get_logger().info(
             f"Selected observation ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}), "
             f"region={region_id}, strategy={self.selection_strategy}; "
+            f"scope={candidate.commitment_scope}, "
+            f"option_targets={len(candidate.option_target_cells)}, "
             f"expected_gain={len(candidate.observation_cells)}, "
             f"connectivity_gain={candidate.connectivity_gain}, "
             f"provisional_portal={candidate.provisional_portal}, "
@@ -2799,6 +2911,12 @@ class FrontierExplorer(Node):
             "region_switches": self.region_switches,
             "active_region_id": (
                 self.active_region_id if self.active_region_id is not None else -1),
+            "active_commitment_kind": (
+                self.active_commitment_scope[0]
+                if self.active_commitment_scope is not None else "none"),
+            "active_commitment_id": (
+                self.active_commitment_scope[1]
+                if self.active_commitment_scope is not None else -1),
             "commitment_state": self.commitment_state,
             "commitment_remaining_cells": self.commitment_remaining_cells,
             "commitment_stagnant_revisions": self.commitment_stagnant_revisions,
@@ -2808,7 +2926,9 @@ class FrontierExplorer(Node):
             "last_commitment_release_reason": self.last_commitment_release_reason,
             "region_option_elapsed_revisions": option_state.elapsed_revisions,
             "region_option_collected_cells": option_state.collected_cells,
-            "region_option_opportunity_streak": option_state.opportunity_streak,
+            "region_option_frozen_target_cells": len(
+                self.commitment_target_cells),
+            "region_option_score_switch_enabled": 0,
             "last_region_switch_reason": self.last_region_switch_reason,
             "goals_reached": self.goals_reached,
             "paths_published": self.paths_published,
