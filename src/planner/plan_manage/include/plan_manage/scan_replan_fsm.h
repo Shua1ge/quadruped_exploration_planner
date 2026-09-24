@@ -70,6 +70,11 @@ namespace scan_planner
     double rolling_replan_max_start_error_;
     double predictive_replan_reaction_time_{0.25};
     double predictive_hard_stop_min_time_{0.35};
+    double tracking_degraded_error_{0.10};
+    double tracking_recovery_max_error_{0.30};
+    double tracking_match_back_time_{0.40};
+    double tracking_match_forward_time_{0.80};
+    int pose_free_release_cycles_{3};
     double goal_tolerance_;
     int heading_freeze_max_recoveries_{2};
     double rviz_goal_height_;
@@ -143,8 +148,20 @@ namespace scan_planner
     Eigen::Quaterniond safety_odom_orient_{Eigen::Quaterniond::Identity()};
     bool safety_have_odom_{false};
     std::atomic<bool> safety_stop_active_{false};
+    std::atomic<bool> pose_occupied_latched_{false};
+    std::atomic<int> pose_free_confirmation_cycles_{0};
     std::atomic<uint64_t> safety_generation_{0};
     std::atomic<bool> predictive_replan_requested_{false};
+    std::atomic<bool> terminal_repair_requested_{false};
+    std::atomic<double> terminal_repair_error_{0.0};
+    enum class LocalRecoveryState : uint8_t
+    {
+      TRACKING = 0,
+      TRACKING_DEGRADED = 1,
+      LOCAL_REPAIR = 2,
+    };
+    std::atomic<uint8_t> local_recovery_state_{
+        static_cast<uint8_t>(LocalRecoveryState::TRACKING)};
     std::atomic<int64_t> last_fsm_callback_wall_ns_{0};
     std::atomic<bool> fsm_callback_stall_reported_{false};
     std::chrono::steady_clock::time_point last_safety_callback_wall_{};
@@ -202,6 +219,9 @@ namespace scan_planner
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
                                            uint64_t request_id);
+    void setLocalRecoveryState(LocalRecoveryState state,
+                               double tracking_error,
+                               const char *reason);
     void tripRealtimeSafety(const std::string &reason,
                             const Eigen::Vector3d *last_free = nullptr,
                             const Eigen::Vector3d *first_blocked = nullptr,

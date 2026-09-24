@@ -42,8 +42,20 @@ public:
     handoff_search_time_ = declare_parameter<double>("handoff_search_time", 1.0);
     handoff_sample_dt_ = declare_parameter<double>("handoff_sample_dt", 0.02);
     max_handoff_error_ = declare_parameter<double>("max_handoff_error", 0.30);
+    min_moving_handoff_error_ = declare_parameter<double>(
+        "min_moving_handoff_error", 0.10);
+    handoff_reaction_time_ = declare_parameter<double>(
+        "handoff_reaction_time", 0.25);
+    handoff_max_deceleration_ = declare_parameter<double>(
+        "handoff_max_deceleration", 0.50);
+    max_handoff_yaw_error_ = declare_parameter<double>(
+        "max_handoff_yaw_error", 0.80);
     if (handoff_search_time_ < 0.0 || handoff_sample_dt_ <= 0.0 ||
-        max_handoff_error_ <= 0.0 || heading_stall_timeout_ <= 0.0 ||
+        max_handoff_error_ <= 0.0 || min_moving_handoff_error_ < 0.0 ||
+        min_moving_handoff_error_ > max_handoff_error_ ||
+        handoff_reaction_time_ < 0.0 || handoff_max_deceleration_ <= 0.0 ||
+        max_handoff_yaw_error_ <= 0.0 ||
+        heading_stall_timeout_ <= 0.0 ||
         heading_progress_epsilon_ <= 0.0)
       throw std::runtime_error(
           "handoff parameters must have a non-negative search time and positive sample interval/error limit");
@@ -223,6 +235,7 @@ private:
     double matched_time = 0.0;
     double start_error = 0.0;
     double matched_error = 0.0;
+    double matched_yaw_error = 0.0;
     if (have_odom_)
     {
       const double search_end = std::min(candidate_duration, handoff_search_time_);
@@ -239,13 +252,52 @@ private:
       matched_time = sample_times[match];
       start_error = (samples.front().head<2>() - odom_pos_.head<2>()).norm();
       matched_error = (samples[match].head<2>() - odom_pos_.head<2>()).norm();
-      if (matched_error > max_handoff_error_)
+      const double handoff_speed = odom_vel_.head<2>().norm();
+      const double dynamic_handoff_limit = speedAwareHandoffErrorLimit(
+          handoff_speed, handoff_max_deceleration_, handoff_reaction_time_,
+          min_moving_handoff_error_, max_handoff_error_);
+      if (matched_error > dynamic_handoff_limit)
       {
         RCLCPP_WARN(get_logger(),
-                    "[TRAJECTORY_HANDOFF_REJECTED] trajectory=%lld start_error=%.3fm matched_error=%.3fm limit=%.3fm; preserving current execution state",
+                    "[TRAJECTORY_HANDOFF_REJECTED] trajectory=%lld start_error=%.3fm matched_error=%.3fm dynamic_limit=%.3fm speed=%.3fm/s; preserving current execution state",
                     static_cast<long long>(msg->traj_id), start_error,
-                    matched_error, max_handoff_error_);
+                    matched_error, dynamic_handoff_limit, handoff_speed);
         return;
+      }
+
+      // A rolling candidate may legitimately leave the current pose in a new
+      // direction after local repair.  Position continuity is mandatory, but
+      // yaw continuity is not: cmdCallback already freezes translation and
+      // performs HEADING_ALIGNMENT whenever the tangent error exceeds
+      // heading_error_threshold_.  Rejecting such a candidate here leaves an
+      // expired active spline installed forever and creates a replan/reject
+      // loop.  Measure the discontinuity for diagnostics and accept the
+      // candidate so the existing in-place alignment state can resolve it.
+      if (receive_traj_ && !soft_hold_)
+      {
+        const double before_time = std::max(
+            0.0, matched_time - handoff_sample_dt_);
+        const double after_time = std::min(
+            candidate_duration, matched_time + handoff_sample_dt_);
+        const Eigen::Vector3d before =
+            candidate[0].evaluateDeBoorT(before_time);
+        const Eigen::Vector3d after =
+            candidate[0].evaluateDeBoorT(after_time);
+        const Eigen::Vector2d tangent = after.head<2>() - before.head<2>();
+        if (tangent.squaredNorm() > 1e-8)
+        {
+          const double candidate_yaw = std::atan2(tangent.y(), tangent.x());
+          matched_yaw_error = std::abs(
+              normalizeAngle(candidate_yaw - odom_yaw_));
+          if (matched_yaw_error > max_handoff_yaw_error_)
+          {
+            RCLCPP_WARN(
+                get_logger(),
+                "[TRAJECTORY_HANDOFF_HEADING_ALIGNMENT] trajectory=%lld matched_yaw_error=%.3frad threshold=%.3frad; accepting position-continuous candidate and freezing translation until aligned",
+                static_cast<long long>(msg->traj_id), matched_yaw_error,
+                max_handoff_yaw_error_);
+          }
+        }
       }
     }
 
@@ -279,10 +331,10 @@ private:
                    : scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
         soft_hold_ ? soft_hold_reason_ : "", 0.0, true);
     RCLCPP_INFO(get_logger(),
-                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm",
+                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm matched_yaw_error=%.3frad",
                 static_cast<unsigned long long>(active_request_id_),
                 static_cast<long long>(traj_id_), traj_duration_, exec_time_,
-                start_error, matched_error);
+                start_error, matched_error, matched_yaw_error);
   }
 
   void executionCommandCallback(
@@ -364,6 +416,8 @@ private:
   void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
   {
     odom_pos_ << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
+    odom_vel_ << msg->twist.twist.linear.x, msg->twist.twist.linear.y,
+        msg->twist.twist.linear.z;
     odom_yaw_ = tf2::getYaw(msg->pose.pose.orientation);
     have_odom_ = true;
   }
@@ -527,6 +581,14 @@ private:
             scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
             "TERMINAL_CONVERGING", terminal_error);
       }
+
+      // Once terminal convergence has made no physical progress, continuing
+      // to publish a shrinking proportional command leaves an RL quadruped in
+      // its low-speed gait deadband (typically a small reverse/lateral
+      // command).  Hold this validated active trajectory stationary while
+      // SCAN creates and validates a replacement from current odometry.
+      if (terminal_event_reported_)
+        command = geometry_msgs::msg::Twist();
     }
     else
       publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING);
@@ -556,6 +618,7 @@ private:
   std::int64_t traj_id_{0};
   std::uint64_t active_request_id_{0};
   Eigen::Vector3d odom_pos_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d odom_vel_{Eigen::Vector3d::Zero()};
   double odom_yaw_{0.0};
   double exec_time_{0.0};
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
@@ -575,6 +638,9 @@ private:
   double heading_stall_timeout_, heading_progress_epsilon_;
   double max_vx_, max_vy_, max_vyaw_, finish_dist_;
   double handoff_search_time_, handoff_sample_dt_, max_handoff_error_;
+  double min_moving_handoff_error_, handoff_reaction_time_;
+  double handoff_max_deceleration_;
+  double max_handoff_yaw_error_;
 };
 }  // namespace scan_planner
 

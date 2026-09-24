@@ -15,6 +15,15 @@ scan_planner_node:
     # A future collision first requests a rolling A* + B-spline replacement.
     # HOLD is reserved for the dynamic stopping horizon.
     fsm.predictive_replan_reaction_time: 0.25
+    # Tracking mismatch remains a local SCAN repair problem.  A virtual
+    # recovery corridor does not by itself invalidate the Explorer route.
+    fsm.tracking_degraded_error: 0.10
+    fsm.tracking_recovery_max_error: 0.30
+    fsm.tracking_match_back_time: 0.40
+    fsm.tracking_match_forward_time: 0.80
+    # A new Explorer path cannot clear a physical pose-occupied latch.  Require
+    # consecutive free Local-map observations before planning resumes.
+    fsm.pose_free_release_cycles: 3
     fsm.predictive_hard_stop_min_time: 0.35
     fsm.goal_tolerance: 0.25
     fsm.heading_freeze_max_recoveries: 2

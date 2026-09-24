@@ -16,6 +16,15 @@ closed_loop_controller:
     handoff_search_time: 1.0
     handoff_sample_dt: 0.02
     max_handoff_error: 0.30
+    # At rest a validated recovery connector may span up to 0.30 m.  As speed
+    # rises, reaction and braking distance tighten this limit toward 0.10 m.
+    min_moving_handoff_error: 0.10
+    handoff_reaction_time: 0.25
+    handoff_max_deceleration: 0.50
+    # Diagnostic threshold for handoffs that require in-place heading
+    # alignment. Position-continuous candidates are accepted; translation is
+    # frozen by heading_error_threshold until the body has turned.
+    max_handoff_yaw_error: 0.80
 
 open_loop_controller:
   ros__parameters:

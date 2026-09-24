@@ -57,9 +57,25 @@ namespace scan_planner
         node_, "fsm.predictive_replan_reaction_time", 0.25);
     predictive_hard_stop_min_time_ = load_parameter<double>(
         node_, "fsm.predictive_hard_stop_min_time", 0.35);
+    tracking_degraded_error_ = load_parameter<double>(
+        node_, "fsm.tracking_degraded_error", 0.10);
+    tracking_recovery_max_error_ = load_parameter<double>(
+        node_, "fsm.tracking_recovery_max_error", 0.30);
+    tracking_match_back_time_ = load_parameter<double>(
+        node_, "fsm.tracking_match_back_time", 0.40);
+    tracking_match_forward_time_ = load_parameter<double>(
+        node_, "fsm.tracking_match_forward_time", 0.80);
+    pose_free_release_cycles_ = load_parameter<int>(
+        node_, "fsm.pose_free_release_cycles", 3);
     if (predictive_replan_reaction_time_ < 0.0 ||
-        predictive_hard_stop_min_time_ < 0.0)
-      throw std::runtime_error("predictive collision timing parameters must be non-negative");
+        predictive_hard_stop_min_time_ < 0.0 ||
+        tracking_degraded_error_ < 0.0 ||
+        tracking_recovery_max_error_ <= tracking_degraded_error_ ||
+        tracking_match_back_time_ < 0.0 ||
+        tracking_match_forward_time_ <= 0.0 ||
+        pose_free_release_cycles_ <= 0)
+      throw std::runtime_error(
+          "predictive collision and tracking recovery parameters are invalid");
     goal_tolerance_ = load_parameter<double>(node_, "fsm.goal_tolerance", 0.25);
     heading_freeze_max_recoveries_ = load_parameter<int>(
         node_, "fsm.heading_freeze_max_recoveries", 2);
@@ -240,9 +256,13 @@ namespace scan_planner
     if (success)
     {
       next_rolling_replan_attempt_ns_ = 0;
-      if (safety_stop_active_.exchange(false))
+      if (newPlanMayReleaseSafetyStop(pose_occupied_latched_.load()) &&
+          safety_stop_active_.exchange(false))
         RCLCPP_INFO(node_->get_logger(),
                     "[SAFETY_RELEASE] source=new_manual_goal; planning may resume");
+      else if (pose_occupied_latched_.load())
+        RCLCPP_WARN(node_->get_logger(),
+                    "[SAFETY_RELEASE_SUPPRESSED] source=new_manual_goal reason=pose_occupied; waiting for the physical footprint to become free");
 
       /*** display ***/
       constexpr double step_size_t = 0.1;
@@ -567,9 +587,13 @@ namespace scan_planner
     if (success)
     {
       predictive_replan_requested_.store(false);
-      if (safety_stop_active_.exchange(false))
+      if (newPlanMayReleaseSafetyStop(pose_occupied_latched_.load()) &&
+          safety_stop_active_.exchange(false))
         RCLCPP_INFO(node_->get_logger(),
                     "[SAFETY_RELEASE] source=new_reference_path; planning may resume");
+      else if (pose_occupied_latched_.load())
+        RCLCPP_WARN(node_->get_logger(),
+                    "[SAFETY_RELEASE_SUPPRESSED] source=new_reference_path reason=pose_occupied; waiting for the physical footprint to become free");
       collision_segment_pending_ = false;
       /*** FSM ***/
       if (exec_state_ == WAIT_TARGET)
@@ -700,6 +724,13 @@ namespace scan_planner
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP);
+
+    if (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED &&
+        msg->reason == "TERMINAL_NO_PROGRESS")
+    {
+      terminal_repair_error_.store(msg->terminal_error);
+      terminal_repair_requested_.store(true);
+    }
   }
 
   void SCANReplanFSM::go2HeadingStalledCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
@@ -963,6 +994,32 @@ namespace scan_planner
       return;
     }
 
+    // The controller has exhausted the active spline but the robot is still
+    // outside its terminal tolerance.  This is a local execution failure, not
+    // evidence that the Explorer's committed region or reference path is
+    // invalid.  Regenerate a candidate from live odometry and keep the global
+    // commitment intact.  The controller holds the last active trajectory at
+    // zero command until that candidate passes the normal handoff checks.
+    if (terminal_repair_requested_.load() &&
+        exec_state_ == EXEC_TRAJ && have_target_)
+    {
+      terminal_repair_requested_.store(false);
+      const double terminal_error = terminal_repair_error_.load();
+      refreshPlanningOdomFromSafety();
+      predictive_replan_requested_.store(true);
+      tracking_recovery_active_ = true;
+      next_rolling_replan_attempt_ns_ = 0;
+      setLocalRecoveryState(
+          LocalRecoveryState::LOCAL_REPAIR, terminal_error,
+          "terminal_no_progress");
+      changeFSMExecState(REPLAN_TRAJ, "TERMINAL_NO_PROGRESS");
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "[TERMINAL_LOCAL_REPAIR] terminal_error=%.3fm; regenerating from current odometry while preserving the committed reference path",
+          terminal_error);
+      return;
+    }
+
     // A collision still outside the dynamic stopping horizon is a planning
     // request, not a terminal failure.  Replan from current odometry while the
     // validated prefix remains executable; the safety timer will escalate to
@@ -973,6 +1030,9 @@ namespace scan_planner
          node_->now().nanoseconds() >= next_rolling_replan_attempt_ns_))
     {
       refreshPlanningOdomFromSafety();
+      tracking_recovery_active_ =
+          local_recovery_state_.load() !=
+          static_cast<uint8_t>(LocalRecoveryState::TRACKING);
       next_rolling_replan_attempt_ns_ = 0;
       changeFSMExecState(REPLAN_TRAJ, "PREDICTIVE_COLLISION");
       RCLCPP_WARN_THROTTLE(
@@ -1085,6 +1145,9 @@ namespace scan_planner
       if (success)
       {
         predictive_replan_requested_.store(false);
+        setLocalRecoveryState(
+            LocalRecoveryState::TRACKING, 0.0,
+            "candidate_trajectory_validated");
         next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
@@ -1115,6 +1178,9 @@ namespace scan_planner
       if (planFromCurrentTraj())
       {
         predictive_replan_requested_.store(false);
+        setLocalRecoveryState(
+            LocalRecoveryState::TRACKING, 0.0,
+            "candidate_trajectory_validated");
         next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
@@ -1503,9 +1569,30 @@ namespace scan_planner
     execution_snapshot_.request_id = request_id;
     execution_snapshot_.trajectory_id = info.traj_id_;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
+    terminal_repair_requested_.store(false);
+    terminal_repair_error_.store(0.0);
     // Frozen is versioned feedback.  Never carry the previous trajectory's
     // frozen bit across a handoff while waiting for the new state heartbeat.
     go2_execution_frozen_.store(false);
+  }
+
+  void SCANReplanFSM::setLocalRecoveryState(
+      LocalRecoveryState state, double tracking_error, const char *reason)
+  {
+    const uint8_t next = static_cast<uint8_t>(state);
+    const uint8_t previous = local_recovery_state_.exchange(next);
+    if (previous == next)
+      return;
+
+    const char *state_name = "TRACKING";
+    if (state == LocalRecoveryState::TRACKING_DEGRADED)
+      state_name = "TRACKING_DEGRADED";
+    else if (state == LocalRecoveryState::LOCAL_REPAIR)
+      state_name = "LOCAL_REPAIR";
+    RCLCPP_WARN(
+        node_->get_logger(),
+        "[LOCAL_RECOVERY_STATE] state=%s tracking_error=%.3fm reason=%s",
+        state_name, tracking_error, reason ? reason : "");
   }
 
   void SCANReplanFSM::tripRealtimeSafety(
@@ -1622,7 +1709,9 @@ namespace scan_planner
 
     if (map->getInflateOccupancy(odom_pos, actual_yaw) != 0)
     {
-      tripRealtimeSafety("BLOCKED");
+      pose_occupied_latched_.store(true);
+      pose_free_confirmation_cycles_.store(0);
+      tripRealtimeSafety("POSE_OCCUPIED");
       RCLCPP_ERROR_THROTTLE(
           node_->get_logger(), *node_->get_clock(), 1000,
           "[REALTIME_SAFETY_STOP] reason=pose_occupied pos=(%.2f,%.2f) map_age=%.1fms",
@@ -1630,42 +1719,118 @@ namespace scan_planner
       return;
     }
 
+    if (pose_occupied_latched_.load())
+    {
+      const int free_cycles = pose_free_confirmation_cycles_.fetch_add(1) + 1;
+      if (free_cycles < pose_free_release_cycles_)
+        return;
+
+      pose_free_confirmation_cycles_.store(0);
+      pose_occupied_latched_.store(false);
+      if (safety_stop_active_.exchange(false))
+      {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[SAFETY_RELEASE] source=physical_footprint_free free_cycles=%d; planning may resume",
+            free_cycles);
+      }
+    }
+
     double t_cur = (node_->now() - trajectory.start_time).seconds();
     t_cur = std::min(std::max(t_cur, 0.0), trajectory.duration);
-    const Eigen::Vector3d tracked_pos = trajectory.position.evaluateDeBoorT(t_cur);
+    // Match the physical robot to a nearby point on the active trajectory.
+    // The raw time-indexed error is not an executable recovery trajectory.
+    const double match_begin = std::max(0.0, t_cur - tracking_match_back_time_);
+    const double match_end = std::min(
+        trajectory.duration, t_cur + tracking_match_forward_time_);
+    double matched_time = t_cur;
+    double matched_error2 = std::numeric_limits<double>::infinity();
+    constexpr double match_step = 0.02;
+    for (double t = match_begin; t <= match_end + 1e-6; t += match_step)
+    {
+      const double sample_time = std::min(t, match_end);
+      const Eigen::Vector3d sample =
+          trajectory.position.evaluateDeBoorT(sample_time);
+      const double error2 =
+          (sample.head<2>() - odom_pos.head<2>()).squaredNorm();
+      if (error2 < matched_error2)
+      {
+        matched_error2 = error2;
+        matched_time = sample_time;
+      }
+    }
+
+    const Eigen::Vector3d tracked_pos =
+        trajectory.position.evaluateDeBoorT(matched_time);
     const Eigen::Vector3d connector = tracked_pos - odom_pos;
     const double connector_length = connector.head<2>().norm();
     constexpr double spatial_step = 0.05;
-    if (connector_length > spatial_step)
+    if (connector_length <= tracking_degraded_error_)
     {
-      const int samples = std::max(1, static_cast<int>(std::ceil(connector_length / spatial_step)));
-      const double yaw = segment_yaw(odom_pos, tracked_pos);
+      setLocalRecoveryState(
+          LocalRecoveryState::TRACKING, connector_length,
+          "nearest_trajectory_match");
+    }
+    else
+    {
+      const double tangent_before_time = std::max(0.0, matched_time - match_step);
+      const double tangent_after_time = std::min(
+          trajectory.duration, matched_time + match_step);
+      const Eigen::Vector3d tangent_before =
+          trajectory.position.evaluateDeBoorT(tangent_before_time);
+      const Eigen::Vector3d tangent_after =
+          trajectory.position.evaluateDeBoorT(tangent_after_time);
+      const double trajectory_yaw = segment_yaw(tangent_before, tangent_after);
+      const int samples = std::max(
+          1, static_cast<int>(std::ceil(connector_length / spatial_step)));
+      bool recovery_corridor_blocked = false;
+      Eigen::Vector3d first_recovery_blocked = tracked_pos;
       for (int sample = 1; sample <= samples; ++sample)
       {
-        const Eigen::Vector3d point = odom_pos +
-            (static_cast<double>(sample) / samples) * connector;
+        const double ratio = static_cast<double>(sample) / samples;
+        const Eigen::Vector3d point = odom_pos + ratio * connector;
+        const double yaw = interpolatePlanarYaw(
+            actual_yaw, trajectory_yaw, ratio);
         if (map->getInflateOccupancy(point, yaw) != 0)
         {
-          tripRealtimeSafety("BLOCKED", &odom_pos, &point,
-                             trajectory.request_id, trajectory.trajectory_id);
-          RCLCPP_WARN(node_->get_logger(),
-                      "[REALTIME_SAFETY_STOP] reason=connector_blocked error=%.2fm hit=(%.2f,%.2f) map_age=%.1fms",
-                      connector_length, point.x(), point.y(), map_age * 1000.0);
-          return;
+          recovery_corridor_blocked = true;
+          first_recovery_blocked = point;
+          break;
         }
+      }
+
+      // A blocked recovery corridor requests local rolling repair.  It does
+      // not prove that the Explorer route is unreachable, because this
+      // connector is only a state-alignment diagnostic.
+      predictive_replan_requested_.store(true);
+      setLocalRecoveryState(
+          recovery_corridor_blocked ||
+                  connector_length > tracking_recovery_max_error_
+              ? LocalRecoveryState::LOCAL_REPAIR
+              : LocalRecoveryState::TRACKING_DEGRADED,
+          connector_length,
+          recovery_corridor_blocked ? "recovery_corridor_blocked"
+                                    : "tracking_error");
+      if (recovery_corridor_blocked)
+      {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 500,
+            "[LOCAL_REPAIR_REQUESTED] tracking_error=%.2fm hit=(%.2f,%.2f) matched_t=%.2fs map_age=%.1fms; preserving the committed reference path",
+            connector_length, first_recovery_blocked.x(),
+            first_recovery_blocked.y(), matched_time, map_age * 1000.0);
       }
     }
 
     constexpr double time_step = 0.02;
     Eigen::Vector3d last_free = odom_pos;
-    for (double t = t_cur; t < trajectory.duration; t += time_step)
+    for (double t = matched_time; t < trajectory.duration; t += time_step)
     {
       const Eigen::Vector3d pos = trajectory.position.evaluateDeBoorT(t);
       const Eigen::Vector3d next = trajectory.position.evaluateDeBoorT(
           std::min(t + time_step, trajectory.duration));
       if (map->getInflateOccupancy(pos, segment_yaw(pos, next)) != 0)
       {
-        const double time_to_hit = std::max(0.0, t - t_cur);
+        const double time_to_hit = std::max(0.0, t - matched_time);
         double speed = 0.0;
         {
           std::lock_guard<std::mutex> lock(safety_odom_mutex_);
@@ -1813,38 +1978,91 @@ namespace scan_planner
       }
 
       Eigen::Vector3d live_odom;
+      Eigen::Vector3d live_velocity = Eigen::Vector3d::Zero();
+      Eigen::Quaterniond live_orient = Eigen::Quaterniond::Identity();
       bool have_live_odom = false;
       {
         std::lock_guard<std::mutex> lock(safety_odom_mutex_);
         have_live_odom = safety_have_odom_;
         live_odom = safety_odom_pos_;
+        live_velocity = safety_odom_vel_;
+        live_orient = safety_odom_orient_;
       }
       if (have_live_odom)
       {
-        const Eigen::Vector3d trajectory_start = info->position_traj_.evaluateDeBoorT(0.0);
-        const Eigen::Vector3d connector = trajectory_start - live_odom;
+        const double search_end = std::min(
+            info->duration_, tracking_match_forward_time_);
+        double matched_time = 0.0;
+        double matched_error2 = std::numeric_limits<double>::infinity();
+        constexpr double handoff_sample_dt = 0.02;
+        for (double t = 0.0; t <= search_end + 1e-6;
+             t += handoff_sample_dt)
+        {
+          const double sample_time = std::min(t, search_end);
+          const Eigen::Vector3d sample =
+              info->position_traj_.evaluateDeBoorT(sample_time);
+          const double error2 =
+              (sample.head<2>() - live_odom.head<2>()).squaredNorm();
+          if (error2 < matched_error2)
+          {
+            matched_error2 = error2;
+            matched_time = sample_time;
+          }
+        }
+
+        const Eigen::Vector3d matched_position =
+            info->position_traj_.evaluateDeBoorT(matched_time);
+        const Eigen::Vector3d connector = matched_position - live_odom;
         const double connector_length = connector.head<2>().norm();
+        const double handoff_speed = live_velocity.head<2>().norm();
+        const double dynamic_handoff_limit = speedAwareHandoffErrorLimit(
+            handoff_speed, std::max(1e-3, planner_manager_->pp_.max_acc_),
+            predictive_replan_reaction_time_, tracking_degraded_error_,
+            rolling_replan_max_start_error_);
         if (!isRollingTrajectoryStartFresh(
-                connector_length, rolling_replan_max_start_error_))
+                connector_length, dynamic_handoff_limit))
         {
           RCLCPP_ERROR(node_->get_logger(),
-                       "[PLAN_RESULT_DISCARDED] stale trajectory start error=%.2fm limit=%.2fm; preserving the currently executing trajectory",
-                       connector_length, rolling_replan_max_start_error_);
+                       "[SPEED_AWARE_HANDOFF_HOLD] error=%.2fm dynamic_limit=%.2fm speed=%.2fm/s matched_t=%.2fs; stopping before local repair",
+                       connector_length, dynamic_handoff_limit, handoff_speed,
+                       matched_time);
+          predictive_replan_requested_.store(true);
+          tracking_recovery_active_ = true;
+          setLocalRecoveryState(
+              LocalRecoveryState::LOCAL_REPAIR, connector_length,
+              "speed_aware_handoff_hold");
+          requestExecutionStop("HANDOFF_PREDICTED_UNSAFE");
           return reject_planned_trajectory();
         }
         if (connector_length > 0.05)
         {
           const int samples = std::max(1, static_cast<int>(std::ceil(connector_length / 0.05)));
-          const double connector_yaw = std::atan2(connector.y(), connector.x());
+          const double actual_yaw = std::atan2(
+              2.0 * (live_orient.w() * live_orient.z() +
+                     live_orient.x() * live_orient.y()),
+              1.0 - 2.0 * (live_orient.y() * live_orient.y() +
+                           live_orient.z() * live_orient.z()));
+          const double tangent_before_time = std::max(
+              0.0, matched_time - handoff_sample_dt);
+          const double tangent_after_time = std::min(
+              info->duration_, matched_time + handoff_sample_dt);
+          const Eigen::Vector3d tangent_before =
+              info->position_traj_.evaluateDeBoorT(tangent_before_time);
+          const Eigen::Vector3d tangent_after =
+              info->position_traj_.evaluateDeBoorT(tangent_after_time);
+          const double trajectory_yaw = estimateYawFromSegment(
+              tangent_before, tangent_after);
           for (int sample = 1; sample <= samples; ++sample)
           {
-            const Eigen::Vector3d point = live_odom +
-                (static_cast<double>(sample) / samples) * connector;
-            if (map->getInflateOccupancy(point, connector_yaw) != 0)
+            const double ratio = static_cast<double>(sample) / samples;
+            const Eigen::Vector3d point = live_odom + ratio * connector;
+            const double recovery_yaw = interpolatePlanarYaw(
+                actual_yaw, trajectory_yaw, ratio);
+            if (map->getInflateOccupancy(point, recovery_yaw) != 0)
             {
               RCLCPP_ERROR(node_->get_logger(),
-                           "[PLAN_RESULT_DISCARDED] latest odom connector is blocked error=%.2fm hit=(%.2f,%.2f)",
-                           connector_length, point.x(), point.y());
+                           "[PLAN_RESULT_DISCARDED] candidate recovery corridor is blocked error=%.2fm matched_t=%.2fs hit=(%.2f,%.2f); preserving active trajectory",
+                           connector_length, matched_time, point.x(), point.y());
               return reject_planned_trajectory();
             }
           }

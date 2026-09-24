@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import os
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -316,6 +317,8 @@ class FrontierExplorer(Node):
         self.pose_history = deque(maxlen=200)
         self.pose_history_max_age_ns = int(
             float(self.declare_parameter("pose_history_max_age", 0.20).value) * 1e9)
+        self.stall_detection_seconds = float(self.declare_parameter(
+            "stall_detection_seconds", 30.0).value)
         self.map_update_count = 0
         self.map_content_revision = 0
         self.map_published = False
@@ -457,6 +460,23 @@ class FrontierExplorer(Node):
         self.latest_frontier_count = 0
         self.latest_region_count = 0
         self.locomotion_actuation_ready = False
+        # Running-state accounting.  A stalled or manually interrupted run keeps
+        # publishing metrics with zero information gain, so every cumulative
+        # counter grows while the map does not.  Classify the run and report
+        # ACTIVE-phase medians, so comparisons stop depending on how long the run
+        # happened to survive before the stall.
+        self.running_state = "startup"
+        self.running_state_since = self.run_start_time
+        self.last_state_known_cells = 0
+        self.last_cell_growth_time = self.run_start_time
+        self.active_duration = 0.0
+        self.active_sample_count = 0
+        self.active_sparse_hit_rates: List[float] = []
+        self.active_planning_ms: List[float] = []
+        self.last_metrics_time = self.run_start_time
+        self.rate_prev_known_cells = 0
+        self.rate_prev_distance = 0.0
+        self.rate_prev_planning_ms = 0.0
         self.perception_pose_valid = False
         self.locomotion_epoch = 0
         self.locomotion_reason = ""
@@ -2705,10 +2725,60 @@ class FrontierExplorer(Node):
             f"approach_clearance={self.last_approach_clearance:.2f}m, "
             f"published {len(world_points)} waypoints, {length:.2f} m")
 
+    def update_running_state(self, known_cells: int) -> str:
+        """Classify the run and accrue ACTIVE-phase time.
+
+        ``complete`` means no frontier is left to visit.  ``stalled`` means the
+        map stopped growing while frontier cells remain -- what a run looks like
+        when the robot is boxed in or blocked: it keeps publishing paths and
+        metrics with zero information gain, inflating every cumulative counter.
+        """
+        now = time.monotonic()
+        if known_cells > self.last_state_known_cells:
+            self.last_state_known_cells = known_cells
+            self.last_cell_growth_time = now
+            state = "active"
+        elif self.latest_frontier_count == 0 and known_cells > 0:
+            state = "complete"
+        elif now - self.last_cell_growth_time > self.stall_detection_seconds:
+            state = "stalled"
+        else:
+            # Growth paused, but not long enough to call it a stall yet.
+            state = "active"
+        if state != self.running_state:
+            self.running_state = state
+            self.running_state_since = now
+        if state == "active":
+            self.active_duration += now - self.last_metrics_time
+        self.last_metrics_time = now
+        return state
+
     def metrics_timer(self):
         known_cells = int(np.count_nonzero(self.grid.data != UNKNOWN))
         total_cells = int(self.grid.data.size)
         option_state = self.region_commitment_gate.state
+        state = self.update_running_state(known_cells)
+        sparse_attempts = (self.last_sparse_candidate_hits
+                           + self.last_sparse_candidate_fallbacks)
+        sparse_hit_rate_inst = (self.last_sparse_candidate_hits / sparse_attempts
+                                if sparse_attempts else 0.0)
+        if state == "active":
+            self.active_sample_count += 1
+            self.active_sparse_hit_rates.append(sparse_hit_rate_inst)
+            self.active_planning_ms.append(self.last_global_plan_ms)
+        # Per-interval rates: numerator and denominator come from the same
+        # window, so they keep their meaning at any point of the exploration
+        # instead of drifting with elapsed time.
+        delta_cells = known_cells - self.rate_prev_known_cells
+        delta_ms = self.cumulative_planning_ms - self.rate_prev_planning_ms
+        delta_distance = self.total_distance - self.rate_prev_distance
+        coverage_gain_per_m = (delta_cells / delta_distance
+                               if delta_distance > 1e-6 else 0.0)
+        planning_ms_per_new_cell = (delta_ms / delta_cells
+                                    if delta_cells > 0 else 0.0)
+        self.rate_prev_known_cells = known_cells
+        self.rate_prev_planning_ms = self.cumulative_planning_ms
+        self.rate_prev_distance = self.total_distance
         record = {
             "run_id": self.run_id,
             "elapsed_s": round(time.monotonic() - self.run_start_time, 3),
@@ -2839,6 +2909,24 @@ class FrontierExplorer(Node):
             "last_region_sequence_ms": self.last_region_sequence_ms,
             "last_planning_ms": self.last_global_plan_ms,
             "cumulative_planning_ms": self.cumulative_planning_ms,
+            # ACTIVE-phase view.  Compare runs on these, never on the cumulative
+            # counters above: those keep growing while the run is stalled, or
+            # up to whatever moment it was stopped.
+            "running_state": state,
+            "state_age_s": round(time.monotonic() - self.running_state_since, 1),
+            "since_map_growth_s": round(
+                time.monotonic() - self.last_cell_growth_time, 1),
+            "active_duration_s": round(self.active_duration, 1),
+            "active_sample_count": self.active_sample_count,
+            "sparse_hit_rate_inst": round(sparse_hit_rate_inst, 4),
+            "sparse_hit_rate_active_median": (
+                round(statistics.median(self.active_sparse_hit_rates), 4)
+                if self.active_sparse_hit_rates else 0.0),
+            "planning_ms_active_median": (
+                round(statistics.median(self.active_planning_ms), 3)
+                if self.active_planning_ms else 0.0),
+            "coverage_gain_per_m": round(coverage_gain_per_m, 4),
+            "planning_ms_per_new_cell": round(planning_ms_per_new_cell, 4),
             "collision": self.disabled_by_collision,
         }
         msg = String()
@@ -2851,9 +2939,26 @@ class FrontierExplorer(Node):
         try:
             directory = os.path.dirname(os.path.abspath(self.metrics_file))
             os.makedirs(directory, exist_ok=True)
+            fieldnames = list(record)
+            existing_header = None
+            if os.path.exists(self.metrics_file):
+                with open(self.metrics_file, "r", newline="",
+                          encoding="utf-8") as stream:
+                    existing_header = stream.readline().rstrip("\r\n")
+            if (existing_header is not None
+                    and existing_header != ",".join(fieldnames)):
+                # Reusing one metrics_file across builds with a different field
+                # set would silently misalign every later row under the stale
+                # header: DictWriter rejects extra keys but quietly fills
+                # missing ones.  Archive rather than corrupt the series.
+                archive = f"{self.metrics_file}.{self.run_id}.bak"
+                os.replace(self.metrics_file, archive)
+                self.get_logger().warning(
+                    "metrics field set changed; previous file archived to "
+                    f"{archive}")
             write_header = not os.path.exists(self.metrics_file)
             with open(self.metrics_file, "a", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=list(record))
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
                 if write_header:
                     writer.writeheader()
                 writer.writerow(record)

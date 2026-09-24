@@ -114,6 +114,11 @@ inline bool shouldResumePendingEmergencyPath(bool path_pending, bool have_target
   return path_pending && have_target;
 }
 
+inline bool newPlanMayReleaseSafetyStop(bool pose_occupied_latched)
+{
+  return !pose_occupied_latched;
+}
+
 inline bool shouldKeepExecutingAfterRollingReplanFailure(
     bool reference_path_active, bool reference_path_update_pending,
     bool safety_stop_active, bool execution_frozen,
@@ -129,6 +134,25 @@ inline bool isRollingTrajectoryStartFresh(
 {
   return std::isfinite(start_error) && maximum_start_error >= 0.0 &&
          start_error <= maximum_start_error;
+}
+
+inline double speedAwareHandoffErrorLimit(
+    double speed, double maximum_deceleration, double reaction_time,
+    double minimum_error, double maximum_error)
+{
+  if (!std::isfinite(speed) || !std::isfinite(maximum_deceleration) ||
+      !std::isfinite(reaction_time) || !std::isfinite(minimum_error) ||
+      !std::isfinite(maximum_error) || maximum_deceleration <= 0.0 ||
+      minimum_error < 0.0 || maximum_error < minimum_error)
+    return 0.0;
+
+  const double nonnegative_speed = std::max(0.0, speed);
+  const double stopping_distance =
+      nonnegative_speed * std::max(0.0, reaction_time) +
+      nonnegative_speed * nonnegative_speed /
+          (2.0 * maximum_deceleration);
+  return std::clamp(
+      maximum_error - stopping_distance, minimum_error, maximum_error);
 }
 
 inline size_t closestForwardTrajectorySample(
@@ -153,6 +177,23 @@ inline size_t closestForwardTrajectorySample(
     }
   }
   return best;
+}
+
+inline double normalizePlanarAngle(double angle)
+{
+  while (angle > M_PI)
+    angle -= 2.0 * M_PI;
+  while (angle < -M_PI)
+    angle += 2.0 * M_PI;
+  return angle;
+}
+
+inline double interpolatePlanarYaw(
+    double start_yaw, double end_yaw, double ratio)
+{
+  const double clamped_ratio = std::clamp(ratio, 0.0, 1.0);
+  return normalizePlanarAngle(
+      start_yaw + clamped_ratio * normalizePlanarAngle(end_yaw - start_yaw));
 }
 
 inline bool trajectorySamplesAreStationary(

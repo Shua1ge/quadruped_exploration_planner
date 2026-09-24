@@ -208,6 +208,12 @@ def generate_launch_description():
                 "region_unreachable_timeout": 5.0,
                 "max_global_regions": 12,
                 "metrics_period": 2.0,
+                # A stalled run keeps publishing metrics with zero information
+                # gain, so cumulative counters grow while the map does not.
+                # After this many seconds without new known cells the run is
+                # reported as stalled, which is how a boxed-in robot is told
+                # apart from a finished exploration (frontier_cells == 0).
+                "stall_detection_seconds": 30.0,
                 "observation_preplanning_enabled": True,
                 "observation_radius": 3.0,
                 "observation_prepare_ratio": 0.60,

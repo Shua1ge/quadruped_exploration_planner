@@ -49,6 +49,12 @@ TEST(EmergencyRecovery, OnlyAPathReceivedWhileStoppingCanResume)
   EXPECT_FALSE(shouldResumePendingEmergencyPath(true, false));
 }
 
+TEST(SafetyRelease, NewPlanNeverClearsPhysicalPoseOccupancy)
+{
+  EXPECT_TRUE(newPlanMayReleaseSafetyStop(false));
+  EXPECT_FALSE(newPlanMayReleaseSafetyStop(true));
+}
+
 TEST(RollingReplanFailure, KeepsSafeRemainderUntilEmergencyWindow)
 {
   EXPECT_TRUE(shouldKeepExecutingAfterRollingReplanFailure(
@@ -78,6 +84,19 @@ TEST(RollingTrajectoryHandoff, RejectsStaleStartBeyondTrackingMargin)
   EXPECT_FALSE(isRollingTrajectoryStartFresh(0.3001, 0.30));
   EXPECT_FALSE(isRollingTrajectoryStartFresh(
       std::numeric_limits<double>::infinity(), 0.30));
+}
+
+TEST(RollingTrajectoryHandoff, TightensPositionContinuityAsSpeedIncreases)
+{
+  EXPECT_NEAR(speedAwareHandoffErrorLimit(
+                  0.0, 0.5, 0.25, 0.10, 0.30),
+              0.30, 1e-9);
+  EXPECT_NEAR(speedAwareHandoffErrorLimit(
+                  0.2, 0.5, 0.25, 0.10, 0.30),
+              0.21, 1e-9);
+  EXPECT_NEAR(speedAwareHandoffErrorLimit(
+                  0.75, 0.5, 0.25, 0.10, 0.30),
+              0.10, 1e-9);
 }
 
 TEST(RollingTrajectoryHandoff, StartsAtCurrentForwardPointInsteadOfReplayingFromA1)
@@ -206,6 +225,17 @@ TEST(ExecutionProtocol, FrozenFeedbackMustMatchExactExecution)
   EXPECT_TRUE(executionStateMatchesExecution(11, 31, 11, 31));
   EXPECT_FALSE(executionStateMatchesExecution(10, 31, 11, 31));
   EXPECT_FALSE(executionStateMatchesExecution(11, 30, 11, 31));
+}
+
+TEST(TrackingRecovery, InterpolatesYawAcrossWrapOnTheShortestArc)
+{
+  const double start = 170.0 * M_PI / 180.0;
+  const double finish = -170.0 * M_PI / 180.0;
+  const double halfway = interpolatePlanarYaw(start, finish, 0.5);
+
+  EXPECT_NEAR(std::abs(halfway), M_PI, 1e-9);
+  EXPECT_NEAR(interpolatePlanarYaw(start, finish, 0.0), start, 1e-9);
+  EXPECT_NEAR(interpolatePlanarYaw(start, finish, 1.0), finish, 1e-9);
 }
 
 } // namespace scan_planner
