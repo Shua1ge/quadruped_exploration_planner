@@ -2,15 +2,12 @@
 """Stage-one frontier explorer using only local world-frame LiDAR observations."""
 
 import csv
-import functools
 import json
 import math
 import os
 import statistics
-import threading
 import time
 from collections import deque
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -32,14 +29,19 @@ from scan_planner_msgs.msg import LocomotionState, TopoGraphDelta
 from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
     advance_completion_streak, advance_reroute_failure_streak, candidate_cells,
-    cluster_frontiers, clustered_frontier_cells, observation_progress,
-    observation_target_cells, frontier_cluster_present,
+    cluster_frontiers, clustered_frontier_cells, frontier_cluster_present,
+    observation_progress, observation_target_cells,
     partition_frontier_clusters,
     partition_frontier_clusters_by_topology, retain_region_commitment,
     region_commitment_scope, region_information_efficiency,
     double_cylinder_footprint_free, double_cylinder_path_free,
     safe_viewpoint_cells, select_rolling_region,
     solve_open_held_karp, update_region_commitment,
+)
+from explorer_core.execution_protocol import (
+    REFERENCE_SCOPED_STATUSES, completion_status_is_new,
+    parse_local_execution_event, parse_planning_status,
+    planning_status_matches_request,
 )
 from explorer_core.grid import (
     Cell, DirectedEdge, ExplorationGrid, FREE, GRID_MOVES, OCCUPIED, Point2, UNKNOWN,
@@ -54,6 +56,13 @@ from explorer_core.path_planning import (
     segment_known_free, simplify_known_path, splice_prepared_path,
     validate_remaining_path,
 )
+from explorer_core.observation_lifecycle import (
+    ObservationTask, evaluate_observation, observation_completion_record,
+    observation_is_complete,
+)
+from explorer_core.planning_coordinator import (
+    PlanningSnapshotCoordinator, with_planning_grid_snapshot,
+)
 from explorer_core.portal_connectivity import SafeRegionConnectivity
 from explorer_core.replan_control import ReplanContext, ReplanGate
 from explorer_core.region_commitment import ResidualCommitmentGate
@@ -62,65 +71,10 @@ from explorer_core.sparse_routing import (
 )
 
 
-REFERENCE_SCOPED_STATUSES = {
-    "PATH_ACCEPTED", "PATH_TRAJECTORY_READY", "REACHED", "WAIT_TARGET", "BLOCKED",
-    "LOCAL_REPAIR_EXHAUSTED", "REFERENCE_PATH_REJECTED",
-    "INVALID_REFERENCE_PATH",
-}
-
 SPARSE_MISS_REASONS = (
     "start_unattached", "target_unattached", "disconnected",
     "connector_rejected", "blocked_disabled",
 )
-
-
-def with_planning_grid_snapshot(callback):
-    """Run one planning callback against one immutable occupancy revision."""
-    @functools.wraps(callback)
-    def wrapped(self, *args, **kwargs):
-        with self.planning_grid_snapshot():
-            return callback(self, *args, **kwargs)
-    return wrapped
-
-
-def parse_planning_status(value: str) -> Tuple[str, Optional[int]]:
-    """Decode SCAN status while retaining compatibility with plain statuses."""
-    fields = value.split()
-    if not fields:
-        return "", None
-    request_generation = None
-    for field in fields[1:]:
-        if not field.startswith("request_id="):
-            continue
-        try:
-            parsed = int(field.partition("=")[2])
-        except ValueError:
-            continue
-        if parsed > 0:
-            request_generation = parsed
-    return fields[0], request_generation
-
-
-def planning_status_matches_request(
-        status: str, request_generation: Optional[int],
-        pending_generation: Optional[int],
-        active_generation: Optional[int]) -> bool:
-    """Return true only when a path-scoped status belongs to this request."""
-    if status not in REFERENCE_SCOPED_STATUSES:
-        return True
-    expected = (pending_generation if status in (
-        "PATH_ACCEPTED", "PATH_TRAJECTORY_READY",
-        "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH")
-        else active_generation)
-    return expected is not None and request_generation == expected
-
-
-def completion_status_is_new(status: str, request_generation: Optional[int],
-                             last_completed: Optional[int]) -> bool:
-    """Deduplicate the REACHED event and its repeated WAIT_TARGET state."""
-    return (status in ("REACHED", "WAIT_TARGET")
-            and request_generation is not None
-            and request_generation != last_completed)
 
 
 def directional_route_allowed(
@@ -164,28 +118,12 @@ class FrontierCandidate:
     option_target_cells: Set[Cell] = field(default_factory=set)
 
 
-@dataclass
-class ObservationTask:
-    """Frozen information objective with stable alternative terminals."""
-
-    region_id: Optional[int]
-    goal: Point2
-    target_cells: Set[Cell]
-    frontier_cell: Optional[Cell] = None
-    frontier_cluster_cells: Set[Cell] = field(default_factory=set)
-    terminal_cells: Tuple[Cell, ...] = ()
-    observed_cells: int = 0
-    progress: float = 0.0
-    completion_streak: int = 0
-    frontier_missing_streak: int = 0
-    completion_reason: str = "none"
-    last_evaluated_update: int = -1
-    preparation_started: bool = False
-
-
 class FrontierExplorer(Node):
     @property
     def grid(self) -> ExplorationGrid:
+        coordinator = getattr(self, "_planning_coordinator", None)
+        if coordinator is not None:
+            return coordinator.value("grid", self._live_grid)
         context = getattr(self, "_planning_context", None)
         planning_grid = (None if context is None
                          else getattr(context, "grid", None))
@@ -199,6 +137,9 @@ class FrontierExplorer(Node):
 
     @property
     def position(self) -> Optional[Point2]:
+        coordinator = getattr(self, "_planning_coordinator", None)
+        if coordinator is not None:
+            return coordinator.value("position", self._live_position)
         context = getattr(self, "_planning_context", None)
         if context is not None and hasattr(context, "position"):
             return context.position
@@ -210,6 +151,10 @@ class FrontierExplorer(Node):
 
     @property
     def map_update_count(self) -> int:
+        coordinator = getattr(self, "_planning_coordinator", None)
+        if coordinator is not None:
+            return coordinator.value(
+                "map_update_count", self._live_map_update_count)
         context = getattr(self, "_planning_context", None)
         if context is not None and hasattr(context, "map_update_count"):
             return context.map_update_count
@@ -221,6 +166,10 @@ class FrontierExplorer(Node):
 
     @property
     def map_content_revision(self) -> int:
+        coordinator = getattr(self, "_planning_coordinator", None)
+        if coordinator is not None:
+            return coordinator.value(
+                "map_content_revision", self._live_map_content_revision)
         context = getattr(self, "_planning_context", None)
         if context is not None and hasattr(context, "map_content_revision"):
             return context.map_content_revision
@@ -230,29 +179,18 @@ class FrontierExplorer(Node):
     def map_content_revision(self, value: int):
         self._live_map_content_revision = value
 
-    @contextmanager
     def planning_grid_snapshot(self):
         """Bind only this planning thread to a stable map copy."""
-        if getattr(self._planning_context, "grid", None) is not None:
-            yield
-            return
-        with self._grid_lock:
-            self._planning_context.grid = self._live_grid.snapshot()
-            self._planning_context.map_update_count = self._live_map_update_count
-            self._planning_context.map_content_revision = self._live_map_content_revision
-        self._planning_context.position = self._live_position
-        try:
-            yield
-        finally:
-            del self._planning_context.grid
-            del self._planning_context.position
-            del self._planning_context.map_update_count
-            del self._planning_context.map_content_revision
+        return self._planning_coordinator.bind(
+            self._live_grid, self._live_position, self._live_map_update_count,
+            self._live_map_content_revision)
 
     def __init__(self):
         super().__init__("frontier_explorer")
-        self._grid_lock = threading.RLock()
-        self._planning_context = threading.local()
+        self._planning_coordinator = PlanningSnapshotCoordinator()
+        # Compatibility aliases for map integration and focused unit tests.
+        self._grid_lock = self._planning_coordinator.lock
+        self._planning_context = self._planning_coordinator.context
         # Sensor callbacks must remain serviceable while the global search is
         # running.  Each group is internally serialized; the executor may run
         # the two groups concurrently, while planning reads an immutable grid.
@@ -1193,51 +1131,23 @@ class FrontierExplorer(Node):
 
     def evaluate_active_observation(self) -> Optional[ObservationTask]:
         """Update information progress once for every accepted map update."""
-        task = self.active_observation
-        if task is None or task.last_evaluated_update == self.map_update_count:
-            return task
-        observed, _, ratio = observation_progress(
-            self.grid, task.target_cells, self.active_goal_cell)
-        task.observed_cells = observed
-        task.progress = ratio
-        task.last_evaluated_update = self.map_update_count
-        task.completion_streak = advance_completion_streak(
-            ratio, self.observation_done_ratio, task.completion_streak)
-        tracked_frontier = (task.frontier_cluster_cells
-                            or ({task.frontier_cell}
-                                if task.frontier_cell is not None else set()))
-        frontier_present = bool(
-            tracked_frontier and frontier_cluster_present(
-                self.grid, tracked_frontier,
-                max(self.viewpoint_standoff, 2.0 * self.grid.resolution)))
-        task.frontier_missing_streak = (
-            0 if frontier_present else task.frontier_missing_streak + 1)
-        if task.completion_streak >= self.observation_done_updates:
-            task.completion_reason = "visible_information_resolved"
-        elif task.frontier_missing_streak >= self.observation_closure_updates:
-            # The purpose signal alone, with no progress floor.  The task was
-            # created to resolve this frontier cluster; if it has been absent
-            # for a long confirmed run, the objective is met whether or not
-            # every neighbouring unknown cell became observable.
-            task.completion_reason = "frontier_closed"
-        else:
-            task.completion_reason = "none"
-        return task
+        return evaluate_observation(
+            self.active_observation, self.grid, self.active_goal_cell,
+            self.map_update_count, self.observation_done_ratio,
+            self.observation_done_updates, self.observation_closure_updates,
+            self.viewpoint_standoff)
 
     def observation_complete(self, task: Optional[ObservationTask]) -> bool:
         """Complete on positive information or confirmed boundary closure."""
-        return bool(task is not None and (
-            task.completion_streak >= self.observation_done_updates
-            or task.frontier_missing_streak >= self.observation_closure_updates))
+        return observation_is_complete(
+            task, self.observation_done_updates,
+            self.observation_closure_updates)
 
     def record_observation_completion(self, task: Optional[ObservationTask]):
         """Freeze completion evidence before the next task replaces it."""
-        if task is None:
-            self.last_observation_completion_reason = "none"
-            self.last_observation_completion_progress = 0.0
-            return
-        self.last_observation_completion_reason = task.completion_reason
-        self.last_observation_completion_progress = task.progress
+        (self.last_observation_completion_reason,
+         self.last_observation_completion_progress) = (
+            observation_completion_record(task))
 
     def prepare_next_observation(self, force: bool = False) -> bool:
         """Select the next information objective without publishing its path."""
@@ -1827,22 +1737,7 @@ class FrontierExplorer(Node):
 
     @staticmethod
     def parse_local_execution_event(value: str):
-        fields = value.split()
-        if not fields:
-            return None
-        parsed = {"event": fields[0]}
-        for field in fields[1:]:
-            if "=" not in field:
-                continue
-            key, raw = field.split("=", 1)
-            parsed[key] = raw
-        try:
-            parsed["request_id"] = int(parsed["request_id"])
-            parsed["trajectory_id"] = int(parsed["trajectory_id"])
-            parsed["terminal_error"] = float(parsed.get("terminal_error", "nan"))
-        except (KeyError, ValueError):
-            return None
-        return parsed
+        return parse_local_execution_event(value)
 
     def local_execution_event_callback(self, msg: String):
         """Accept only the terminal event for the currently active request.
