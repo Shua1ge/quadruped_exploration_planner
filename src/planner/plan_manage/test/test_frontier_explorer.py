@@ -83,9 +83,95 @@ def test_transient_hit_is_reversible_after_free_ray_evidence():
     assert grid.value(target) == MODULE.OCCUPIED
 
     miss = [math.inf] * 360
-    for _ in range(3):
-        grid.integrate_ranges((0.0, 0.0), miss, 3.0, no_return_range=3.0)
+    grid.integrate_ranges((0.0, 0.0), miss, 3.0, no_return_range=3.0)
+    assert grid.value(target) == MODULE.OCCUPIED
+    grid.integrate_ranges((0.0, 0.0), miss, 3.0, no_return_range=3.0)
+    assert grid.value(target) == MODULE.OCCUPIED
+    grid.integrate_ranges((0.0, 0.0), miss, 3.0, no_return_range=3.0)
     assert grid.value(target) == MODULE.FREE
+
+
+def test_no_return_does_not_clear_behind_an_occupied_occluder():
+    grid = MODULE.ExplorationGrid(10.0, 10.0, 0.25)
+    ray_count = 8
+    east_bin = 4
+    angle = -math.pi + (east_bin + 0.5) * (2.0 * math.pi / ray_count)
+    wall = grid.world_to_cell(math.cos(angle), math.sin(angle))
+    behind = grid.world_to_cell(2.0 * math.cos(angle), 2.0 * math.sin(angle))
+
+    hit = [math.nan] * ray_count
+    hit[east_bin] = 1.0
+    grid.integrate_ranges((0.0, 0.0), hit, 3.0)
+    assert grid.value(wall) == MODULE.OCCUPIED
+    assert grid.value(behind) == MODULE.UNKNOWN
+
+    miss = [math.nan] * ray_count
+    miss[east_bin] = math.inf
+    for _ in range(3):
+        grid.integrate_ranges(
+            (0.0, 0.0), miss, 3.0, no_return_range=3.0)
+        assert grid.value(behind) == MODULE.UNKNOWN
+    assert grid.value(wall) == MODULE.FREE
+
+    # Only a later observation may see through the now-revoked wall.
+    grid.integrate_ranges(
+        (0.0, 0.0), miss, 3.0, no_return_range=3.0)
+    assert grid.value(behind) == MODULE.FREE
+
+
+def test_grid_snapshot_is_independent_from_live_evidence():
+    grid = MODULE.ExplorationGrid(10.0, 10.0, 0.25)
+    cell = grid.world_to_cell(1.0, 0.0)
+    grid.data[cell[1], cell[0]] = MODULE.OCCUPIED
+    grid.evidence[cell[1], cell[0]] = 4
+
+    snapshot = grid.snapshot()
+    grid.data[cell[1], cell[0]] = MODULE.FREE
+    grid.evidence[cell[1], cell[0]] = -3
+
+    assert snapshot.value(cell) == MODULE.OCCUPIED
+    assert snapshot.evidence[cell[1], cell[0]] == 4
+    assert snapshot.data is not grid.data
+    assert snapshot.evidence is not grid.evidence
+
+
+def test_height_filtered_return_is_non_clearing_not_no_return():
+    # East is an accepted wall hit; north is a real return below the 2-D
+    # projection band.  The latter must become NaN/ignored rather than Inf/free.
+    dx = np.array([2.0, 0.0])
+    dy = np.array([0.0, 2.0])
+    point_z = np.array([0.2, -0.2])
+    ranges = MODULE.classify_planar_ranges(
+        dx, dy, point_z, 0.08, 0.85, 0.35, 3.0, 8, 0)
+
+    east_bin = 4
+    north_bin = 6
+    assert ranges[east_bin] == 2.0
+    assert math.isnan(ranges[north_bin])
+    assert math.isinf(ranges[0])
+
+    grid = MODULE.ExplorationGrid(10.0, 10.0, 0.2)
+    north_angle = -math.pi + (north_bin + 0.5) * (2.0 * math.pi / 8.0)
+    north_cell = grid.world_to_cell(
+        2.0 * math.cos(north_angle), 2.0 * math.sin(north_angle))
+    grid.evidence[north_cell[1], north_cell[0]] = 1
+    grid.data[north_cell[1], north_cell[0]] = MODULE.OCCUPIED
+
+    grid.integrate_ranges(
+        (0.0, 0.0), ranges, 3.0, no_return_range=3.0)
+
+    assert grid.value(north_cell) == MODULE.OCCUPIED
+
+
+def test_cloud_pose_wait_only_expires_after_pose_watermark_passes_timeout():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.cloud_pose_wait_timeout_ns = 100_000_000
+    explorer.pose_history = [
+        (1_000_000_000, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0),
+    ]
+
+    assert not explorer.cloud_pose_wait_expired(950_000_000)
+    assert explorer.cloud_pose_wait_expired(899_999_999)
 
 
 def test_frontier_explorer_declares_map_update_throttle_state():
@@ -951,6 +1037,15 @@ def test_local_execution_event_requires_version_and_terminal_error():
         "LOCAL_TRAJECTORY_FINISHED request_id=202") is None
 
 
+def test_local_repair_exhausted_is_scoped_to_active_request():
+    assert MODULE.planning_status_matches_request(
+        "LOCAL_REPAIR_EXHAUSTED", 202,
+        pending_generation=None, active_generation=202)
+    assert not MODULE.planning_status_matches_request(
+        "LOCAL_REPAIR_EXHAUSTED", 201,
+        pending_generation=None, active_generation=202)
+
+
 def test_idle_handoff_releases_only_stale_region_commitment():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.scan_waiting_for_target = True
@@ -1192,6 +1287,47 @@ def test_dense_failures_release_only_an_exhausted_active_region():
     assert explorer.last_commitment_release_reason == "dense_validation_failed"
     assert gate.reset_calls == 1
     assert explorer.dense_invalid_region_revisions == {3: 17}
+
+
+def test_region_failure_cooldown_requires_time_and_new_map_evidence():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer._planning_context = None
+    explorer.map_update_count = 10
+    explorer.map_content_revision = 30
+    explorer.region_failure_cooldown_updates = 5
+    explorer.region_failure_cooldowns = {}
+    explorer.get_logger = lambda: SimpleNamespace(
+        warning=lambda *args, **kwargs: None)
+
+    explorer.add_region_failure_cooldown(7, "LOCAL_REPAIR_EXHAUSTED")
+    assert explorer.is_region_on_failure_cooldown(7)
+
+    explorer.map_update_count = 15
+    assert explorer.is_region_on_failure_cooldown(7)
+
+    explorer.map_content_revision = 31
+    assert not explorer.is_region_on_failure_cooldown(7)
+
+
+def test_directional_commitment_rejects_spatial_backtracking():
+    assert MODULE.directional_route_allowed(
+        origin=(0.0, 0.0), forward=(1.0, 0.0), progress_floor=4.0,
+        route=((4.2, 0.0), (5.0, 1.0)), backtrack_tolerance=0.6)
+    assert not MODULE.directional_route_allowed(
+        origin=(0.0, 0.0), forward=(1.0, 0.0), progress_floor=4.0,
+        route=((4.2, 0.0), (3.0, 0.5), (5.0, 1.0)),
+        backtrack_tolerance=0.6)
+
+
+def test_directional_recovery_allows_only_bounded_retreat():
+    route = ((4.1, 0.0), (2.5, 0.3), (4.5, 2.0))
+    assert not MODULE.directional_route_allowed(
+        (0.0, 0.0), (1.0, 0.0), 4.0, route, 0.6)
+    assert MODULE.directional_route_allowed(
+        (0.0, 0.0), (1.0, 0.0), 4.0, route, 2.0)
+    assert not MODULE.directional_route_allowed(
+        (0.0, 0.0), (1.0, 0.0), 4.0,
+        ((4.1, 0.0), (1.5, 0.3), (4.5, 2.0)), 2.0)
 
 
 def test_region_information_efficiency_prefers_near_useful_frontier():

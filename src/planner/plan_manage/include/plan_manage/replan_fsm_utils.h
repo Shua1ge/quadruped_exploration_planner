@@ -114,9 +114,243 @@ inline bool shouldResumePendingEmergencyPath(bool path_pending, bool have_target
   return path_pending && have_target;
 }
 
-inline bool newPlanMayReleaseSafetyStop(bool pose_occupied_latched)
+inline bool safetyLatchAllowsPlanning(
+    bool replacement_planning_pending,
+    bool emergency_path_pending,
+    bool stopped_local_repair_active)
 {
-  return !pose_occupied_latched;
+  return replacement_planning_pending || emergency_path_pending ||
+         stopped_local_repair_active;
+}
+
+inline bool shouldStartStoppedLocalRepair(
+    bool repair_pending, bool have_target, double planar_speed,
+    bool pose_occupied_latched, bool temporal_safety_latched)
+{
+  return repair_pending && have_target && std::isfinite(planar_speed) &&
+         planar_speed <= 0.05 && !pose_occupied_latched &&
+         !temporal_safety_latched;
+}
+
+inline bool newPlanMayReleaseSafetyStop(
+    bool pose_occupied_latched,
+    bool predictive_hold_latched = false,
+    bool temporal_safety_latched = false)
+{
+  return !pose_occupied_latched && !predictive_hold_latched &&
+         !temporal_safety_latched;
+}
+
+inline bool clearanceViolationAllowedDuringEscape(
+    bool started_inside_clearance, bool already_exited_clearance,
+    bool physical_collision, double trajectory_time, double escape_deadline,
+    size_t current_violations, size_t initial_violations)
+{
+  return started_inside_clearance && !already_exited_clearance &&
+         !physical_collision && std::isfinite(trajectory_time) &&
+         std::isfinite(escape_deadline) && trajectory_time >= 0.0 &&
+         trajectory_time <= escape_deadline &&
+         current_violations <= initial_violations;
+}
+
+inline std::vector<Eigen::Vector2d> structuredLocalRepairDirections(
+    const Eigen::Vector2d &forward)
+{
+  Eigen::Vector2d unit_forward = forward;
+  if (!unit_forward.allFinite() || unit_forward.norm() < 1e-6)
+    unit_forward = Eigen::Vector2d::UnitX();
+  else
+    unit_forward.normalize();
+
+  const Eigen::Vector2d left(-unit_forward.y(), unit_forward.x());
+  const auto normalized = [](const Eigen::Vector2d &direction) {
+    return direction.normalized();
+  };
+  return {
+      normalized(unit_forward + left),
+      normalized(unit_forward - left),
+      left,
+      -left,
+      normalized(-0.35 * unit_forward + left),
+      normalized(-0.35 * unit_forward - left),
+      -unit_forward};
+}
+
+inline bool recoveryClearanceEvidenceIsNonWorsening(
+    const std::vector<size_t> &violation_counts)
+{
+  if (violation_counts.empty())
+    return false;
+  for (size_t i = 1; i < violation_counts.size(); ++i)
+  {
+    if (violation_counts[i] > violation_counts[i - 1])
+      return false;
+  }
+  return violation_counts.back() == 0;
+}
+
+inline double brakingSweepHorizon(
+    double speed, double maximum_deceleration, double reaction_time,
+    double maximum_horizon)
+{
+  if (!std::isfinite(speed) || !std::isfinite(maximum_deceleration) ||
+      !std::isfinite(reaction_time) || !std::isfinite(maximum_horizon) ||
+      maximum_deceleration <= 0.0 || maximum_horizon < 0.0)
+    return 0.0;
+  return std::min(maximum_horizon,
+                  std::max(0.0, reaction_time) +
+                      std::max(0.0, speed) / maximum_deceleration);
+}
+
+inline double brakingSweepDistance(
+    double speed, double maximum_deceleration, double reaction_time,
+    double time)
+{
+  if (!std::isfinite(speed) || !std::isfinite(maximum_deceleration) ||
+      !std::isfinite(reaction_time) || !std::isfinite(time) ||
+      maximum_deceleration <= 0.0)
+    return 0.0;
+  const double v = std::max(0.0, speed);
+  const double reaction = std::max(0.0, reaction_time);
+  const double t = std::max(0.0, time);
+  if (t <= reaction)
+    return v * t;
+  const double braking_time = std::min(t - reaction, v / maximum_deceleration);
+  return v * reaction + v * braking_time -
+         0.5 * maximum_deceleration * braking_time * braking_time;
+}
+
+inline double exponentialFilterAlpha(double dt, double time_constant)
+{
+  if (!std::isfinite(dt) || !std::isfinite(time_constant) || dt <= 0.0)
+    return 0.0;
+  if (time_constant <= 0.0)
+    return 1.0;
+  return 1.0 - std::exp(-dt / time_constant);
+}
+
+inline Eigen::Vector3d rotateBodyVelocityToWorld(
+    const Eigen::Quaterniond &world_from_body,
+    const Eigen::Vector3d &body_velocity)
+{
+  if (!world_from_body.coeffs().allFinite() ||
+      !body_velocity.allFinite() || world_from_body.norm() < 1e-9)
+    return Eigen::Vector3d::Zero();
+  return world_from_body.normalized() * body_velocity;
+}
+
+inline double unwrapPlanarYaw(
+    double previous_unwrapped_yaw, double previous_raw_yaw,
+    double current_raw_yaw)
+{
+  if (!std::isfinite(previous_unwrapped_yaw) ||
+      !std::isfinite(previous_raw_yaw) || !std::isfinite(current_raw_yaw))
+    return 0.0;
+  return previous_unwrapped_yaw +
+         std::atan2(std::sin(current_raw_yaw - previous_raw_yaw),
+                    std::cos(current_raw_yaw - previous_raw_yaw));
+}
+
+inline bool estimatePlanarMotionFromPoseHistory(
+    const std::vector<double> &times,
+    const std::vector<Eigen::Vector2d> &positions,
+    const std::vector<double> &unwrapped_yaws,
+    Eigen::Vector2d *world_velocity, double *yaw_rate)
+{
+  if (!world_velocity || !yaw_rate || times.size() < 3 ||
+      positions.size() != times.size() ||
+      unwrapped_yaws.size() != times.size())
+    return false;
+
+  const double time_origin = times.back();
+  double mean_t = 0.0;
+  Eigen::Vector2d mean_position = Eigen::Vector2d::Zero();
+  double mean_yaw = 0.0;
+  for (size_t i = 0; i < times.size(); ++i)
+  {
+    if (!std::isfinite(times[i]) || !positions[i].allFinite() ||
+        !std::isfinite(unwrapped_yaws[i]))
+      return false;
+    mean_t += times[i] - time_origin;
+    mean_position += positions[i];
+    mean_yaw += unwrapped_yaws[i];
+  }
+  const double count = static_cast<double>(times.size());
+  mean_t /= count;
+  mean_position /= count;
+  mean_yaw /= count;
+
+  double denominator = 0.0;
+  Eigen::Vector2d position_numerator = Eigen::Vector2d::Zero();
+  double yaw_numerator = 0.0;
+  for (size_t i = 0; i < times.size(); ++i)
+  {
+    const double centered_time = (times[i] - time_origin) - mean_t;
+    denominator += centered_time * centered_time;
+    position_numerator +=
+        centered_time * (positions[i] - mean_position);
+    yaw_numerator += centered_time * (unwrapped_yaws[i] - mean_yaw);
+  }
+  if (denominator < 1e-8 || times.back() - times.front() < 0.05)
+    return false;
+
+  *world_velocity = position_numerator / denominator;
+  *yaw_rate = yaw_numerator / denominator;
+  return world_velocity->allFinite() && std::isfinite(*yaw_rate);
+}
+
+inline double brakingSpeedAtTime(
+    double initial_speed, double guaranteed_deceleration,
+    double reaction_time, double time)
+{
+  if (!std::isfinite(initial_speed) ||
+      !std::isfinite(guaranteed_deceleration) ||
+      !std::isfinite(reaction_time) || !std::isfinite(time) ||
+      guaranteed_deceleration <= 0.0)
+    return 0.0;
+  const double speed = std::max(0.0, initial_speed);
+  const double braking_time = std::max(
+      0.0, std::max(0.0, time) - std::max(0.0, reaction_time));
+  return std::max(0.0, speed - guaranteed_deceleration * braking_time);
+}
+
+struct PlanarBrakingState
+{
+  Eigen::Vector2d position{Eigen::Vector2d::Zero()};
+  double yaw{0.0};
+};
+
+inline void advancePlanarBrakingState(
+    PlanarBrakingState *state, double initial_speed,
+    double initial_travel_heading, double initial_yaw,
+    double initial_yaw_rate, double guaranteed_deceleration,
+    double reaction_time, double elapsed_time, double dt)
+{
+  if (!state || !std::isfinite(dt) || dt <= 0.0 ||
+      !std::isfinite(initial_travel_heading) ||
+      !std::isfinite(initial_yaw) || !std::isfinite(initial_yaw_rate))
+    return;
+
+  const double start_speed = brakingSpeedAtTime(
+      initial_speed, guaranteed_deceleration, reaction_time, elapsed_time);
+  const double end_speed = brakingSpeedAtTime(
+      initial_speed, guaranteed_deceleration, reaction_time,
+      elapsed_time + dt);
+  const double average_speed = 0.5 * (start_speed + end_speed);
+  const double speed_ratio = initial_speed > 1e-6
+      ? std::clamp(average_speed / initial_speed, 0.0, 1.0)
+      : 0.0;
+  const double average_yaw_rate = initial_yaw_rate * speed_ratio;
+  const double midpoint_yaw = state->yaw + 0.5 * average_yaw_rate * dt;
+  const double slip_angle = std::atan2(
+      std::sin(initial_travel_heading - initial_yaw),
+      std::cos(initial_travel_heading - initial_yaw));
+  const double travel_heading = midpoint_yaw + slip_angle;
+  state->position += average_speed * dt * Eigen::Vector2d(
+      std::cos(travel_heading), std::sin(travel_heading));
+  state->yaw = std::atan2(
+      std::sin(state->yaw + average_yaw_rate * dt),
+      std::cos(state->yaw + average_yaw_rate * dt));
 }
 
 inline bool shouldKeepExecutingAfterRollingReplanFailure(

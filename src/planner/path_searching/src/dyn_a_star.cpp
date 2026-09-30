@@ -124,10 +124,23 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
     occ = checkOccupancy(Index2Coord(end_idx), path_yaw);
     if (occ)
     {
-        //ROS_WARN("End point is insdide an obstacle.");
+        // The end of a collision segment may land inside the inflated layer.
+        // Moving farther along start_to_end pushes it deeper behind the
+        // obstacle and eventually outside the fixed A* pool.  Recover toward
+        // the known-free side of the segment instead, and never walk past the
+        // start point while searching for a usable endpoint.
+        const double start_end_distance = (end_pt - start_pt).norm();
+        double retreat_distance = 0.0;
         do
         {
-            end_pt += start_to_end * step_size_;
+            end_pt -= start_to_end * step_size_;
+            retreat_distance += step_size_;
+            if (retreat_distance > start_end_distance)
+            {
+                RCLCPP_WARN(rclcpp::get_logger("path_searching"),
+                            "[Astar] No free endpoint before the start point.");
+                return false;
+            }
             if (!Coord2Index(end_pt, end_idx))
                 return false;
 
@@ -138,6 +151,8 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
                 return false;
             }
         } while (occ);
+        RCLCPP_INFO(rclcpp::get_logger("path_searching"),
+                    "[ASTAR_ENDPOINT_RECOVERED] retreated=%.2fm", retreat_distance);
     }
 
     return true;

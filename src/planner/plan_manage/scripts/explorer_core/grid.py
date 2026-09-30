@@ -129,6 +129,56 @@ def dilate_hit_ranges(ranges: Sequence[float], bins: int) -> np.ndarray:
     return result
 
 
+def classify_planar_ranges(
+        dx: np.ndarray, dy: np.ndarray, point_z: np.ndarray,
+        min_z: float, max_z: float, min_range: float, max_range: float,
+        ray_count: int, dilation_bins: int) -> np.ndarray:
+    """Build three-state planar rays from finite 3-D returns.
+
+    Finite values are accepted obstacle hits, ``inf`` means a genuine empty
+    bearing that may clear conservative near-field free space, and ``nan``
+    means a real return was observed but rejected by the height projection.
+    Rejected returns are deliberately non-clearing: on a pitched robot they
+    are commonly the wall base or terrain, not evidence of free space.
+    """
+    dx = np.asarray(dx, dtype=np.float64)
+    dy = np.asarray(dy, dtype=np.float64)
+    point_z = np.asarray(point_z, dtype=np.float64)
+    if dx.shape != dy.shape or dx.shape != point_z.shape:
+        raise ValueError("dx, dy and point_z must have matching shapes")
+    if ray_count <= 0:
+        raise ValueError("ray_count must be positive")
+
+    distances = np.hypot(dx, dy)
+    finite_return = (np.isfinite(dx) & np.isfinite(dy)
+                     & np.isfinite(point_z) & np.isfinite(distances))
+    projectable = (finite_return & (distances >= min_range)
+                   & (distances < max_range))
+    angles = np.arctan2(dy[projectable], dx[projectable])
+    bins = np.floor(
+        (angles + math.pi) * ray_count / (2.0 * math.pi)).astype(int)
+    bins = np.clip(bins, 0, ray_count - 1)
+
+    return_seen = np.zeros(ray_count, dtype=bool)
+    return_seen[bins] = True
+    accepted = projectable & (point_z >= min_z) & (point_z <= max_z)
+    accepted_angles = np.arctan2(dy[accepted], dx[accepted])
+    accepted_bins = np.floor(
+        (accepted_angles + math.pi) * ray_count / (2.0 * math.pi)).astype(int)
+    accepted_bins = np.clip(accepted_bins, 0, ray_count - 1)
+    nearest = np.full(ray_count, np.inf, dtype=np.float64)
+    if accepted_bins.size:
+        np.minimum.at(nearest, accepted_bins, distances[accepted])
+    nearest = dilate_hit_ranges(nearest, dilation_bins)
+
+    # Conservative dilation may turn a filtered bearing into a neighbouring
+    # valid hit.  A finite obstacle hit wins; only remaining filtered bearings
+    # become non-clearing NaNs.
+    filtered_return = return_seen & ~np.isfinite(nearest)
+    nearest[filtered_return] = np.nan
+    return nearest
+
+
 def bresenham(start: Cell, end: Cell) -> List[Cell]:
     x0, y0 = start
     x1, y1 = end
@@ -167,7 +217,32 @@ class ExplorationGrid:
         self.evidence = np.zeros((self.height, self.width), dtype=np.int16)
         self.occupied_threshold = 1
         self.free_threshold = -1
+        # An occupied cell remains inflated until three consecutive valid free
+        # observations overcome its first hit.  Ignored/height-filtered rays
+        # never contribute negative evidence.
+        self.occupied_clear_threshold = -2
         self.evidence_limit = 32
+
+    def snapshot(self) -> "ExplorationGrid":
+        """Return an independent map image for a planning cycle.
+
+        Planning may take hundreds of milliseconds.  Copy the two dense arrays
+        once so sensor callbacks can continue updating the live grid without
+        changing the occupancy revision underneath A* and frontier scoring.
+        """
+        result = ExplorationGrid(
+            self.width * self.resolution,
+            self.height * self.resolution,
+            self.resolution,
+            self.origin_x,
+            self.origin_y)
+        result.data = self.data.copy()
+        result.evidence = self.evidence.copy()
+        result.occupied_threshold = self.occupied_threshold
+        result.free_threshold = self.free_threshold
+        result.occupied_clear_threshold = self.occupied_clear_threshold
+        result.evidence_limit = self.evidence_limit
+        return result
 
     def in_bounds(self, cell: Cell) -> bool:
         return 0 <= cell[0] < self.width and 0 <= cell[1] < self.height
@@ -190,6 +265,9 @@ class ExplorationGrid:
         for x, y in free_cells - occupied_cells:
             evidence = int(self.evidence[y, x]) - 1
             self.evidence[y, x] = max(-self.evidence_limit, evidence)
+            if (self.data[y, x] == OCCUPIED
+                    and self.evidence[y, x] > self.occupied_clear_threshold):
+                continue
             if self.evidence[y, x] <= self.free_threshold:
                 self.data[y, x] = FREE
             elif self.evidence[y, x] < self.occupied_threshold:
@@ -210,6 +288,11 @@ class ExplorationGrid:
         occupied_cells: Set[Cell] = set()
         ray_count = len(ranges)
         for index, measured_range in enumerate(ranges):
+            # NaN is an observed but deliberately ignored 3-D return.  It is
+            # neither an obstacle hit in the 2-D projection nor free-space
+            # evidence.  Infinity alone represents a genuine no-return ray.
+            if math.isnan(measured_range):
+                continue
             hit = math.isfinite(measured_range) and measured_range < max_range
             miss_range = (max_range if no_return_range is None
                           else min(max_range, no_return_range))
@@ -227,7 +310,18 @@ class ExplorationGrid:
                 free_cells.update(line[:-1])
                 occupied_cells.add(line[-1])
             else:
-                free_cells.update(line)
+                # A missing return is free-space evidence only up to the first
+                # wall already present when this scan began.  Let it weaken
+                # that cell by one evidence step, but do not clear cells behind
+                # the wall in the same observation.  Once repeated valid rays
+                # have actually revoked the wall, a later scan may continue
+                # into the newly visible space.
+                first_occluder = next((offset for offset, cell in enumerate(line)
+                                       if self.value(cell) == OCCUPIED), None)
+                if first_occluder is None:
+                    free_cells.update(line)
+                else:
+                    free_cells.update(line[:first_occluder + 1])
 
         self._apply_evidence(free_cells, occupied_cells)
 

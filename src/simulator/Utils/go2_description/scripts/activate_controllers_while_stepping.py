@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 
 import rclpy
-from controller_manager_msgs.srv import SwitchController
+from controller_manager_msgs.srv import ListControllers, SwitchController
 
 
 def _world_name(world_file: str) -> str:
@@ -34,6 +34,47 @@ def _step_world(world_name: str, steps: int) -> bool:
         text=True,
     )
     return result.returncode == 0 and "data: true" in result.stdout.lower()
+
+
+def _all_controllers_active(response, controller_names) -> bool:
+    """Return whether every requested controller is reported active."""
+    if response is None:
+        return False
+    states = {
+        controller.name: controller.state
+        for controller in response.controller
+    }
+    return all(states.get(name) == "active" for name in controller_names)
+
+
+def _confirm_controllers_active(node, controller_names,
+                                timeout_sec: float = 2.0) -> bool:
+    """Resolve a late switch response from controller_manager's real state.
+
+    A switch can be applied in the final stepped update while its service
+    response is still in flight.  Treating that response delay as an activation
+    failure leaves Gazebo paused even though all requested controllers are
+    already active.
+    """
+    client = node.create_client(
+        ListControllers, "/controller_manager/list_controllers")
+    if not client.wait_for_service(timeout_sec=timeout_sec):
+        node.get_logger().warning(
+            "controller state verification service did not become available")
+        return False
+
+    future = client.call_async(ListControllers.Request())
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+    if not future.done():
+        node.get_logger().warning("controller state verification timed out")
+        return False
+    try:
+        response = future.result()
+    except Exception as error:  # service transport errors are reported as failure
+        node.get_logger().warning(
+            f"controller state verification failed: {error}")
+        return False
+    return _all_controllers_active(response, controller_names)
 
 
 def main() -> int:
@@ -76,22 +117,42 @@ def main() -> int:
         # it applies the switch and completes the service response.
         future = client.call_async(request)
         deadline = time.monotonic() + args.switch_timeout + 2.0
+        activation_confirmed = False
         while rclpy.ok() and not future.done():
             rclpy.spin_once(node, timeout_sec=0.05)
             if future.done():
                 break
             if time.monotonic() >= deadline:
-                node.get_logger().error("controller activation timed out")
+                # One final executor drain catches a response queued by the
+                # last stepped controller-manager update.  If it is still late,
+                # query the authoritative controller states before declaring a
+                # failure.  This avoids a false-negative exit that prevents the
+                # launch event handler from resuming Gazebo.
+                rclpy.spin_once(node, timeout_sec=0.25)
+                if future.done():
+                    break
+                activation_confirmed = _confirm_controllers_active(
+                    node, args.controller)
+                if activation_confirmed:
+                    node.get_logger().warning(
+                        "switch response missed its deadline, but all requested "
+                        "controllers are active; accepting activation")
+                    break
+                node.get_logger().error(
+                    "controller activation timed out and requested controllers "
+                    "are not all active")
                 return 1
             if not _step_world(world_name, args.step_batch):
                 node.get_logger().error(
                     f"failed to advance paused Gazebo world '{world_name}'")
                 return 1
 
-        response = future.result()
-        if response is None or not response.ok:
-            node.get_logger().error("controller manager rejected controller activation")
-            return 1
+        if not activation_confirmed:
+            response = future.result()
+            if response is None or not response.ok:
+                node.get_logger().error(
+                    "controller manager rejected controller activation")
+                return 1
         node.get_logger().info(
             "controllers activated while Gazebo remained paused")
         return 0

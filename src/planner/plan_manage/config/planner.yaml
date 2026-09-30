@@ -21,6 +21,43 @@ scan_planner_node:
     fsm.tracking_recovery_max_error: 0.30
     fsm.tracking_match_back_time: 0.40
     fsm.tracking_match_forward_time: 0.80
+    # The physical capsule remains radius=0.35 m with +/-0.18 m body centres.
+    # This is an additional hard planning belt checked only against immutable
+    # local-map snapshots; it is not baked into the map and does not enlarge
+    # Explorer's global obstacles.
+    fsm.planning_clearance_margin: 0.10
+    # Only after ordinary rolling repair fails, try short local anchors that
+    # move away from the hard planning belt before rejoining the unchanged
+    # Explorer reference path. These bounds keep recovery local and cheap.
+    fsm.local_repair_anchor_min_distance: 0.45
+    fsm.local_repair_anchor_max_distance: 0.90
+    fsm.local_repair_anchor_step: 0.15
+    fsm.local_repair_max_backtrack: 0.60
+    fsm.local_repair_max_candidates: 6
+    # Runtime safety predicts the actual odometry velocity through reaction
+    # and braking, sampling a short swept capsule instead of assuming that the
+    # robot remains exactly on the theoretical B-spline.
+    fsm.braking_sweep_spatial_step: 0.05
+    # 4 s covers a full stop from the observed ~0.85 m/s even with the
+    # conservative 0.32 m/s^2 guaranteed deceleration below.
+    fsm.braking_sweep_max_horizon: 4.0
+    # Stale perception or a severely delayed safety callback must HOLD, not
+    # merely print a warning. Recovery requires consecutive fresh callbacks.
+    fsm.safety_map_stale_warn_age: 0.25
+    fsm.safety_map_stale_hold_age: 0.50
+    fsm.safety_callback_hold_gap: 0.30
+    fsm.local_hold_release_cycles: 3
+    # Gazebo quadruped odometry oscillates within every gait cycle. Use a
+    # short world-frame pose history plus low-pass estimates instead of one
+    # raw body-frame twist sample.
+    fsm.odom_velocity_filter_tau: 0.20
+    fsm.motion_estimation_window: 0.35
+    fsm.yaw_rate_filter_tau: 0.15
+    # Trajectory acceleration is not a guaranteed RL-policy stopping rate.
+    # Keep the safety contract independent and conservative; normal operation
+    # still requests a rolling local repair before this final HOLD envelope.
+    fsm.guaranteed_braking_deceleration: 0.32
+    fsm.command_stop_latency: 0.30
     # A new Explorer path cannot clear a physical pose-occupied latch.  Require
     # consecutive free Local-map observations before planning resumes.
     fsm.pose_free_release_cycles: 3

@@ -53,6 +53,120 @@ TEST(SafetyRelease, NewPlanNeverClearsPhysicalPoseOccupancy)
 {
   EXPECT_TRUE(newPlanMayReleaseSafetyStop(false));
   EXPECT_FALSE(newPlanMayReleaseSafetyStop(true));
+  EXPECT_FALSE(newPlanMayReleaseSafetyStop(false, true, false));
+  EXPECT_FALSE(newPlanMayReleaseSafetyStop(false, false, true));
+}
+
+TEST(ClearanceEscape, AllowsOnlyNonWorseningNonPhysicalPrefix)
+{
+  EXPECT_TRUE(clearanceViolationAllowedDuringEscape(
+      true, false, false, 0.20, 0.75, 3, 3));
+  EXPECT_FALSE(clearanceViolationAllowedDuringEscape(
+      true, false, true, 0.20, 0.75, 3, 3));
+  EXPECT_FALSE(clearanceViolationAllowedDuringEscape(
+      true, false, false, 0.20, 0.75, 4, 3));
+  EXPECT_FALSE(clearanceViolationAllowedDuringEscape(
+      true, true, false, 0.20, 0.75, 1, 3));
+  EXPECT_FALSE(clearanceViolationAllowedDuringEscape(
+      true, false, false, 0.76, 0.75, 1, 3));
+  EXPECT_FALSE(clearanceViolationAllowedDuringEscape(
+      false, false, false, 0.20, 0.75, 0, 0));
+}
+
+TEST(StructuredLocalRepair, GeneratesDistinctSideAndBoundedBacktrackDirections)
+{
+  const auto directions = structuredLocalRepairDirections(
+      Eigen::Vector2d::UnitX());
+  ASSERT_EQ(directions.size(), 7U);
+  EXPECT_GT(directions[0].x(), 0.0);
+  EXPECT_GT(directions[0].y(), 0.0);
+  EXPECT_GT(directions[1].x(), 0.0);
+  EXPECT_LT(directions[1].y(), 0.0);
+  EXPECT_NEAR(directions[2].dot(Eigen::Vector2d::UnitX()), 0.0, 1e-9);
+  EXPECT_NEAR(directions[3].dot(Eigen::Vector2d::UnitX()), 0.0, 1e-9);
+  EXPECT_LT(directions[4].x(), 0.0);
+  EXPECT_GT(directions[4].y(), 0.0);
+  EXPECT_LT(directions[5].x(), 0.0);
+  EXPECT_LT(directions[5].y(), 0.0);
+  EXPECT_NEAR(directions[6].x(), -1.0, 1e-9);
+}
+
+TEST(StructuredLocalRepair, RequiresMonotonicClearanceImprovementToFree)
+{
+  EXPECT_TRUE(recoveryClearanceEvidenceIsNonWorsening({3, 3, 2, 1, 0}));
+  EXPECT_TRUE(recoveryClearanceEvidenceIsNonWorsening({0, 0, 0}));
+  EXPECT_FALSE(recoveryClearanceEvidenceIsNonWorsening({3, 2, 3, 0}));
+  EXPECT_FALSE(recoveryClearanceEvidenceIsNonWorsening({2, 1, 1}));
+  EXPECT_FALSE(recoveryClearanceEvidenceIsNonWorsening({}));
+}
+
+TEST(PredictiveBrakingSweep, IncludesReactionAndBrakingButCapsTheHorizon)
+{
+  EXPECT_NEAR(brakingSweepHorizon(0.75, 0.5, 0.25, 2.0), 1.75, 1e-9);
+  EXPECT_NEAR(brakingSweepDistance(0.75, 0.5, 0.25, 0.25), 0.1875, 1e-9);
+  EXPECT_NEAR(brakingSweepDistance(0.75, 0.5, 0.25, 1.75), 0.75, 1e-9);
+  EXPECT_NEAR(brakingSweepHorizon(2.0, 0.5, 0.25, 2.0), 2.0, 1e-9);
+  EXPECT_NEAR(brakingSweepHorizon(0.85, 0.32, 0.30, 4.0),
+              0.30 + 0.85 / 0.32, 1e-9);
+}
+
+TEST(PredictiveBrakingSweep, FiltersGaitCycleVelocityWithoutAddingAQueue)
+{
+  EXPECT_NEAR(exponentialFilterAlpha(0.02, 0.20),
+              1.0 - std::exp(-0.1), 1e-9);
+  EXPECT_NEAR(exponentialFilterAlpha(0.02, 0.0), 1.0, 1e-9);
+  EXPECT_NEAR(exponentialFilterAlpha(0.0, 0.20), 0.0, 1e-9);
+}
+
+TEST(PredictiveBrakingSweep, ConvertsChildFrameTwistToWorldBeforeFiltering)
+{
+  const Eigen::Quaterniond world_from_body(
+      Eigen::AngleAxisd(M_PI_2, Eigen::Vector3d::UnitZ()));
+  const Eigen::Vector3d world_velocity = rotateBodyVelocityToWorld(
+      world_from_body, Eigen::Vector3d(0.8, 0.0, 0.0));
+  EXPECT_NEAR(world_velocity.x(), 0.0, 1e-9);
+  EXPECT_NEAR(world_velocity.y(), 0.8, 1e-9);
+}
+
+TEST(PredictiveBrakingSweep, EstimatesWorldVelocityAndUnwrappedYawRate)
+{
+  const std::vector<double> times{10.0, 10.1, 10.2, 10.3};
+  const std::vector<Eigen::Vector2d> positions{
+      {1.0, 2.0}, {1.075, 2.04}, {1.15, 2.08}, {1.225, 2.12}};
+  const double yaw0 = 3.10;
+  const double yaw1 = unwrapPlanarYaw(yaw0, 3.10, -3.13);
+  const double yaw2 = unwrapPlanarYaw(yaw1, -3.13, -3.08);
+  const double yaw3 = unwrapPlanarYaw(yaw2, -3.08, -3.03);
+  Eigen::Vector2d velocity;
+  double yaw_rate = 0.0;
+  ASSERT_TRUE(estimatePlanarMotionFromPoseHistory(
+      times, positions, {yaw0, yaw1, yaw2, yaw3}, &velocity, &yaw_rate));
+  EXPECT_NEAR(velocity.x(), 0.75, 1e-9);
+  EXPECT_NEAR(velocity.y(), 0.40, 1e-9);
+  EXPECT_NEAR(yaw_rate, 0.5, 0.08);
+}
+
+TEST(PredictiveBrakingSweep, TurningMotionProducesAnArcNotAWorldXAxisLine)
+{
+  PlanarBrakingState state;
+  state.position = Eigen::Vector2d::Zero();
+  state.yaw = 0.0;
+  const double speed = 0.8;
+  const double deceleration = 0.4;
+  const double reaction = 0.2;
+  const double horizon = brakingSweepHorizon(speed, deceleration, reaction, 3.0);
+  double elapsed = 0.0;
+  while (elapsed < horizon - 1e-9)
+  {
+    const double dt = std::min(0.02, horizon - elapsed);
+    advancePlanarBrakingState(
+        &state, speed, 0.0, 0.0, 0.5, deceleration, reaction,
+        elapsed, dt);
+    elapsed += dt;
+  }
+  EXPECT_GT(state.position.x(), 0.7);
+  EXPECT_GT(state.position.y(), 0.15);
+  EXPECT_GT(state.yaw, 0.25);
 }
 
 TEST(RollingReplanFailure, KeepsSafeRemainderUntilEmergencyWindow)
@@ -147,6 +261,28 @@ TEST(RollingTrajectoryReuse, UsesValidatedSuffixBeforeFreshPlanning)
       false, true, 0.0, 0.05, 0.30));
   EXPECT_FALSE(shouldReuseCurrentTrajectorySuffix(
       false, true, 2.0, 0.31, 0.30));
+}
+
+TEST(StoppedLocalRepair, SafetyLatchAllowsOnlyExplicitPlanningOwners)
+{
+  EXPECT_FALSE(safetyLatchAllowsPlanning(false, false, false));
+  EXPECT_TRUE(safetyLatchAllowsPlanning(true, false, false));
+  EXPECT_TRUE(safetyLatchAllowsPlanning(false, true, false));
+  EXPECT_TRUE(safetyLatchAllowsPlanning(false, false, true));
+}
+
+TEST(StoppedLocalRepair, StartsOnlyAfterAFreeStationaryPose)
+{
+  EXPECT_TRUE(shouldStartStoppedLocalRepair(
+      true, true, 0.05, false, false));
+  EXPECT_FALSE(shouldStartStoppedLocalRepair(
+      true, true, 0.051, false, false));
+  EXPECT_FALSE(shouldStartStoppedLocalRepair(
+      true, true, 0.0, true, false));
+  EXPECT_FALSE(shouldStartStoppedLocalRepair(
+      true, true, 0.0, false, true));
+  EXPECT_FALSE(shouldStartStoppedLocalRepair(
+      true, false, 0.0, false, false));
 }
 
 TEST(RollingTrajectoryReuse, RejectsDegenerateSampledSuffix)

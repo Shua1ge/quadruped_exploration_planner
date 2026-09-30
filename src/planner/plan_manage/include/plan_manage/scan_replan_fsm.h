@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <mutex>
@@ -74,7 +75,24 @@ namespace scan_planner
     double tracking_recovery_max_error_{0.30};
     double tracking_match_back_time_{0.40};
     double tracking_match_forward_time_{0.80};
+    double planning_clearance_margin_{0.10};
+    double local_repair_anchor_min_distance_{0.45};
+    double local_repair_anchor_max_distance_{0.90};
+    double local_repair_anchor_step_{0.15};
+    double local_repair_max_backtrack_{0.60};
+    int local_repair_max_candidates_{6};
+    double braking_sweep_spatial_step_{0.05};
+    double braking_sweep_max_horizon_{4.0};
+    double safety_map_stale_warn_age_{0.25};
+    double safety_map_stale_hold_age_{0.50};
+    double safety_callback_hold_gap_{0.30};
+    double odom_velocity_filter_tau_{0.20};
+    double motion_estimation_window_{0.35};
+    double yaw_rate_filter_tau_{0.15};
+    double guaranteed_braking_deceleration_{0.32};
+    double command_stop_latency_{0.30};
     int pose_free_release_cycles_{3};
+    int local_hold_release_cycles_{3};
     double goal_tolerance_;
     int heading_freeze_max_recoveries_{2};
     double rviz_goal_height_;
@@ -120,6 +138,8 @@ namespace scan_planner
     bool flag_escape_emergency_;
     bool emergency_path_pending_{false};
     bool tracking_recovery_active_{false};
+    std::atomic<bool> stopped_local_repair_pending_{false};
+    std::atomic<bool> stopped_local_repair_active_{false};
     bool heading_stall_handled_{false};
     int heading_freeze_recoveries_{0};
     bool collision_segment_pending_{false};
@@ -133,6 +153,9 @@ namespace scan_planner
       double duration{0.0};
       uint64_t request_id{0};
       int64_t trajectory_id{0};
+      bool clearance_escape_active{false};
+      double clearance_escape_deadline{0.0};
+      size_t initial_clearance_violations{0};
       bool valid{false};
     };
     std::mutex execution_snapshot_mutex_;
@@ -144,12 +167,29 @@ namespace scan_planner
     std::string last_execution_command_reason_;
     std::mutex safety_odom_mutex_;
     Eigen::Vector3d safety_odom_pos_{Eigen::Vector3d::Zero()};
+    // All safety velocities are stored in the odom/world frame. Odometry
+    // twist arrives in child_frame_id and must never be used here directly.
     Eigen::Vector3d safety_odom_vel_{Eigen::Vector3d::Zero()};
     Eigen::Quaterniond safety_odom_orient_{Eigen::Quaterniond::Identity()};
+    double safety_yaw_rate_{0.0};
+    int64_t safety_odom_velocity_stamp_ns_{0};
     bool safety_have_odom_{false};
+    struct SafetyPoseSample
+    {
+      int64_t stamp_ns{0};
+      Eigen::Vector3d position_world{Eigen::Vector3d::Zero()};
+      double raw_yaw{0.0};
+      double unwrapped_yaw{0.0};
+    };
+    std::deque<SafetyPoseSample> safety_pose_history_;
+    std::vector<Eigen::Vector2d> planning_clearance_offsets_;
     std::atomic<bool> safety_stop_active_{false};
     std::atomic<bool> pose_occupied_latched_{false};
     std::atomic<int> pose_free_confirmation_cycles_{0};
+    std::atomic<bool> predictive_hold_latched_{false};
+    std::atomic<int> predictive_hold_release_cycles_{0};
+    std::atomic<bool> temporal_safety_latched_{false};
+    std::atomic<int> temporal_safety_release_cycles_{0};
     std::atomic<uint64_t> safety_generation_{0};
     std::atomic<bool> predictive_replan_requested_{false};
     std::atomic<bool> terminal_repair_requested_{false};
@@ -189,9 +229,12 @@ namespace scan_planner
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
 
     /* helper functions */
-    bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
+    bool callReboundReplan(
+        bool flag_use_poly_init, bool flag_randomPolyTraj,
+        const Eigen::Vector3d *local_target_override = nullptr); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
+    bool tryStructuredLocalRepair();
     void setStartStateFromOdomOrCurrentTraj();
     void refreshPlanningOdomFromSafety();
     void alignStartStateToReferencePath();
@@ -213,12 +256,16 @@ namespace scan_planner
     double getOdomYaw() const;
     double estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
     void updateLocalTrajTimeFreeze();
-    void requestExecutionStop(const std::string &reason);
+    void requestExecutionStop(const std::string &reason,
+                              bool publish_reference_status = true);
     void publishStatus(const std::string &status);
     void publishReferenceStatus(const std::string &status, uint64_t request_id = 0);
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
-                                           uint64_t request_id);
+                                           uint64_t request_id,
+                                           bool clearance_escape_active = false,
+                                           double clearance_escape_deadline = 0.0,
+                                           size_t initial_clearance_violations = 0);
     void setLocalRecoveryState(LocalRecoveryState state,
                                double tracking_error,
                                const char *reason);
@@ -227,6 +274,13 @@ namespace scan_planner
                             const Eigen::Vector3d *first_blocked = nullptr,
                             uint64_t request_id = 0,
                             int64_t trajectory_id = 0);
+    bool footprintOccupiedWithMargin(
+        const GridMap::Ptr &map, const Eigen::Vector3d &position,
+        double yaw, double margin,
+        Eigen::Vector3d *first_blocked = nullptr,
+        size_t *blocked_count = nullptr) const;
+    void latchLocalSafetyHold(const std::string &reason,
+                              std::atomic<bool> &source_latch);
 
     /* ROS functions */
     void execFSMCallback();
