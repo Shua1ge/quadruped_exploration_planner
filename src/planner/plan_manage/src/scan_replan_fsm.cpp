@@ -607,6 +607,11 @@ namespace scan_planner
     // later proves invalid.  Do not let recovery ownership or retry state from
     // the old request leak into the new request's terminal status.
     structured_local_repair_active_.store(false);
+    structured_local_repair_executing_.store(false);
+    structured_local_repair_finished_.store(false);
+    structured_local_repair_rejoin_pending_.store(false);
+    structured_local_repair_request_id_.store(0);
+    structured_local_repair_trajectory_id_.store(0);
     stopped_local_repair_pending_.store(false);
     stopped_local_repair_active_.store(false);
     last_wait_target_status_ns_.store(0);
@@ -933,6 +938,21 @@ namespace scan_planner
       terminal_repair_error_.store(msg->terminal_error);
       terminal_repair_requested_.store(true);
     }
+
+    if (structured_local_repair_executing_.load() &&
+        msg->request_id == structured_local_repair_request_id_.load() &&
+        msg->trajectory_id == structured_local_repair_trajectory_id_.load() &&
+        (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_FINISHED ||
+         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED))
+    {
+      structured_local_repair_finished_.store(true);
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_EXECUTION_TERMINAL] request_id=%llu trajectory=%lld state=%u terminal_error=%.3fm; retaining recovery ownership until reference rejoin",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id),
+          static_cast<unsigned int>(msg->state), msg->terminal_error);
+    }
   }
 
   void SCANReplanFSM::go2HeadingStalledCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
@@ -1015,11 +1035,12 @@ namespace scan_planner
     bool publish_command = true;
     {
       std::lock_guard<std::mutex> lock(execution_command_mutex_);
+      // HOLD is level-triggered at the controller.  Once a version is held,
+      // changing the diagnostic reason does not require another command.  A
+      // newer trajectory id naturally creates a new command owner.
       const bool duplicate =
           msg.request_id == last_execution_command_request_id_ &&
-          msg.trajectory_id == last_execution_command_trajectory_id_ &&
-          reason == last_execution_command_reason_ &&
-          now_ns - last_execution_command_time_ns_ < 500000000LL;
+          msg.trajectory_id == last_execution_command_trajectory_id_;
       if (duplicate)
         publish_command = false;
       else
@@ -1237,13 +1258,40 @@ namespace scan_planner
       return;
     }
 
+    // A published structured repair owns execution until feedback for that
+    // exact request/trajectory version says it is terminal.  Only then may the
+    // FSM try to rejoin the unchanged reference path.  Ordinary predictive
+    // rolling replans must not interrupt the short repair halfway through.
+    if (structured_local_repair_active_.load() &&
+        structured_local_repair_executing_.load() &&
+        structured_local_repair_finished_.exchange(false) &&
+        exec_state_ == EXEC_TRAJ && have_target_)
+    {
+      structured_local_repair_executing_.store(false);
+      structured_local_repair_rejoin_pending_.store(true);
+      predictive_replan_requested_.store(false);
+      terminal_repair_requested_.store(false);
+      next_rolling_replan_attempt_ns_ = 0;
+      refreshPlanningOdomFromSafety();
+      changeFSMExecState(REPLAN_TRAJ, "STRUCTURED_REPAIR_FINISHED");
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_REJOIN] request_id=%llu trajectory=%lld; repair finished, rejoining the unchanged reference path",
+          static_cast<unsigned long long>(
+              structured_local_repair_request_id_.load()),
+          static_cast<long long>(
+              structured_local_repair_trajectory_id_.load()));
+      return;
+    }
+
     // The controller has exhausted the active spline but the robot is still
     // outside its terminal tolerance.  This is a local execution failure, not
     // evidence that the Explorer's committed region or reference path is
     // invalid.  Regenerate a candidate from live odometry and keep the global
     // commitment intact.  The controller holds the last active trajectory at
     // zero command until that candidate passes the normal handoff checks.
-    if (terminal_repair_requested_.load() &&
+    if (!structured_local_repair_executing_.load() &&
+        terminal_repair_requested_.load() &&
         exec_state_ == EXEC_TRAJ && have_target_)
     {
       terminal_repair_requested_.store(false);
@@ -1267,7 +1315,8 @@ namespace scan_planner
     // request, not a terminal failure.  Replan from current odometry while the
     // validated prefix remains executable; the safety timer will escalate to
     // a hard HOLD if the obstacle enters the stopping horizon first.
-    if (predictive_replan_requested_.load() && exec_state_ == EXEC_TRAJ &&
+    if (!structured_local_repair_executing_.load() &&
+        predictive_replan_requested_.load() && exec_state_ == EXEC_TRAJ &&
         have_target_ &&
         (next_rolling_replan_attempt_ns_ == 0 ||
          node_->now().nanoseconds() >= next_rolling_replan_attempt_ns_))
@@ -1399,13 +1448,25 @@ namespace scan_planner
         success = tryStructuredLocalRepair();
       if (success)
       {
+        const bool structured_execution =
+            structured_local_repair_executing_.load();
         stopped_local_repair_pending_.store(false);
         stopped_local_repair_active_.store(false);
-        structured_local_repair_active_.store(false);
         predictive_replan_requested_.store(false);
-        setLocalRecoveryState(
-            LocalRecoveryState::TRACKING, 0.0,
-            "candidate_trajectory_validated");
+        if (structured_execution)
+        {
+          setLocalRecoveryState(
+              LocalRecoveryState::LOCAL_REPAIR, 0.0,
+              "structured_repair_executing");
+        }
+        else
+        {
+          structured_local_repair_active_.store(false);
+          structured_local_repair_rejoin_pending_.store(false);
+          setLocalRecoveryState(
+              LocalRecoveryState::TRACKING, 0.0,
+              "candidate_trajectory_validated");
+        }
         next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
@@ -1435,13 +1496,28 @@ namespace scan_planner
 
       if (planFromCurrentTraj())
       {
+        const bool structured_execution =
+            structured_local_repair_executing_.load();
         stopped_local_repair_pending_.store(false);
         stopped_local_repair_active_.store(false);
-        structured_local_repair_active_.store(false);
         predictive_replan_requested_.store(false);
-        setLocalRecoveryState(
-            LocalRecoveryState::TRACKING, 0.0,
-            "candidate_trajectory_validated");
+        if (structured_execution)
+        {
+          structured_local_repair_rejoin_pending_.store(false);
+          setLocalRecoveryState(
+              LocalRecoveryState::LOCAL_REPAIR, 0.0,
+              "structured_repair_executing");
+        }
+        else
+        {
+          structured_local_repair_active_.store(false);
+          structured_local_repair_rejoin_pending_.store(false);
+          structured_local_repair_request_id_.store(0);
+          structured_local_repair_trajectory_id_.store(0);
+          setLocalRecoveryState(
+              LocalRecoveryState::TRACKING, 0.0,
+              "structured_repair_rejoined");
+        }
         next_rolling_replan_attempt_ns_ = 0;
         replan_fail_count_ = 0;
         tracking_recovery_active_ = false;
@@ -1482,6 +1558,13 @@ namespace scan_planner
 
     case EXEC_TRAJ:
     {
+      if (structured_local_repair_executing_.load())
+      {
+        // The controller's versioned FINISHED/STALLED feedback above is the
+        // sole normal completion signal for this recovery segment.  Safety
+        // callbacks remain active and can still issue a hard stop.
+        predictive_replan_requested_.store(false);
+      }
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
       rclcpp::Time time_now = node_->now();
@@ -1497,6 +1580,14 @@ namespace scan_planner
         reference_path_active_ = false;
         requestExecutionStop("REACHED");
         changeFSMExecState(WAIT_TARGET, "GOAL_REACHED");
+        return;
+      }
+
+      if (structured_local_repair_executing_.load())
+      {
+        // The repair endpoint is a local anchor, not the global goal.  Keep
+        // executing this exact version until versioned controller feedback
+        // marks it terminal; the safety timer remains independently active.
         return;
       }
 
@@ -1655,6 +1746,11 @@ namespace scan_planner
       {
         const uint64_t failed_request = active_reference_request_id_.load();
         stopped_local_repair_pending_.store(false);
+        structured_local_repair_executing_.store(false);
+        structured_local_repair_finished_.store(false);
+        structured_local_repair_rejoin_pending_.store(false);
+        structured_local_repair_request_id_.store(0);
+        structured_local_repair_trajectory_id_.store(0);
         replan_fail_count_ = 0;
         next_rolling_replan_attempt_ns_ = 0;
         have_target_ = false;
@@ -1797,7 +1893,9 @@ namespace scan_planner
 
     if (reference_path_active_ &&
         (predictive_replan_requested_.load() || tracking_recovery_active_ ||
-         stopped_local_repair_active_.load() || safety_stop_active_.load()))
+         stopped_local_repair_active_.load() ||
+         structured_local_repair_active_.load() ||
+         safety_stop_active_.load()))
       return tryStructuredLocalRepair();
     return false;
   }
@@ -3001,6 +3099,12 @@ namespace scan_planner
           low_speed_local_repair, local_repair_body_yaw);
       if (low_speed_local_repair)
       {
+        structured_local_repair_active_.store(true);
+        structured_local_repair_executing_.store(true);
+        structured_local_repair_finished_.store(false);
+        structured_local_repair_rejoin_pending_.store(false);
+        structured_local_repair_request_id_.store(planning_request_id);
+        structured_local_repair_trajectory_id_.store(info->traj_id_);
         // Publish first, then retire the braking latch. Merely reaching zero
         // speed is insufficient; the replacement escape has now passed the
         // optimizer, complete collision validation, and handoff checks.

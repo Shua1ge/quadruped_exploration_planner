@@ -143,6 +143,11 @@ namespace scan_planner
     std::atomic<bool> stopped_local_repair_pending_{false};
     std::atomic<bool> stopped_local_repair_active_{false};
     std::atomic<bool> structured_local_repair_active_{false};
+    std::atomic<bool> structured_local_repair_executing_{false};
+    std::atomic<bool> structured_local_repair_finished_{false};
+    std::atomic<bool> structured_local_repair_rejoin_pending_{false};
+    std::atomic<uint64_t> structured_local_repair_request_id_{0};
+    std::atomic<int64_t> structured_local_repair_trajectory_id_{0};
     std::atomic<bool> terminal_local_repair_hold_{false};
     bool heading_stall_handled_{false};
     int heading_freeze_recoveries_{0};

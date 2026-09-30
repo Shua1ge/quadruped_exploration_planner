@@ -257,6 +257,11 @@ class FrontierExplorer(Node):
         # running.  Each group is internally serialized; the executor may run
         # the two groups concurrently, while planning reads an immutable grid.
         self.sensor_callback_group = MutuallyExclusiveCallbackGroup()
+        # Locomotion validity is a safety contract for map fusion.  It must not
+        # sit behind a point-cloud callback or a long Python planning callback,
+        # otherwise a healthy high-rate supervisor appears stale and freezes
+        # observation progress.
+        self.locomotion_callback_group = MutuallyExclusiveCallbackGroup()
         self.planning_callback_group = MutuallyExclusiveCallbackGroup()
         resolution = float(self.declare_parameter("resolution", 0.20).value)
         size_x = float(self.declare_parameter("map_size_x", 64.0).value)
@@ -664,6 +669,11 @@ class FrontierExplorer(Node):
         self.locomotion_reason = ""
         self.map_fusion_started = False
         self.last_locomotion_state_ns = 0
+        self.last_locomotion_state_stamp_ns = 0
+        self.locomotion_state_max_age = float(self.declare_parameter(
+            "locomotion_state_max_age", 1.0).value)
+        if self.locomotion_state_max_age <= 0.0:
+            raise ValueError("locomotion_state_max_age must be positive")
         self.last_task_clock_ns = self.get_clock().now().nanoseconds
         self.healthy_task_elapsed = 0.0
         self.unreachable_context = None
@@ -702,7 +712,7 @@ class FrontierExplorer(Node):
         self.create_subscription(
             LocomotionState, "/robot/locomotion_state",
             self.locomotion_state_callback, locomotion_qos,
-            callback_group=self.sensor_callback_group)
+            callback_group=self.locomotion_callback_group)
         self.create_subscription(
             TopoGraphDelta, "global_representation/topology_delta",
             self.topology_delta_callback, 10,
@@ -752,12 +762,28 @@ class FrontierExplorer(Node):
         self.locomotion_epoch = msg.epoch
         self.locomotion_reason = msg.reason
         self.last_locomotion_state_ns = self.get_clock().now().nanoseconds
+        self.last_locomotion_state_stamp_ns = (
+            int(msg.stamp.sec) * 1000000000 + int(msg.stamp.nanosec))
+
+    def locomotion_state_age_ns(self) -> Optional[int]:
+        """Return publisher age, falling back to local receipt for old bags."""
+        if self.last_locomotion_state_ns == 0:
+            return None
+        now_ns = self.get_clock().now().nanoseconds
+        reference_ns = (self.last_locomotion_state_stamp_ns
+                        if self.last_locomotion_state_stamp_ns > 0
+                        else self.last_locomotion_state_ns)
+        # Clock resets can occur when a simulation restarts.  A future stamp is
+        # not stale; the next state sample will re-establish the epoch.
+        return max(0, now_ns - reference_ns)
+
+    def locomotion_state_is_fresh(self) -> bool:
+        age_ns = self.locomotion_state_age_ns()
+        return (age_ns is not None
+                and age_ns <= int(self.locomotion_state_max_age * 1e9))
 
     def locomotion_ready(self) -> bool:
-        return (self.locomotion_actuation_ready
-                and self.last_locomotion_state_ns > 0
-                and (self.get_clock().now().nanoseconds
-                     - self.last_locomotion_state_ns) <= 500000000)
+        return self.locomotion_actuation_ready and self.locomotion_state_is_fresh()
 
     def map_fusion_allowed(self) -> bool:
         """Whether a scan may be integrated into the occupancy grid.
@@ -774,18 +800,17 @@ class FrontierExplorer(Node):
         ``actuation_ready`` answers a different question (may motion commands be
         accepted) and is only equal to it by accident in the current supervisor.
         """
-        if self.last_locomotion_state_ns == 0:
-            return False
-        if (self.get_clock().now().nanoseconds
-                - self.last_locomotion_state_ns) > 500000000:
+        if not self.locomotion_state_is_fresh():
             return False
         return self.perception_pose_valid
 
     def report_fusion_blocked(self):
-        if (self.last_locomotion_state_ns == 0
-                or (self.get_clock().now().nanoseconds
-                    - self.last_locomotion_state_ns) > 500000000):
-            detail = "no fresh /robot/locomotion_state"
+        age_ns = self.locomotion_state_age_ns()
+        if not self.locomotion_state_is_fresh():
+            age_detail = ("never received" if age_ns is None
+                          else f"age={age_ns * 1e-9:.3f}s")
+            detail = ("no fresh /robot/locomotion_state "
+                      f"({age_detail}, limit={self.locomotion_state_max_age:.3f}s)")
         else:
             detail = (f"perception_pose_valid=false "
                       f"(supervisor reason={self.locomotion_reason})")
@@ -3662,7 +3687,10 @@ class FrontierExplorer(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = FrontierExplorer()
-    executor = MultiThreadedExecutor(num_threads=3)
+    # Point cloud, locomotion contract, planning/status, and executor overhead
+    # each have an independent lane.  This prevents a valid stance heartbeat
+    # from expiring while a Python global-planning callback is running.
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()
