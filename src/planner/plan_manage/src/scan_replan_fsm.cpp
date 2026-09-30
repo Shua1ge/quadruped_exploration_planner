@@ -939,11 +939,15 @@ namespace scan_planner
       terminal_repair_requested_.store(true);
     }
 
-    if (structured_local_repair_executing_.load() &&
-        msg->request_id == structured_local_repair_request_id_.load() &&
-        msg->trajectory_id == structured_local_repair_trajectory_id_.load() &&
-        (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_FINISHED ||
-         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED))
+    const bool structured_feedback_terminal =
+        msg->state == scan_planner_msgs::msg::ExecutionState::STATE_FINISHED ||
+        msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED;
+    if (structuredRepairTerminalFeedbackMatches(
+            structured_local_repair_executing_.load(),
+            structured_local_repair_request_id_.load(),
+            structured_local_repair_trajectory_id_.load(),
+            msg->request_id, msg->trajectory_id,
+            structured_feedback_terminal))
     {
       structured_local_repair_finished_.store(true);
       RCLCPP_INFO(
@@ -1038,9 +1042,10 @@ namespace scan_planner
       // HOLD is level-triggered at the controller.  Once a version is held,
       // changing the diagnostic reason does not require another command.  A
       // newer trajectory id naturally creates a new command owner.
-      const bool duplicate =
-          msg.request_id == last_execution_command_request_id_ &&
-          msg.trajectory_id == last_execution_command_trajectory_id_;
+      const bool duplicate = holdCommandAlreadyIssuedForVersion(
+          msg.request_id, msg.trajectory_id,
+          last_execution_command_request_id_,
+          last_execution_command_trajectory_id_);
       if (duplicate)
         publish_command = false;
       else
@@ -1315,8 +1320,10 @@ namespace scan_planner
     // request, not a terminal failure.  Replan from current odometry while the
     // validated prefix remains executable; the safety timer will escalate to
     // a hard HOLD if the obstacle enters the stopping horizon first.
-    if (!structured_local_repair_executing_.load() &&
-        predictive_replan_requested_.load() && exec_state_ == EXEC_TRAJ &&
+    if (ordinaryRollingReplanAllowed(
+            structured_local_repair_executing_.load(),
+            predictive_replan_requested_.load()) &&
+        exec_state_ == EXEC_TRAJ &&
         have_target_ &&
         (next_rolling_replan_attempt_ns_ == 0 ||
          node_->now().nanoseconds() >= next_rolling_replan_attempt_ns_))

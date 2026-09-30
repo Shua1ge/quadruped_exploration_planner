@@ -179,6 +179,36 @@ def test_frontier_explorer_declares_map_update_throttle_state():
     assert "self.last_map_update_ns = 0" in source
 
 
+def test_locomotion_state_freshness_uses_publisher_stamp_and_transport_budget():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.last_locomotion_state_ns = 1_700_000_000
+    explorer.last_locomotion_state_stamp_ns = 1_000_000_000
+    explorer.locomotion_state_max_age = 1.0
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=1_750_000_000))
+
+    # A 750 ms callback-service delay used to trip the hard-coded 500 ms gate
+    # and freeze observation progress even though the supervisor stayed alive.
+    assert explorer.locomotion_state_age_ns() == 750_000_000
+    assert explorer.locomotion_state_is_fresh()
+
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=2_010_000_000))
+    assert not explorer.locomotion_state_is_fresh()
+
+
+def test_locomotion_state_freshness_supports_legacy_zero_stamp():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.last_locomotion_state_ns = 1_600_000_000
+    explorer.last_locomotion_state_stamp_ns = 0
+    explorer.locomotion_state_max_age = 1.0
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=1_750_000_000))
+
+    assert explorer.locomotion_state_age_ns() == 150_000_000
+    assert explorer.locomotion_state_is_fresh()
+
+
 def test_ray_integration_preserves_unknown_and_marks_hit():
     grid = MODULE.ExplorationGrid(20.0, 20.0, 0.5)
     ranges = [math.inf] * 72

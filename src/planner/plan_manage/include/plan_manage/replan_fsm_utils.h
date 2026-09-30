@@ -236,6 +236,30 @@ inline bool localRepairOwnsFailure(
   return stopped_local_repair_active || structured_local_repair_active;
 }
 
+inline bool structuredRepairTerminalFeedbackMatches(
+    bool repair_executing,
+    uint64_t repair_request, int64_t repair_trajectory,
+    uint64_t feedback_request, int64_t feedback_trajectory,
+    bool feedback_is_terminal)
+{
+  return repair_executing && feedback_is_terminal &&
+         repair_request == feedback_request &&
+         repair_trajectory == feedback_trajectory;
+}
+
+inline bool ordinaryRollingReplanAllowed(
+    bool structured_repair_executing, bool replan_requested)
+{
+  return !structured_repair_executing && replan_requested;
+}
+
+inline bool holdCommandAlreadyIssuedForVersion(
+    uint64_t request, int64_t trajectory,
+    uint64_t previous_request, int64_t previous_trajectory)
+{
+  return request == previous_request && trajectory == previous_trajectory;
+}
+
 inline double brakingSweepHorizon(
     double speed, double maximum_deceleration, double reaction_time,
     double maximum_horizon)

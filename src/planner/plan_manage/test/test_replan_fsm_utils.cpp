@@ -132,6 +132,34 @@ TEST(StructuredLocalRepair, KeepsFailureOwnershipAcrossRecoveryStates)
   EXPECT_FALSE(localRepairOwnsFailure(false, false));
 }
 
+TEST(StructuredLocalRepair, RetainsExecutionUntilExactTerminalFeedback)
+{
+  EXPECT_FALSE(structuredRepairTerminalFeedbackMatches(
+      true, 202, 17, 202, 17, false));
+  EXPECT_FALSE(structuredRepairTerminalFeedbackMatches(
+      true, 202, 17, 202, 16, true));
+  EXPECT_FALSE(structuredRepairTerminalFeedbackMatches(
+      true, 202, 17, 201, 17, true));
+  EXPECT_FALSE(structuredRepairTerminalFeedbackMatches(
+      false, 202, 17, 202, 17, true));
+  EXPECT_TRUE(structuredRepairTerminalFeedbackMatches(
+      true, 202, 17, 202, 17, true));
+}
+
+TEST(StructuredLocalRepair, SuppressesOrdinaryRollingUntilRepairEnds)
+{
+  EXPECT_FALSE(ordinaryRollingReplanAllowed(true, true));
+  EXPECT_FALSE(ordinaryRollingReplanAllowed(false, false));
+  EXPECT_TRUE(ordinaryRollingReplanAllowed(false, true));
+}
+
+TEST(ExecutionHold, DeduplicatesOneHoldPerExecutionVersion)
+{
+  EXPECT_TRUE(holdCommandAlreadyIssuedForVersion(202, 17, 202, 17));
+  EXPECT_FALSE(holdCommandAlreadyIssuedForVersion(202, 18, 202, 17));
+  EXPECT_FALSE(holdCommandAlreadyIssuedForVersion(203, 1, 202, 17));
+}
+
 TEST(ClearanceEscape, CompletesOnlyAfterActualPoseIsConfirmedFree)
 {
   EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(true, true, 3, 3));
