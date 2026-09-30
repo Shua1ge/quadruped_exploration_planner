@@ -86,8 +86,25 @@ namespace scan_planner
 
   bool SCANPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit,
+                                        bool flag_randomPolyTraj,
+                                        double initialization_speed_limit,
+                                        double minimum_initial_duration,
+                                        double collision_yaw_override)
   {
+
+    const bool use_collision_yaw_override =
+        std::isfinite(collision_yaw_override);
+    bspline_optimizer_rebound_->setCollisionYawOverride(
+        use_collision_yaw_override, collision_yaw_override);
+    struct CollisionYawOverrideScope
+    {
+      BsplineOptimizer::Ptr &optimizer;
+      ~CollisionYawOverrideScope()
+      {
+        optimizer->setCollisionYawOverride(false);
+      }
+    } collision_yaw_override_scope{bspline_optimizer_rebound_};
 
     static int count = 0;
     std::cout << endl
@@ -107,7 +124,13 @@ namespace scan_planner
     double t_init = 0.0, t_opt = 0.0, t_refine = 0.0;
 
     /*** STEP 1: INIT ***/
-    double ts = (start_pt - local_target_pt).norm() > 0.1 ? pp_.ctrl_pt_dist / pp_.max_vel_ * 1.2 : pp_.ctrl_pt_dist / pp_.max_vel_ * 5; // pp_.ctrl_pt_dist / pp_.max_vel_ is too tense, and will surely exceed the acc/vel limits
+    const double initialization_speed =
+        initialization_speed_limit > 0.0
+            ? std::min(initialization_speed_limit, pp_.max_vel_)
+            : pp_.max_vel_;
+    double ts = (start_pt - local_target_pt).norm() > 0.1
+                    ? pp_.ctrl_pt_dist / initialization_speed * 1.2
+                    : pp_.ctrl_pt_dist / initialization_speed * 5;
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
     static bool flag_first_call = true, flag_force_polynomial = false;
     bool flag_regenerate = false;
@@ -125,7 +148,12 @@ namespace scan_planner
         PolynomialTraj gl_traj;
 
         double dist = (start_pt - local_target_pt).norm();
-        double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? sqrt(dist / pp_.max_acc_) : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
+        double time = pow(initialization_speed, 2) / pp_.max_acc_ > dist
+                          ? sqrt(dist / pp_.max_acc_)
+                          : (dist - pow(initialization_speed, 2) / pp_.max_acc_) /
+                                    initialization_speed +
+                                2 * initialization_speed / pp_.max_acc_;
+        time = std::max(time, minimum_initial_duration);
 
         if (!flag_randomPolyTraj)
         {
@@ -204,7 +232,9 @@ namespace scan_planner
           continue;
         }
 
-        double poly_time = (local_data_.position_traj_.evaluateDeBoorT(t) - local_target_pt).norm() / pp_.max_vel_ * 2;
+        double poly_time =
+            (local_data_.position_traj_.evaluateDeBoorT(t) - local_target_pt).norm() /
+            initialization_speed * 2;
         if (poly_time > ts)
         {
           PolynomialTraj gl_traj = PolynomialTraj::one_segment_traj_gen(local_data_.position_traj_.evaluateDeBoorT(t),

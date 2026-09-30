@@ -80,6 +80,8 @@ namespace scan_planner
     double local_repair_anchor_max_distance_{0.90};
     double local_repair_anchor_step_{0.15};
     double local_repair_max_backtrack_{0.60};
+    double local_repair_max_speed_{0.25};
+    double local_repair_time_margin_{1.20};
     int local_repair_max_candidates_{6};
     double braking_sweep_spatial_step_{0.05};
     double braking_sweep_max_horizon_{4.0};
@@ -140,6 +142,8 @@ namespace scan_planner
     bool tracking_recovery_active_{false};
     std::atomic<bool> stopped_local_repair_pending_{false};
     std::atomic<bool> stopped_local_repair_active_{false};
+    std::atomic<bool> structured_local_repair_active_{false};
+    std::atomic<bool> terminal_local_repair_hold_{false};
     bool heading_stall_handled_{false};
     int heading_freeze_recoveries_{0};
     bool collision_segment_pending_{false};
@@ -156,6 +160,9 @@ namespace scan_planner
       bool clearance_escape_active{false};
       double clearance_escape_deadline{0.0};
       size_t initial_clearance_violations{0};
+      int clearance_escape_free_cycles{0};
+      bool fixed_body_yaw{false};
+      double body_yaw{0.0};
       bool valid{false};
     };
     std::mutex execution_snapshot_mutex_;
@@ -231,7 +238,8 @@ namespace scan_planner
     /* helper functions */
     bool callReboundReplan(
         bool flag_use_poly_init, bool flag_randomPolyTraj,
-        const Eigen::Vector3d *local_target_override = nullptr); // front-end and back-end method
+        const Eigen::Vector3d *local_target_override = nullptr,
+        bool low_speed_local_repair = false); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
     bool tryStructuredLocalRepair();
@@ -265,7 +273,9 @@ namespace scan_planner
                                            uint64_t request_id,
                                            bool clearance_escape_active = false,
                                            double clearance_escape_deadline = 0.0,
-                                           size_t initial_clearance_violations = 0);
+                                           size_t initial_clearance_violations = 0,
+                                           bool fixed_body_yaw = false,
+                                           double body_yaw = 0.0);
     void setLocalRecoveryState(LocalRecoveryState state,
                                double tracking_error,
                                const char *reason);

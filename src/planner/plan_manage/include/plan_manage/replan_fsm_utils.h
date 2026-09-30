@@ -141,6 +141,17 @@ inline bool newPlanMayReleaseSafetyStop(
          !temporal_safety_latched;
 }
 
+inline bool brakingHoldMayReleaseAfterStop(
+    double planar_speed, int consecutive_stopped_cycles,
+    int required_stopped_cycles, bool pose_occupied_latched,
+    bool planning_clearance_blocked)
+{
+  return std::isfinite(planar_speed) && planar_speed <= 0.05 &&
+         required_stopped_cycles > 0 &&
+         consecutive_stopped_cycles >= required_stopped_cycles &&
+         !pose_occupied_latched && !planning_clearance_blocked;
+}
+
 inline bool clearanceViolationAllowedDuringEscape(
     bool started_inside_clearance, bool already_exited_clearance,
     bool physical_collision, double trajectory_time, double escape_deadline,
@@ -151,6 +162,15 @@ inline bool clearanceViolationAllowedDuringEscape(
          std::isfinite(escape_deadline) && trajectory_time >= 0.0 &&
          trajectory_time <= escape_deadline &&
          current_violations <= initial_violations;
+}
+
+inline bool clearanceEscapeConfirmedAtActualPose(
+    bool escape_active, bool actual_clearance_blocked,
+    int consecutive_free_cycles, int required_free_cycles)
+{
+  return escape_active && !actual_clearance_blocked &&
+         required_free_cycles > 0 &&
+         consecutive_free_cycles >= required_free_cycles;
 }
 
 inline std::vector<Eigen::Vector2d> structuredLocalRepairDirections(
@@ -187,6 +207,33 @@ inline bool recoveryClearanceEvidenceIsNonWorsening(
       return false;
   }
   return violation_counts.back() == 0;
+}
+
+inline double restToRestMinimumDuration(
+    double distance, double speed_limit, double acceleration_limit,
+    double time_margin = 1.0)
+{
+  if (!std::isfinite(distance) || !std::isfinite(speed_limit) ||
+      !std::isfinite(acceleration_limit) || !std::isfinite(time_margin) ||
+      distance <= 0.0 || speed_limit <= 0.0 ||
+      acceleration_limit <= 0.0 || time_margin < 1.0)
+    return 0.0;
+
+  // A rest-to-rest triangular profile reaches 2*d/T peak speed and requires
+  // 4*d/T^2 peak acceleration. Satisfy both bounds before adding a small
+  // execution margin for the quadruped policy and spline fitting.
+  const double speed_limited_time = 2.0 * distance / speed_limit;
+  const double acceleration_limited_time =
+      2.0 * std::sqrt(distance / acceleration_limit);
+  return time_margin *
+         std::max(speed_limited_time, acceleration_limited_time);
+}
+
+inline bool localRepairOwnsFailure(
+    bool stopped_local_repair_active,
+    bool structured_local_repair_active)
+{
+  return stopped_local_repair_active || structured_local_repair_active;
 }
 
 inline double brakingSweepHorizon(

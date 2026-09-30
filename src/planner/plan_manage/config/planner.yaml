@@ -34,6 +34,11 @@ scan_planner_node:
     fsm.local_repair_anchor_step: 0.15
     fsm.local_repair_max_backtrack: 0.60
     fsm.local_repair_max_candidates: 6
+    # Short escape segments start and end at rest. Keep their initialization
+    # slow enough that spline fitting does not turn a safe 0.45 m sidestep into
+    # a dynamically infeasible normal-speed maneuver.
+    fsm.local_repair_max_speed: 0.25
+    fsm.local_repair_time_margin: 1.20
     # Runtime safety predicts the actual odometry velocity through reaction
     # and braking, sampling a short swept capsule instead of assuming that the
     # robot remains exactly on the theoretical B-spline.

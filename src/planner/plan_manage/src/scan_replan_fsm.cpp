@@ -77,6 +77,10 @@ namespace scan_planner
         node_, "fsm.local_repair_max_backtrack", 0.60);
     local_repair_max_candidates_ = load_parameter<int>(
         node_, "fsm.local_repair_max_candidates", 6);
+    local_repair_max_speed_ = load_parameter<double>(
+        node_, "fsm.local_repair_max_speed", 0.25);
+    local_repair_time_margin_ = load_parameter<double>(
+        node_, "fsm.local_repair_time_margin", 1.20);
     braking_sweep_spatial_step_ = load_parameter<double>(
         node_, "fsm.braking_sweep_spatial_step", 0.05);
     braking_sweep_max_horizon_ = load_parameter<double>(
@@ -114,6 +118,8 @@ namespace scan_planner
         local_repair_anchor_step_ <= 0.0 ||
         local_repair_max_backtrack_ < 0.0 ||
         local_repair_max_candidates_ <= 0 ||
+        local_repair_max_speed_ <= 0.0 ||
+        local_repair_time_margin_ < 1.0 ||
         braking_sweep_spatial_step_ <= 0.0 ||
         braking_sweep_max_horizon_ <= 0.0 ||
         safety_map_stale_warn_age_ < 0.0 ||
@@ -597,6 +603,12 @@ namespace scan_planner
     }
     active_reference_request_id_.store(request_id);
     completed_reference_request_id_.store(0);
+    // A newer request supersedes the previous request even if its reference
+    // later proves invalid.  Do not let recovery ownership or retry state from
+    // the old request leak into the new request's terminal status.
+    structured_local_repair_active_.store(false);
+    stopped_local_repair_pending_.store(false);
+    stopped_local_repair_active_.store(false);
     last_wait_target_status_ns_.store(0);
     next_rolling_replan_attempt_ns_ = 0;
     go2_heading_stalled_.store(false);
@@ -1372,15 +1384,24 @@ namespace scan_planner
       else
         flag_random_poly_init = true;
 
-      bool success = callReboundReplan(true, flag_random_poly_init);
-      if (!success && flag_random_poly_init && reference_path_active_ &&
-          (stopped_local_repair_active_.load() ||
-           emergency_path_pending_ || safety_stop_active_.load()))
+      // A stopped local repair is a different planning problem from normal
+      // rolling replanning.  Go directly to the bounded, low-speed escape
+      // candidates instead of repeatedly accepting an ordinary trajectory
+      // whose future prefix merely promises to leave the clearance belt.
+      const bool stopped_structured_repair =
+          stopped_local_repair_active_.load();
+      bool success = stopped_structured_repair
+                         ? tryStructuredLocalRepair()
+                         : callReboundReplan(true, flag_random_poly_init);
+      if (!success && !stopped_structured_repair && flag_random_poly_init &&
+          reference_path_active_ &&
+          (emergency_path_pending_ || safety_stop_active_.load()))
         success = tryStructuredLocalRepair();
       if (success)
       {
         stopped_local_repair_pending_.store(false);
         stopped_local_repair_active_.store(false);
+        structured_local_repair_active_.store(false);
         predictive_replan_requested_.store(false);
         setLocalRecoveryState(
             LocalRecoveryState::TRACKING, 0.0,
@@ -1416,6 +1437,7 @@ namespace scan_planner
       {
         stopped_local_repair_pending_.store(false);
         stopped_local_repair_active_.store(false);
+        structured_local_repair_active_.store(false);
         predictive_replan_requested_.store(false);
         setLocalRecoveryState(
             LocalRecoveryState::TRACKING, 0.0,
@@ -1624,7 +1646,12 @@ namespace scan_planner
   {
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
-      if (stopped_local_repair_active_.exchange(false))
+      const bool stopped_repair_owned =
+          stopped_local_repair_active_.exchange(false);
+      const bool structured_repair_owned =
+          structured_local_repair_active_.exchange(false);
+      if (localRepairOwnsFailure(
+              stopped_repair_owned, structured_repair_owned))
       {
         const uint64_t failed_request = active_reference_request_id_.load();
         stopped_local_repair_pending_.store(false);
@@ -1638,6 +1665,16 @@ namespace scan_planner
         emergency_path_pending_ = false;
         tracking_recovery_active_ = false;
         trigger_ = false;
+        terminal_local_repair_hold_.store(true);
+        predictive_hold_latched_.store(false);
+        predictive_hold_release_cycles_.store(0);
+        predictive_replan_requested_.store(false);
+        {
+          std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+          execution_snapshot_.valid = false;
+          execution_snapshot_.clearance_escape_active = false;
+          execution_snapshot_.clearance_escape_free_cycles = 0;
+        }
         changeFSMExecState(WAIT_TARGET, "LOCAL_REPAIR_EXHAUSTED");
         requestExecutionStop("LOCAL_REPAIR_EXHAUSTED");
         RCLCPP_ERROR(
@@ -1771,6 +1808,42 @@ namespace scan_planner
         !have_target_)
       return false;
 
+    // From this point until a validated candidate succeeds (or the bounded
+    // retry budget is exhausted), SCAN owns the request as LOCAL_REPAIR.  A
+    // failed optimizer call must not silently downgrade it to generic
+    // TRACKING_RECOVERY_FAILED/BLOCKED.
+    structured_local_repair_active_.store(true);
+
+    double safety_planar_speed = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(safety_odom_mutex_);
+      safety_planar_speed = safety_odom_vel_.head<2>().norm();
+    }
+    if (!std::isfinite(safety_planar_speed) || safety_planar_speed > 0.05)
+    {
+      // A rest-to-rest escape trajectory is only a valid handoff after the
+      // physical robot has settled.  Retain this request, latch HOLD, and let
+      // the normal stopped-local-repair transition resume planning once odom
+      // confirms the speed threshold.
+      stopped_local_repair_pending_.store(true);
+      stopped_local_repair_active_.store(false);
+      if (!safety_stop_active_.exchange(true))
+        safety_generation_.fetch_add(1);
+      predictive_replan_requested_.store(false);
+      replan_fail_count_ = 0;
+      setLocalRecoveryState(
+          LocalRecoveryState::LOCAL_REPAIR, 0.0,
+          "structured_repair_waiting_for_stop");
+      requestExecutionStop("LOCAL_REPAIR_HOLD", false);
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_WAITING_FOR_STOP] speed=%.3fm/s; retaining request_id=%llu and deferring rest-to-rest candidate generation",
+          safety_planar_speed,
+          static_cast<unsigned long long>(
+              active_reference_request_id_.load()));
+      return false;
+    }
+
     ReferencePathLookahead reference_entry = projectReferencePathLookahead(
         reference_path_, start_pt_, reference_progress_idx_,
         reference_progress_ratio_, 0.50);
@@ -1857,19 +1930,29 @@ namespace scan_planner
 
     const Eigen::Vector3d saved_local_target = local_target_pt_;
     const Eigen::Vector3d saved_local_velocity = local_target_vel_;
+    const Eigen::Vector3d saved_start_velocity = start_vel_;
+    const Eigen::Vector3d saved_start_acceleration = start_acc_;
+    start_vel_.setZero();
+    start_acc_.setZero();
     for (size_t attempt = 0; attempt < anchors.size(); ++attempt)
     {
       const RecoveryAnchor &anchor = anchors[attempt];
+      const double minimum_duration = restToRestMinimumDuration(
+          anchor.distance, local_repair_max_speed_,
+          planner_manager_->pp_.max_acc_, local_repair_time_margin_);
       RCLCPP_WARN(
           node_->get_logger(),
-          "[STRUCTURED_LOCAL_REPAIR_ATTEMPT] request_id=%llu attempt=%zu/%zu direction=%zu anchor=(%.2f,%.2f,%.2f) distance=%.2fm; global_target=(%.2f,%.2f,%.2f) unchanged",
+          "[STRUCTURED_LOCAL_REPAIR_ATTEMPT] request_id=%llu attempt=%zu/%zu direction=%zu anchor=(%.2f,%.2f,%.2f) distance=%.2fm max_speed=%.2fm/s min_duration=%.2fs; global_target=(%.2f,%.2f,%.2f) unchanged",
           static_cast<unsigned long long>(
               active_reference_request_id_.load()),
           attempt + 1, anchors.size(), anchor.direction_index,
           anchor.point.x(), anchor.point.y(), anchor.point.z(),
-          anchor.distance, end_pt_.x(), end_pt_.y(), end_pt_.z());
-      if (callReboundReplan(true, false, &anchor.point))
+          anchor.distance, local_repair_max_speed_, minimum_duration,
+          end_pt_.x(), end_pt_.y(), end_pt_.z());
+      if (callReboundReplan(true, false, &anchor.point, true))
       {
+        start_vel_ = saved_start_velocity;
+        start_acc_ = saved_start_acceleration;
         RCLCPP_INFO(
             node_->get_logger(),
             "[STRUCTURED_LOCAL_REPAIR_SELECTED] request_id=%llu anchor=(%.2f,%.2f,%.2f); executing the short escape segment before rejoining the same reference path",
@@ -1879,6 +1962,8 @@ namespace scan_planner
         return true;
       }
     }
+    start_vel_ = saved_start_velocity;
+    start_acc_ = saved_start_acceleration;
     local_target_pt_ = saved_local_target;
     local_target_vel_ = saved_local_velocity;
     RCLCPP_WARN_THROTTLE(
@@ -1954,7 +2039,8 @@ namespace scan_planner
   void SCANReplanFSM::updateExecutionTrajectorySnapshot(
       const LocalTrajData &info, uint64_t request_id,
       bool clearance_escape_active, double clearance_escape_deadline,
-      size_t initial_clearance_violations)
+      size_t initial_clearance_violations, bool fixed_body_yaw,
+      double body_yaw)
   {
     std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
     execution_snapshot_.position = info.position_traj_;
@@ -1966,6 +2052,9 @@ namespace scan_planner
     execution_snapshot_.clearance_escape_deadline = clearance_escape_deadline;
     execution_snapshot_.initial_clearance_violations =
         initial_clearance_violations;
+    execution_snapshot_.clearance_escape_free_cycles = 0;
+    execution_snapshot_.fixed_body_yaw = fixed_body_yaw;
+    execution_snapshot_.body_yaw = body_yaw;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
     terminal_repair_requested_.store(false);
     terminal_repair_error_.store(0.0);
@@ -2203,6 +2292,13 @@ namespace scan_planner
       }
     }
 
+    // LOCAL_REPAIR_EXHAUSTED is a terminal ownership state for the failed
+    // request.  It may only be released by publishing a fully validated
+    // trajectory for a newer request; ordinary predictive/temporal release
+    // paths must not revive the invalidated execution snapshot.
+    if (terminal_local_repair_hold_.load())
+      return;
+
     if (temporal_safety_latched_.load())
     {
       const int fresh_cycles = temporal_safety_release_cycles_.fetch_add(1) + 1;
@@ -2238,6 +2334,31 @@ namespace scan_planner
       const int stopped_cycles = predictive_hold_release_cycles_.fetch_add(1) + 1;
       if (stopped_cycles < local_hold_release_cycles_)
         return;
+
+      size_t current_clearance_violations = 0;
+      const bool current_clearance_blocked = footprintOccupiedWithMargin(
+          map, odom_pos, actual_yaw, planning_clearance_margin_, nullptr,
+          &current_clearance_violations);
+      if (!brakingHoldMayReleaseAfterStop(
+              actual_speed, stopped_cycles, local_hold_release_cycles_,
+              pose_occupied_latched_.load(), current_clearance_blocked))
+      {
+        // Zero speed removes the kinetic risk, but it does not make this a
+        // valid restart pose. Retain HOLD and transfer planning ownership to
+        // the bounded rest-to-rest clearance escape. A validated candidate is
+        // the only event allowed to release this predictive latch.
+        predictive_hold_release_cycles_.store(0);
+        stopped_local_repair_pending_.store(true);
+        predictive_replan_requested_.store(true);
+        setLocalRecoveryState(
+            LocalRecoveryState::LOCAL_REPAIR, 0.0,
+            "braking_hold_needs_clearance_escape");
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 500,
+            "[LOCAL_SAFETY_HOLD] reason=stopped_inside_planning_belt violations=%zu; retaining HOLD until a validated clearance escape is published",
+            current_clearance_violations);
+        return;
+      }
       predictive_hold_release_cycles_.store(0);
       predictive_hold_latched_.store(false);
       if (!pose_occupied_latched_.load() &&
@@ -2359,7 +2480,10 @@ namespace scan_planner
           trajectory.position.evaluateDeBoorT(tangent_before_time);
       const Eigen::Vector3d tangent_after =
           trajectory.position.evaluateDeBoorT(tangent_after_time);
-      const double trajectory_yaw = segment_yaw(tangent_before, tangent_after);
+      const double trajectory_yaw = trajectory.fixed_body_yaw
+                                        ? trajectory.body_yaw
+                                        : segment_yaw(tangent_before,
+                                                      tangent_after);
       const int samples = std::max(
           1, static_cast<int>(std::ceil(connector_length / spatial_step)));
       bool recovery_corridor_blocked = false;
@@ -2401,6 +2525,60 @@ namespace scan_planner
       }
     }
 
+    if (trajectory.clearance_escape_active)
+    {
+      size_t actual_clearance_violations = 0;
+      const bool actual_clearance_blocked = footprintOccupiedWithMargin(
+          map, odom_pos, actual_yaw, planning_clearance_margin_, nullptr,
+          &actual_clearance_violations);
+      int actual_free_cycles = 0;
+      bool completed = false;
+      {
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        if (execution_snapshot_.valid &&
+            safetyResultMatchesExecution(
+                trajectory.request_id, trajectory.trajectory_id,
+                execution_snapshot_.request_id,
+                execution_snapshot_.trajectory_id))
+        {
+          if (actual_clearance_blocked)
+            execution_snapshot_.clearance_escape_free_cycles = 0;
+          else
+            ++execution_snapshot_.clearance_escape_free_cycles;
+          actual_free_cycles =
+              execution_snapshot_.clearance_escape_free_cycles;
+          completed = clearanceEscapeConfirmedAtActualPose(
+              execution_snapshot_.clearance_escape_active,
+              actual_clearance_blocked, actual_free_cycles,
+              local_hold_release_cycles_);
+          if (completed)
+          {
+            execution_snapshot_.clearance_escape_active = false;
+            execution_snapshot_.clearance_escape_free_cycles = 0;
+          }
+        }
+      }
+      if (completed)
+      {
+        trajectory.clearance_escape_active = false;
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[CLEARANCE_ESCAPE_COMPLETE] request_id=%llu trajectory=%lld matched_t=%.2fs actual_pose=(%.2f,%.2f) free_cycles=%d",
+            static_cast<unsigned long long>(trajectory.request_id),
+            static_cast<long long>(trajectory.trajectory_id), matched_time,
+            odom_pos.x(), odom_pos.y(), actual_free_cycles);
+      }
+      else if (actual_clearance_blocked)
+      {
+        RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 250,
+            "[CLEARANCE_ESCAPE_WAITING] request_id=%llu trajectory=%lld actual_violations=%zu matched_t=%.2fs",
+            static_cast<unsigned long long>(trajectory.request_id),
+            static_cast<long long>(trajectory.trajectory_id),
+            actual_clearance_violations, matched_time);
+      }
+    }
+
     constexpr double time_step = 0.02;
     Eigen::Vector3d last_free = odom_pos;
     for (double t = matched_time; t < trajectory.duration; t += time_step)
@@ -2408,28 +2586,15 @@ namespace scan_planner
       const Eigen::Vector3d pos = trajectory.position.evaluateDeBoorT(t);
       const Eigen::Vector3d next = trajectory.position.evaluateDeBoorT(
           std::min(t + time_step, trajectory.duration));
-      const double trajectory_yaw = segment_yaw(pos, next);
+      const double trajectory_yaw = trajectory.fixed_body_yaw
+                                        ? trajectory.body_yaw
+                                        : segment_yaw(pos, next);
       size_t clearance_violations = 0;
       const bool clearance_blocked = footprintOccupiedWithMargin(
           map, pos, trajectory_yaw, planning_clearance_margin_, nullptr,
           &clearance_violations);
       if (!clearance_blocked)
       {
-        if (trajectory.clearance_escape_active)
-        {
-          std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
-          if (execution_snapshot_.valid &&
-              safetyResultMatchesExecution(
-                  trajectory.request_id, trajectory.trajectory_id,
-                  execution_snapshot_.request_id,
-                  execution_snapshot_.trajectory_id))
-            execution_snapshot_.clearance_escape_active = false;
-          trajectory.clearance_escape_active = false;
-          RCLCPP_INFO(node_->get_logger(),
-                      "[CLEARANCE_ESCAPE_COMPLETE] request_id=%llu trajectory=%lld t=%.2fs",
-                      static_cast<unsigned long long>(trajectory.request_id),
-                      static_cast<long long>(trajectory.trajectory_id), t);
-        }
         last_free = pos;
         continue;
       }
@@ -2507,10 +2672,13 @@ namespace scan_planner
   }
   bool SCANReplanFSM::callReboundReplan(
       bool flag_use_poly_init, bool flag_randomPolyTraj,
-      const Eigen::Vector3d *local_target_override)
+      const Eigen::Vector3d *local_target_override,
+      bool low_speed_local_repair)
   {
     auto map = planner_manager_->grid_map_;
     const uint64_t planning_request_id = active_reference_request_id_.load();
+    const double local_repair_body_yaw =
+        low_speed_local_repair ? getOdomYaw() : 0.0;
     // reboundReplan commits its successful result to local_data_ before the
     // real-time publication checks below.  Preserve the trajectory that the
     // controller is actually executing so every rejected result is atomic.
@@ -2533,8 +2701,22 @@ namespace scan_planner
       getLocalTarget();
     }
 
-    bool plan_success =
-        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
+    double initialization_speed_limit = -1.0;
+    double minimum_initial_duration = 0.0;
+    if (low_speed_local_repair)
+    {
+      initialization_speed_limit = local_repair_max_speed_;
+      minimum_initial_duration = restToRestMinimumDuration(
+          (local_target_pt_ - start_pt_).norm(), local_repair_max_speed_,
+          planner_manager_->pp_.max_acc_, local_repair_time_margin_);
+    }
+    bool plan_success = planner_manager_->reboundReplan(
+        start_pt_, start_vel_, start_acc_, local_target_pt_,
+        local_target_vel_, (have_new_target_ || flag_use_poly_init),
+        flag_randomPolyTraj, initialization_speed_limit,
+        minimum_initial_duration,
+        low_speed_local_repair ? local_repair_body_yaw
+                               : std::numeric_limits<double>::quiet_NaN());
     map->clearInflatedOccupancySnapshotForCurrentThread();
     const double optimization_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - planning_started).count();
@@ -2595,7 +2777,10 @@ namespace scan_planner
       // B-spline again immediately before publishing it to the controller so a
       // successful solver result can never authorize an occupied trajectory.
       constexpr double validation_dt = 0.02;
-      constexpr double clearance_escape_deadline = 0.75;
+      const double clearance_escape_deadline =
+          low_speed_local_repair && minimum_initial_duration > 0.0
+              ? minimum_initial_duration
+              : 0.75;
       bool candidate_started_inside_clearance = false;
       bool candidate_exited_clearance = false;
       size_t initial_clearance_violations = 0;
@@ -2606,9 +2791,15 @@ namespace scan_planner
             std::min(t + validation_dt, info->duration_));
         Eigen::Vector3d blocked_point;
         size_t clearance_violations = 0;
-        const double candidate_yaw = estimateYawFromSegment(pos, pos_next);
+        // A quadruped can translate laterally during a short rest-to-rest
+        // escape. Do not reinterpret that translation tangent as an
+        // instantaneous body rotation; keep the measured body yaw while the
+        // robot leaves the planning belt.
+        const double candidate_yaw = low_speed_local_repair
+                                         ? local_repair_body_yaw
+                                         : estimateYawFromSegment(pos, pos_next);
         const bool clearance_blocked = footprintOccupiedWithMargin(
-                map, pos, estimateYawFromSegment(pos, pos_next),
+                map, pos, candidate_yaw,
                 planning_clearance_margin_, &blocked_point,
                 &clearance_violations);
         if (t <= 1e-9)
@@ -2724,8 +2915,11 @@ namespace scan_planner
               info->position_traj_.evaluateDeBoorT(tangent_before_time);
           const Eigen::Vector3d tangent_after =
               info->position_traj_.evaluateDeBoorT(tangent_after_time);
-          const double trajectory_yaw = estimateYawFromSegment(
-              tangent_before, tangent_after);
+          const double trajectory_yaw = low_speed_local_repair
+                                            ? local_repair_body_yaw
+                                            : estimateYawFromSegment(
+                                                  tangent_before,
+                                                  tangent_after);
           for (int sample = 1; sample <= samples; ++sample)
           {
             const double ratio = static_cast<double>(sample) / samples;
@@ -2787,13 +2981,34 @@ namespace scan_planner
         bspline.knots.push_back(knots(i));
       }
 
+      // A structured clearance escape was validated with the robot retaining
+      // its measured body heading.  Carry that contract to the controller so
+      // it strafes along the short escape instead of rotating the capsule to
+      // the translation tangent and executing an unvalidated footprint.
+      if (low_speed_local_repair)
+      {
+        bspline.yaw_pts.push_back(local_repair_body_yaw);
+        bspline.yaw_dt = info->duration_;
+      }
+
       bspline_pub_->publish(bspline);
       // Keep safety bound to the old spline until the replacement has actually
       // been published.  From this point on request_id + traj_id is the single
       // execution version used by the controller and safety checker.
       updateExecutionTrajectorySnapshot(
           *info, planning_request_id, candidate_started_inside_clearance,
-          clearance_escape_deadline, initial_clearance_violations);
+          clearance_escape_deadline, initial_clearance_violations,
+          low_speed_local_repair, local_repair_body_yaw);
+      if (low_speed_local_repair)
+      {
+        // Publish first, then retire the braking latch. Merely reaching zero
+        // speed is insufficient; the replacement escape has now passed the
+        // optimizer, complete collision validation, and handoff checks.
+        predictive_hold_latched_.store(false);
+        predictive_hold_release_cycles_.store(0);
+      }
+      const bool released_terminal_repair_hold =
+          terminal_local_repair_hold_.exchange(false);
       if (newPlanMayReleaseSafetyStop(
               pose_occupied_latched_.load(), predictive_hold_latched_.load(),
               temporal_safety_latched_.load()) &&
@@ -2805,6 +3020,14 @@ namespace scan_planner
             static_cast<unsigned long long>(planning_request_id),
             static_cast<long long>(info->traj_id_),
             candidate_started_inside_clearance);
+      }
+      if (released_terminal_repair_hold)
+      {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[LOCAL_REPAIR_TERMINAL_HOLD_RELEASED] request_id=%llu trajectory=%lld source=validated_replacement",
+            static_cast<unsigned long long>(planning_request_id),
+            static_cast<long long>(info->traj_id_));
       }
       if (reference_path_update_pending_)
       {

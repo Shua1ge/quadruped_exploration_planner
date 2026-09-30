@@ -106,6 +106,8 @@ private:
 
   double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des) const
   {
+    if (fixed_trajectory_yaw_)
+      return trajectory_yaw_;
     const double t_look = std::min(traj_duration_, t_cur + time_forward_);
     Eigen::Vector3d direction = traj_[0].evaluateDeBoorT(t_look) - pos_des;
     if (direction.head<2>().squaredNorm() < 1e-4)
@@ -203,6 +205,15 @@ private:
     UniformBspline position(points, msg->order, 0.1);
     position.setKnot(knots);
 
+    const bool candidate_fixed_yaw = !msg->yaw_pts.empty();
+    const double candidate_body_yaw =
+        candidate_fixed_yaw ? msg->yaw_pts.front() : 0.0;
+    if (candidate_fixed_yaw && !std::isfinite(candidate_body_yaw))
+    {
+      RCLCPP_WARN(get_logger(), "Ignoring B-spline with invalid body yaw");
+      return;
+    }
+
     std::vector<Eigen::Vector3d> control_points;
     control_points.reserve(points.cols());
     for (Eigen::Index column = 0; column < points.cols(); ++column)
@@ -273,7 +284,12 @@ private:
       // expired active spline installed forever and creates a replan/reject
       // loop.  Measure the discontinuity for diagnostics and accept the
       // candidate so the existing in-place alignment state can resolve it.
-      if (receive_traj_ && !soft_hold_)
+      if (candidate_fixed_yaw)
+      {
+        matched_yaw_error = std::abs(
+            normalizeAngle(candidate_body_yaw - odom_yaw_));
+      }
+      else if (receive_traj_ && !soft_hold_)
       {
         const double before_time = std::max(
             0.0, matched_time - handoff_sample_dt_);
@@ -305,6 +321,8 @@ private:
     traj_duration_ = candidate_duration;
     traj_id_ = msg->traj_id;
     active_request_id_ = msg->request_id;
+    fixed_trajectory_yaw_ = candidate_fixed_yaw;
+    trajectory_yaw_ = candidate_body_yaw;
     exec_time_ = matched_time;
     last_update_time_ = now();
     receive_traj_ = true;
@@ -331,10 +349,11 @@ private:
                    : scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
         soft_hold_ ? soft_hold_reason_ : "", 0.0, true);
     RCLCPP_INFO(get_logger(),
-                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm matched_yaw_error=%.3frad",
+                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm matched_yaw_error=%.3frad fixed_body_yaw=%d",
                 static_cast<unsigned long long>(active_request_id_),
                 static_cast<long long>(traj_id_), traj_duration_, exec_time_,
-                start_error, matched_error, matched_yaw_error);
+                start_error, matched_error, matched_yaw_error,
+                fixed_trajectory_yaw_ ? 1 : 0);
   }
 
   void executionCommandCallback(
@@ -614,6 +633,8 @@ private:
   std::int64_t soft_hold_trajectory_id_{0};
   std::string soft_hold_reason_;
   std::vector<UniformBspline> traj_;
+  bool fixed_trajectory_yaw_{false};
+  double trajectory_yaw_{0.0};
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
   std::uint64_t active_request_id_{0};

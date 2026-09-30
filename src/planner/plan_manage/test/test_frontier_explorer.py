@@ -1083,18 +1083,91 @@ def test_running_scan_does_not_release_region_commitment():
     assert explorer.active_region_id == 8
 
 
-def test_failure_cooldown_expires_after_configured_map_revision():
+def test_failure_cooldown_requires_time_and_new_reachability_evidence():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.blacklist_radius = 1.5
     explorer.map_update_count = 10
-    explorer.goal_failure_cooldowns = {(2.0, 3.0): 16}
+    explorer.map_content_revision = 20
+    explorer.route_constraint_revision = 4
+    explorer.goal_failure_cooldowns = {(2.0, 3.0): (16, 20, 4)}
 
     assert explorer.is_goal_on_failure_cooldown((2.5, 3.0))
     assert not explorer.is_goal_on_failure_cooldown((4.0, 3.0))
 
+    # Receiving enough identical scans is not evidence that the failed goal
+    # became reachable.
     explorer.map_update_count = 16
+    assert explorer.is_goal_on_failure_cooldown((2.5, 3.0))
+
+    explorer.map_content_revision = 21
     assert not explorer.is_goal_on_failure_cooldown((2.5, 3.0))
     assert explorer.goal_failure_cooldowns == {}
+
+
+def test_failure_cooldown_can_release_on_new_route_constraint_evidence():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.blacklist_radius = 1.5
+    explorer.map_update_count = 16
+    explorer.map_content_revision = 20
+    explorer.route_constraint_revision = 5
+    explorer.goal_failure_cooldowns = {(2.0, 3.0): (16, 20, 4)}
+
+    assert not explorer.is_goal_on_failure_cooldown((2.5, 3.0))
+    assert explorer.goal_failure_cooldowns == {}
+
+
+def test_blocked_without_sibling_releases_failed_region_before_retry():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.pending_path_request_generation = 42
+    explorer.active_path_request_generation = 42
+    explorer.last_completed_request_generation = None
+    explorer.scan_blocked_count = 0
+    explorer.global_reroute_failure_streak = 3
+    explorer.pending_path_publish_ns = 123
+    explorer.pending_blocked_edge = None
+    explorer.active_region_id = 12
+    explorer.active_goal = (32.1, 0.7)
+    explorer.active_goal_cell = (860, 703)
+    explorer.active_observation = object()
+    explorer.active_raw_path = [(1, 1), (2, 1)]
+    explorer.prepared_candidate = object()
+    explorer.replacement_pending = True
+    explorer.last_active_goal_clear_reason = "none"
+    goal_cooldowns = []
+    region_cooldowns = []
+    terminations = []
+    statuses = []
+    planning_calls = []
+
+    explorer.get_logger = lambda: SimpleNamespace(
+        warning=lambda *args, **kwargs: None)
+    explorer.add_goal_failure_cooldown = (
+        lambda goal, reason: goal_cooldowns.append((goal, reason)))
+    explorer.add_region_failure_cooldown = (
+        lambda region, reason: region_cooldowns.append((region, reason)))
+
+    def terminate(reason):
+        terminations.append(reason)
+        explorer.active_region_id = None
+        return True
+
+    explorer.terminate_region_option = terminate
+
+    def plan_from_current_position(excluded_goals=()):
+        planning_calls.append(tuple(excluded_goals))
+        return len(planning_calls) == 2
+
+    explorer.plan_from_current_position = plan_from_current_position
+    explorer.publish_status = statuses.append
+
+    explorer.planning_status_callback(
+        SimpleNamespace(data="BLOCKED request_id=42"))
+
+    assert goal_cooldowns == [((32.1, 0.7), "BLOCKED")]
+    assert planning_calls == [((32.1, 0.7),), ((32.1, 0.7),)]
+    assert region_cooldowns == [(12, "BLOCKED_NO_ALTERNATIVE")]
+    assert terminations == ["blocked_no_alternative"]
+    assert statuses == ["LOCAL_BLOCKED_REGION_CHANGED"]
 
 
 def test_replan_gate_bounds_attempts_until_planning_context_changes():
@@ -1239,6 +1312,8 @@ def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
     explorer.dense_final_validation_searches = 0
     explorer.sparse_final_validation_failures = 0
     explorer.map_update_count = 0
+    explorer.map_content_revision = 0
+    explorer.route_constraint_revision = 0
     explorer.goal_failure_cooldown_updates = 6
     explorer.goal_failure_cooldowns = {}
     explorer.blacklist_radius = 0.75

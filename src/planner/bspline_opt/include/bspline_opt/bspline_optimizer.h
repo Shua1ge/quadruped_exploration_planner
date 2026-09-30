@@ -64,6 +64,7 @@ namespace scan_planner
     void setBsplineInterval(const double &ts);
     void setCostFunction(const int &cost_function);
     void setTerminateCond(const int &max_num_id, const int &max_time_id);
+    void setCollisionYawOverride(bool enabled, double yaw = 0.0);
 
     // optional inputs
     void setGuidePath(const vector<Eigen::Vector3d> &guide_pt);
@@ -124,6 +125,8 @@ namespace scan_planner
     double min_cost_;               //
 
     ControlPoints cps_;
+    bool collision_yaw_override_enabled_{false};
+    double collision_yaw_override_{0.0};
 
     /* cost function */
     /* calculate each part of cost function with control points q as input */

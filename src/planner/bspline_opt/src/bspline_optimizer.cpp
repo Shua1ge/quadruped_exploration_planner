@@ -32,10 +32,18 @@ namespace scan_planner
 
   double BsplineOptimizer::estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const
   {
+    if (collision_yaw_override_enabled_)
+      return collision_yaw_override_;
     Eigen::Vector2d diff(to(0) - from(0), to(1) - from(1));
     if (diff.squaredNorm() < 1e-8)
       return 0.0;
     return std::atan2(diff(1), diff(0));
+  }
+
+  void BsplineOptimizer::setCollisionYawOverride(bool enabled, double yaw)
+  {
+    collision_yaw_override_enabled_ = enabled;
+    collision_yaw_override_ = yaw;
   }
 
   double BsplineOptimizer::estimateControlPointYaw(const Eigen::MatrixXd &q, int id) const

@@ -534,7 +534,12 @@ class FrontierExplorer(Node):
         self.active_since_ns = 0
         self.blacklist: List[Point2] = []
         self.completed_goals: List[Point2] = []
-        self.goal_failure_cooldowns: Dict[Point2, int] = {}
+        # goal -> (minimum map update, map content revision at failure,
+        #          route constraint revision at failure).  A timer/update
+        # count alone is not new reachability evidence: a stationary robot
+        # keeps receiving scans even when the failed corridor is unchanged.
+        self.goal_failure_cooldowns: Dict[
+            Point2, Tuple[int, int, int]] = {}
         self.region_failure_cooldowns: Dict[int, Tuple[int, int]] = {}
         self.dense_invalid_region_revisions: Dict[int, int] = {}
         self.temporary_blocked_edges: Dict[DirectedEdge, int] = {}
@@ -2004,6 +2009,7 @@ class FrontierExplorer(Node):
                     and blocked_edge in self.current_blocked_edges()
                     and self.reroute_active_goal()):
                 return
+            failed_region = self.active_region_id
             previous_goal = self.active_goal
             self.active_goal = None
             self.active_goal_cell = None
@@ -2015,8 +2021,27 @@ class FrontierExplorer(Node):
             self.last_active_goal_clear_reason = "BLOCKED"
             if previous_goal is not None:
                 self.add_goal_failure_cooldown(previous_goal, "BLOCKED")
-            if previous_goal is not None and self.plan_from_current_position():
+            excluded_goals = ((previous_goal,)
+                              if previous_goal is not None else ())
+            if (previous_goal is not None
+                    and self.plan_from_current_position(
+                        excluded_goals=excluded_goals)):
                 self.publish_status("LOCAL_BLOCKED_VIEWPOINT_CHANGED")
+                return
+
+            # No sibling viewpoint in the committed option survived the same
+            # dense checks.  Keeping that option while a frame-count cooldown
+            # expires reproduces the identical rejected path forever.  Cool
+            # the failed child region, release only this option, then permit a
+            # different region/portal to take ownership.
+            if failed_region is not None:
+                self.add_region_failure_cooldown(
+                    failed_region, "BLOCKED_NO_ALTERNATIVE")
+                if self.active_region_id == failed_region:
+                    self.terminate_region_option("blocked_no_alternative")
+            if self.plan_from_current_position(
+                    excluded_goals=excluded_goals):
+                self.publish_status("LOCAL_BLOCKED_REGION_CHANGED")
             else:
                 self.publish_status("LOCAL_BLOCKED_WAITING_FOR_ROUTE")
         elif status in ("REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
@@ -2061,22 +2086,40 @@ class FrontierExplorer(Node):
 
     def add_goal_failure_cooldown(self, point: Point2, reason: str):
         release_update = self.map_update_count + self.goal_failure_cooldown_updates
-        self.goal_failure_cooldowns[point] = max(
-            release_update, self.goal_failure_cooldowns.get(point, 0))
+        previous = self.goal_failure_cooldowns.get(point)
+        failure_content_revision = self.map_content_revision
+        failure_route_revision = self.route_constraint_revision
+        if previous is not None:
+            release_update = max(release_update, previous[0])
+            failure_content_revision = max(
+                failure_content_revision, previous[1])
+            failure_route_revision = max(
+                failure_route_revision, previous[2])
+        self.goal_failure_cooldowns[point] = (
+            release_update, failure_content_revision,
+            failure_route_revision)
         self.get_logger().warning(
             f"[GOAL_FAILURE_COOLDOWN] goal=({point[0]:.2f},{point[1]:.2f}) "
-            f"reason={reason} release_update={release_update}")
+            f"reason={reason} release_update={release_update} "
+            f"failure_content_revision={failure_content_revision} "
+            f"failure_route_revision={failure_route_revision}")
 
     def is_goal_on_failure_cooldown(self, point: Point2) -> bool:
-        expired = [goal for goal, release in self.goal_failure_cooldowns.items()
-                   if self.map_update_count >= release]
+        expired = [
+            goal
+            for goal, (release_update, failure_content_revision,
+                       failure_route_revision)
+            in self.goal_failure_cooldowns.items()
+            if (self.map_update_count >= release_update
+                and (self.map_content_revision > failure_content_revision
+                     or self.route_constraint_revision
+                     > failure_route_revision))]
         for goal in expired:
             del self.goal_failure_cooldowns[goal]
         return any(
-            self.map_update_count < release
-            and math.hypot(point[0] - goal[0], point[1] - goal[1])
+            math.hypot(point[0] - goal[0], point[1] - goal[1])
             < self.blacklist_radius
-            for goal, release in self.goal_failure_cooldowns.items())
+            for goal in self.goal_failure_cooldowns)
 
     def add_region_failure_cooldown(self, region_id: int, reason: str):
         release_update = (

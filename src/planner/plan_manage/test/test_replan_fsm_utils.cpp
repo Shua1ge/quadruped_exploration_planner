@@ -57,6 +57,20 @@ TEST(SafetyRelease, NewPlanNeverClearsPhysicalPoseOccupancy)
   EXPECT_FALSE(newPlanMayReleaseSafetyStop(false, false, true));
 }
 
+TEST(SafetyRelease, BrakingHoldRequiresStopAndClearPlanningBelt)
+{
+  EXPECT_TRUE(brakingHoldMayReleaseAfterStop(
+      0.0, 3, 3, false, false));
+  EXPECT_FALSE(brakingHoldMayReleaseAfterStop(
+      0.06, 3, 3, false, false));
+  EXPECT_FALSE(brakingHoldMayReleaseAfterStop(
+      0.0, 2, 3, false, false));
+  EXPECT_FALSE(brakingHoldMayReleaseAfterStop(
+      0.0, 3, 3, true, false));
+  EXPECT_FALSE(brakingHoldMayReleaseAfterStop(
+      0.0, 3, 3, false, true));
+}
+
 TEST(ClearanceEscape, AllowsOnlyNonWorseningNonPhysicalPrefix)
 {
   EXPECT_TRUE(clearanceViolationAllowedDuringEscape(
@@ -98,6 +112,32 @@ TEST(StructuredLocalRepair, RequiresMonotonicClearanceImprovementToFree)
   EXPECT_FALSE(recoveryClearanceEvidenceIsNonWorsening({3, 2, 3, 0}));
   EXPECT_FALSE(recoveryClearanceEvidenceIsNonWorsening({2, 1, 1}));
   EXPECT_FALSE(recoveryClearanceEvidenceIsNonWorsening({}));
+}
+
+TEST(StructuredLocalRepair, ComputesRestToRestDurationFromBothLimits)
+{
+  EXPECT_NEAR(restToRestMinimumDuration(0.45, 0.25, 0.50, 1.20),
+              4.32, 1e-9);
+  EXPECT_NEAR(restToRestMinimumDuration(0.45, 2.0, 0.50, 1.0),
+              2.0 * std::sqrt(0.45 / 0.50), 1e-9);
+  EXPECT_DOUBLE_EQ(restToRestMinimumDuration(0.45, 0.0, 0.50, 1.20), 0.0);
+  EXPECT_DOUBLE_EQ(restToRestMinimumDuration(0.45, 0.25, 0.50, 0.9), 0.0);
+}
+
+TEST(StructuredLocalRepair, KeepsFailureOwnershipAcrossRecoveryStates)
+{
+  EXPECT_TRUE(localRepairOwnsFailure(true, false));
+  EXPECT_TRUE(localRepairOwnsFailure(false, true));
+  EXPECT_TRUE(localRepairOwnsFailure(true, true));
+  EXPECT_FALSE(localRepairOwnsFailure(false, false));
+}
+
+TEST(ClearanceEscape, CompletesOnlyAfterActualPoseIsConfirmedFree)
+{
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(true, true, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(true, false, 2, 3));
+  EXPECT_TRUE(clearanceEscapeConfirmedAtActualPose(true, false, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(false, false, 3, 3));
 }
 
 TEST(PredictiveBrakingSweep, IncludesReactionAndBrakingButCapsTheHorizon)

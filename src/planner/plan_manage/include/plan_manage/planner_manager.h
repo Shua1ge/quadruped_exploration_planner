@@ -2,6 +2,7 @@
 #define _PLANNER_MANAGER_H_
 
 #include <stdlib.h>
+#include <limits>
 
 #include <bspline_opt/bspline_optimizer.h>
 #include <bspline_opt/uniform_bspline.h>
@@ -27,7 +28,11 @@ namespace scan_planner
 
     /* main planning interface */
     bool reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel, Eigen::Vector3d start_acc,
-                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit, bool flag_randomPolyTraj);
+                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit,
+                       bool flag_randomPolyTraj, double initialization_speed_limit = -1.0,
+                       double minimum_initial_duration = 0.0,
+                       double collision_yaw_override =
+                           std::numeric_limits<double>::quiet_NaN());
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
