@@ -7,6 +7,7 @@ import math
 import os
 import statistics
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -457,6 +458,11 @@ class FrontierExplorer(Node):
         self.region_anchor_cells: Dict[int, Cell] = {}
         self.sparse_router = SparseRouteGraph(
             bucket_size=max(self.grid.resolution, 1.0))
+        self.topology_messages_received = 0
+        self.topology_messages_applied = 0
+        self.topology_messages_rejected = 0
+        self.topology_snapshot_recovery_count = 0
+        self.last_rejected_topology_revision = 0
         self.safe_region_connectivity = SafeRegionConnectivity()
         self.region_edge_cache_hits = 0
         self.region_edge_cache_misses = 0
@@ -811,14 +817,28 @@ class FrontierExplorer(Node):
 
     def topology_delta_callback(self, msg: TopoGraphDelta):
         """Keep a lightweight query index of the independently maintained graph."""
-        self.sparse_router.apply_delta(
-            msg.graph_revision, msg.source_map_revision,
-            [self.sparse_node_from_message(node) for node in msg.added_nodes],
-            [self.sparse_node_from_message(node) for node in msg.updated_nodes],
-            msg.removed_node_ids,
-            [self.sparse_edge_from_message(edge) for edge in msg.added_edges],
-            [self.sparse_edge_from_message(edge) for edge in msg.updated_edges],
-            msg.removed_edge_ids)
+        self.topology_messages_received += 1
+        revision_before = self.sparse_router.graph_revision
+        try:
+            self.sparse_router.apply_delta(
+                msg.graph_revision, msg.source_map_revision,
+                [self.sparse_node_from_message(node) for node in msg.added_nodes],
+                [self.sparse_node_from_message(node) for node in msg.updated_nodes],
+                msg.removed_node_ids,
+                [self.sparse_edge_from_message(edge) for edge in msg.added_edges],
+                [self.sparse_edge_from_message(edge) for edge in msg.updated_edges],
+                msg.removed_edge_ids)
+        except Exception as error:  # ROS callback boundary: preserve the executor.
+            self.topology_messages_rejected += 1
+            self.last_rejected_topology_revision = int(msg.graph_revision)
+            self.get_logger().error(
+                "[SPARSE_GRAPH_REJECTED] "
+                f"kind=delta revision={msg.graph_revision} reason={error}\n"
+                f"{traceback.format_exc()}",
+                throttle_duration_sec=1.0)
+            return
+        if self.sparse_router.graph_revision != revision_before:
+            self.topology_messages_applied += 1
         self.get_logger().debug(
             f"[SPARSE_GRAPH_SYNC] revision={self.sparse_router.graph_revision} "
             f"nodes={len(self.sparse_router.nodes)} "
@@ -826,17 +846,30 @@ class FrontierExplorer(Node):
 
     def topology_snapshot_callback(self, msg: TopoGraphDelta):
         """Atomically restore a complete graph after launch races or restarts."""
+        self.topology_messages_received += 1
         if msg.graph_revision < self.sparse_router.graph_revision:
             return
-        replacement = SparseRouteGraph(
-            bucket_size=max(self.grid.resolution, 1.0))
-        replacement.apply_delta(
-            msg.graph_revision, msg.source_map_revision,
-            [self.sparse_node_from_message(node) for node in msg.added_nodes],
-            [], [],
-            [self.sparse_edge_from_message(edge) for edge in msg.added_edges],
-            [], [])
+        try:
+            replacement = SparseRouteGraph(
+                bucket_size=max(self.grid.resolution, 1.0))
+            replacement.apply_delta(
+                msg.graph_revision, msg.source_map_revision,
+                [self.sparse_node_from_message(node) for node in msg.added_nodes],
+                [], [],
+                [self.sparse_edge_from_message(edge) for edge in msg.added_edges],
+                [], [])
+        except Exception as error:  # Keep the last complete graph on bad input.
+            self.topology_messages_rejected += 1
+            self.last_rejected_topology_revision = int(msg.graph_revision)
+            self.get_logger().error(
+                "[SPARSE_GRAPH_REJECTED] "
+                f"kind=snapshot revision={msg.graph_revision} reason={error}\n"
+                f"{traceback.format_exc()}",
+                throttle_duration_sec=1.0)
+            return
         self.sparse_router = replacement
+        self.topology_messages_applied += 1
+        self.topology_snapshot_recovery_count += 1
         self.get_logger().info(
             f"[SPARSE_GRAPH_SNAPSHOT] revision={replacement.graph_revision} "
             f"nodes={len(replacement.nodes)} edges={len(replacement.edges)}",
@@ -3390,6 +3423,13 @@ class FrontierExplorer(Node):
             "sparse_graph_revision": self.sparse_router.graph_revision,
             "sparse_graph_nodes": len(self.sparse_router.nodes),
             "sparse_graph_edges": len(self.sparse_router.edges),
+            "topology_messages_received": self.topology_messages_received,
+            "topology_messages_applied": self.topology_messages_applied,
+            "topology_messages_rejected": self.topology_messages_rejected,
+            "topology_snapshot_recovery_count": (
+                self.topology_snapshot_recovery_count),
+            "last_rejected_topology_revision": (
+                self.last_rejected_topology_revision),
             "sparse_candidate_queries": self.sparse_candidate_queries,
             "sparse_candidate_hits": self.sparse_candidate_hits,
             "sparse_candidate_fallbacks": self.sparse_candidate_fallbacks,

@@ -339,6 +339,7 @@ namespace scan_planner
       if (newPlanMayReleaseSafetyStop(
               pose_occupied_latched_.load(), predictive_hold_latched_.load(),
               temporal_safety_latched_.load()) &&
+          !invalid_odom_latched_.load() &&
           safety_stop_active_.exchange(false))
         RCLCPP_INFO(node_->get_logger(),
                     "[SAFETY_RELEASE] source=new_manual_goal; planning may resume");
@@ -734,9 +735,30 @@ namespace scan_planner
 
   void SCANReplanFSM::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
   {
-    odom_pos_(0) = msg->pose.pose.position.x;
-    odom_pos_(1) = msg->pose.pose.position.y;
-    odom_pos_(2) = msg->pose.pose.position.z;
+    const Eigen::Vector3d position(
+        msg->pose.pose.position.x,
+        msg->pose.pose.position.y,
+        msg->pose.pose.position.z);
+    const Eigen::Vector3d velocity(
+        msg->twist.twist.linear.x,
+        msg->twist.twist.linear.y,
+        msg->twist.twist.linear.z);
+    Eigen::Quaterniond orientation(
+        msg->pose.pose.orientation.w,
+        msg->pose.pose.orientation.x,
+        msg->pose.pose.orientation.y,
+        msg->pose.pose.orientation.z);
+    if (!position.allFinite() || !velocity.allFinite() ||
+        !normalizeFiniteQuaternion(&orientation))
+    {
+      have_odom_ = false;
+      RCLCPP_ERROR_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "[ODOMETRY_REJECTED] planning odometry contains a non-finite state or invalid quaternion");
+      return;
+    }
+
+    odom_pos_ = position;
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET && !rviz_height_ready_)
     {
@@ -745,16 +767,11 @@ namespace scan_planner
       RCLCPP_INFO(node_->get_logger(), "Set RViz goal height from initial body_pose z: %.3f", rviz_goal_height_);
     }
 
-    odom_vel_(0) = msg->twist.twist.linear.x;
-    odom_vel_(1) = msg->twist.twist.linear.y;
-    odom_vel_(2) = msg->twist.twist.linear.z;
+    odom_vel_ = velocity;
 
     //odom_acc_ = estimateAcc( msg );
 
-    odom_orient_.w() = msg->pose.pose.orientation.w;
-    odom_orient_.x() = msg->pose.pose.orientation.x;
-    odom_orient_.y() = msg->pose.pose.orientation.y;
-    odom_orient_.z() = msg->pose.pose.orientation.z;
+    odom_orient_ = orientation;
 
     have_odom_ = true;
     publishSelfInflationMarker();
@@ -768,7 +785,6 @@ namespace scan_planner
   void SCANReplanFSM::safetyOdometryCallback(
       const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
   {
-    std::lock_guard<std::mutex> lock(safety_odom_mutex_);
     const Eigen::Vector3d position_world(
         msg->pose.pose.position.x,
         msg->pose.pose.position.y,
@@ -778,14 +794,32 @@ namespace scan_planner
         msg->pose.pose.orientation.x,
         msg->pose.pose.orientation.y,
         msg->pose.pose.orientation.z);
-    if (world_from_body.norm() > 1e-6)
-      world_from_body.normalize();
-    else
-      world_from_body = Eigen::Quaterniond::Identity();
     const Eigen::Vector3d body_velocity(
         msg->twist.twist.linear.x,
         msg->twist.twist.linear.y,
         msg->twist.twist.linear.z);
+    const double angular_z = msg->twist.twist.angular.z;
+    if (!position_world.allFinite() || !body_velocity.allFinite() ||
+        !std::isfinite(angular_z) ||
+        !normalizeFiniteQuaternion(&world_from_body))
+    {
+      {
+        std::lock_guard<std::mutex> lock(safety_odom_mutex_);
+        safety_have_odom_ = false;
+        safety_pose_history_.clear();
+        safety_odom_velocity_stamp_ns_ = 0;
+        safety_odom_vel_.setZero();
+        safety_yaw_rate_ = 0.0;
+      }
+      invalid_odom_release_cycles_.store(0);
+      latchLocalSafetyHold("INVALID_ODOMETRY", invalid_odom_latched_);
+      RCLCPP_ERROR_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "[ODOMETRY_REJECTED] safety odometry contains a non-finite state or invalid quaternion; retaining HOLD and last valid planning state");
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(safety_odom_mutex_);
     const Eigen::Vector3d twist_velocity_world =
         rotateBodyVelocityToWorld(world_from_body, body_velocity);
     int64_t stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
@@ -853,7 +887,7 @@ namespace scan_planner
     {
       safety_odom_vel_ = measured_velocity_world;
       safety_yaw_rate_ = have_pose_motion ? pose_yaw_rate
-                                          : msg->twist.twist.angular.z;
+                                          : angular_z;
     }
     else
     {
@@ -867,7 +901,7 @@ namespace scan_planner
       const double yaw_alpha = exponentialFilterAlpha(
           dt, yaw_rate_filter_tau_);
       const double measured_yaw_rate = have_pose_motion
-          ? pose_yaw_rate : msg->twist.twist.angular.z;
+          ? pose_yaw_rate : angular_z;
       safety_yaw_rate_ +=
           yaw_alpha * (measured_yaw_rate - safety_yaw_rate_);
     }
@@ -1227,7 +1261,7 @@ namespace scan_planner
     if (safety_stop_active_.load() && shouldStartStoppedLocalRepair(
             stopped_local_repair_pending_.load(), have_target_,
             safety_planar_speed, pose_occupied_latched_.load(),
-            temporal_safety_latched_.load()))
+            temporal_safety_latched_.load() || invalid_odom_latched_.load()))
     {
       stopped_local_repair_pending_.store(false);
       stopped_local_repair_active_.store(true);
@@ -2000,6 +2034,11 @@ namespace scan_planner
           const Eigen::Vector3d point = start_pt_ + ratio * (anchor - start_pt_);
           const double yaw = interpolatePlanarYaw(
               actual_yaw, target_yaw, ratio);
+          if (!std::isfinite(yaw))
+          {
+            physical_collision = true;
+            break;
+          }
           size_t violations = 0;
           footprintOccupiedWithMargin(
               map, point, yaw, planning_clearance_margin_, nullptr,
@@ -2334,6 +2373,31 @@ namespace scan_planner
       odom_yaw_rate = safety_yaw_rate_;
     }
 
+    if (invalid_odom_latched_.load())
+    {
+      const int valid_cycles = invalid_odom_release_cycles_.fetch_add(1) + 1;
+      if (valid_cycles < local_hold_release_cycles_)
+        return;
+      invalid_odom_release_cycles_.store(0);
+      invalid_odom_latched_.store(false);
+      predictive_replan_requested_.store(true);
+      setLocalRecoveryState(
+          LocalRecoveryState::LOCAL_REPAIR, 0.0,
+          "valid_odometry_restored");
+      if (!pose_occupied_latched_.load() &&
+          !predictive_hold_latched_.load() &&
+          !temporal_safety_latched_.load() &&
+          !stopped_local_repair_pending_.load() &&
+          safety_stop_active_.exchange(false))
+      {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[LOCAL_SAFETY_RELEASE] source=valid_odometry valid_cycles=%d; requesting a fresh rolling trajectory",
+            valid_cycles);
+      }
+      return;
+    }
+
     const double map_age = map->getMapAgeSeconds();
     if (map_age > safety_map_stale_warn_age_)
       RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
@@ -2387,6 +2451,7 @@ namespace scan_planner
       pose_occupied_latched_.store(false);
       if (!predictive_hold_latched_.load() &&
           !temporal_safety_latched_.load() &&
+          !invalid_odom_latched_.load() &&
           !stopped_local_repair_pending_.load() &&
           safety_stop_active_.exchange(false))
       {
@@ -2413,6 +2478,7 @@ namespace scan_planner
       temporal_safety_latched_.store(false);
       if (!pose_occupied_latched_.load() &&
           !predictive_hold_latched_.load() &&
+          !invalid_odom_latched_.load() &&
           !stopped_local_repair_pending_.load() &&
           safety_stop_active_.exchange(false))
       {
@@ -2468,6 +2534,7 @@ namespace scan_planner
       predictive_hold_latched_.store(false);
       if (!pose_occupied_latched_.load() &&
           !temporal_safety_latched_.load() &&
+          !invalid_odom_latched_.load() &&
           !stopped_local_repair_pending_.load() &&
           safety_stop_active_.exchange(false))
       {
@@ -2599,6 +2666,12 @@ namespace scan_planner
         const Eigen::Vector3d point = odom_pos + ratio * connector;
         const double yaw = interpolatePlanarYaw(
             actual_yaw, trajectory_yaw, ratio);
+        if (!std::isfinite(yaw))
+        {
+          recovery_corridor_blocked = true;
+          first_recovery_blocked = point;
+          break;
+        }
         if (footprintOccupiedWithMargin(
                 map, point, yaw, planning_clearance_margin_))
         {
@@ -3031,6 +3104,13 @@ namespace scan_planner
             const Eigen::Vector3d point = live_odom + ratio * connector;
             const double recovery_yaw = interpolatePlanarYaw(
                 actual_yaw, trajectory_yaw, ratio);
+            if (!std::isfinite(recovery_yaw))
+            {
+              RCLCPP_ERROR(
+                  node_->get_logger(),
+                  "[PLAN_RESULT_DISCARDED] candidate recovery corridor has a non-finite yaw; preserving active trajectory");
+              return reject_planned_trajectory();
+            }
             if (footprintOccupiedWithMargin(
                     map, point, recovery_yaw,
                     planning_clearance_margin_))
@@ -3123,6 +3203,7 @@ namespace scan_planner
       if (newPlanMayReleaseSafetyStop(
               pose_occupied_latched_.load(), predictive_hold_latched_.load(),
               temporal_safety_latched_.load()) &&
+          !invalid_odom_latched_.load() &&
           safety_stop_active_.exchange(false))
       {
         RCLCPP_INFO(

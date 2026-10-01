@@ -11,6 +11,22 @@
 namespace scan_planner
 {
 
+inline bool normalizeFiniteQuaternion(
+    Eigen::Quaterniond *quaternion,
+    double minimum_squared_norm = 1e-12,
+    double maximum_squared_norm = 1e12)
+{
+  if (quaternion == nullptr || !quaternion->coeffs().allFinite())
+    return false;
+  const double squared_norm = quaternion->squaredNorm();
+  if (!std::isfinite(squared_norm) ||
+      squared_norm < minimum_squared_norm ||
+      squared_norm > maximum_squared_norm)
+    return false;
+  quaternion->normalize();
+  return quaternion->coeffs().allFinite();
+}
+
 struct ReferencePathLookahead
 {
   bool valid{false};
@@ -486,16 +502,17 @@ inline size_t closestForwardTrajectorySample(
 
 inline double normalizePlanarAngle(double angle)
 {
-  while (angle > M_PI)
-    angle -= 2.0 * M_PI;
-  while (angle < -M_PI)
-    angle += 2.0 * M_PI;
-  return angle;
+  if (!std::isfinite(angle))
+    return std::numeric_limits<double>::quiet_NaN();
+  return std::remainder(angle, 2.0 * M_PI);
 }
 
 inline double interpolatePlanarYaw(
     double start_yaw, double end_yaw, double ratio)
 {
+  if (!std::isfinite(start_yaw) || !std::isfinite(end_yaw) ||
+      !std::isfinite(ratio))
+    return std::numeric_limits<double>::quiet_NaN();
   const double clamped_ratio = std::clamp(ratio, 0.0, 1.0);
   return normalizePlanarAngle(
       start_yaw + clamped_ratio * normalizePlanarAngle(end_yaw - start_yaw));

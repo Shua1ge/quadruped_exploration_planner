@@ -108,18 +108,49 @@ class SparseRouteGraph:
         return (math.floor(point[0] / self.bucket_size),
                 math.floor(point[1] / self.bucket_size))
 
+    @staticmethod
+    def _validate_point(point: Point2, label: str):
+        if len(point) != 2 or not all(math.isfinite(value) for value in point):
+            raise ValueError(f"{label} must contain two finite coordinates")
+
+    @classmethod
+    def _validate_node(cls, node: SparseNode):
+        if int(node.node_id) < 0:
+            raise ValueError("sparse node id must be non-negative")
+        cls._validate_point(node.position, "sparse node position")
+        if not math.isfinite(node.clearance) or node.clearance < 0.0:
+            raise ValueError("sparse node clearance must be finite and non-negative")
+
+    @classmethod
+    def _validate_edge(cls, edge: SparseEdge):
+        if int(edge.edge_id) < 0:
+            raise ValueError("sparse edge id must be non-negative")
+        if int(edge.source_id) < 0 or int(edge.target_id) < 0:
+            raise ValueError("sparse edge endpoints must be non-negative")
+        if int(edge.source_id) == int(edge.target_id):
+            raise ValueError("sparse edge endpoints must be distinct")
+        if not math.isfinite(edge.length) or edge.length < 0.0:
+            raise ValueError("sparse edge length must be finite and non-negative")
+        if (not math.isfinite(edge.minimum_clearance)
+                or edge.minimum_clearance < 0.0):
+            raise ValueError(
+                "sparse edge minimum clearance must be finite and non-negative")
+        for index, point in enumerate(edge.polyline):
+            cls._validate_point(point, f"sparse edge polyline point {index}")
+
     def upsert_node(self, node: SparseNode):
-        key = self._node_bucket_keys.pop(node.node_id, None)
-        if key is not None:
-            bucket = self._node_buckets.get(key)
+        self._validate_node(node)
+        new_key = self._bucket(node.position)
+        old_key = self._node_bucket_keys.get(node.node_id)
+        if old_key is not None:
+            bucket = self._node_buckets.get(old_key)
             if bucket is not None:
                 bucket.pop(node.node_id, None)
                 if not bucket:
-                    self._node_buckets.pop(key, None)
+                    self._node_buckets.pop(old_key, None)
         self.nodes[node.node_id] = node
-        key = self._bucket(node.position)
-        self._node_buckets.setdefault(key, {})[node.node_id] = node.position
-        self._node_bucket_keys[node.node_id] = key
+        self._node_buckets.setdefault(new_key, {})[node.node_id] = node.position
+        self._node_bucket_keys[node.node_id] = new_key
         self.adjacency.setdefault(node.node_id, {})
         self._components_dirty = True
 
@@ -166,6 +197,11 @@ class SparseRouteGraph:
         self._components_dirty = True
 
     def upsert_edge(self, edge: SparseEdge):
+        self._validate_edge(edge)
+        # Resolve every bucket before mutating the existing edge.  This keeps
+        # a direct update atomic even if a future bucket implementation adds
+        # stricter coordinate checks.
+        sample_buckets = [self._bucket(point) for point in edge.polyline]
         self.remove_edge(edge.edge_id)
         if edge.source_id not in self.nodes or edge.target_id not in self.nodes:
             return
@@ -183,7 +219,7 @@ class SparseRouteGraph:
                 along += math.hypot(point[0] - previous[0],
                                     point[1] - previous[1])
             previous = point
-            bucket_key = self._bucket(point)
+            bucket_key = sample_buckets[index]
             sample_key = (edge.edge_id, index)
             self._sample_buckets.setdefault(bucket_key, {})[sample_key] = (
                 point, min(max(0.0, along), edge.length))
@@ -253,8 +289,31 @@ class SparseRouteGraph:
                     updated_edges: Iterable[SparseEdge],
                     removed_edge_ids: Iterable[int]):
         graph_revision = int(graph_revision)
+        source_map_revision = int(source_map_revision)
         if graph_revision <= 0:
             return
+        if source_map_revision < 0:
+            raise ValueError("source map revision must be non-negative")
+        added_nodes = tuple(added_nodes)
+        updated_nodes = tuple(updated_nodes)
+        removed_node_ids = tuple(int(value) for value in removed_node_ids)
+        added_edges = tuple(added_edges)
+        updated_edges = tuple(updated_edges)
+        removed_edge_ids = tuple(int(value) for value in removed_edge_ids)
+
+        # Validate the complete message before touching any graph container.
+        # Once this phase succeeds, every coordinate-to-bucket conversion used
+        # by the commit phase is guaranteed to be finite.
+        for node in added_nodes + updated_nodes:
+            self._validate_node(node)
+            self._bucket(node.position)
+        for edge in added_edges + updated_edges:
+            self._validate_edge(edge)
+            for point in edge.polyline:
+                self._bucket(point)
+        if any(value < 0 for value in removed_node_ids + removed_edge_ids):
+            raise ValueError("removed topology ids must be non-negative")
+
         if self.graph_revision and graph_revision < self.graph_revision:
             self.clear()
         if graph_revision <= self.graph_revision:
@@ -263,12 +322,12 @@ class SparseRouteGraph:
             self.remove_edge(int(edge_id))
         for node_id in removed_node_ids:
             self.remove_node(int(node_id))
-        for node in list(added_nodes) + list(updated_nodes):
+        for node in added_nodes + updated_nodes:
             self.upsert_node(node)
-        for edge in list(added_edges) + list(updated_edges):
+        for edge in added_edges + updated_edges:
             self.upsert_edge(edge)
         self.graph_revision = graph_revision
-        self.source_map_revision = int(source_map_revision)
+        self.source_map_revision = source_map_revision
 
     def _nearby_buckets(self, point: Point2, radius: float):
         first_x = math.floor((point[0] - radius) / self.bucket_size)

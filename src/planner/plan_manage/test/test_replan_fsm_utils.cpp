@@ -442,4 +442,34 @@ TEST(TrackingRecovery, InterpolatesYawAcrossWrapOnTheShortestArc)
   EXPECT_NEAR(interpolatePlanarYaw(start, finish, 1.0), finish, 1e-9);
 }
 
+TEST(TrackingRecovery, AngleNormalizationRejectsNonFiniteAndBoundsHugeValues)
+{
+  const double huge = normalizePlanarAngle(1e300);
+  EXPECT_TRUE(std::isfinite(huge));
+  EXPECT_GE(huge, -M_PI);
+  EXPECT_LE(huge, M_PI);
+  EXPECT_TRUE(std::isnan(normalizePlanarAngle(
+      std::numeric_limits<double>::infinity())));
+  EXPECT_TRUE(std::isnan(normalizePlanarAngle(
+      -std::numeric_limits<double>::infinity())));
+  EXPECT_TRUE(std::isnan(normalizePlanarAngle(
+      std::numeric_limits<double>::quiet_NaN())));
+  EXPECT_TRUE(std::isnan(interpolatePlanarYaw(
+      0.0, std::numeric_limits<double>::infinity(), 0.5)));
+}
+
+TEST(OdometryValidation, NormalizesOnlyFiniteNonDegenerateQuaternions)
+{
+  Eigen::Quaterniond valid(2.0, 0.0, 0.0, 0.0);
+  EXPECT_TRUE(normalizeFiniteQuaternion(&valid));
+  EXPECT_NEAR(valid.norm(), 1.0, 1e-12);
+
+  Eigen::Quaterniond zero(0.0, 0.0, 0.0, 0.0);
+  EXPECT_FALSE(normalizeFiniteQuaternion(&zero));
+
+  Eigen::Quaterniond non_finite(
+      std::numeric_limits<double>::infinity(), 0.0, 0.0, 0.0);
+  EXPECT_FALSE(normalizeFiniteQuaternion(&non_finite));
+}
+
 } // namespace scan_planner

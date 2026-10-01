@@ -1,6 +1,8 @@
 import pathlib
 import sys
 
+import pytest
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -130,6 +132,50 @@ def test_delta_removal_disconnects_the_route():
     result = graph.batch_estimates((0.0, 0.0), [(10.0, 0.0)], 0.2)[0]
 
     assert result is None
+
+
+def test_nonfinite_node_update_is_rejected_before_mutating_graph():
+    graph = straight_graph()
+    nodes_before = dict(graph.nodes)
+    buckets_before = {
+        key: dict(value) for key, value in graph._node_buckets.items()}
+
+    with pytest.raises(ValueError, match="finite coordinates"):
+        graph.upsert_node(SparseNode(1, (float("nan"), 0.0), 1.0))
+
+    assert graph.nodes == nodes_before
+    assert graph._node_buckets == buckets_before
+    assert graph.graph_revision == 1
+
+
+def test_bad_delta_does_not_partially_apply_valid_nodes_or_advance_revision():
+    graph = straight_graph()
+    nodes_before = dict(graph.nodes)
+
+    with pytest.raises(ValueError, match="finite coordinates"):
+        graph.apply_delta(
+            2, 8,
+            [SparseNode(3, (20.0, 0.0), 1.0),
+             SparseNode(4, (float("inf"), 0.0), 1.0)],
+            [], [], [], [], [])
+
+    assert graph.nodes == nodes_before
+    assert graph.graph_revision == 1
+    assert graph.source_map_revision == 0
+
+
+def test_bad_edge_update_preserves_previous_edge_and_sample_index():
+    graph = straight_graph()
+    edge_before = graph.edges[11]
+    samples_before = list(graph._edge_sample_keys[11])
+
+    with pytest.raises(ValueError, match="finite coordinates"):
+        graph.upsert_edge(SparseEdge(
+            11, 1, 2, 10.0, 1.0,
+            ((0.0, 0.0), (float("nan"), 0.0))))
+
+    assert graph.edges[11] == edge_before
+    assert graph._edge_sample_keys[11] == samples_before
 
 
 def test_topology_attachment_identifies_component_and_corridor_branch():

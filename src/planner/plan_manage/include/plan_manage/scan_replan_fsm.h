@@ -202,6 +202,8 @@ namespace scan_planner
     std::atomic<int> predictive_hold_release_cycles_{0};
     std::atomic<bool> temporal_safety_latched_{false};
     std::atomic<int> temporal_safety_release_cycles_{0};
+    std::atomic<bool> invalid_odom_latched_{false};
+    std::atomic<int> invalid_odom_release_cycles_{0};
     std::atomic<uint64_t> safety_generation_{0};
     std::atomic<bool> predictive_replan_requested_{false};
     std::atomic<bool> terminal_repair_requested_{false};
