@@ -25,7 +25,7 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
-from scan_planner_msgs.msg import LocomotionState, TopoGraphDelta
+from scan_planner_msgs.msg import FailureEvidence, LocomotionState, TopoGraphDelta
 
 from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
@@ -566,6 +566,11 @@ class FrontierExplorer(Node):
         self.region_switches = 0
         self.intra_scope_region_switches = 0
         self.local_repair_exhausted_count = 0
+        self.failure_evidence_received = 0
+        self.failure_evidence_matched = 0
+        self.last_failure_stage = "none"
+        self.last_failure_reason = "none"
+        self.last_failure_clearance = 0.0
         self.directional_candidate_suppressed_count = 0
         self.directional_recovery_switches = 0
         self.directional_suppression_revision = -1
@@ -638,6 +643,10 @@ class FrontierExplorer(Node):
             String, "planning/status", self.planning_status_callback, 10,
             callback_group=self.planning_callback_group)
         self.create_subscription(
+            FailureEvidence, "planning/failure_evidence",
+            self.failure_evidence_callback, 20,
+            callback_group=self.planning_callback_group)
+        self.create_subscription(
             String, "planning/local_execution_event",
             self.local_execution_event_callback, 10,
             callback_group=self.planning_callback_group)
@@ -708,6 +717,29 @@ class FrontierExplorer(Node):
         self.last_locomotion_state_ns = self.get_clock().now().nanoseconds
         self.last_locomotion_state_stamp_ns = (
             int(msg.stamp.sec) * 1000000000 + int(msg.stamp.nanosec))
+
+    def failure_evidence_callback(self, msg: FailureEvidence):
+        """Record structured local failures without changing goal ownership.
+
+        The matching terminal planning/status message remains the sole state
+        transition authority.  Keeping evidence observational prevents a
+        reordered evidence/status pair from cooling a newer request.
+        """
+        self.failure_evidence_received += 1
+        if (self.active_path_request_generation is not None and
+                int(msg.request_id) !=
+                int(self.active_path_request_generation)):
+            return
+        self.failure_evidence_matched += 1
+        self.last_failure_stage = str(msg.stage)
+        self.last_failure_reason = str(msg.reason)
+        self.last_failure_clearance = float(msg.required_clearance)
+        self.get_logger().warn(
+            "[LOCAL_FAILURE_EVIDENCE] "
+            f"request_id={msg.request_id} trajectory={msg.trajectory_id} "
+            f"stage={msg.stage} reason={msg.reason} "
+            f"attempts={msg.attempted_candidates} "
+            f"clearance={msg.required_clearance:.3f}m")
 
     def locomotion_state_age_ns(self) -> Optional[int]:
         """Return publisher age, falling back to local receipt for old bags."""
@@ -1912,6 +1944,53 @@ class FrontierExplorer(Node):
                     f"{task.frontier_missing_streak if task is not None else 0}"
                     f"/{self.observation_closure_updates}; switching anyway")
                 self.replace_unsatisfied_observation()
+        elif status == "VIEWPOINT_LOCAL_REJECTED":
+            # SCAN exhausted a finite family of geometrically distinct local
+            # paths for this exact viewpoint.  This is not evidence that the
+            # committed region or portal is bad.  Cool only the rejected pose
+            # and first ask the existing region commitment for a sibling
+            # viewpoint.  Region ownership changes only if no sibling exists.
+            self.local_repair_exhausted_count += 1
+            self.global_reroute_failure_streak = 0
+            self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
+            self.active_path_request_generation = None
+            failed_region = self.active_region_id
+            previous_goal = self.active_goal
+            if previous_goal is not None:
+                self.add_goal_failure_cooldown(
+                    previous_goal, "VIEWPOINT_LOCAL_REJECTED")
+            self.active_goal = None
+            self.active_goal_cell = None
+            self.active_observation = None
+            self.active_raw_path = []
+            self.active_path_progress_index = 0
+            self.pending_blocked_edge = None
+            self.prepared_candidate = None
+            self.replacement_pending = False
+            self.last_active_goal_clear_reason = "VIEWPOINT_LOCAL_REJECTED"
+            excluded_goals = ((previous_goal,)
+                              if previous_goal is not None else ())
+            if self.plan_from_current_position(excluded_goals=excluded_goals):
+                self.publish_status(
+                    "VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED")
+                return
+
+            # The viewpoint-level alternative set is empty.  Only now may the
+            # failed child region be cooled and the enclosing commitment move
+            # to a different child/portal.
+            if failed_region is not None:
+                self.add_region_failure_cooldown(
+                    failed_region, "VIEWPOINT_ALTERNATIVES_EXHAUSTED")
+                if self.active_region_id == failed_region:
+                    self.terminate_region_option(
+                        "viewpoint_alternatives_exhausted")
+            if self.plan_from_current_position(excluded_goals=excluded_goals):
+                self.publish_status(
+                    "VIEWPOINT_LOCAL_REJECTED_REGION_CHANGED")
+            else:
+                self.publish_status(
+                    "VIEWPOINT_LOCAL_REJECTED_WAITING_FOR_ROUTE")
         elif status == "LOCAL_REPAIR_EXHAUSTED":
             # SCAN has already held the robot and spent its local alternative
             # budget for this exact request.  Retire only the failed child
@@ -3348,6 +3427,11 @@ class FrontierExplorer(Node):
             "region_switches": self.region_switches,
             "intra_scope_region_switches": self.intra_scope_region_switches,
             "local_repair_exhausted_count": self.local_repair_exhausted_count,
+            "failure_evidence_received": self.failure_evidence_received,
+            "failure_evidence_matched": self.failure_evidence_matched,
+            "last_failure_stage": self.last_failure_stage,
+            "last_failure_reason": self.last_failure_reason,
+            "last_failure_clearance_m": self.last_failure_clearance,
             "region_failure_cooldowns": len(self.region_failure_cooldowns),
             "directional_candidate_suppressed_count": (
                 self.directional_candidate_suppressed_count),

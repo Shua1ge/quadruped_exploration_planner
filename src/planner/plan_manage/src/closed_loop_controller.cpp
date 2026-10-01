@@ -13,6 +13,7 @@
 #include <scan_planner_msgs/msg/execution_command.hpp>
 #include <scan_planner_msgs/msg/execution_state.hpp>
 #include <scan_planner_msgs/msg/locomotion_state.hpp>
+#include <scan_planner_msgs/msg/trajectory_ack.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -69,6 +70,8 @@ public:
     cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 20);
     execution_state_pub_ = create_publisher<scan_planner_msgs::msg::ExecutionState>(
         "planning/execution_state", rclcpp::QoS(20).reliable());
+    trajectory_ack_pub_ = create_publisher<scan_planner_msgs::msg::TrajectoryAck>(
+        "planning/trajectory_ack", rclcpp::QoS(20).reliable());
     heading_error_pub_ = create_publisher<std_msgs::msg::Float64>("planning/go2_heading_error", 10);
     heading_stalled_pub_ = create_publisher<std_msgs::msg::Bool>("planning/go2_heading_stalled", 10);
     execution_event_pub_ = create_publisher<std_msgs::msg::String>(
@@ -93,15 +96,31 @@ private:
 
   static double normalizeAngle(double angle)
   {
-    while (angle > M_PI) angle -= 2.0 * M_PI;
-    while (angle < -M_PI) angle += 2.0 * M_PI;
-    return angle;
+    return normalizePlanarAngle(angle);
   }
 
   static Eigen::Vector2d clampNorm(const Eigen::Vector2d &value, double max_norm)
   {
     const double norm = value.norm();
     return (norm <= max_norm || norm < 1e-6) ? value : value / norm * max_norm;
+  }
+
+  void publishTrajectoryAck(
+      const scan_planner_msgs::msg::Bspline &candidate, uint8_t status,
+      const std::string &reason, double matched_time = 0.0,
+      double position_error = std::numeric_limits<double>::quiet_NaN(),
+      double yaw_error = std::numeric_limits<double>::quiet_NaN())
+  {
+    scan_planner_msgs::msg::TrajectoryAck ack;
+    ack.stamp = now();
+    ack.request_id = candidate.request_id;
+    ack.trajectory_id = candidate.traj_id;
+    ack.status = status;
+    ack.reason = reason;
+    ack.matched_time = matched_time;
+    ack.position_error = position_error;
+    ack.yaw_error = yaw_error;
+    trajectory_ack_pub_->publish(ack);
   }
 
   double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des) const
@@ -178,9 +197,14 @@ private:
 
   void bsplineCallback(const scan_planner_msgs::msg::Bspline::ConstSharedPtr msg)
   {
-    if (msg->pos_pts.empty() || msg->knots.empty() || msg->order <= 0)
+    if (!validBsplineStructure(
+            msg->pos_pts.size(), msg->knots.size(), msg->order) ||
+        !validBsplineKnots(msg->knots, msg->pos_pts.size(), msg->order))
     {
       RCLCPP_WARN(get_logger(), "Ignoring invalid B-spline");
+      publishTrajectoryAck(
+          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "INVALID_SPLINE_SHAPE");
       return;
     }
     if (!shouldAcceptTrajectoryVersion(
@@ -195,6 +219,9 @@ private:
           static_cast<long long>(msg->traj_id),
           static_cast<unsigned long long>(active_request_id_),
           static_cast<long long>(traj_id_));
+      publishTrajectoryAck(
+          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "STALE_TRAJECTORY_VERSION");
       return;
     }
     Eigen::MatrixXd points(3, msg->pos_pts.size());
@@ -202,6 +229,14 @@ private:
       points.col(i) << msg->pos_pts[i].x, msg->pos_pts[i].y, msg->pos_pts[i].z;
     Eigen::VectorXd knots(msg->knots.size());
     for (size_t i = 0; i < msg->knots.size(); ++i) knots(i) = msg->knots[i];
+    if (!points.allFinite() || !knots.allFinite())
+    {
+      RCLCPP_WARN(get_logger(), "Ignoring non-finite B-spline");
+      publishTrajectoryAck(
+          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "NONFINITE_SPLINE");
+      return;
+    }
     UniformBspline position(points, msg->order, 0.1);
     position.setKnot(knots);
 
@@ -211,6 +246,9 @@ private:
     if (candidate_fixed_yaw && !std::isfinite(candidate_body_yaw))
     {
       RCLCPP_WARN(get_logger(), "Ignoring B-spline with invalid body yaw");
+      publishTrajectoryAck(
+          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "INVALID_BODY_YAW");
       return;
     }
 
@@ -230,6 +268,9 @@ private:
       // command from the same request cannot become current again.
       receive_traj_ = true;
       resetHeadingFreezeState();
+      publishTrajectoryAck(
+          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED,
+          "STATIONARY_HOLD_ACCEPTED");
       publishExecutionState(
           scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
           soft_hold_reason_, std::numeric_limits<double>::quiet_NaN(), true);
@@ -273,6 +314,10 @@ private:
                     "[TRAJECTORY_HANDOFF_REJECTED] trajectory=%lld start_error=%.3fm matched_error=%.3fm dynamic_limit=%.3fm speed=%.3fm/s; preserving current execution state",
                     static_cast<long long>(msg->traj_id), start_error,
                     matched_error, dynamic_handoff_limit, handoff_speed);
+        publishTrajectoryAck(
+            *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+            "HANDOFF_POSITION_ERROR", matched_time, matched_error,
+            matched_yaw_error);
         return;
       }
 
@@ -344,6 +389,9 @@ private:
       soft_hold_ = false;
       soft_hold_reason_.clear();
     }
+    publishTrajectoryAck(
+        *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED,
+        "HANDOFF_ACCEPTED", matched_time, matched_error, matched_yaw_error);
     publishExecutionState(
         soft_hold_ ? scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD
                    : scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
@@ -434,10 +482,39 @@ private:
 
   void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
   {
-    odom_pos_ << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
-    odom_vel_ << msg->twist.twist.linear.x, msg->twist.twist.linear.y,
-        msg->twist.twist.linear.z;
-    odom_yaw_ = tf2::getYaw(msg->pose.pose.orientation);
+    const Eigen::Vector3d position(
+        msg->pose.pose.position.x, msg->pose.pose.position.y,
+        msg->pose.pose.position.z);
+    const Eigen::Vector3d velocity(
+        msg->twist.twist.linear.x, msg->twist.twist.linear.y,
+        msg->twist.twist.linear.z);
+    Eigen::Quaterniond orientation(
+        msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
+        msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+    if (!position.allFinite() || !velocity.allFinite() ||
+        !normalizeFiniteQuaternion(&orientation))
+    {
+      have_odom_ = false;
+      publishStop();
+      RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "[INVALID_ODOMETRY_REJECTED] controller stopped; pose, velocity, or quaternion is non-finite/degenerate");
+      return;
+    }
+    const double yaw = std::atan2(
+        2.0 * (orientation.w() * orientation.z() +
+               orientation.x() * orientation.y()),
+        1.0 - 2.0 * (orientation.y() * orientation.y() +
+                     orientation.z() * orientation.z()));
+    if (!std::isfinite(yaw))
+    {
+      have_odom_ = false;
+      publishStop();
+      return;
+    }
+    odom_pos_ = position;
+    odom_vel_ = velocity;
+    odom_yaw_ = yaw;
     have_odom_ = true;
   }
 
@@ -616,6 +693,7 @@ private:
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<scan_planner_msgs::msg::ExecutionState>::SharedPtr execution_state_pub_;
+  rclcpp::Publisher<scan_planner_msgs::msg::TrajectoryAck>::SharedPtr trajectory_ack_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_error_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr heading_stalled_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_event_pub_;

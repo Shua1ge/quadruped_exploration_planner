@@ -90,8 +90,20 @@ namespace scan_planner
                                         bool flag_randomPolyTraj,
                                         double initialization_speed_limit,
                                         double minimum_initial_duration,
-                                        double collision_yaw_override)
+                                        double collision_yaw_override,
+                                        double planning_clearance_margin)
   {
+
+    grid_map_->usePlanningClearanceMarginForCurrentThread(
+        planning_clearance_margin);
+    struct PlanningClearanceScope
+    {
+      GridMap::Ptr map;
+      ~PlanningClearanceScope()
+      {
+        map->clearPlanningClearanceMarginForCurrentThread();
+      }
+    } planning_clearance_scope{grid_map_};
 
     const bool use_collision_yaw_override =
         std::isfinite(collision_yaw_override);

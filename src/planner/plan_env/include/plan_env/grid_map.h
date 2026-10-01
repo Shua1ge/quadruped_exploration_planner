@@ -235,7 +235,9 @@ public:
     double body_offset{0.0};
     uint64_t revision{0};
 
-    int getInflateOccupancy(const Eigen::Vector3d& pos, double yaw) const;
+    int getInflateOccupancy(
+        const Eigen::Vector3d& pos, double yaw,
+        const std::vector<Eigen::Vector2d>& clearance_offsets) const;
   };
   using InflatedOccupancySnapshotPtr = std::shared_ptr<const InflatedOccupancySnapshot>;
 
@@ -246,6 +248,8 @@ public:
   void useInflatedOccupancySnapshotForCurrentThread(
       InflatedOccupancySnapshotPtr snapshot) const;
   void clearInflatedOccupancySnapshotForCurrentThread() const;
+  void usePlanningClearanceMarginForCurrentThread(double margin) const;
+  void clearPlanningClearanceMarginForCurrentThread() const;
   uint64_t getMapRevision() const { return map_revision_.load(); }
   double getMapAgeSeconds() const;
 
@@ -282,6 +286,9 @@ private:
   mutable InflatedOccupancySnapshotPtr latest_inflated_snapshot_;
   static thread_local const GridMap* tls_snapshot_owner_;
   static thread_local InflatedOccupancySnapshotPtr tls_snapshot_;
+  static thread_local const GridMap* tls_clearance_owner_;
+  static thread_local double tls_planning_clearance_margin_;
+  static thread_local std::vector<Eigen::Vector2d> tls_clearance_offsets_;
 
   // get depth image and sensor pose
   void depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img,
@@ -471,17 +478,41 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   if (tls_snapshot_owner_ == this && tls_snapshot_)
-    return tls_snapshot_->getInflateOccupancy(pos, yaw);
+  {
+    if (tls_clearance_owner_ == this)
+      return tls_snapshot_->getInflateOccupancy(
+          pos, yaw, tls_clearance_offsets_);
+    static const std::vector<Eigen::Vector2d> no_clearance_offsets;
+    return tls_snapshot_->getInflateOccupancy(
+        pos, yaw, no_clearance_offsets);
+  }
 
   std::shared_lock<std::shared_mutex> lock(map_mutex_);
   Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
   Eigen::Vector3d front = pos + mp_.double_cylinder_offset_ * heading;
   Eigen::Vector3d rear = pos - mp_.double_cylinder_offset_ * heading;
 
-  int front_occ = getInflateOccupancyFromBuffer(front, md_.occupancy_buffer_inflate_);
+  const auto query_with_margin = [this](
+      const Eigen::Vector3d& center) {
+    if (tls_clearance_owner_ != this || tls_clearance_offsets_.empty())
+      return getInflateOccupancyFromBuffer(
+          center, md_.occupancy_buffer_inflate_);
+    for (const Eigen::Vector2d &offset : tls_clearance_offsets_)
+    {
+      Eigen::Vector3d sample = center;
+      sample.head<2>() += offset;
+      const int occupancy = getInflateOccupancyFromBuffer(
+          sample, md_.occupancy_buffer_inflate_);
+      if (occupancy != 0)
+        return occupancy;
+    }
+    return 0;
+  };
+
+  int front_occ = query_with_margin(front);
   if (front_occ != 0) return front_occ;
 
-  return getInflateOccupancyFromBuffer(rear, md_.occupancy_buffer_inflate_);
+  return query_with_margin(rear);
 }
 
 inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer) {

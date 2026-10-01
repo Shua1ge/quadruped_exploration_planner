@@ -116,9 +116,13 @@ int plan_env::endpointObservation(bool self_filter_enabled, bool inside_self_fil
 
 thread_local const GridMap* GridMap::tls_snapshot_owner_ = nullptr;
 thread_local GridMap::InflatedOccupancySnapshotPtr GridMap::tls_snapshot_ = nullptr;
+thread_local const GridMap* GridMap::tls_clearance_owner_ = nullptr;
+thread_local double GridMap::tls_planning_clearance_margin_ = 0.0;
+thread_local std::vector<Eigen::Vector2d> GridMap::tls_clearance_offsets_;
 
 int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
-    const Eigen::Vector3d& pos, double yaw) const
+    const Eigen::Vector3d& pos, double yaw,
+    const std::vector<Eigen::Vector2d>& clearance_offsets) const
 {
   auto query = [this](const Eigen::Vector3d& point) {
     Eigen::Vector3i id;
@@ -140,9 +144,26 @@ int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
     return static_cast<int>(buffer[address]);
   };
 
+  const auto query_with_margin = [&query, &clearance_offsets](
+      const Eigen::Vector3d& center) {
+    if (clearance_offsets.empty())
+      return query(center);
+    for (const Eigen::Vector2d &offset : clearance_offsets)
+    {
+      Eigen::Vector3d sample = center;
+      sample.head<2>() += offset;
+      const int occupancy = query(sample);
+      if (occupancy != 0)
+        return occupancy;
+    }
+    return 0;
+  };
+
   const Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
-  const int front = query(pos + body_offset * heading);
-  return front != 0 ? front : query(pos - body_offset * heading);
+  const int front = query_with_margin(pos + body_offset * heading);
+  return front != 0
+             ? front
+             : query_with_margin(pos - body_offset * heading);
 }
 
 GridMap::InflatedOccupancySnapshotPtr GridMap::captureInflatedOccupancySnapshot() const
@@ -1334,6 +1355,34 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstShared
       local_patch_reference_z_, pos.z, dt_seconds,
       local_patch_z_filter_tau_, local_patch_z_max_rate_);
   local_patch_reference_stamp_ns_ = stamp_ns;
+}
+
+void GridMap::usePlanningClearanceMarginForCurrentThread(double margin) const
+{
+  tls_clearance_owner_ = this;
+  tls_planning_clearance_margin_ = std::max(0.0, margin);
+  tls_clearance_offsets_.clear();
+  const int cells = static_cast<int>(std::ceil(
+      tls_planning_clearance_margin_ / mp_.resolution_));
+  for (int x = -cells; x <= cells; ++x)
+    for (int y = -cells; y <= cells; ++y)
+    {
+      const Eigen::Vector2d offset(
+          x * mp_.resolution_, y * mp_.resolution_);
+      if (offset.norm() <= tls_planning_clearance_margin_ + 1e-9)
+        tls_clearance_offsets_.push_back(offset);
+    }
+  if (tls_clearance_offsets_.empty())
+    tls_clearance_offsets_.push_back(Eigen::Vector2d::Zero());
+}
+
+void GridMap::clearPlanningClearanceMarginForCurrentThread() const
+{
+  if (tls_clearance_owner_ != this)
+    return;
+  tls_clearance_owner_ = nullptr;
+  tls_planning_clearance_margin_ = 0.0;
+  tls_clearance_offsets_.clear();
 }
 
 void GridMap::locomotionStateCallback(

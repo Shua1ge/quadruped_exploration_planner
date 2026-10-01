@@ -1074,6 +1074,9 @@ def test_local_repair_exhausted_is_scoped_to_active_request():
     assert not MODULE.planning_status_matches_request(
         "LOCAL_REPAIR_EXHAUSTED", 201,
         pending_generation=None, active_generation=202)
+    assert MODULE.planning_status_matches_request(
+        "VIEWPOINT_LOCAL_REJECTED", 202,
+        pending_generation=None, active_generation=202)
 
 
 def test_idle_handoff_releases_only_stale_region_commitment():
@@ -1198,6 +1201,136 @@ def test_blocked_without_sibling_releases_failed_region_before_retry():
     assert region_cooldowns == [(12, "BLOCKED_NO_ALTERNATIVE")]
     assert terminations == ["blocked_no_alternative"]
     assert statuses == ["LOCAL_BLOCKED_REGION_CHANGED"]
+
+
+def test_viewpoint_local_rejection_preserves_region_when_sibling_exists():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.pending_path_request_generation = None
+    explorer.active_path_request_generation = 42
+    explorer.last_completed_request_generation = None
+    explorer.local_repair_exhausted_count = 0
+    explorer.global_reroute_failure_streak = 3
+    explorer.pending_path_publish_ns = 123
+    explorer.active_region_id = 12
+    explorer.active_goal = (32.1, 0.7)
+    explorer.active_goal_cell = (860, 703)
+    explorer.active_observation = object()
+    explorer.active_raw_path = [(1, 1), (2, 1)]
+    explorer.active_path_progress_index = 1
+    explorer.pending_blocked_edge = None
+    explorer.prepared_candidate = object()
+    explorer.replacement_pending = True
+    explorer.last_active_goal_clear_reason = "none"
+    goal_cooldowns = []
+    region_cooldowns = []
+    terminations = []
+    statuses = []
+
+    explorer.get_logger = lambda: SimpleNamespace(
+        warning=lambda *args, **kwargs: None)
+    explorer.add_goal_failure_cooldown = (
+        lambda goal, reason: goal_cooldowns.append((goal, reason)))
+    explorer.add_region_failure_cooldown = (
+        lambda region, reason: region_cooldowns.append((region, reason)))
+    explorer.terminate_region_option = lambda reason: terminations.append(reason)
+    explorer.plan_from_current_position = lambda excluded_goals=(): True
+    explorer.publish_status = statuses.append
+
+    explorer.planning_status_callback(
+        SimpleNamespace(data="VIEWPOINT_LOCAL_REJECTED request_id=42"))
+
+    assert goal_cooldowns == [
+        ((32.1, 0.7), "VIEWPOINT_LOCAL_REJECTED")]
+    assert explorer.active_region_id == 12
+    assert region_cooldowns == []
+    assert terminations == []
+    assert statuses == ["VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED"]
+
+
+def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.pending_path_request_generation = None
+    explorer.active_path_request_generation = 42
+    explorer.last_completed_request_generation = None
+    explorer.local_repair_exhausted_count = 0
+    explorer.global_reroute_failure_streak = 3
+    explorer.pending_path_publish_ns = 123
+    explorer.active_region_id = 12
+    explorer.active_goal = (32.1, 0.7)
+    explorer.active_goal_cell = (860, 703)
+    explorer.active_observation = object()
+    explorer.active_raw_path = [(1, 1), (2, 1)]
+    explorer.active_path_progress_index = 1
+    explorer.pending_blocked_edge = None
+    explorer.prepared_candidate = object()
+    explorer.replacement_pending = True
+    explorer.last_active_goal_clear_reason = "none"
+    goal_cooldowns = []
+    region_cooldowns = []
+    terminations = []
+    statuses = []
+    planning_calls = []
+
+    explorer.get_logger = lambda: SimpleNamespace(
+        warning=lambda *args, **kwargs: None)
+    explorer.add_goal_failure_cooldown = (
+        lambda goal, reason: goal_cooldowns.append((goal, reason)))
+    explorer.add_region_failure_cooldown = (
+        lambda region, reason: region_cooldowns.append((region, reason)))
+
+    def terminate(reason):
+        terminations.append(reason)
+        explorer.active_region_id = None
+        return True
+
+    explorer.terminate_region_option = terminate
+
+    def plan_from_current_position(excluded_goals=()):
+        planning_calls.append(tuple(excluded_goals))
+        return len(planning_calls) == 2
+
+    explorer.plan_from_current_position = plan_from_current_position
+    explorer.publish_status = statuses.append
+    explorer.planning_status_callback(
+        SimpleNamespace(data="VIEWPOINT_LOCAL_REJECTED request_id=42"))
+
+    assert goal_cooldowns == [
+        ((32.1, 0.7), "VIEWPOINT_LOCAL_REJECTED")]
+    assert planning_calls == [((32.1, 0.7),), ((32.1, 0.7),)]
+    assert region_cooldowns == [
+        (12, "VIEWPOINT_ALTERNATIVES_EXHAUSTED")]
+    assert terminations == ["viewpoint_alternatives_exhausted"]
+    assert statuses == ["VIEWPOINT_LOCAL_REJECTED_REGION_CHANGED"]
+
+
+def test_failure_evidence_is_observational_and_request_scoped():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.active_path_request_generation = 42
+    explorer.failure_evidence_received = 0
+    explorer.failure_evidence_matched = 0
+    explorer.last_failure_stage = "none"
+    explorer.last_failure_reason = "none"
+    explorer.last_failure_clearance = 0.0
+    warnings = []
+    explorer.get_logger = lambda: SimpleNamespace(warn=warnings.append)
+
+    explorer.failure_evidence_callback(SimpleNamespace(
+        request_id=41, trajectory_id=8, stage="FINAL_CLEARANCE",
+        reason="STALE", attempted_candidates=1, required_clearance=0.1))
+    assert explorer.failure_evidence_received == 1
+    assert explorer.failure_evidence_matched == 0
+    assert warnings == []
+
+    explorer.failure_evidence_callback(SimpleNamespace(
+        request_id=42, trajectory_id=9, stage="FINAL_CLEARANCE",
+        reason="PLANNING_MARGIN", attempted_candidates=3,
+        required_clearance=0.1))
+    assert explorer.failure_evidence_received == 2
+    assert explorer.failure_evidence_matched == 1
+    assert explorer.last_failure_stage == "FINAL_CLEARANCE"
+    assert explorer.last_failure_reason == "PLANNING_MARGIN"
+    assert explorer.last_failure_clearance == 0.1
+    assert len(warnings) == 1
 
 
 def test_replan_gate_bounds_attempts_until_planning_context_changes():

@@ -32,7 +32,8 @@ namespace scan_planner
                        bool flag_randomPolyTraj, double initialization_speed_limit = -1.0,
                        double minimum_initial_duration = 0.0,
                        double collision_yaw_override =
-                           std::numeric_limits<double>::quiet_NaN());
+                           std::numeric_limits<double>::quiet_NaN(),
+                       double planning_clearance_margin = 0.0);
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);

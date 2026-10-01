@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -37,6 +38,51 @@ struct ReferencePathLookahead
   Eigen::Vector3d tangent{Eigen::Vector3d::Zero()};
   double remaining_after_target{0.0};
 };
+
+enum class ClearanceFailure : uint8_t
+{
+  NONE = 0,
+  PHYSICAL_COLLISION = 1,
+  PLANNING_MARGIN = 2,
+  ESCAPE_WORSENING = 3,
+  ESCAPE_TIMEOUT = 4,
+};
+
+struct ClearanceResult
+{
+  bool physical_collision{false};
+  bool planning_margin_violation{false};
+  bool escape_prefix_allowed{false};
+  size_t violation_count{0};
+  ClearanceFailure failure{ClearanceFailure::NONE};
+
+  bool accepted() const
+  {
+    return failure == ClearanceFailure::NONE && !physical_collision &&
+           (!planning_margin_violation || escape_prefix_allowed);
+  }
+};
+
+inline ClearanceResult classifyClearanceResult(
+    bool margin_violation, bool physical_collision,
+    bool escape_prefix_allowed, bool escape_timed_out,
+    bool escape_worsened, size_t violation_count)
+{
+  ClearanceResult result;
+  result.physical_collision = physical_collision;
+  result.planning_margin_violation = margin_violation;
+  result.escape_prefix_allowed = escape_prefix_allowed;
+  result.violation_count = violation_count;
+  if (physical_collision)
+    result.failure = ClearanceFailure::PHYSICAL_COLLISION;
+  else if (escape_timed_out)
+    result.failure = ClearanceFailure::ESCAPE_TIMEOUT;
+  else if (escape_worsened)
+    result.failure = ClearanceFailure::ESCAPE_WORSENING;
+  else if (margin_violation && !escape_prefix_allowed)
+    result.failure = ClearanceFailure::PLANNING_MARGIN;
+  return result;
+}
 
 inline ReferencePathLookahead projectReferencePathLookahead(
     const std::vector<Eigen::Vector3d> &path,
@@ -274,6 +320,41 @@ inline bool holdCommandAlreadyIssuedForVersion(
     uint64_t previous_request, int64_t previous_trajectory)
 {
   return request == previous_request && trajectory == previous_trajectory;
+}
+
+inline bool trajectoryHandoffTimedOut(
+    bool pending, double elapsed_seconds, double timeout_seconds)
+{
+  return pending && std::isfinite(elapsed_seconds) &&
+         std::isfinite(timeout_seconds) && timeout_seconds > 0.0 &&
+         elapsed_seconds >= timeout_seconds;
+}
+
+inline bool validBsplineStructure(
+    size_t control_point_count, size_t knot_count, int order)
+{
+  if (order <= 0 || control_point_count <= static_cast<size_t>(order))
+    return false;
+  const size_t order_size = static_cast<size_t>(order);
+  if (control_point_count >
+      std::numeric_limits<size_t>::max() - order_size - 1)
+    return false;
+  return knot_count == control_point_count + order_size + 1;
+}
+
+inline bool validBsplineKnots(
+    const std::vector<double> &knots, size_t control_point_count, int order)
+{
+  if (!validBsplineStructure(control_point_count, knots.size(), order))
+    return false;
+  for (size_t index = 0; index < knots.size(); ++index)
+  {
+    if (!std::isfinite(knots[index]) ||
+        (index > 0 && knots[index] < knots[index - 1]))
+      return false;
+  }
+  return knots[control_point_count] - knots[static_cast<size_t>(order)] >
+         1e-9;
 }
 
 inline double brakingSweepHorizon(

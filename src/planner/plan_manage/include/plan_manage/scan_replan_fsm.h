@@ -24,6 +24,8 @@
 #include <scan_planner_msgs/msg/data_disp.hpp>
 #include <scan_planner_msgs/msg/execution_command.hpp>
 #include <scan_planner_msgs/msg/execution_state.hpp>
+#include <scan_planner_msgs/msg/failure_evidence.hpp>
+#include <scan_planner_msgs/msg/trajectory_ack.hpp>
 #include <plan_manage/planner_manager.h>
 #include <plan_manage/replan_fsm_utils.h>
 #include <traj_utils/planning_visualization.h>
@@ -93,6 +95,7 @@ namespace scan_planner
     double yaw_rate_filter_tau_{0.15};
     double guaranteed_braking_deceleration_{0.32};
     double command_stop_latency_{0.30};
+    double trajectory_ack_timeout_{0.75};
     int pose_free_release_cycles_{3};
     int local_hold_release_cycles_{3};
     double goal_tolerance_;
@@ -172,6 +175,24 @@ namespace scan_planner
     };
     std::mutex execution_snapshot_mutex_;
     ExecutionTrajectorySnapshot execution_snapshot_;
+    struct PendingTrajectoryHandoff
+    {
+      LocalTrajData candidate;
+      LocalTrajData previous;
+      uint64_t request_id{0};
+      int64_t trajectory_id{0};
+      bool clearance_escape_active{false};
+      double clearance_escape_deadline{0.0};
+      size_t initial_clearance_violations{0};
+      bool fixed_body_yaw{false};
+      double body_yaw{0.0};
+      bool reference_path_update{false};
+      uint64_t reference_request_id{0};
+      std::chrono::steady_clock::time_point submitted_at{};
+      bool valid{false};
+    };
+    std::mutex pending_handoff_mutex_;
+    PendingTrajectoryHandoff pending_handoff_;
     std::mutex execution_command_mutex_;
     uint64_t last_execution_command_request_id_{0};
     int64_t last_execution_command_trajectory_id_{0};
@@ -233,6 +254,7 @@ namespace scan_planner
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Subscription<scan_planner_msgs::msg::ExecutionState>::SharedPtr execution_state_sub_;
+    rclcpp::Subscription<scan_planner_msgs::msg::TrajectoryAck>::SharedPtr trajectory_ack_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr go2_heading_stalled_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr go2_heading_error_sub_;
     rclcpp::Publisher<scan_planner_msgs::msg::Bspline>::SharedPtr bspline_pub_;
@@ -240,6 +262,7 @@ namespace scan_planner
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr self_inflation_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr blocked_segment_pub_;
     rclcpp::Publisher<scan_planner_msgs::msg::ExecutionCommand>::SharedPtr execution_command_pub_;
+    rclcpp::Publisher<scan_planner_msgs::msg::FailureEvidence>::SharedPtr failure_evidence_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
 
     /* helper functions */
@@ -275,6 +298,13 @@ namespace scan_planner
                               bool publish_reference_status = true);
     void publishStatus(const std::string &status);
     void publishReferenceStatus(const std::string &status, uint64_t request_id = 0);
+    void publishFailureEvidence(uint64_t request_id, int64_t trajectory_id,
+                                const std::string &stage,
+                                const std::string &reason,
+                                const Eigen::Vector3d &position,
+                                uint32_t attempted_candidates,
+                                double required_clearance,
+                                ClearanceFailure clearance_failure);
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
                                            uint64_t request_id,
@@ -310,6 +340,8 @@ namespace scan_planner
     void safetyOdometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg);
     void executionStateCallback(
         const scan_planner_msgs::msg::ExecutionState::ConstSharedPtr &msg);
+    void trajectoryAckCallback(
+        const scan_planner_msgs::msg::TrajectoryAck::ConstSharedPtr &msg);
     void go2HeadingStalledCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg);
     void go2HeadingErrorCallback(const std_msgs::msg::Float64::ConstSharedPtr &msg);
 

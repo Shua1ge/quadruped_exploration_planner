@@ -101,6 +101,8 @@ namespace scan_planner
         node_, "fsm.guaranteed_braking_deceleration", 0.32);
     command_stop_latency_ = load_parameter<double>(
         node_, "fsm.command_stop_latency", 0.30);
+    trajectory_ack_timeout_ = load_parameter<double>(
+        node_, "fsm.trajectory_ack_timeout", 0.75);
     pose_free_release_cycles_ = load_parameter<int>(
         node_, "fsm.pose_free_release_cycles", 3);
     local_hold_release_cycles_ = load_parameter<int>(
@@ -130,6 +132,7 @@ namespace scan_planner
         yaw_rate_filter_tau_ < 0.0 ||
         guaranteed_braking_deceleration_ <= 0.0 ||
         command_stop_latency_ < 0.0 ||
+        trajectory_ack_timeout_ <= 0.0 ||
         pose_free_release_cycles_ <= 0 ||
         local_hold_release_cycles_ <= 0)
       throw std::runtime_error(
@@ -231,6 +234,10 @@ namespace scan_planner
         "planning/execution_state", rclcpp::QoS(20).reliable(),
         std::bind(&SCANReplanFSM::executionStateCallback, this, std::placeholders::_1),
         control_feedback_options);
+    trajectory_ack_sub_ = node_->create_subscription<scan_planner_msgs::msg::TrajectoryAck>(
+        "planning/trajectory_ack", rclcpp::QoS(20).reliable(),
+        std::bind(&SCANReplanFSM::trajectoryAckCallback, this, std::placeholders::_1),
+        control_feedback_options);
     go2_heading_stalled_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
         "planning/go2_heading_stalled", 10,
         std::bind(&SCANReplanFSM::go2HeadingStalledCallback, this, std::placeholders::_1),
@@ -248,6 +255,8 @@ namespace scan_planner
         "planning/blocked_segment", 10);
     execution_command_pub_ = node_->create_publisher<scan_planner_msgs::msg::ExecutionCommand>(
         "planning/execution_command", rclcpp::QoS(20).reliable());
+    failure_evidence_pub_ = node_->create_publisher<scan_planner_msgs::msg::FailureEvidence>(
+        "planning/failure_evidence", rclcpp::QoS(20).reliable());
     status_pub_ = node_->create_publisher<std_msgs::msg::String>("planning/status", 10);
     publishStatus("IDLE");
 
@@ -993,6 +1002,122 @@ namespace scan_planner
     }
   }
 
+  void SCANReplanFSM::trajectoryAckCallback(
+      const scan_planner_msgs::msg::TrajectoryAck::ConstSharedPtr &msg)
+  {
+    PendingTrajectoryHandoff handoff;
+    std::unique_lock<std::mutex> handoff_lock(pending_handoff_mutex_);
+    if (!pending_handoff_.valid ||
+        pending_handoff_.request_id != msg->request_id ||
+        pending_handoff_.trajectory_id != msg->trajectory_id)
+    {
+      // Emergency-stop splines are committed synchronously because safety
+      // must not wait for a round trip.  Their controller ACK therefore has
+      // no pending transaction, but it is not stale if it names the currently
+      // executing snapshot exactly.
+      bool acknowledges_current_execution = false;
+      {
+        std::lock_guard<std::mutex> execution_lock(execution_snapshot_mutex_);
+        acknowledges_current_execution =
+            execution_snapshot_.valid &&
+            execution_snapshot_.request_id == msg->request_id &&
+            execution_snapshot_.trajectory_id == msg->trajectory_id;
+      }
+      if (!acknowledges_current_execution)
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 1000,
+            "[STALE_TRAJECTORY_ACK_IGNORED] request_id=%llu trajectory=%lld status=%u",
+            static_cast<unsigned long long>(msg->request_id),
+            static_cast<long long>(msg->trajectory_id),
+            static_cast<unsigned int>(msg->status));
+      return;
+    }
+    handoff = pending_handoff_;
+
+    if (msg->status != scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED)
+    {
+      planner_manager_->local_data_ = handoff.previous;
+      predictive_replan_requested_.store(true);
+      if (handoff.clearance_escape_active)
+      {
+        stopped_local_repair_pending_.store(true);
+        stopped_local_repair_active_.store(true);
+      }
+      // Clear pending only after the previous planning state is restored.
+      // Until this assignment, execFSMCallback remains unable to start a new
+      // plan and cannot observe a half-committed handoff.
+      pending_handoff_.valid = false;
+      handoff_lock.unlock();
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "[CANDIDATE_TRAJECTORY_REJECTED] request_id=%llu trajectory=%lld reason=%s position_error=%.3fm yaw_error=%.3frad; active execution snapshot preserved",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id), msg->reason.c_str(),
+          msg->position_error, msg->yaw_error);
+      return;
+    }
+
+    planner_manager_->local_data_ = handoff.candidate;
+    updateExecutionTrajectorySnapshot(
+        handoff.candidate, handoff.request_id,
+        handoff.clearance_escape_active,
+        handoff.clearance_escape_deadline,
+        handoff.initial_clearance_violations,
+        handoff.fixed_body_yaw, handoff.body_yaw);
+    if (handoff.clearance_escape_active)
+    {
+      structured_local_repair_active_.store(true);
+      structured_local_repair_executing_.store(true);
+      structured_local_repair_finished_.store(false);
+      structured_local_repair_rejoin_pending_.store(false);
+      structured_local_repair_request_id_.store(handoff.request_id);
+      structured_local_repair_trajectory_id_.store(handoff.trajectory_id);
+      predictive_hold_latched_.store(false);
+      predictive_hold_release_cycles_.store(0);
+    }
+
+    const bool released_terminal_repair_hold =
+        terminal_local_repair_hold_.exchange(false);
+    if (newPlanMayReleaseSafetyStop(
+            pose_occupied_latched_.load(), predictive_hold_latched_.load(),
+            temporal_safety_latched_.load()) &&
+        !invalid_odom_latched_.load() &&
+        safety_stop_active_.exchange(false))
+    {
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[SAFETY_RELEASE] source=controller_handoff_ack request_id=%llu trajectory=%lld clearance_escape=%d",
+          static_cast<unsigned long long>(handoff.request_id),
+          static_cast<long long>(handoff.trajectory_id),
+          handoff.clearance_escape_active ? 1 : 0);
+    }
+    if (released_terminal_repair_hold)
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[LOCAL_REPAIR_TERMINAL_HOLD_RELEASED] request_id=%llu trajectory=%lld source=controller_handoff_ack",
+          static_cast<unsigned long long>(handoff.request_id),
+          static_cast<long long>(handoff.trajectory_id));
+
+    if (handoff.reference_path_update && reference_path_update_pending_ &&
+        pending_reference_request_id_ == handoff.reference_request_id)
+    {
+      publishReferenceStatus(
+          "PATH_TRAJECTORY_READY", handoff.reference_request_id);
+      reference_path_update_pending_ = false;
+      pending_reference_request_id_ = 0;
+    }
+    // The candidate, execution snapshot, latch ownership, and reference-path
+    // terminal status now describe one version.  Only now may planning resume.
+    pending_handoff_.valid = false;
+    handoff_lock.unlock();
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "[CANDIDATE_TRAJECTORY_COMMITTED] request_id=%llu trajectory=%lld matched_time=%.3fs position_error=%.3fm",
+        static_cast<unsigned long long>(handoff.request_id),
+        static_cast<long long>(handoff.trajectory_id), msg->matched_time,
+        msg->position_error);
+  }
+
   void SCANReplanFSM::go2HeadingStalledCallback(const std_msgs::msg::Bool::ConstSharedPtr &msg)
   {
     go2_heading_stalled_.store(msg->data);
@@ -1021,6 +1146,27 @@ namespace scan_planner
       return;
     }
     publishStatus(status + " request_id=" + std::to_string(request_id));
+  }
+
+  void SCANReplanFSM::publishFailureEvidence(
+      uint64_t request_id, int64_t trajectory_id,
+      const std::string &stage, const std::string &reason,
+      const Eigen::Vector3d &position, uint32_t attempted_candidates,
+      double required_clearance, ClearanceFailure clearance_failure)
+  {
+    scan_planner_msgs::msg::FailureEvidence evidence;
+    evidence.stamp = node_->now();
+    evidence.request_id = request_id;
+    evidence.trajectory_id = trajectory_id;
+    evidence.stage = stage;
+    evidence.reason = reason;
+    evidence.position.x = position.x();
+    evidence.position.y = position.y();
+    evidence.position.z = position.z();
+    evidence.attempted_candidates = attempted_candidates;
+    evidence.required_clearance = required_clearance;
+    evidence.clearance_failure = static_cast<uint8_t>(clearance_failure);
+    failure_evidence_pub_->publish(evidence);
   }
 
   void SCANReplanFSM::publishBlockedSegment()
@@ -1224,6 +1370,40 @@ namespace scan_planner
     last_fsm_callback_wall_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     fsm_callback_stall_reported_.store(false);
+    std::shared_ptr<scan_planner_msgs::msg::TrajectoryAck> timeout_ack;
+    {
+      std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+      if (pending_handoff_.valid)
+      {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() -
+            pending_handoff_.submitted_at).count();
+        if (trajectoryHandoffTimedOut(
+                true, elapsed, trajectory_ack_timeout_))
+        {
+          timeout_ack =
+              std::make_shared<scan_planner_msgs::msg::TrajectoryAck>();
+          timeout_ack->request_id = pending_handoff_.request_id;
+          timeout_ack->trajectory_id = pending_handoff_.trajectory_id;
+          timeout_ack->status =
+              scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED;
+          timeout_ack->reason = "CONTROLLER_ACK_TIMEOUT";
+        }
+      }
+    }
+    if (timeout_ack)
+      trajectoryAckCallback(timeout_ack);
+    {
+      std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+      if (pending_handoff_.valid)
+      {
+        // The planning timer must not advance trajectory time, trigger another
+        // replan, or complete a request while Controller still owns the old
+        // execution version.  Odometry and real-time safety use independent
+        // callback groups and continue running during this bounded wait.
+        return;
+      }
+    }
     refreshPlanningOdomFromSafety();
     if (have_odom_)
     {
@@ -1786,6 +1966,8 @@ namespace scan_planner
               stopped_repair_owned, structured_repair_owned))
       {
         const uint64_t failed_request = active_reference_request_id_.load();
+        const int64_t failed_trajectory =
+            structured_local_repair_trajectory_id_.load();
         stopped_local_repair_pending_.store(false);
         structured_local_repair_executing_.store(false);
         structured_local_repair_finished_.store(false);
@@ -1812,11 +1994,16 @@ namespace scan_planner
           execution_snapshot_.clearance_escape_active = false;
           execution_snapshot_.clearance_escape_free_cycles = 0;
         }
-        changeFSMExecState(WAIT_TARGET, "LOCAL_REPAIR_EXHAUSTED");
-        requestExecutionStop("LOCAL_REPAIR_EXHAUSTED");
+        changeFSMExecState(WAIT_TARGET, "VIEWPOINT_LOCAL_REJECTED");
+        publishFailureEvidence(
+            failed_request, failed_trajectory,
+            "STRUCTURED_LOCAL_REPAIR", "FINITE_CANDIDATE_FAMILY_EXHAUSTED",
+            odom_pos_, static_cast<uint32_t>(max_replan_fail_count_),
+            planning_clearance_margin_, ClearanceFailure::NONE);
+        requestExecutionStop("VIEWPOINT_LOCAL_REJECTED");
         RCLCPP_ERROR(
             node_->get_logger(),
-            "[LOCAL_REPAIR_EXHAUSTED] request_id=%llu attempts=%d; retaining HOLD and returning the failed local option to Explorer",
+            "[VIEWPOINT_LOCAL_REJECTED] request_id=%llu attempts=%d; retaining HOLD and returning only the failed viewpoint to Explorer",
             static_cast<unsigned long long>(failed_request),
             max_replan_fail_count_);
         return;
@@ -2894,7 +3081,13 @@ namespace scan_planner
         flag_randomPolyTraj, initialization_speed_limit,
         minimum_initial_duration,
         low_speed_local_repair ? local_repair_body_yaw
-                               : std::numeric_limits<double>::quiet_NaN());
+                               : std::numeric_limits<double>::quiet_NaN(),
+        // Normal candidates must satisfy the complete planning belt inside
+        // A* and optimization.  A structured escape is the sole exception:
+        // it may start inside that belt, so the optimizer uses physical
+        // occupancy while the validator below enforces a non-worsening,
+        // time-bounded exit from the same planning belt.
+        low_speed_local_repair ? 0.0 : planning_clearance_margin_);
     map->clearInflatedOccupancySnapshotForCurrentThread();
     const double optimization_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - planning_started).count();
@@ -3000,14 +3193,25 @@ namespace scan_planner
                 candidate_exited_clearance, physical_collision, t,
                 clearance_escape_deadline, clearance_violations,
                 initial_clearance_violations);
-        if (!valid_escape_prefix)
+        const ClearanceResult clearance_result = classifyClearanceResult(
+            clearance_blocked, physical_collision, valid_escape_prefix,
+            t > clearance_escape_deadline,
+            clearance_violations > initial_clearance_violations,
+            clearance_violations);
+        if (!clearance_result.accepted())
         {
+          publishFailureEvidence(
+              planning_request_id, info->traj_id_, "FINAL_CLEARANCE",
+              "CANDIDATE_CLEARANCE_REJECTED", blocked_point,
+              static_cast<uint32_t>(replan_fail_count_ + 1),
+              planning_clearance_margin_, clearance_result.failure);
           RCLCPP_ERROR(node_->get_logger(),
-                       "[CANDIDATE_CLEARANCE_REJECTED] t=%.3fs center=(%.3f,%.3f,%.3f) hit=(%.3f,%.3f) hard_margin=%.2fm violations=%zu initial=%zu physical_collision=%d",
+                       "[CANDIDATE_CLEARANCE_REJECTED] t=%.3fs center=(%.3f,%.3f,%.3f) hit=(%.3f,%.3f) hard_margin=%.2fm violations=%zu initial=%zu physical_collision=%d failure=%u",
                        t, pos.x(), pos.y(), pos.z(), blocked_point.x(),
                        blocked_point.y(), planning_clearance_margin_,
                        clearance_violations, initial_clearance_violations,
-                       physical_collision);
+                       physical_collision,
+                       static_cast<unsigned int>(clearance_result.failure));
           return reject_planned_trajectory();
         }
       }
@@ -3176,57 +3380,37 @@ namespace scan_planner
         bspline.yaw_dt = info->duration_;
       }
 
+      // Publishing is phase one of a trajectory transaction.  The controller
+      // may still reject this candidate after matching it against the current
+      // physical pose and speed.  Preserve the active execution snapshot and
+      // every safety latch until the exact request/trajectory version is ACKed.
+      {
+        std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+        pending_handoff_.candidate = *info;
+        pending_handoff_.previous = executing_trajectory;
+        pending_handoff_.request_id = planning_request_id;
+        pending_handoff_.trajectory_id = info->traj_id_;
+        pending_handoff_.clearance_escape_active =
+            candidate_started_inside_clearance;
+        pending_handoff_.clearance_escape_deadline = clearance_escape_deadline;
+        pending_handoff_.initial_clearance_violations =
+            initial_clearance_violations;
+        pending_handoff_.fixed_body_yaw = low_speed_local_repair;
+        pending_handoff_.body_yaw = local_repair_body_yaw;
+        pending_handoff_.reference_path_update =
+            reference_path_update_pending_;
+        pending_handoff_.reference_request_id =
+            pending_reference_request_id_;
+        pending_handoff_.submitted_at = std::chrono::steady_clock::now();
+        pending_handoff_.valid = true;
+      }
       bspline_pub_->publish(bspline);
-      // Keep safety bound to the old spline until the replacement has actually
-      // been published.  From this point on request_id + traj_id is the single
-      // execution version used by the controller and safety checker.
-      updateExecutionTrajectorySnapshot(
-          *info, planning_request_id, candidate_started_inside_clearance,
-          clearance_escape_deadline, initial_clearance_violations,
-          low_speed_local_repair, local_repair_body_yaw);
-      if (low_speed_local_repair)
-      {
-        structured_local_repair_active_.store(true);
-        structured_local_repair_executing_.store(true);
-        structured_local_repair_finished_.store(false);
-        structured_local_repair_rejoin_pending_.store(false);
-        structured_local_repair_request_id_.store(planning_request_id);
-        structured_local_repair_trajectory_id_.store(info->traj_id_);
-        // Publish first, then retire the braking latch. Merely reaching zero
-        // speed is insufficient; the replacement escape has now passed the
-        // optimizer, complete collision validation, and handoff checks.
-        predictive_hold_latched_.store(false);
-        predictive_hold_release_cycles_.store(0);
-      }
-      const bool released_terminal_repair_hold =
-          terminal_local_repair_hold_.exchange(false);
-      if (newPlanMayReleaseSafetyStop(
-              pose_occupied_latched_.load(), predictive_hold_latched_.load(),
-              temporal_safety_latched_.load()) &&
-          !invalid_odom_latched_.load() &&
-          safety_stop_active_.exchange(false))
-      {
-        RCLCPP_INFO(
-            node_->get_logger(),
-            "[SAFETY_RELEASE] source=trajectory_ready request_id=%llu trajectory=%lld clearance_escape=%d",
-            static_cast<unsigned long long>(planning_request_id),
-            static_cast<long long>(info->traj_id_),
-            candidate_started_inside_clearance);
-      }
-      if (released_terminal_repair_hold)
-      {
-        RCLCPP_INFO(
-            node_->get_logger(),
-            "[LOCAL_REPAIR_TERMINAL_HOLD_RELEASED] request_id=%llu trajectory=%lld source=validated_replacement",
-            static_cast<unsigned long long>(planning_request_id),
-            static_cast<long long>(info->traj_id_));
-      }
-      if (reference_path_update_pending_)
-      {
-        publishReferenceStatus("PATH_TRAJECTORY_READY", pending_reference_request_id_);
-        reference_path_update_pending_ = false;
-        pending_reference_request_id_ = 0;
-      }
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[CANDIDATE_TRAJECTORY_SUBMITTED] request_id=%llu trajectory=%lld clearance_escape=%d; waiting for controller ACK before replacing execution",
+          static_cast<unsigned long long>(planning_request_id),
+          static_cast<long long>(info->traj_id_),
+          candidate_started_inside_clearance ? 1 : 0);
 
       visualization_->displayOptimalTraj(info->position_traj_, 0);
 

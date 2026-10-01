@@ -87,6 +87,58 @@ TEST(ClearanceEscape, AllowsOnlyNonWorseningNonPhysicalPrefix)
       false, false, false, 0.20, 0.75, 0, 0));
 }
 
+TEST(ClearanceContract, DistinguishesPhysicalMarginAndEscapeFailures)
+{
+  const auto physical = classifyClearanceResult(
+      true, true, false, false, false, 2);
+  EXPECT_FALSE(physical.accepted());
+  EXPECT_EQ(physical.failure, ClearanceFailure::PHYSICAL_COLLISION);
+
+  const auto recoverable = classifyClearanceResult(
+      true, false, true, false, false, 2);
+  EXPECT_TRUE(recoverable.accepted());
+  EXPECT_EQ(recoverable.failure, ClearanceFailure::NONE);
+
+  const auto margin = classifyClearanceResult(
+      true, false, false, false, false, 1);
+  EXPECT_FALSE(margin.accepted());
+  EXPECT_EQ(margin.failure, ClearanceFailure::PLANNING_MARGIN);
+
+  const auto worsening = classifyClearanceResult(
+      true, false, false, false, true, 3);
+  EXPECT_EQ(worsening.failure, ClearanceFailure::ESCAPE_WORSENING);
+}
+
+TEST(ClearanceContract, ExhaustivelyClassifiesBooleanSafetyInputs)
+{
+  // Pseudo-brute-force the complete Boolean contract.  This locks down both
+  // acceptance and failure precedence, so later fixes cannot make a margin
+  // escape accidentally override physical collision or timeout evidence.
+  for (int mask = 0; mask < 32; ++mask)
+  {
+    const bool margin = (mask & 1) != 0;
+    const bool physical = (mask & 2) != 0;
+    const bool escape_allowed = (mask & 4) != 0;
+    const bool timeout = (mask & 8) != 0;
+    const bool worsening = (mask & 16) != 0;
+    const auto result = classifyClearanceResult(
+        margin, physical, escape_allowed, timeout, worsening, 3);
+    EXPECT_EQ(result.accepted(),
+              !physical && !timeout && !worsening &&
+                  (!margin || escape_allowed)) << "mask=" << mask;
+    const ClearanceFailure expected = physical
+        ? ClearanceFailure::PHYSICAL_COLLISION
+        : timeout
+            ? ClearanceFailure::ESCAPE_TIMEOUT
+            : worsening
+                ? ClearanceFailure::ESCAPE_WORSENING
+                : margin && !escape_allowed
+                    ? ClearanceFailure::PLANNING_MARGIN
+                    : ClearanceFailure::NONE;
+    EXPECT_EQ(result.failure, expected) << "mask=" << mask;
+  }
+}
+
 TEST(StructuredLocalRepair, GeneratesDistinctSideAndBoundedBacktrackDirections)
 {
   const auto directions = structuredLocalRepairDirections(
@@ -158,6 +210,57 @@ TEST(ExecutionHold, DeduplicatesOneHoldPerExecutionVersion)
   EXPECT_TRUE(holdCommandAlreadyIssuedForVersion(202, 17, 202, 17));
   EXPECT_FALSE(holdCommandAlreadyIssuedForVersion(202, 18, 202, 17));
   EXPECT_FALSE(holdCommandAlreadyIssuedForVersion(203, 1, 202, 17));
+}
+
+TEST(TrajectoryHandoff, RequiresBoundedControllerAcknowledgement)
+{
+  EXPECT_FALSE(trajectoryHandoffTimedOut(false, 10.0, 0.75));
+  EXPECT_FALSE(trajectoryHandoffTimedOut(true, 0.74, 0.75));
+  EXPECT_TRUE(trajectoryHandoffTimedOut(true, 0.75, 0.75));
+  EXPECT_FALSE(trajectoryHandoffTimedOut(
+      true, std::numeric_limits<double>::quiet_NaN(), 0.75));
+  EXPECT_FALSE(trajectoryHandoffTimedOut(true, 1.0, 0.0));
+}
+
+TEST(TrajectoryHandoff, ExhaustivelyPreservesPendingAndTimeoutSemantics)
+{
+  const std::vector<double> elapsed = {
+      -1.0, 0.0, 0.749, 0.75, 5.0,
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()};
+  const std::vector<double> timeouts = {-1.0, 0.0, 0.75};
+  for (const bool pending : {false, true})
+    for (const double age : elapsed)
+      for (const double timeout : timeouts)
+      {
+        const bool expected = pending && std::isfinite(age) &&
+            std::isfinite(timeout) && timeout > 0.0 && age >= timeout;
+        EXPECT_EQ(trajectoryHandoffTimedOut(pending, age, timeout), expected)
+            << "pending=" << pending << " age=" << age
+            << " timeout=" << timeout;
+      }
+}
+
+TEST(TrajectoryHandoff, RejectsMalformedBsplineStructuresBeforeConstruction)
+{
+  EXPECT_TRUE(validBsplineStructure(6, 10, 3));
+  EXPECT_FALSE(validBsplineStructure(3, 7, 3));
+  EXPECT_FALSE(validBsplineStructure(6, 9, 3));
+  EXPECT_FALSE(validBsplineStructure(6, 10, 0));
+
+  EXPECT_TRUE(validBsplineKnots(
+      {-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6},
+      6, 3));
+  EXPECT_FALSE(validBsplineKnots(
+      {-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.2, 0.5, 0.6},
+      6, 3));
+  EXPECT_FALSE(validBsplineKnots(
+      {-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
+       std::numeric_limits<double>::infinity()},
+      6, 3));
+  EXPECT_FALSE(validBsplineKnots(
+      {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+      6, 3));
 }
 
 TEST(ClearanceEscape, CompletesOnlyAfterActualPoseIsConfirmedFree)

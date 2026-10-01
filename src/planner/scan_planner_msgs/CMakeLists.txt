@@ -12,11 +12,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DataDisp.msg"
   "msg/ExecutionCommand.msg"
   "msg/ExecutionState.msg"
+  "msg/FailureEvidence.msg"
   "msg/LocalMapPatch.msg"
   "msg/LocomotionState.msg"
   "msg/TopoNode.msg"
   "msg/TopoEdge.msg"
   "msg/TopoGraphDelta.msg"
+  "msg/TrajectoryAck.msg"
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
 )
 

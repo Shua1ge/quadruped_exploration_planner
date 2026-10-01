@@ -63,6 +63,9 @@ scan_planner_node:
     # still requests a rolling local repair before this final HOLD envelope.
     fsm.guaranteed_braking_deceleration: 0.32
     fsm.command_stop_latency: 0.30
+    # Candidate publication is only phase one.  SCAN keeps the old execution
+    # snapshot and safety latches until the controller accepts this version.
+    fsm.trajectory_ack_timeout: 0.75
     # A new Explorer path cannot clear a physical pose-occupied latch.  Require
     # consecutive free Local-map observations before planning resumes.
     fsm.pose_free_release_cycles: 3
