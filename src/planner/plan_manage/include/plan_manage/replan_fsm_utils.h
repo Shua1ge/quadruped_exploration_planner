@@ -228,11 +228,30 @@ inline bool clearanceViolationAllowedDuringEscape(
 
 inline bool clearanceEscapeConfirmedAtActualPose(
     bool escape_active, bool actual_clearance_blocked,
-    int consecutive_free_cycles, int required_free_cycles)
+    bool clearance_improved, double actual_displacement,
+    double required_displacement, double matched_progress_ratio,
+    double required_progress_ratio, int consecutive_free_cycles,
+    int required_free_cycles)
 {
   return escape_active && !actual_clearance_blocked &&
+         clearance_improved && std::isfinite(actual_displacement) &&
+         std::isfinite(required_displacement) &&
+         std::isfinite(matched_progress_ratio) &&
+         std::isfinite(required_progress_ratio) &&
+         actual_displacement >= required_displacement &&
+         matched_progress_ratio >= required_progress_ratio &&
          required_free_cycles > 0 &&
          consecutive_free_cycles >= required_free_cycles;
+}
+
+inline bool referenceRequestMustBeDeferred(
+    bool structured_repair_active, bool structured_repair_executing,
+    bool structured_repair_rejoin_pending, bool stopped_repair_pending,
+    bool stopped_repair_active, bool structured_handoff_pending)
+{
+  return structured_repair_active || structured_repair_executing ||
+         structured_repair_rejoin_pending || stopped_repair_pending ||
+         stopped_repair_active || structured_handoff_pending;
 }
 
 inline std::vector<Eigen::Vector2d> structuredLocalRepairDirections(
@@ -296,6 +315,31 @@ inline bool localRepairOwnsFailure(
     bool structured_local_repair_active)
 {
   return stopped_local_repair_active || structured_local_repair_active;
+}
+
+inline bool structuredRepairHandoffRetainsOwnership(
+    bool repair_segment, bool repair_rejoin, bool ack_accepted)
+{
+  // An accepted escape segment is still only the first half of recovery.
+  // A rejected escape or rejoin also remains owned so the finite retry budget
+  // can produce one terminal failure.  Only an accepted rejoin completes it.
+  return repair_segment || (repair_rejoin && !ack_accepted);
+}
+
+inline bool structuredRepairHandoffCompletesRecovery(
+    bool repair_segment, bool repair_rejoin, bool ack_accepted)
+{
+  return !repair_segment && repair_rejoin && ack_accepted;
+}
+
+inline bool structuredRepairSegmentBudgetAvailable(
+    int committed_segments, int max_segments)
+{
+  // This budget belongs to the complete recovery transaction, not to one
+  // invocation of the anchor generator.  A successful short segment must not
+  // silently buy a fresh family of attempts after its rejoin fails.
+  return max_segments > 0 && committed_segments >= 0 &&
+         committed_segments < max_segments;
 }
 
 inline bool structuredRepairTerminalFeedbackMatches(

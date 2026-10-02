@@ -184,6 +184,33 @@ TEST(StructuredLocalRepair, KeepsFailureOwnershipAcrossRecoveryStates)
   EXPECT_FALSE(localRepairOwnsFailure(false, false));
 }
 
+TEST(StructuredLocalRepair, KeepsOwnershipUntilRejoinAck)
+{
+  EXPECT_TRUE(structuredRepairHandoffRetainsOwnership(true, false, false));
+  EXPECT_TRUE(structuredRepairHandoffRetainsOwnership(true, false, true));
+  EXPECT_TRUE(structuredRepairHandoffRetainsOwnership(false, true, false));
+  EXPECT_FALSE(structuredRepairHandoffRetainsOwnership(false, true, true));
+  EXPECT_FALSE(structuredRepairHandoffRetainsOwnership(false, false, true));
+
+  EXPECT_FALSE(structuredRepairHandoffCompletesRecovery(true, false, true));
+  EXPECT_FALSE(structuredRepairHandoffCompletesRecovery(false, true, false));
+  EXPECT_TRUE(structuredRepairHandoffCompletesRecovery(false, true, true));
+}
+
+TEST(StructuredLocalRepair, SegmentBudgetSpansTheWholeTransaction)
+{
+  constexpr int max_segments = 5;
+  for (int committed = 0; committed < max_segments; ++committed)
+    EXPECT_TRUE(structuredRepairSegmentBudgetAvailable(
+        committed, max_segments)) << "committed=" << committed;
+  EXPECT_FALSE(structuredRepairSegmentBudgetAvailable(
+      max_segments, max_segments));
+  EXPECT_FALSE(structuredRepairSegmentBudgetAvailable(
+      max_segments + 1, max_segments));
+  EXPECT_FALSE(structuredRepairSegmentBudgetAvailable(0, 0));
+  EXPECT_FALSE(structuredRepairSegmentBudgetAvailable(-1, max_segments));
+}
+
 TEST(StructuredLocalRepair, RetainsExecutionUntilExactTerminalFeedback)
 {
   EXPECT_FALSE(structuredRepairTerminalFeedbackMatches(
@@ -265,10 +292,38 @@ TEST(TrajectoryHandoff, RejectsMalformedBsplineStructuresBeforeConstruction)
 
 TEST(ClearanceEscape, CompletesOnlyAfterActualPoseIsConfirmedFree)
 {
-  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(true, true, 3, 3));
-  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(true, false, 2, 3));
-  EXPECT_TRUE(clearanceEscapeConfirmedAtActualPose(true, false, 3, 3));
-  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(false, false, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(
+      true, true, true, 0.20, 0.10, 0.50, 0.15, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(
+      true, false, true, 0.20, 0.10, 0.50, 0.15, 2, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(
+      true, false, false, 0.20, 0.10, 0.50, 0.15, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(
+      true, false, true, 0.04, 0.10, 0.50, 0.15, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(
+      true, false, true, 0.20, 0.10, 0.10, 0.15, 3, 3));
+  EXPECT_TRUE(clearanceEscapeConfirmedAtActualPose(
+      true, false, true, 0.20, 0.10, 0.50, 0.15, 3, 3));
+  EXPECT_FALSE(clearanceEscapeConfirmedAtActualPose(
+      false, false, true, 0.20, 0.10, 0.50, 0.15, 3, 3));
+}
+
+TEST(StructuredRepairTransaction, DefersReferenceUntilOwnershipEnds)
+{
+  EXPECT_TRUE(referenceRequestMustBeDeferred(
+      true, false, false, false, false, false));
+  EXPECT_TRUE(referenceRequestMustBeDeferred(
+      false, true, false, false, false, false));
+  EXPECT_TRUE(referenceRequestMustBeDeferred(
+      false, false, true, false, false, false));
+  EXPECT_TRUE(referenceRequestMustBeDeferred(
+      false, false, false, true, false, false));
+  EXPECT_TRUE(referenceRequestMustBeDeferred(
+      false, false, false, false, true, false));
+  EXPECT_TRUE(referenceRequestMustBeDeferred(
+      false, false, false, false, false, true));
+  EXPECT_FALSE(referenceRequestMustBeDeferred(
+      false, false, false, false, false, false));
 }
 
 TEST(PredictiveBrakingSweep, IncludesReactionAndBrakingButCapsTheHorizon)

@@ -4,7 +4,8 @@ from typing import Dict, Optional, Tuple
 
 
 REFERENCE_SCOPED_STATUSES = {
-    "PATH_ACCEPTED", "PATH_TRAJECTORY_READY", "REACHED", "WAIT_TARGET",
+    "PATH_ACCEPTED", "PATH_DEFERRED", "PATH_TRAJECTORY_READY",
+    "REACHED", "WAIT_TARGET",
     "BLOCKED", "VIEWPOINT_LOCAL_REJECTED", "LOCAL_REPAIR_EXHAUSTED",
     "REFERENCE_PATH_REJECTED",
     "INVALID_REFERENCE_PATH",
@@ -37,7 +38,7 @@ def planning_status_matches_request(
     if status not in REFERENCE_SCOPED_STATUSES:
         return True
     expected = (pending_generation if status in (
-        "PATH_ACCEPTED", "PATH_TRAJECTORY_READY",
+        "PATH_ACCEPTED", "PATH_DEFERRED", "PATH_TRAJECTORY_READY",
         "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH")
         else active_generation)
     return expected is not None and request_generation == expected

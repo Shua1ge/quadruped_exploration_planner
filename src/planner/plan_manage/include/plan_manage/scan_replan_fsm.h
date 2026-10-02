@@ -85,6 +85,7 @@ namespace scan_planner
     double local_repair_max_speed_{0.25};
     double local_repair_time_margin_{1.20};
     int local_repair_max_candidates_{6};
+    int local_repair_max_segments_per_transaction_{3};
     double braking_sweep_spatial_step_{0.05};
     double braking_sweep_max_horizon_{4.0};
     double safety_map_stale_warn_age_{0.25};
@@ -134,6 +135,8 @@ namespace scan_planner
     double reference_progress_ratio_{0.0};
     bool reference_path_active_{false};
     bool reference_path_update_pending_{false};
+    std::mutex deferred_reference_path_mutex_;
+    nav_msgs::msg::Path::ConstSharedPtr deferred_reference_path_;
     std::atomic<uint64_t> active_reference_request_id_{0};
     std::atomic<uint64_t> completed_reference_request_id_{0};
     std::atomic<int64_t> last_wait_target_status_ns_{0};
@@ -151,6 +154,7 @@ namespace scan_planner
     std::atomic<bool> structured_local_repair_rejoin_pending_{false};
     std::atomic<uint64_t> structured_local_repair_request_id_{0};
     std::atomic<int64_t> structured_local_repair_trajectory_id_{0};
+    std::atomic<int> structured_local_repair_segments_committed_{0};
     std::atomic<bool> terminal_local_repair_hold_{false};
     bool heading_stall_handled_{false};
     int heading_freeze_recoveries_{0};
@@ -169,6 +173,9 @@ namespace scan_planner
       double clearance_escape_deadline{0.0};
       size_t initial_clearance_violations{0};
       int clearance_escape_free_cycles{0};
+      Eigen::Vector3d clearance_escape_start_position{Eigen::Vector3d::Zero()};
+      double clearance_escape_min_displacement{0.0};
+      double clearance_escape_min_progress_ratio{0.0};
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
       bool valid{false};
@@ -186,6 +193,12 @@ namespace scan_planner
       size_t initial_clearance_violations{0};
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
+      // Recovery is a transaction spanning two controller handoffs: the
+      // short clearance-escape segment and the trajectory that rejoins the
+      // unchanged reference path.  Keep the phase on the pending handoff so
+      // merely publishing a candidate can never clear recovery ownership.
+      bool structured_repair_segment{false};
+      bool structured_repair_rejoin{false};
       bool reference_path_update{false};
       uint64_t reference_request_id{0};
       std::chrono::steady_clock::time_point submitted_at{};
@@ -291,6 +304,9 @@ namespace scan_planner
     void getReferencePathLocalTarget();
     void finishProcess();
     void publishSelfInflationMarker();
+    bool recoveryTransactionOwnsReferenceRequest();
+    bool activateDeferredReferencePathIfReady();
+    void finishGoalReached(const char *source);
     double getOdomYaw() const;
     double estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
     void updateLocalTrajTimeFreeze();

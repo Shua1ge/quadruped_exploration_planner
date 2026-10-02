@@ -77,6 +77,8 @@ namespace scan_planner
         node_, "fsm.local_repair_max_backtrack", 0.60);
     local_repair_max_candidates_ = load_parameter<int>(
         node_, "fsm.local_repair_max_candidates", 6);
+    local_repair_max_segments_per_transaction_ = load_parameter<int>(
+        node_, "fsm.local_repair_max_segments_per_transaction", 3);
     local_repair_max_speed_ = load_parameter<double>(
         node_, "fsm.local_repair_max_speed", 0.25);
     local_repair_time_margin_ = load_parameter<double>(
@@ -120,6 +122,7 @@ namespace scan_planner
         local_repair_anchor_step_ <= 0.0 ||
         local_repair_max_backtrack_ < 0.0 ||
         local_repair_max_candidates_ <= 0 ||
+        local_repair_max_segments_per_transaction_ <= 0 ||
         local_repair_max_speed_ <= 0.0 ||
         local_repair_time_margin_ < 1.0 ||
         braking_sweep_spatial_step_ <= 0.0 ||
@@ -611,6 +614,34 @@ namespace scan_planner
                   static_cast<unsigned long long>(active_request_id));
       return;
     }
+    if (recoveryTransactionOwnsReferenceRequest())
+    {
+      bool retained = false;
+      {
+        std::lock_guard<std::mutex> lock(deferred_reference_path_mutex_);
+        uint64_t deferred_request_id = 0;
+        if (deferred_reference_path_)
+          deferred_request_id =
+              static_cast<uint64_t>(deferred_reference_path_->header.stamp.sec) *
+                  1000000000ULL +
+              static_cast<uint64_t>(deferred_reference_path_->header.stamp.nanosec);
+        if (!deferred_reference_path_ || request_id > deferred_request_id)
+        {
+          deferred_reference_path_ = msg;
+          retained = true;
+        }
+      }
+      if (retained)
+      {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[REFERENCE_PATH_DEFERRED] request_id=%llu active_request_id=%llu; structured local recovery retains ownership until rejoin ACK or terminal rejection",
+            static_cast<unsigned long long>(request_id),
+            static_cast<unsigned long long>(active_request_id));
+        publishReferenceStatus("PATH_DEFERRED", request_id);
+      }
+      return;
+    }
     active_reference_request_id_.store(request_id);
     completed_reference_request_id_.store(0);
     // A newer request supersedes the previous request even if its reference
@@ -622,6 +653,7 @@ namespace scan_planner
     structured_local_repair_rejoin_pending_.store(false);
     structured_local_repair_request_id_.store(0);
     structured_local_repair_trajectory_id_.store(0);
+    structured_local_repair_segments_committed_.store(0);
     stopped_local_repair_pending_.store(false);
     stopped_local_repair_active_.store(false);
     last_wait_target_status_ns_.store(0);
@@ -739,6 +771,90 @@ namespace scan_planner
       reference_path_active_ = false;
       requestExecutionStop("REFERENCE_PATH_REJECTED");
       RCLCPP_ERROR(node_->get_logger(), "Unable to generate global trajectory from reference path");
+    }
+  }
+
+  bool SCANReplanFSM::recoveryTransactionOwnsReferenceRequest()
+  {
+    bool structured_handoff_pending = false;
+    {
+      std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+      structured_handoff_pending =
+          pending_handoff_.valid &&
+          (pending_handoff_.structured_repair_segment ||
+           pending_handoff_.structured_repair_rejoin);
+    }
+    return referenceRequestMustBeDeferred(
+        structured_local_repair_active_.load(),
+        structured_local_repair_executing_.load(),
+        structured_local_repair_rejoin_pending_.load(),
+        stopped_local_repair_pending_.load(),
+        stopped_local_repair_active_.load(), structured_handoff_pending);
+  }
+
+  bool SCANReplanFSM::activateDeferredReferencePathIfReady()
+  {
+    if (recoveryTransactionOwnsReferenceRequest())
+      return false;
+
+    nav_msgs::msg::Path::ConstSharedPtr deferred;
+    {
+      std::lock_guard<std::mutex> lock(deferred_reference_path_mutex_);
+      deferred = deferred_reference_path_;
+      deferred_reference_path_.reset();
+    }
+    if (!deferred)
+      return false;
+
+    const uint64_t request_id =
+        static_cast<uint64_t>(deferred->header.stamp.sec) * 1000000000ULL +
+        static_cast<uint64_t>(deferred->header.stamp.nanosec);
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "[REFERENCE_PATH_DEFERRED_ACTIVATED] request_id=%llu; previous recovery transaction reached a terminal boundary",
+        static_cast<unsigned long long>(request_id));
+    pathCallback(deferred);
+    return true;
+  }
+
+  void SCANReplanFSM::finishGoalReached(const char *source)
+  {
+    const uint64_t completed_request = active_reference_request_id_.load();
+    const bool recovery_was_active =
+        structured_local_repair_active_.exchange(false) ||
+        structured_local_repair_executing_.load() ||
+        structured_local_repair_rejoin_pending_.load() ||
+        stopped_local_repair_pending_.load() ||
+        stopped_local_repair_active_.load();
+
+    structured_local_repair_executing_.store(false);
+    structured_local_repair_finished_.store(false);
+    structured_local_repair_rejoin_pending_.store(false);
+    structured_local_repair_request_id_.store(0);
+    structured_local_repair_trajectory_id_.store(0);
+    structured_local_repair_segments_committed_.store(0);
+    stopped_local_repair_pending_.store(false);
+    stopped_local_repair_active_.store(false);
+    terminal_repair_requested_.store(false);
+    terminal_repair_error_.store(0.0);
+    predictive_replan_requested_.store(false);
+    tracking_recovery_active_ = false;
+    replan_fail_count_ = 0;
+    next_rolling_replan_attempt_ns_ = 0;
+    have_target_ = false;
+    have_new_target_ = false;
+    reference_path_active_ = false;
+    reference_path_update_pending_ = false;
+    pending_reference_request_id_ = 0;
+
+    requestExecutionStop("REACHED");
+    changeFSMExecState(WAIT_TARGET, source);
+    if (recovery_was_active)
+    {
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_GOAL_REACHED] request_id=%llu; closing recovery ownership so a deferred reference path may activate",
+          static_cast<unsigned long long>(completed_request));
     }
   }
 
@@ -1038,10 +1154,27 @@ namespace scan_planner
     {
       planner_manager_->local_data_ = handoff.previous;
       predictive_replan_requested_.store(true);
-      if (handoff.clearance_escape_active)
+      const bool recovery_handoff =
+          handoff.structured_repair_segment ||
+          handoff.structured_repair_rejoin;
+      if (structuredRepairHandoffRetainsOwnership(
+              handoff.structured_repair_segment,
+              handoff.structured_repair_rejoin, false))
       {
-        stopped_local_repair_pending_.store(true);
-        stopped_local_repair_active_.store(true);
+        structured_local_repair_active_.store(true);
+        if (handoff.structured_repair_segment)
+        {
+          stopped_local_repair_pending_.store(true);
+          stopped_local_repair_active_.store(true);
+        }
+        else
+        {
+          // The escape already finished, but Controller did not accept the
+          // rejoin candidate.  Keep the transaction in its rejoin phase.
+          structured_local_repair_executing_.store(false);
+          structured_local_repair_rejoin_pending_.store(true);
+        }
+        ++replan_fail_count_;
       }
       // Clear pending only after the previous planning state is restored.
       // Until this assignment, execFSMCallback remains unable to start a new
@@ -1054,6 +1187,9 @@ namespace scan_planner
           static_cast<unsigned long long>(msg->request_id),
           static_cast<long long>(msg->trajectory_id), msg->reason.c_str(),
           msg->position_error, msg->yaw_error);
+      if (recovery_handoff &&
+          replan_fail_count_ >= max_replan_fail_count_)
+        finishProcess();
       return;
     }
 
@@ -1064,7 +1200,7 @@ namespace scan_planner
         handoff.clearance_escape_deadline,
         handoff.initial_clearance_violations,
         handoff.fixed_body_yaw, handoff.body_yaw);
-    if (handoff.clearance_escape_active)
+    if (handoff.structured_repair_segment)
     {
       structured_local_repair_active_.store(true);
       structured_local_repair_executing_.store(true);
@@ -1072,8 +1208,62 @@ namespace scan_planner
       structured_local_repair_rejoin_pending_.store(false);
       structured_local_repair_request_id_.store(handoff.request_id);
       structured_local_repair_trajectory_id_.store(handoff.trajectory_id);
+      stopped_local_repair_pending_.store(false);
+      stopped_local_repair_active_.store(false);
       predictive_hold_latched_.store(false);
       predictive_hold_release_cycles_.store(0);
+      predictive_replan_requested_.store(false);
+      tracking_recovery_active_ = false;
+      const int committed_segments =
+          structured_local_repair_segments_committed_.fetch_add(1) + 1;
+      // Do not reset a transaction-wide budget here.  The previous behavior
+      // let every accepted 0.45 m segment purchase a fresh retry family,
+      // producing an unbounded left/right crawl when every rejoin failed.
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_BUDGET] request_id=%llu committed=%d/%d",
+          static_cast<unsigned long long>(handoff.request_id),
+          committed_segments, local_repair_max_segments_per_transaction_);
+      setLocalRecoveryState(
+          LocalRecoveryState::LOCAL_REPAIR, 0.0,
+          "structured_repair_segment_acknowledged");
+    }
+    else if (structuredRepairHandoffCompletesRecovery(
+                 handoff.structured_repair_segment,
+                 handoff.structured_repair_rejoin, true))
+    {
+      // This exact candidate is now the controller's execution version.  The
+      // recovery transaction ends here, not when SCAN merely generated or
+      // published the candidate.
+      structured_local_repair_active_.store(false);
+      structured_local_repair_executing_.store(false);
+      structured_local_repair_finished_.store(false);
+      structured_local_repair_rejoin_pending_.store(false);
+      structured_local_repair_request_id_.store(0);
+      structured_local_repair_trajectory_id_.store(0);
+      structured_local_repair_segments_committed_.store(0);
+      stopped_local_repair_pending_.store(false);
+      stopped_local_repair_active_.store(false);
+      predictive_replan_requested_.store(false);
+      tracking_recovery_active_ = false;
+      replan_fail_count_ = 0;
+      setLocalRecoveryState(
+          LocalRecoveryState::TRACKING, 0.0,
+          "structured_repair_rejoin_acknowledged");
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_COMPLETE] request_id=%llu trajectory=%lld; controller accepted the reference-path rejoin",
+          static_cast<unsigned long long>(handoff.request_id),
+          static_cast<long long>(handoff.trajectory_id));
+    }
+    else if (!structured_local_repair_active_.load())
+    {
+      predictive_replan_requested_.store(false);
+      tracking_recovery_active_ = false;
+      replan_fail_count_ = 0;
+      setLocalRecoveryState(
+          LocalRecoveryState::TRACKING, 0.0,
+          "candidate_trajectory_acknowledged");
     }
 
     const bool released_terminal_repair_hold =
@@ -1110,6 +1300,10 @@ namespace scan_planner
     // terminal status now describe one version.  Only now may planning resume.
     pending_handoff_.valid = false;
     handoff_lock.unlock();
+    // RUNNING is an execution fact, not a publication fact.  Keep the FSM in
+    // GEN_NEW_TRAJ/REPLAN_TRAJ while the candidate is pending and expose the
+    // transition only after Controller accepted this exact version.
+    changeFSMExecState(EXEC_TRAJ, "TRAJECTORY_ACK");
     RCLCPP_INFO(
         node_->get_logger(),
         "[CANDIDATE_TRAJECTORY_COMMITTED] request_id=%llu trajectory=%lld matched_time=%.3fs position_error=%.3fm",
@@ -1404,6 +1598,8 @@ namespace scan_planner
         return;
       }
     }
+    if (activateDeferredReferencePathIfReady())
+      return;
     refreshPlanningOdomFromSafety();
     if (have_odom_)
     {
@@ -1669,30 +1865,12 @@ namespace scan_planner
         success = tryStructuredLocalRepair();
       if (success)
       {
-        const bool structured_execution =
-            structured_local_repair_executing_.load();
-        stopped_local_repair_pending_.store(false);
-        stopped_local_repair_active_.store(false);
-        predictive_replan_requested_.store(false);
-        if (structured_execution)
-        {
-          setLocalRecoveryState(
-              LocalRecoveryState::LOCAL_REPAIR, 0.0,
-              "structured_repair_executing");
-        }
-        else
-        {
-          structured_local_repair_active_.store(false);
-          structured_local_repair_rejoin_pending_.store(false);
-          setLocalRecoveryState(
-              LocalRecoveryState::TRACKING, 0.0,
-              "candidate_trajectory_validated");
-        }
+        // callReboundReplan() has only submitted a candidate.  The matching
+        // TrajectoryAck callback owns every recovery-state transition; doing
+        // it here races the ACK and used to erase recovery ownership before
+        // the escape/rejoin transaction was complete.
         next_rolling_replan_attempt_ns_ = 0;
-        replan_fail_count_ = 0;
-        tracking_recovery_active_ = false;
         collision_segment_pending_ = false;
-        changeFSMExecState(EXEC_TRAJ, "FSM");
         flag_escape_emergency_ = true;
       }
       else
@@ -1708,42 +1886,17 @@ namespace scan_planner
       if (!isWaypointSequenceMode() &&
           (end_pt_.head<2>() - odom_pos_.head<2>()).norm() <= goal_tolerance_)
       {
-        have_target_ = false;
-        reference_path_active_ = false;
-        requestExecutionStop("REACHED");
-        changeFSMExecState(WAIT_TARGET, "GOAL_REACHED");
+        finishGoalReached("GOAL_REACHED");
         return;
       }
 
       if (planFromCurrentTraj())
       {
-        const bool structured_execution =
-            structured_local_repair_executing_.load();
-        stopped_local_repair_pending_.store(false);
-        stopped_local_repair_active_.store(false);
-        predictive_replan_requested_.store(false);
-        if (structured_execution)
-        {
-          structured_local_repair_rejoin_pending_.store(false);
-          setLocalRecoveryState(
-              LocalRecoveryState::LOCAL_REPAIR, 0.0,
-              "structured_repair_executing");
-        }
-        else
-        {
-          structured_local_repair_active_.store(false);
-          structured_local_repair_rejoin_pending_.store(false);
-          structured_local_repair_request_id_.store(0);
-          structured_local_repair_trajectory_id_.store(0);
-          setLocalRecoveryState(
-              LocalRecoveryState::TRACKING, 0.0,
-              "structured_repair_rejoined");
-        }
+        // Submission is phase one only.  In particular, a recovery rejoin
+        // remains owned by LOCAL_REPAIR until Controller ACKs this exact
+        // request/trajectory version.
         next_rolling_replan_attempt_ns_ = 0;
-        replan_fail_count_ = 0;
-        tracking_recovery_active_ = false;
         collision_segment_pending_ = false;
-        changeFSMExecState(EXEC_TRAJ, "FSM");
       }
       else
       {
@@ -1797,10 +1950,7 @@ namespace scan_planner
       if (!isWaypointSequenceMode() &&
           (end_pt_.head<2>() - odom_pos_.head<2>()).norm() <= goal_tolerance_)
       {
-        have_target_ = false;
-        reference_path_active_ = false;
-        requestExecutionStop("REACHED");
-        changeFSMExecState(WAIT_TARGET, "GOAL_REACHED");
+        finishGoalReached("GOAL_REACHED");
         return;
       }
 
@@ -1873,11 +2023,7 @@ namespace scan_planner
           current_wp_ = 0;
         }
 
-        have_target_ = false;
-        reference_path_active_ = false;
-        requestExecutionStop("REACHED");
-
-        changeFSMExecState(WAIT_TARGET, "FSM");
+        finishGoalReached("FSM");
         return;
       }
       else if (next_rolling_replan_attempt_ns_ > 0 &&
@@ -1965,6 +2111,11 @@ namespace scan_planner
       if (localRepairOwnsFailure(
               stopped_repair_owned, structured_repair_owned))
       {
+        const int committed_repair_segments =
+            structured_local_repair_segments_committed_.exchange(0);
+        const uint32_t attempted_recovery_candidates =
+            static_cast<uint32_t>(std::max(
+                replan_fail_count_, committed_repair_segments));
         const uint64_t failed_request = active_reference_request_id_.load();
         const int64_t failed_trajectory =
             structured_local_repair_trajectory_id_.load();
@@ -1998,14 +2149,14 @@ namespace scan_planner
         publishFailureEvidence(
             failed_request, failed_trajectory,
             "STRUCTURED_LOCAL_REPAIR", "FINITE_CANDIDATE_FAMILY_EXHAUSTED",
-            odom_pos_, static_cast<uint32_t>(max_replan_fail_count_),
+            odom_pos_, attempted_recovery_candidates,
             planning_clearance_margin_, ClearanceFailure::NONE);
         requestExecutionStop("VIEWPOINT_LOCAL_REJECTED");
         RCLCPP_ERROR(
             node_->get_logger(),
-            "[VIEWPOINT_LOCAL_REJECTED] request_id=%llu attempts=%d; retaining HOLD and returning only the failed viewpoint to Explorer",
+            "[VIEWPOINT_LOCAL_REJECTED] request_id=%llu attempts=%u; retaining HOLD and returning only the failed viewpoint to Explorer",
             static_cast<unsigned long long>(failed_request),
-            max_replan_fail_count_);
+            attempted_recovery_candidates);
         return;
       }
       const bool tracking_recovery_failed = tracking_recovery_active_;
@@ -2138,7 +2289,29 @@ namespace scan_planner
     // retry budget is exhausted), SCAN owns the request as LOCAL_REPAIR.  A
     // failed optimizer call must not silently downgrade it to generic
     // TRACKING_RECOVERY_FAILED/BLOCKED.
-    structured_local_repair_active_.store(true);
+    const bool new_recovery_transaction =
+        !structured_local_repair_active_.exchange(true);
+    if (new_recovery_transaction)
+      structured_local_repair_segments_committed_.store(0);
+
+    const int committed_segments =
+        structured_local_repair_segments_committed_.load();
+    if (!structuredRepairSegmentBudgetAvailable(
+            committed_segments,
+            local_repair_max_segments_per_transaction_))
+    {
+      // Escalate directly to the transaction terminal handled by
+      // finishProcess().  Re-entering the anchor generator here would merely
+      // create another geometrically similar short segment from a new pose.
+      replan_fail_count_ = max_replan_fail_count_;
+      RCLCPP_ERROR(
+          node_->get_logger(),
+          "[STRUCTURED_LOCAL_REPAIR_TRANSACTION_EXHAUSTED] request_id=%llu committed=%d/%d; rejecting this viewpoint instead of generating another crawl segment",
+          static_cast<unsigned long long>(
+              active_reference_request_id_.load()),
+          committed_segments, local_repair_max_segments_per_transaction_);
+      return false;
+    }
 
     double safety_planar_speed = 0.0;
     {
@@ -2384,6 +2557,19 @@ namespace scan_planner
     execution_snapshot_.initial_clearance_violations =
         initial_clearance_violations;
     execution_snapshot_.clearance_escape_free_cycles = 0;
+    const Eigen::Vector3d escape_start =
+        info.position_traj_.evaluateDeBoorT(0.0);
+    const Eigen::Vector3d escape_end =
+        info.position_traj_.evaluateDeBoorT(info.duration_);
+    const double escape_distance =
+        (escape_end.head<2>() - escape_start.head<2>()).norm();
+    execution_snapshot_.clearance_escape_start_position = escape_start;
+    execution_snapshot_.clearance_escape_min_displacement =
+        clearance_escape_active
+            ? std::min(0.10, std::max(0.03, 0.25 * escape_distance))
+            : 0.0;
+    execution_snapshot_.clearance_escape_min_progress_ratio =
+        clearance_escape_active ? 0.15 : 0.0;
     execution_snapshot_.fixed_body_yaw = fixed_body_yaw;
     execution_snapshot_.body_yaw = body_yaw;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
@@ -2737,6 +2923,16 @@ namespace scan_planner
       return;
     }
 
+    ExecutionTrajectorySnapshot trajectory;
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      if (!execution_snapshot_.valid)
+        return;
+      if (go2_execution_frozen_.load() && callback_gap > 0.0 && callback_gap < 0.5)
+        execution_snapshot_.start_time += rclcpp::Duration::from_seconds(callback_gap);
+      trajectory = execution_snapshot_;
+    }
+
     // Predict where the physical robot can travel before a HOLD takes effect.
     // Velocity is expressed in odom/world coordinates and the footprint
     // follows the measured yaw rate. A fixed-direction line is unsafe while a
@@ -2757,6 +2953,9 @@ namespace scan_planner
       predicted_state.yaw = actual_yaw;
       Eigen::Vector3d blocked_point;
       double elapsed = 0.0;
+      bool braking_escape_exited_clearance = false;
+      size_t previous_braking_violations =
+          trajectory.initial_clearance_violations;
       for (int sample = 1; sample <= samples; ++sample)
       {
         const double time = horizon * static_cast<double>(sample) / samples;
@@ -2767,9 +2966,35 @@ namespace scan_planner
         elapsed = time;
         Eigen::Vector3d predicted = odom_pos;
         predicted.head<2>() = predicted_state.position;
-        if (footprintOccupiedWithMargin(
-                map, predicted, predicted_state.yaw,
-                planning_clearance_margin_, &blocked_point))
+        size_t clearance_violations = 0;
+        const bool clearance_blocked = footprintOccupiedWithMargin(
+            map, predicted, predicted_state.yaw,
+            planning_clearance_margin_, &blocked_point,
+            &clearance_violations);
+        if (!clearance_blocked)
+        {
+          braking_escape_exited_clearance = true;
+          previous_braking_violations = 0;
+          continue;
+        }
+        const bool physical_collision =
+            map->getInflateOccupancy(predicted, predicted_state.yaw) != 0;
+        if (clearanceViolationAllowedDuringEscape(
+                trajectory.clearance_escape_active,
+                braking_escape_exited_clearance, physical_collision, time,
+                trajectory.clearance_escape_deadline,
+                clearance_violations, previous_braking_violations))
+        {
+          previous_braking_violations = clearance_violations;
+          RCLCPP_INFO_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 250,
+              "[CLEARANCE_ESCAPE_BRAKING_SWEEP_ALLOWED] request_id=%llu trajectory=%lld time=%.2fs violations=%zu; predicted footprint is not worsening and remains physically free",
+              static_cast<unsigned long long>(trajectory.request_id),
+              static_cast<long long>(trajectory.trajectory_id), time,
+              clearance_violations);
+          continue;
+        }
+        if (clearance_blocked)
         {
           predictive_hold_release_cycles_.store(0);
           latchLocalSafetyHold(
@@ -2783,16 +3008,6 @@ namespace scan_planner
           return;
         }
       }
-    }
-
-    ExecutionTrajectorySnapshot trajectory;
-    {
-      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
-      if (!execution_snapshot_.valid)
-        return;
-      if (go2_execution_frozen_.load() && callback_gap > 0.0 && callback_gap < 0.5)
-        execution_snapshot_.start_time += rclcpp::Duration::from_seconds(callback_gap);
-      trajectory = execution_snapshot_;
     }
 
     double t_cur = (node_->now() - trajectory.start_time).seconds();
@@ -2898,6 +3113,16 @@ namespace scan_planner
           &actual_clearance_violations);
       int actual_free_cycles = 0;
       bool completed = false;
+      const double actual_displacement =
+          (odom_pos.head<2>() -
+           trajectory.clearance_escape_start_position.head<2>()).norm();
+      const double matched_progress_ratio =
+          trajectory.duration > 1e-6
+              ? std::clamp(matched_time / trajectory.duration, 0.0, 1.0)
+              : 0.0;
+      const bool clearance_improved =
+          trajectory.initial_clearance_violations >
+          actual_clearance_violations;
       {
         std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
         if (execution_snapshot_.valid &&
@@ -2914,7 +3139,12 @@ namespace scan_planner
               execution_snapshot_.clearance_escape_free_cycles;
           completed = clearanceEscapeConfirmedAtActualPose(
               execution_snapshot_.clearance_escape_active,
-              actual_clearance_blocked, actual_free_cycles,
+              actual_clearance_blocked, clearance_improved,
+              actual_displacement,
+              execution_snapshot_.clearance_escape_min_displacement,
+              matched_progress_ratio,
+              execution_snapshot_.clearance_escape_min_progress_ratio,
+              actual_free_cycles,
               local_hold_release_cycles_);
           if (completed)
           {
@@ -2928,10 +3158,14 @@ namespace scan_planner
         trajectory.clearance_escape_active = false;
         RCLCPP_INFO(
             node_->get_logger(),
-            "[CLEARANCE_ESCAPE_COMPLETE] request_id=%llu trajectory=%lld matched_t=%.2fs actual_pose=(%.2f,%.2f) free_cycles=%d",
+            "[CLEARANCE_ESCAPE_COMPLETE] request_id=%llu trajectory=%lld matched_t=%.2fs progress=%.2f actual_pose=(%.2f,%.2f) displacement=%.2fm/%.2fm violations=%zu/%zu free_cycles=%d",
             static_cast<unsigned long long>(trajectory.request_id),
             static_cast<long long>(trajectory.trajectory_id), matched_time,
-            odom_pos.x(), odom_pos.y(), actual_free_cycles);
+            matched_progress_ratio, odom_pos.x(), odom_pos.y(),
+            actual_displacement,
+            trajectory.clearance_escape_min_displacement,
+            actual_clearance_violations,
+            trajectory.initial_clearance_violations, actual_free_cycles);
       }
       else if (actual_clearance_blocked)
       {
@@ -2946,6 +3180,9 @@ namespace scan_planner
 
     constexpr double time_step = 0.02;
     Eigen::Vector3d last_free = odom_pos;
+    bool runtime_escape_exited_clearance = false;
+    size_t previous_runtime_violations =
+        trajectory.initial_clearance_violations;
     for (double t = matched_time; t < trajectory.duration; t += time_step)
     {
       const Eigen::Vector3d pos = trajectory.position.evaluateDeBoorT(t);
@@ -2960,6 +3197,8 @@ namespace scan_planner
           &clearance_violations);
       if (!clearance_blocked)
       {
+        runtime_escape_exited_clearance = true;
+        previous_runtime_violations = 0;
         last_free = pos;
         continue;
       }
@@ -2967,12 +3206,14 @@ namespace scan_planner
       const bool physical_collision =
           map->getInflateOccupancy(pos, trajectory_yaw) != 0;
       if (clearanceViolationAllowedDuringEscape(
-              trajectory.clearance_escape_active, false,
+              trajectory.clearance_escape_active,
+              runtime_escape_exited_clearance,
               physical_collision, t,
               trajectory.clearance_escape_deadline,
               clearance_violations,
-              trajectory.initial_clearance_violations))
+              previous_runtime_violations))
       {
+        previous_runtime_violations = clearance_violations;
         RCLCPP_INFO_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 250,
             "[CLEARANCE_ESCAPE_EXECUTING] request_id=%llu trajectory=%lld t=%.2fs violations=%zu/%zu",
@@ -3397,6 +3638,12 @@ namespace scan_planner
             initial_clearance_violations;
         pending_handoff_.fixed_body_yaw = low_speed_local_repair;
         pending_handoff_.body_yaw = local_repair_body_yaw;
+        pending_handoff_.structured_repair_segment =
+            low_speed_local_repair;
+        pending_handoff_.structured_repair_rejoin =
+            !low_speed_local_repair &&
+            structured_local_repair_active_.load() &&
+            structured_local_repair_rejoin_pending_.load();
         pending_handoff_.reference_path_update =
             reference_path_update_pending_;
         pending_handoff_.reference_request_id =

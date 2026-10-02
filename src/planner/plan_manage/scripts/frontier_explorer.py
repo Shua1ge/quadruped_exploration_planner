@@ -471,6 +471,7 @@ class FrontierExplorer(Node):
         self.last_handoff_attempt_update = -1
         self.pipeline_latency_ewma = 0.0
         self.pending_path_publish_ns = 0
+        self.pending_path_deferred = False
         self.last_path_request_generation = 0
         self.pending_path_request_generation: Optional[int] = None
         self.active_path_request_generation: Optional[int] = None
@@ -1898,8 +1899,21 @@ class FrontierExplorer(Node):
                     f"[LOCAL_TRAJECTORY_READY] pipeline_latency={latency:.2f}s, "
                     f"ewma={self.pipeline_latency_ewma:.2f}s")
             self.pending_path_publish_ns = 0
+            self.pending_path_deferred = False
             self.pending_path_request_generation = None
+        elif status == "PATH_DEFERRED":
+            self.pending_path_deferred = True
+            self.scan_waiting_for_target = False
+            self.get_logger().info(
+                f"[PATH_REQUEST_DEFERRED] request_id={request_generation}; "
+                "SCAN retains the current structured-recovery transaction")
         elif status in ("RUNNING", "PATH_ACCEPTED"):
+            if status == "PATH_ACCEPTED" and self.pending_path_deferred:
+                # Start the bounded planner-response timeout when SCAN really
+                # activates the queued request, not while an older recovery
+                # transaction still owns execution.
+                self.pending_path_publish_ns = self.get_clock().now().nanoseconds
+                self.pending_path_deferred = False
             self.scan_waiting_for_target = False
             # A successful replacement trajectory resolves the pending local
             # failure.  Keep the short-lived edge record, but do not let it be
@@ -1952,7 +1966,15 @@ class FrontierExplorer(Node):
             # viewpoint.  Region ownership changes only if no sibling exists.
             self.local_repair_exhausted_count += 1
             self.global_reroute_failure_streak = 0
+            # This terminal event is new route knowledge even when the global
+            # occupancy grid did not change: SCAN proved that the exact local
+            # approach to this viewpoint has exhausted its finite candidate
+            # family.  Advance the route context before asking ReplanGate for
+            # a sibling so it cannot suppress the replacement as an unchanged
+            # BLOCKED retry.
+            self.route_constraint_revision += 1
             self.pending_path_publish_ns = 0
+            self.pending_path_deferred = False
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
             failed_region = self.active_region_id
@@ -1999,6 +2021,7 @@ class FrontierExplorer(Node):
             self.local_repair_exhausted_count += 1
             self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
+            self.pending_path_deferred = False
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
             failed_region = self.active_region_id
@@ -2033,6 +2056,7 @@ class FrontierExplorer(Node):
             self.scan_blocked_count += 1
             self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
+            self.pending_path_deferred = False
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
             blocked_edge = self.pending_blocked_edge
@@ -2080,6 +2104,7 @@ class FrontierExplorer(Node):
             self.scan_reference_rejected_count += 1
             self.global_reroute_failure_streak = 0
             self.pending_path_publish_ns = 0
+            self.pending_path_deferred = False
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
             if self.active_goal is not None:
@@ -2195,6 +2220,13 @@ class FrontierExplorer(Node):
         if not self.auto_start or self.position is None or self.map_update_count < 2:
             return
         if self.pending_path_publish_ns:
+            if self.pending_path_deferred:
+                self.get_logger().info(
+                    f"[PATH_REQUEST_DEFERRED_WAIT] request_id="
+                    f"{self.pending_path_request_generation}; waiting for "
+                    "the active SCAN recovery transaction to terminate",
+                    throttle_duration_sec=2.0)
+                return
             request_age = ((self.get_clock().now().nanoseconds
                             - self.pending_path_publish_ns) * 1e-9)
             if request_age >= self.path_request_timeout:
@@ -3293,6 +3325,7 @@ class FrontierExplorer(Node):
         self.path_pub.publish(msg)
         self.path_vis_pub.publish(msg)
         self.pending_path_publish_ns = now_ns
+        self.pending_path_deferred = False
         self.pending_path_request_generation = request_generation
         self.active_path_request_generation = request_generation
         self.scan_waiting_for_target = False

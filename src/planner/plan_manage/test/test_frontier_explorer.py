@@ -1043,6 +1043,36 @@ def test_ready_status_must_match_pending_not_only_active_request():
         pending_generation=None, active_generation=202)
 
 
+def test_deferred_reference_waits_without_consuming_planner_timeout():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.pending_path_request_generation = 202
+    explorer.active_path_request_generation = 202
+    explorer.last_completed_request_generation = None
+    explorer.pending_path_publish_ns = 100
+    explorer.pending_path_deferred = False
+    explorer.scan_waiting_for_target = False
+    explorer.pending_blocked_edge = object()
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=500))
+    explorer.get_logger = lambda: SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None)
+
+    explorer.planning_status_callback(
+        SimpleNamespace(data="PATH_DEFERRED request_id=202"))
+
+    assert explorer.pending_path_deferred
+    assert explorer.pending_path_publish_ns == 100
+    assert explorer.pending_path_request_generation == 202
+
+    explorer.planning_status_callback(
+        SimpleNamespace(data="PATH_ACCEPTED request_id=202"))
+
+    assert not explorer.pending_path_deferred
+    assert explorer.pending_path_publish_ns == 500
+    assert explorer.pending_path_request_generation == 202
+
+
 def test_wait_target_is_request_scoped_and_completion_is_idempotent():
     assert MODULE.planning_status_matches_request(
         "WAIT_TARGET", 202, pending_generation=None, active_generation=202)
@@ -1210,6 +1240,7 @@ def test_viewpoint_local_rejection_preserves_region_when_sibling_exists():
     explorer.last_completed_request_generation = None
     explorer.local_repair_exhausted_count = 0
     explorer.global_reroute_failure_streak = 3
+    explorer.route_constraint_revision = 7
     explorer.pending_path_publish_ns = 123
     explorer.active_region_id = 12
     explorer.active_goal = (32.1, 0.7)
@@ -1245,6 +1276,7 @@ def test_viewpoint_local_rejection_preserves_region_when_sibling_exists():
     assert region_cooldowns == []
     assert terminations == []
     assert statuses == ["VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED"]
+    assert explorer.route_constraint_revision == 8
 
 
 def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted():
@@ -1254,6 +1286,7 @@ def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted(
     explorer.last_completed_request_generation = None
     explorer.local_repair_exhausted_count = 0
     explorer.global_reroute_failure_streak = 3
+    explorer.route_constraint_revision = 11
     explorer.pending_path_publish_ns = 123
     explorer.active_region_id = 12
     explorer.active_goal = (32.1, 0.7)
@@ -1301,6 +1334,7 @@ def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted(
         (12, "VIEWPOINT_ALTERNATIVES_EXHAUSTED")]
     assert terminations == ["viewpoint_alternatives_exhausted"]
     assert statuses == ["VIEWPOINT_LOCAL_REJECTED_REGION_CHANGED"]
+    assert explorer.route_constraint_revision == 12
 
 
 def test_failure_evidence_is_observational_and_request_scoped():
