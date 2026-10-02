@@ -67,6 +67,16 @@ namespace scan_planner
         node_, "fsm.tracking_match_forward_time", 0.80);
     planning_clearance_margin_ = load_parameter<double>(
         node_, "fsm.planning_clearance_margin", 0.10);
+    preferred_clearance_margin_ = load_parameter<double>(
+        node_, "fsm.preferred_clearance_margin", 0.20);
+    clearance_limited_max_forward_speed_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_max_forward_speed", 0.25);
+    clearance_limited_max_lateral_speed_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_max_lateral_speed", 0.08);
+    clearance_limited_max_yaw_rate_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_max_yaw_rate", 0.50);
+    clearance_limited_max_tracking_correction_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_max_tracking_correction", 0.08);
     local_repair_anchor_min_distance_ = load_parameter<double>(
         node_, "fsm.local_repair_anchor_min_distance", 0.45);
     local_repair_anchor_max_distance_ = load_parameter<double>(
@@ -83,6 +93,8 @@ namespace scan_planner
         node_, "fsm.local_repair_max_speed", 0.25);
     local_repair_time_margin_ = load_parameter<double>(
         node_, "fsm.local_repair_time_margin", 1.20);
+    enable_holonomic_lateral_repair_ = load_parameter<bool>(
+        node_, "fsm.enable_holonomic_lateral_repair", false);
     braking_sweep_spatial_step_ = load_parameter<double>(
         node_, "fsm.braking_sweep_spatial_step", 0.05);
     braking_sweep_max_horizon_ = load_parameter<double>(
@@ -116,6 +128,11 @@ namespace scan_planner
         tracking_match_back_time_ < 0.0 ||
         tracking_match_forward_time_ <= 0.0 ||
         planning_clearance_margin_ < 0.0 ||
+        preferred_clearance_margin_ <= planning_clearance_margin_ ||
+        clearance_limited_max_forward_speed_ <= 0.0 ||
+        clearance_limited_max_lateral_speed_ < 0.0 ||
+        clearance_limited_max_yaw_rate_ <= 0.0 ||
+        clearance_limited_max_tracking_correction_ <= 0.0 ||
         local_repair_anchor_min_distance_ <= 0.2 ||
         local_repair_anchor_max_distance_ <
             local_repair_anchor_min_distance_ ||
@@ -1199,7 +1216,8 @@ namespace scan_planner
         handoff.clearance_escape_active,
         handoff.clearance_escape_deadline,
         handoff.initial_clearance_violations,
-        handoff.fixed_body_yaw, handoff.body_yaw);
+        handoff.fixed_body_yaw, handoff.body_yaw,
+        handoff.execution_mode);
     if (handoff.structured_repair_segment)
     {
       structured_local_repair_active_.store(true);
@@ -1346,7 +1364,8 @@ namespace scan_planner
       uint64_t request_id, int64_t trajectory_id,
       const std::string &stage, const std::string &reason,
       const Eigen::Vector3d &position, uint32_t attempted_candidates,
-      double required_clearance, ClearanceFailure clearance_failure)
+      double required_clearance, ClearanceFailure clearance_failure,
+      uint8_t failure_scope)
   {
     scan_planner_msgs::msg::FailureEvidence evidence;
     evidence.stamp = node_->now();
@@ -1360,6 +1379,7 @@ namespace scan_planner
     evidence.attempted_candidates = attempted_candidates;
     evidence.required_clearance = required_clearance;
     evidence.clearance_failure = static_cast<uint8_t>(clearance_failure);
+    evidence.failure_scope = failure_scope;
     failure_evidence_pub_->publish(evidence);
   }
 
@@ -2145,12 +2165,16 @@ namespace scan_planner
           execution_snapshot_.clearance_escape_active = false;
           execution_snapshot_.clearance_escape_free_cycles = 0;
         }
-        changeFSMExecState(WAIT_TARGET, "VIEWPOINT_LOCAL_REJECTED");
         publishFailureEvidence(
             failed_request, failed_trajectory,
             "STRUCTURED_LOCAL_REPAIR", "FINITE_CANDIDATE_FAMILY_EXHAUSTED",
-            odom_pos_, attempted_recovery_candidates,
-            planning_clearance_margin_, ClearanceFailure::NONE);
+            end_pt_, attempted_recovery_candidates,
+            planning_clearance_margin_, ClearanceFailure::NONE,
+            scan_planner_msgs::msg::FailureEvidence::SCOPE_VIEWPOINT);
+        // Publish graph evidence before the terminal state transition.  The
+        // graph may update route constraints immediately, while the following
+        // status remains the sole owner of request/goal lifecycle changes.
+        changeFSMExecState(WAIT_TARGET, "VIEWPOINT_LOCAL_REJECTED");
         requestExecutionStop("VIEWPOINT_LOCAL_REJECTED");
         RCLCPP_ERROR(
             node_->get_logger(),
@@ -2284,6 +2308,25 @@ namespace scan_planner
     if (!reference_path_active_ || reference_path_.size() < 2 ||
         !have_target_)
       return false;
+
+    if (!enable_holonomic_lateral_repair_)
+    {
+      // The former anchor family held body yaw fixed while translating in an
+      // arbitrary clearance direction.  That is a holonomic-base assumption,
+      // not a certified Go2 RL locomotion primitive.  Preserve recovery
+      // ownership so finishProcess() produces a viewpoint-scoped terminal
+      // instead of silently downgrading this to a generic BLOCKED retry.
+      structured_local_repair_active_.store(true);
+      stopped_local_repair_active_.store(true);
+      structured_local_repair_segments_committed_.store(0);
+      replan_fail_count_ = max_replan_fail_count_;
+      RCLCPP_ERROR_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "[HOLONOMIC_LOCAL_REPAIR_DISABLED] request_id=%llu; ordinary same-goal path candidates are exhausted, rejecting the exact viewpoint instead of commanding fixed-yaw lateral motion",
+          static_cast<unsigned long long>(
+              active_reference_request_id_.load()));
+      return false;
+    }
 
     // From this point until a validated candidate succeeds (or the bounded
     // retry budget is exhausted), SCAN owns the request as LOCAL_REPAIR.  A
@@ -2544,7 +2587,7 @@ namespace scan_planner
       const LocalTrajData &info, uint64_t request_id,
       bool clearance_escape_active, double clearance_escape_deadline,
       size_t initial_clearance_violations, bool fixed_body_yaw,
-      double body_yaw)
+      double body_yaw, uint8_t execution_mode)
   {
     std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
     execution_snapshot_.position = info.position_traj_;
@@ -2572,6 +2615,7 @@ namespace scan_planner
         clearance_escape_active ? 0.15 : 0.0;
     execution_snapshot_.fixed_body_yaw = fixed_body_yaw;
     execution_snapshot_.body_yaw = body_yaw;
+    execution_snapshot_.execution_mode = execution_mode;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
     terminal_repair_requested_.store(false);
     terminal_repair_error_.store(0.0);
@@ -3183,6 +3227,8 @@ namespace scan_planner
     bool runtime_escape_exited_clearance = false;
     size_t previous_runtime_violations =
         trajectory.initial_clearance_violations;
+    double first_preferred_conflict_time =
+        std::numeric_limits<double>::infinity();
     for (double t = matched_time; t < trajectory.duration; t += time_step)
     {
       const Eigen::Vector3d pos = trajectory.position.evaluateDeBoorT(t);
@@ -3197,6 +3243,18 @@ namespace scan_planner
           &clearance_violations);
       if (!clearance_blocked)
       {
+        const bool preferred_clearance_blocked =
+            trajectory.execution_mode ==
+                scan_planner_msgs::msg::Bspline::MODE_NORMAL &&
+            footprintOccupiedWithMargin(
+                map, pos, trajectory_yaw,
+                preferred_clearance_margin_);
+        if (preferred_clearance_blocked)
+        {
+          first_preferred_conflict_time = std::min(
+              first_preferred_conflict_time,
+              std::max(0.0, t - matched_time));
+        }
         runtime_escape_exited_clearance = true;
         previous_runtime_violations = 0;
         last_free = pos;
@@ -3259,6 +3317,18 @@ namespace scan_planner
         return;
       }
     }
+    // Preferred clearance is a replanning trigger, never a reason to skip the
+    // rest of the hard-safety scan.  Only request the smooth replacement after
+    // the complete suffix has been proven free of hard-margin conflicts.
+    if (std::isfinite(first_preferred_conflict_time))
+    {
+      predictive_replan_requested_.store(true);
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 500,
+          "[PREFERRED_CLEARANCE_REPLAN] time_to_belt=%.2fs hard_margin=%.2fm preferred_margin=%.2fm; complete suffix remains hard-safe, requesting a wider or speed-limited replacement",
+          first_preferred_conflict_time, planning_clearance_margin_,
+          preferred_clearance_margin_);
+    }
   }
 
   void SCANReplanFSM::checkCollisionCallback()
@@ -3316,19 +3386,36 @@ namespace scan_planner
           (local_target_pt_ - start_pt_).norm(), local_repair_max_speed_,
           planner_manager_->pp_.max_acc_, local_repair_time_margin_);
     }
-    bool plan_success = planner_manager_->reboundReplan(
-        start_pt_, start_vel_, start_acc_, local_target_pt_,
-        local_target_vel_, (have_new_target_ || flag_use_poly_init),
-        flag_randomPolyTraj, initialization_speed_limit,
-        minimum_initial_duration,
-        low_speed_local_repair ? local_repair_body_yaw
-                               : std::numeric_limits<double>::quiet_NaN(),
-        // Normal candidates must satisfy the complete planning belt inside
-        // A* and optimization.  A structured escape is the sole exception:
-        // it may start inside that belt, so the optimizer uses physical
-        // occupancy while the validator below enforces a non-worsening,
-        // time-bounded exit from the same planning belt.
-        low_speed_local_repair ? 0.0 : planning_clearance_margin_);
+    const bool initialize_from_polynomial =
+        have_new_target_ || flag_use_poly_init;
+    const auto plan_with_margin = [&](double clearance_margin) {
+      return planner_manager_->reboundReplan(
+          start_pt_, start_vel_, start_acc_, local_target_pt_,
+          local_target_vel_, initialize_from_polynomial,
+          flag_randomPolyTraj, initialization_speed_limit,
+          minimum_initial_duration,
+          low_speed_local_repair ? local_repair_body_yaw
+                                 : std::numeric_limits<double>::quiet_NaN(),
+          clearance_margin);
+    };
+
+    // Generate normal candidates against the preferred belt first, so A* and
+    // optimization actively search for a wider route.  A narrow but physically
+    // valid corridor is not rejected outright: retry once with the hard belt,
+    // then mark the resulting trajectory clearance-limited during validation.
+    // Structured escape remains the sole exception because it may start
+    // inside even the hard belt and is validated by its non-worsening exit.
+    bool plan_success = plan_with_margin(
+        low_speed_local_repair ? 0.0 : preferred_clearance_margin_);
+    if (!plan_success && !low_speed_local_repair)
+    {
+      planner_manager_->local_data_ = executing_trajectory;
+      RCLCPP_INFO_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 500,
+          "[PREFERRED_CLEARANCE_FALLBACK] no %.2fm route; retrying the same target with hard margin %.2fm and a controller-limited execution profile",
+          preferred_clearance_margin_, planning_clearance_margin_);
+      plan_success = plan_with_margin(planning_clearance_margin_);
+    }
     map->clearInflatedOccupancySnapshotForCurrentThread();
     const double optimization_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - planning_started).count();
@@ -3395,6 +3482,7 @@ namespace scan_planner
               : 0.75;
       bool candidate_started_inside_clearance = false;
       bool candidate_exited_clearance = false;
+      bool candidate_requires_clearance_limited_profile = false;
       size_t initial_clearance_violations = 0;
       for (double t = 0.0; t <= info->duration_; t += validation_dt)
       {
@@ -3422,6 +3510,10 @@ namespace scan_planner
 
         if (!clearance_blocked)
         {
+          if (!low_speed_local_repair && footprintOccupiedWithMargin(
+                  map, pos, candidate_yaw,
+                  preferred_clearance_margin_))
+            candidate_requires_clearance_limited_profile = true;
           candidate_exited_clearance = true;
           continue;
         }
@@ -3592,6 +3684,25 @@ namespace scan_planner
       bspline.start_time = info->start_time_;
       bspline.traj_id = info->traj_id_;
       bspline.request_id = planning_request_id;
+      bspline.execution_mode = low_speed_local_repair
+          ? scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE
+          : (candidate_requires_clearance_limited_profile
+                 ? scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED
+                 : scan_planner_msgs::msg::Bspline::MODE_NORMAL);
+      if (bspline.execution_mode !=
+          scan_planner_msgs::msg::Bspline::MODE_NORMAL)
+      {
+        bspline.max_forward_speed = low_speed_local_repair
+            ? local_repair_max_speed_
+            : clearance_limited_max_forward_speed_;
+        bspline.max_lateral_speed = low_speed_local_repair
+            ? std::min(local_repair_max_speed_,
+                       clearance_limited_max_lateral_speed_)
+            : clearance_limited_max_lateral_speed_;
+        bspline.max_yaw_rate = clearance_limited_max_yaw_rate_;
+        bspline.max_tracking_correction =
+            clearance_limited_max_tracking_correction_;
+      }
 
       Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
       bspline.pos_pts.reserve(pos_pts.cols());
@@ -3638,6 +3749,7 @@ namespace scan_planner
             initial_clearance_violations;
         pending_handoff_.fixed_body_yaw = low_speed_local_repair;
         pending_handoff_.body_yaw = local_repair_body_yaw;
+        pending_handoff_.execution_mode = bspline.execution_mode;
         pending_handoff_.structured_repair_segment =
             low_speed_local_repair;
         pending_handoff_.structured_repair_rejoin =
@@ -3654,10 +3766,11 @@ namespace scan_planner
       bspline_pub_->publish(bspline);
       RCLCPP_INFO(
           node_->get_logger(),
-          "[CANDIDATE_TRAJECTORY_SUBMITTED] request_id=%llu trajectory=%lld clearance_escape=%d; waiting for controller ACK before replacing execution",
+          "[CANDIDATE_TRAJECTORY_SUBMITTED] request_id=%llu trajectory=%lld clearance_escape=%d execution_mode=%u; waiting for controller ACK before replacing execution",
           static_cast<unsigned long long>(planning_request_id),
           static_cast<long long>(info->traj_id_),
-          candidate_started_inside_clearance ? 1 : 0);
+          candidate_started_inside_clearance ? 1 : 0,
+          static_cast<unsigned int>(bspline.execution_mode));
 
       visualization_->displayOptimalTraj(info->position_traj_, 0);
 

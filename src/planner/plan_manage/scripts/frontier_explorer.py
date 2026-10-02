@@ -569,6 +569,8 @@ class FrontierExplorer(Node):
         self.local_repair_exhausted_count = 0
         self.failure_evidence_received = 0
         self.failure_evidence_matched = 0
+        self.global_viewpoint_constraint_requests: Set[int] = set()
+        self.global_viewpoint_constraints: Dict[int, Tuple[float, float, float]] = {}
         self.last_failure_stage = "none"
         self.last_failure_reason = "none"
         self.last_failure_clearance = 0.0
@@ -644,7 +646,7 @@ class FrontierExplorer(Node):
             String, "planning/status", self.planning_status_callback, 10,
             callback_group=self.planning_callback_group)
         self.create_subscription(
-            FailureEvidence, "planning/failure_evidence",
+            FailureEvidence, "global_representation/failure_evidence",
             self.failure_evidence_callback, 20,
             callback_group=self.planning_callback_group)
         self.create_subscription(
@@ -720,21 +722,29 @@ class FrontierExplorer(Node):
             int(msg.stamp.sec) * 1000000000 + int(msg.stamp.nanosec))
 
     def failure_evidence_callback(self, msg: FailureEvidence):
-        """Record structured local failures without changing goal ownership.
+        """Apply graph-mediated evidence without taking terminal ownership.
 
         The matching terminal planning/status message remains the sole state
-        transition authority.  Keeping evidence observational prevents a
-        reordered evidence/status pair from cooling a newer request.
+        transition authority.  Viewpoint-scoped evidence may immediately
+        change route scoring/cooldown, but it never clears the active request.
         """
         self.failure_evidence_received += 1
-        if (self.active_path_request_generation is not None and
-                int(msg.request_id) !=
+        if (self.active_path_request_generation is None
+                or int(msg.request_id) !=
                 int(self.active_path_request_generation)):
             return
         self.failure_evidence_matched += 1
         self.last_failure_stage = str(msg.stage)
         self.last_failure_reason = str(msg.reason)
         self.last_failure_clearance = float(msg.required_clearance)
+        failure_scope = int(getattr(
+            msg, "failure_scope", FailureEvidence.SCOPE_PATH))
+        if failure_scope == FailureEvidence.SCOPE_VIEWPOINT:
+            self.apply_global_viewpoint_constraint(
+                int(msg.request_id),
+                (float(msg.position.x), float(msg.position.y)),
+                self.blacklist_radius,
+                str(msg.reason))
         self.get_logger().warn(
             "[LOCAL_FAILURE_EVIDENCE] "
             f"request_id={msg.request_id} trajectory={msg.trajectory_id} "
@@ -802,10 +812,58 @@ class FrontierExplorer(Node):
         self.status_pub.publish(msg)
 
     def safe_region_snapshot_callback(self, msg: String):
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            for item in payload.get("viewpoint_constraints", ()):
+                try:
+                    self.apply_global_viewpoint_constraint(
+                        int(item["request_id"]),
+                        (float(item["x"]), float(item["y"])),
+                        float(item.get("radius", self.blacklist_radius)),
+                        str(item.get("reason", "GLOBAL_GRAPH_SNAPSHOT")))
+                except (KeyError, TypeError, ValueError):
+                    self.get_logger().warning(
+                        "Rejected malformed viewpoint constraint",
+                        throttle_duration_sec=2.0)
         if not self.safe_region_connectivity.update_json(msg.data):
             self.get_logger().warning(
                 "Rejected malformed or stale safe-region snapshot",
                 throttle_duration_sec=2.0)
+
+    def apply_global_viewpoint_constraint(
+            self, request_id: int, point: Point2, radius: float,
+            reason: str) -> bool:
+        """Install one graph-owned rejected-viewpoint constraint exactly once."""
+        requests = getattr(self, "global_viewpoint_constraint_requests", None)
+        if requests is None:
+            requests = set()
+            self.global_viewpoint_constraint_requests = requests
+        constraints = getattr(self, "global_viewpoint_constraints", None)
+        if constraints is None:
+            constraints = {}
+            self.global_viewpoint_constraints = constraints
+        if (request_id <= 0 or request_id in requests
+                or radius <= 0.0
+                or not all(math.isfinite(value)
+                           for value in (point[0], point[1], radius))):
+            return False
+        requests.add(request_id)
+        constraints[request_id] = (
+            float(point[0]), float(point[1]), float(radius))
+        self.route_constraint_revision += 1
+        if (self.active_path_request_generation == request_id
+                and self.active_goal is not None):
+            self.add_goal_failure_cooldown(
+                self.active_goal, "GLOBAL_GRAPH_VIEWPOINT_CONSTRAINT")
+        self.get_logger().warning(
+            "[GLOBAL_VIEWPOINT_CONSTRAINT_APPLIED] "
+            f"revision={self.route_constraint_revision} "
+            f"request_id={request_id} point=({point[0]:.2f},{point[1]:.2f}) "
+            f"radius={radius:.2f}m reason={reason}")
+        return True
 
     def attach_safe_region_commitment_scopes(
             self, candidates: Sequence[FrontierCandidate],
@@ -1972,14 +2030,19 @@ class FrontierExplorer(Node):
             # family.  Advance the route context before asking ReplanGate for
             # a sibling so it cannot suppress the replacement as an unchanged
             # BLOCKED retry.
-            self.route_constraint_revision += 1
+            constraint_preapplied = (
+                request_generation is not None
+                and int(request_generation) in
+                getattr(self, "global_viewpoint_constraint_requests", set()))
+            if not constraint_preapplied:
+                self.route_constraint_revision += 1
             self.pending_path_publish_ns = 0
             self.pending_path_deferred = False
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
             failed_region = self.active_region_id
             previous_goal = self.active_goal
-            if previous_goal is not None:
+            if previous_goal is not None and not constraint_preapplied:
                 self.add_goal_failure_cooldown(
                     previous_goal, "VIEWPOINT_LOCAL_REJECTED")
             self.active_goal = None
@@ -2173,10 +2236,15 @@ class FrontierExplorer(Node):
                      > failure_route_revision))]
         for goal in expired:
             del self.goal_failure_cooldowns[goal]
-        return any(
+        locally_cooled = any(
             math.hypot(point[0] - goal[0], point[1] - goal[1])
             < self.blacklist_radius
             for goal in self.goal_failure_cooldowns)
+        globally_constrained = any(
+            math.hypot(point[0] - x, point[1] - y) < radius
+            for x, y, radius in
+            getattr(self, "global_viewpoint_constraints", {}).values())
+        return locally_cooled or globally_constrained
 
     def add_region_failure_cooldown(self, region_id: int, reason: str):
         release_update = (

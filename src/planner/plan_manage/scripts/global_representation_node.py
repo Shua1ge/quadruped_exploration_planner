@@ -12,7 +12,7 @@ from geometry_msgs.msg import Point
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scan_planner_msgs.msg import (
-    LocalMapPatch, TopoEdge, TopoGraphDelta, TopoNode)
+    FailureEvidence, LocalMapPatch, TopoEdge, TopoGraphDelta, TopoNode)
 from std_msgs.msg import String
 
 from explorer_core.topology import (
@@ -78,6 +78,16 @@ class GlobalRepresentationNode(Node):
             self.blocked_confirmation_patches)
         self.graph_revision = 0
         self.last_map_revision = 0
+        self.route_constraint_revision = 0
+        self.viewpoint_constraint_radius = float(self.declare_parameter(
+            "viewpoint_constraint_radius", 0.60).value)
+        self.max_viewpoint_constraints = max(1, int(self.declare_parameter(
+            "max_viewpoint_constraints", 128).value))
+        if self.viewpoint_constraint_radius <= 0.0:
+            raise ValueError("viewpoint_constraint_radius must be positive")
+        self.viewpoint_constraints = {}
+        self.failure_evidence_received = 0
+        self.failure_evidence_forwarded = 0
 
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -95,6 +105,15 @@ class GlobalRepresentationNode(Node):
             snapshot_qos)
         self.safe_region_pub = self.create_publisher(
             String, "global_representation/safe_region_snapshot", snapshot_qos)
+        failure_qos = QoSProfile(depth=20)
+        failure_qos.reliability = ReliabilityPolicy.RELIABLE
+        failure_qos.durability = DurabilityPolicy.VOLATILE
+        self.create_subscription(
+            FailureEvidence, "planning/failure_evidence",
+            self.failure_evidence_callback, failure_qos)
+        self.failure_evidence_pub = self.create_publisher(
+            FailureEvidence, "global_representation/failure_evidence",
+            failure_qos)
         self.metrics_pub = self.create_publisher(
             String, "global_representation/oracle_metrics", 10)
         self.get_logger().info(
@@ -126,6 +145,90 @@ class GlobalRepresentationNode(Node):
             point.z = patch.origin.z
             msg.polyline.append(point)
         return msg
+
+    def nearest_safe_region(self, x: float, y: float):
+        """Return the nearest persistent region within the attachment radius."""
+        if not self.global_safe_regions:
+            return None
+        region_id, distance = min(
+            ((int(region_id), math.hypot(
+                float(item["x"]) - x, float(item["y"]) - y))
+             for region_id, item in self.global_safe_regions.items()),
+            key=lambda item: item[1])
+        return (region_id if distance <= self.viewpoint_constraint_radius
+                else None)
+
+    def safe_region_snapshot(self, map_revision=None):
+        """Build the graph snapshot together with execution-derived overlays."""
+        return {
+            "map_revision": int(
+                self.last_map_revision if map_revision is None
+                else map_revision),
+            "route_constraint_revision": int(self.route_constraint_revision),
+            "regions": list(self.global_safe_regions.values()),
+            "portals": [
+                item for item in self.global_safe_portals.values()
+                if item["source"] in self.global_safe_regions
+                and item["target"] in self.global_safe_regions],
+            "viewpoint_constraints": list(
+                self.viewpoint_constraints.values()),
+        }
+
+    def publish_safe_region_snapshot(self, map_revision=None):
+        msg = String()
+        msg.data = json.dumps(
+            self.safe_region_snapshot(map_revision), separators=(",", ":"))
+        self.safe_region_pub.publish(msg)
+
+    def failure_evidence_callback(self, evidence: FailureEvidence):
+        """Persist execution-derived route evidence and forward it immediately.
+
+        Occupancy/topology remains geometric.  A rejected viewpoint is stored
+        as a graph-owned constraint overlay, so a later map refresh cannot
+        silently erase execution knowledge about the same approach.
+        """
+        self.failure_evidence_received += 1
+        position = evidence.position
+        if (int(evidence.request_id) <= 0
+                or not all(math.isfinite(value) for value in (
+                    position.x, position.y, position.z,
+                    evidence.required_clearance))):
+            self.get_logger().warning(
+                "[FAILURE_EVIDENCE_REJECTED] non-finite or unscoped evidence")
+            return
+
+        if int(evidence.failure_scope) == FailureEvidence.SCOPE_VIEWPOINT:
+            request_id = int(evidence.request_id)
+            constraint = {
+                "request_id": request_id,
+                "trajectory_id": int(evidence.trajectory_id),
+                "x": float(position.x),
+                "y": float(position.y),
+                "radius": float(self.viewpoint_constraint_radius),
+                "region_id": self.nearest_safe_region(
+                    float(position.x), float(position.y)),
+                "stage": str(evidence.stage),
+                "reason": str(evidence.reason),
+                "source_map_revision": int(self.last_map_revision),
+            }
+            if self.viewpoint_constraints.get(request_id) != constraint:
+                self.viewpoint_constraints[request_id] = constraint
+                while (len(self.viewpoint_constraints)
+                       > self.max_viewpoint_constraints):
+                    oldest = next(iter(self.viewpoint_constraints))
+                    del self.viewpoint_constraints[oldest]
+                self.route_constraint_revision += 1
+                self.publish_safe_region_snapshot()
+                self.get_logger().warning(
+                    "[GLOBAL_VIEWPOINT_CONSTRAINT] "
+                    f"revision={self.route_constraint_revision} "
+                    f"request_id={request_id} "
+                    f"region_id={constraint['region_id']} "
+                    f"position=({position.x:.2f},{position.y:.2f}) "
+                    f"reason={evidence.reason}")
+
+        self.failure_evidence_pub.publish(evidence)
+        self.failure_evidence_forwarded += 1
 
     def patch_callback(self, patch: LocalMapPatch):
         if patch.map_revision <= self.last_map_revision:
@@ -241,16 +344,7 @@ class GlobalRepresentationNode(Node):
                         * float(patch.resolution)),
                     "width": float(portal.width),
                     "bottleneck": bool(portal.bottleneck)}
-            safe_snapshot = {
-                "map_revision": int(patch.map_revision),
-                "regions": list(self.global_safe_regions.values()),
-                "portals": [item for item in self.global_safe_portals.values()
-                            if item["source"] in self.global_safe_regions
-                            and item["target"] in self.global_safe_regions],
-            }
-            safe_msg = String()
-            safe_msg.data = json.dumps(safe_snapshot, separators=(",", ":"))
-            self.safe_region_pub.publish(safe_msg)
+            self.publish_safe_region_snapshot(patch.map_revision)
         elif self.safe_region_shadow_enabled and self.last_safe_shadow_metrics:
             safe_metrics = dict(self.last_safe_shadow_metrics)
             safe_metrics.update({
@@ -371,6 +465,10 @@ class GlobalRepresentationNode(Node):
             "destructive_updates_allowed": destructive_updates_allowed,
             "pending_node_blockages": self.node_blockage.pending,
             "pending_edge_blockages": self.edge_blockage.pending,
+            "route_constraint_revision": self.route_constraint_revision,
+            "viewpoint_constraints": len(self.viewpoint_constraints),
+            "failure_evidence_received": self.failure_evidence_received,
+            "failure_evidence_forwarded": self.failure_evidence_forwarded,
             "node_compression_ratio": (
                 1.0 - len(local_graph.nodes) / dense_free if dense_free else 0.0),
         })

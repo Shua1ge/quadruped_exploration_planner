@@ -78,6 +78,12 @@ namespace scan_planner
     double tracking_match_back_time_{0.40};
     double tracking_match_forward_time_{0.80};
     double planning_clearance_margin_{0.10};
+    double preferred_clearance_margin_{0.20};
+    double clearance_limited_max_forward_speed_{0.25};
+    double clearance_limited_max_lateral_speed_{0.08};
+    double clearance_limited_max_yaw_rate_{0.50};
+    double clearance_limited_max_tracking_correction_{0.08};
+    bool enable_holonomic_lateral_repair_{false};
     double local_repair_anchor_min_distance_{0.45};
     double local_repair_anchor_max_distance_{0.90};
     double local_repair_anchor_step_{0.15};
@@ -178,6 +184,7 @@ namespace scan_planner
       double clearance_escape_min_progress_ratio{0.0};
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
+      uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
       bool valid{false};
     };
     std::mutex execution_snapshot_mutex_;
@@ -193,6 +200,7 @@ namespace scan_planner
       size_t initial_clearance_violations{0};
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
+      uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
       // Recovery is a transaction spanning two controller handoffs: the
       // short clearance-escape segment and the trajectory that rejoins the
       // unchanged reference path.  Keep the phase on the pending handoff so
@@ -320,7 +328,9 @@ namespace scan_planner
                                 const Eigen::Vector3d &position,
                                 uint32_t attempted_candidates,
                                 double required_clearance,
-                                ClearanceFailure clearance_failure);
+                                ClearanceFailure clearance_failure,
+                                uint8_t failure_scope =
+                                    scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
                                            uint64_t request_id,
@@ -328,7 +338,9 @@ namespace scan_planner
                                            double clearance_escape_deadline = 0.0,
                                            size_t initial_clearance_violations = 0,
                                            bool fixed_body_yaw = false,
-                                           double body_yaw = 0.0);
+                                           double body_yaw = 0.0,
+                                           uint8_t execution_mode =
+                                               scan_planner_msgs::msg::Bspline::MODE_NORMAL);
     void setLocalRecoveryState(LocalRecoveryState state,
                                double tracking_error,
                                const char *reason);

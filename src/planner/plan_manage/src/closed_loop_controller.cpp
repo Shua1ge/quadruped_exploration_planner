@@ -61,6 +61,11 @@ public:
       throw std::runtime_error(
           "handoff parameters must have a non-negative search time and positive sample interval/error limit");
 
+    active_max_vx_ = max_vx_;
+    active_max_vy_ = max_vy_;
+    active_max_vyaw_ = max_vyaw_;
+    active_max_tracking_correction_ = std::max(max_vx_, max_vy_);
+
     bspline_sub_ = create_subscription<scan_planner_msgs::msg::Bspline>(
         "planning/bspline", 10,
         std::bind(&ClosedLoopController::bsplineCallback, this, std::placeholders::_1));
@@ -138,7 +143,8 @@ private:
   void publishStop(double yaw_rate = 0.0)
   {
     geometry_msgs::msg::Twist cmd;
-    cmd.angular.z = std::clamp(yaw_rate, -max_vyaw_, max_vyaw_);
+    cmd.angular.z = std::clamp(
+        yaw_rate, -active_max_vyaw_, active_max_vyaw_);
     cmd_vel_pub_->publish(cmd);
   }
 
@@ -224,6 +230,32 @@ private:
           "STALE_TRAJECTORY_VERSION");
       return;
     }
+    if (msg->execution_mode >
+            scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE ||
+        !std::isfinite(msg->max_forward_speed) ||
+        !std::isfinite(msg->max_lateral_speed) ||
+        !std::isfinite(msg->max_yaw_rate) ||
+        !std::isfinite(msg->max_tracking_correction) ||
+        msg->max_forward_speed < 0.0 || msg->max_lateral_speed < 0.0 ||
+        msg->max_yaw_rate < 0.0 || msg->max_tracking_correction < 0.0)
+    {
+      RCLCPP_WARN(
+          get_logger(), "Ignoring B-spline with invalid execution profile");
+      publishTrajectoryAck(
+          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "INVALID_EXECUTION_PROFILE");
+      return;
+    }
+    const double candidate_max_vx = msg->max_forward_speed > 0.0
+        ? std::min(msg->max_forward_speed, max_vx_) : max_vx_;
+    const double candidate_max_vy = msg->max_lateral_speed > 0.0
+        ? std::min(msg->max_lateral_speed, max_vy_) : max_vy_;
+    const double candidate_max_vyaw = msg->max_yaw_rate > 0.0
+        ? std::min(msg->max_yaw_rate, max_vyaw_) : max_vyaw_;
+    const double candidate_max_tracking_correction =
+        msg->max_tracking_correction > 0.0
+            ? msg->max_tracking_correction
+            : std::max(candidate_max_vx, candidate_max_vy);
     Eigen::MatrixXd points(3, msg->pos_pts.size());
     for (size_t i = 0; i < msg->pos_pts.size(); ++i)
       points.col(i) << msg->pos_pts[i].x, msg->pos_pts[i].y, msg->pos_pts[i].z;
@@ -368,6 +400,12 @@ private:
     active_request_id_ = msg->request_id;
     fixed_trajectory_yaw_ = candidate_fixed_yaw;
     trajectory_yaw_ = candidate_body_yaw;
+    active_execution_mode_ = msg->execution_mode;
+    active_max_vx_ = candidate_max_vx;
+    active_max_vy_ = candidate_max_vy;
+    active_max_vyaw_ = candidate_max_vyaw;
+    active_max_tracking_correction_ =
+        candidate_max_tracking_correction;
     exec_time_ = matched_time;
     last_update_time_ = now();
     receive_traj_ = true;
@@ -397,11 +435,14 @@ private:
                    : scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
         soft_hold_ ? soft_hold_reason_ : "", 0.0, true);
     RCLCPP_INFO(get_logger(),
-                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm matched_yaw_error=%.3frad fixed_body_yaw=%d",
+                "[TRAJECTORY_HANDOFF] request_id=%llu trajectory=%lld duration=%.3fs matched_time=%.3fs start_error=%.3fm matched_error=%.3fm matched_yaw_error=%.3frad fixed_body_yaw=%d execution_mode=%u limits=(%.2f,%.2f,%.2f) correction=%.2f",
                 static_cast<unsigned long long>(active_request_id_),
                 static_cast<long long>(traj_id_), traj_duration_, exec_time_,
                 start_error, matched_error, matched_yaw_error,
-                fixed_trajectory_yaw_ ? 1 : 0);
+                fixed_trajectory_yaw_ ? 1 : 0,
+                static_cast<unsigned int>(active_execution_mode_),
+                active_max_vx_, active_max_vy_, active_max_vyaw_,
+                active_max_tracking_correction_);
   }
 
   void executionCommandCallback(
@@ -562,7 +603,8 @@ private:
     std_msgs::msg::Float64 heading_error_msg;
     heading_error_msg.data = yaw_error;
     heading_error_pub_->publish(heading_error_msg);
-    const double yaw_command = std::clamp(kp_yaw_ * yaw_error, -max_vyaw_, max_vyaw_);
+    const double yaw_command = std::clamp(
+        kp_yaw_ * yaw_error, -active_max_vyaw_, active_max_vyaw_);
     if (std::abs(yaw_error) > heading_error_threshold_)
     {
       const double abs_error = std::abs(yaw_error);
@@ -616,14 +658,20 @@ private:
     pos_des = traj_[0].evaluateDeBoorT(exec_time_);
     const Eigen::Vector3d vel_des = traj_[1].evaluateDeBoorT(exec_time_);
     const Eigen::Vector2d pos_error(pos_des.x() - odom_pos_.x(), pos_des.y() - odom_pos_.y());
+    const Eigen::Vector2d tracking_correction = clampNorm(
+        kp_pos_ * pos_error, active_max_tracking_correction_);
     const Eigen::Vector2d vel_world = clampNorm(
-        Eigen::Vector2d(vel_des.x(), vel_des.y()) + kp_pos_ * pos_error,
-        std::max(max_vx_, max_vy_));
+        Eigen::Vector2d(vel_des.x(), vel_des.y()) + tracking_correction,
+        std::max(active_max_vx_, active_max_vy_));
     const double c = std::cos(odom_yaw_);
     const double s = std::sin(odom_yaw_);
     geometry_msgs::msg::Twist command;
-    command.linear.x = std::clamp(c * vel_world.x() + s * vel_world.y(), -max_vx_, max_vx_);
-    command.linear.y = std::clamp(-s * vel_world.x() + c * vel_world.y(), -max_vy_, max_vy_);
+    command.linear.x = std::clamp(
+        c * vel_world.x() + s * vel_world.y(),
+        -active_max_vx_, active_max_vx_);
+    command.linear.y = std::clamp(
+        -s * vel_world.x() + c * vel_world.y(),
+        -active_max_vy_, active_max_vy_);
     command.angular.z = yaw_command;
     const double terminal_error = pos_error.norm();
     if (exec_time_ >= traj_duration_ && terminal_error < finish_dist_)
@@ -713,6 +761,12 @@ private:
   std::vector<UniformBspline> traj_;
   bool fixed_trajectory_yaw_{false};
   double trajectory_yaw_{0.0};
+  uint8_t active_execution_mode_{
+      scan_planner_msgs::msg::Bspline::MODE_NORMAL};
+  double active_max_vx_{0.0};
+  double active_max_vy_{0.0};
+  double active_max_vyaw_{0.0};
+  double active_max_tracking_correction_{0.0};
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
   std::uint64_t active_request_id_{0};

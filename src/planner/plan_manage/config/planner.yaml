@@ -26,6 +26,15 @@ scan_planner_node:
     # local-map snapshots; it is not baked into the map and does not enlarge
     # Explorer's global obstacles.
     fsm.planning_clearance_margin: 0.10
+    # The hard belt above remains the collision contract.  Entering this wider
+    # preferred belt is not a failure: it starts an early rolling replan and,
+    # when no wider corridor exists, installs a controller-enforced slow
+    # execution profile instead of waiting for a hard-margin violation.
+    fsm.preferred_clearance_margin: 0.20
+    fsm.clearance_limited_max_forward_speed: 0.25
+    fsm.clearance_limited_max_lateral_speed: 0.08
+    fsm.clearance_limited_max_yaw_rate: 0.50
+    fsm.clearance_limited_max_tracking_correction: 0.08
     # Only after ordinary rolling repair fails, try short local anchors that
     # move away from the hard planning belt before rejoining the unchanged
     # Explorer reference path. These bounds keep recovery local and cheap.
@@ -43,6 +52,10 @@ scan_planner_node:
     # a dynamically infeasible normal-speed maneuver.
     fsm.local_repair_max_speed: 0.25
     fsm.local_repair_time_margin: 1.20
+    # Arbitrary fixed-yaw strafing is a holonomic-base assumption and is not a
+    # certified Go2 RL locomotion primitive.  Keep it disabled until a bounded
+    # turn/forward-arc primitive has its own controller contract.
+    fsm.enable_holonomic_lateral_repair: false
     # Runtime safety predicts the actual odometry velocity through reaction
     # and braking, sampling a short swept capsule instead of assuming that the
     # robot remains exactly on the theoretical B-spline.

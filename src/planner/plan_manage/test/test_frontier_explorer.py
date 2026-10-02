@@ -1367,6 +1367,84 @@ def test_failure_evidence_is_observational_and_request_scoped():
     assert len(warnings) == 1
 
 
+def test_viewpoint_evidence_immediately_installs_graph_constraint_once():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.active_path_request_generation = 42
+    explorer.active_goal = (8.0, 3.0)
+    explorer.blacklist_radius = 0.6
+    explorer.route_constraint_revision = 7
+    explorer.failure_evidence_received = 0
+    explorer.failure_evidence_matched = 0
+    explorer.last_failure_stage = "none"
+    explorer.last_failure_reason = "none"
+    explorer.last_failure_clearance = 0.0
+    explorer.global_viewpoint_constraint_requests = set()
+    explorer.global_viewpoint_constraints = {}
+    explorer.goal_failure_cooldowns = {}
+    explorer.map_update_count = 0
+    explorer.map_content_revision = 0
+    cooldowns = []
+    warnings = []
+    explorer.add_goal_failure_cooldown = (
+        lambda goal, reason: cooldowns.append((goal, reason)))
+    explorer.get_logger = lambda: SimpleNamespace(
+        warn=warnings.append, warning=warnings.append)
+    evidence = SimpleNamespace(
+        request_id=42, trajectory_id=9,
+        stage="STRUCTURED_LOCAL_REPAIR",
+        reason="FINITE_CANDIDATE_FAMILY_EXHAUSTED",
+        attempted_candidates=4, required_clearance=0.1,
+        failure_scope=MODULE.FailureEvidence.SCOPE_VIEWPOINT,
+        position=SimpleNamespace(x=8.0, y=3.0, z=0.4))
+
+    explorer.failure_evidence_callback(evidence)
+    explorer.failure_evidence_callback(evidence)
+
+    assert explorer.route_constraint_revision == 8
+    assert explorer.global_viewpoint_constraints[42] == (8.0, 3.0, 0.6)
+    assert cooldowns == [
+        ((8.0, 3.0), "GLOBAL_GRAPH_VIEWPOINT_CONSTRAINT")]
+    assert explorer.is_goal_on_failure_cooldown((8.2, 3.0))
+
+
+def test_viewpoint_terminal_does_not_double_apply_graph_constraint():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.pending_path_request_generation = None
+    explorer.active_path_request_generation = 42
+    explorer.last_completed_request_generation = None
+    explorer.local_repair_exhausted_count = 0
+    explorer.global_reroute_failure_streak = 0
+    explorer.route_constraint_revision = 8
+    explorer.global_viewpoint_constraint_requests = {42}
+    explorer.pending_path_publish_ns = 123
+    explorer.pending_path_deferred = False
+    explorer.active_region_id = 12
+    explorer.active_goal = (8.0, 3.0)
+    explorer.active_goal_cell = (10, 10)
+    explorer.active_observation = object()
+    explorer.active_raw_path = [(1, 1)]
+    explorer.active_path_progress_index = 0
+    explorer.pending_blocked_edge = None
+    explorer.prepared_candidate = None
+    explorer.replacement_pending = False
+    explorer.last_active_goal_clear_reason = "none"
+    cooldowns = []
+    statuses = []
+    explorer.get_logger = lambda: SimpleNamespace(
+        warning=lambda *args, **kwargs: None)
+    explorer.add_goal_failure_cooldown = (
+        lambda goal, reason: cooldowns.append((goal, reason)))
+    explorer.plan_from_current_position = lambda excluded_goals=(): True
+    explorer.publish_status = statuses.append
+
+    explorer.planning_status_callback(
+        SimpleNamespace(data="VIEWPOINT_LOCAL_REJECTED request_id=42"))
+
+    assert explorer.route_constraint_revision == 8
+    assert cooldowns == []
+    assert statuses == ["VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED"]
+
+
 def test_replan_gate_bounds_attempts_until_planning_context_changes():
     gate = MODULE.ReplanGate(max_attempts=2)
     context = MODULE.ReplanContext((4, 5), 10, 3, 7)
