@@ -22,6 +22,7 @@
 
 #include "bspline_opt/uniform_bspline.h"
 #include "plan_manage/replan_fsm_utils.h"
+#include "plan_manage/task_protocol.h"
 
 namespace scan_planner
 {
@@ -119,6 +120,9 @@ private:
     scan_planner_msgs::msg::TrajectoryAck ack;
     ack.stamp = now();
     ack.request_id = candidate.request_id;
+    ack.task_id = candidate.task_id;
+    ack.task_version = candidate.task_version;
+    ack.candidate_id = candidate.candidate_id;
     ack.trajectory_id = candidate.traj_id;
     ack.status = status;
     ack.reason = reason;
@@ -159,6 +163,8 @@ private:
       return;
     scan_planner_msgs::msg::ExecutionState msg;
     msg.request_id = active_request_id_;
+    msg.task_id = active_task_id_;
+    msg.task_version = active_task_version_;
     msg.trajectory_id = traj_id_;
     msg.state = state;
     msg.execution_time = exec_time_;
@@ -203,6 +209,13 @@ private:
 
   void bsplineCallback(const scan_planner_msgs::msg::Bspline::ConstSharedPtr msg)
   {
+    if (!taskCandidateIsLive({msg->task_id, msg->task_version}, retired_task_))
+    {
+      publishTrajectoryAck(*msg,
+          scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "TASK_RETIRED_OR_INVALID");
+      return;
+    }
     if (!validBsplineStructure(
             msg->pos_pts.size(), msg->knots.size(), msg->order) ||
         !validBsplineKnots(msg->knots, msg->pos_pts.size(), msg->order))
@@ -298,6 +311,8 @@ private:
     if (trajectorySamplesAreStationary(control_points, 1e-4))
     {
       active_request_id_ = msg->request_id;
+      active_task_id_ = msg->task_id;
+      active_task_version_ = msg->task_version;
       traj_id_ = msg->traj_id;
       soft_hold_ = true;
       soft_hold_request_id_ = msg->request_id;
@@ -405,6 +420,8 @@ private:
     traj_duration_ = candidate_duration;
     traj_id_ = msg->traj_id;
     active_request_id_ = msg->request_id;
+    active_task_id_ = msg->task_id;
+    active_task_version_ = msg->task_version;
     fixed_trajectory_yaw_ = candidate_fixed_yaw;
     trajectory_yaw_ = candidate_body_yaw;
     active_execution_mode_ = msg->execution_mode;
@@ -458,6 +475,27 @@ private:
   void executionCommandCallback(
       const scan_planner_msgs::msg::ExecutionCommand::ConstSharedPtr msg)
   {
+    // Retirement is a task fence, not a trajectory command. It also rejects
+    // delayed candidates that arrive after cancellation, before any ACK.
+    if (msg->command == scan_planner_msgs::msg::ExecutionCommand::COMMAND_RETIRE_TASK)
+    {
+      if (msg->task_id == 0 || msg->task_version == 0) return;
+      retired_task_ = std::max(retired_task_,
+          std::make_pair(msg->task_id, msg->task_version));
+      if (taskExecutionIsRetired({active_task_id_, active_task_version_}, retired_task_))
+      {
+        soft_hold_ = true;
+        soft_hold_reason_ = "TASK_RETIRED";
+        soft_hold_request_id_ = active_request_id_;
+        soft_hold_trajectory_id_ = traj_id_;
+        publishStop();
+        publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
+                              soft_hold_reason_, 0.0, true);
+      }
+      return;
+    }
+    if (taskExecutionIsRetired({active_task_id_, active_task_version_}, retired_task_))
+      return;
     if (!executionCommandTargetsCurrentOrNewer(
             msg->request_id, msg->trajectory_id,
             active_request_id_, receive_traj_ ? traj_id_ : 0))
@@ -838,6 +876,9 @@ private:
   double traj_duration_{0.0};
   std::int64_t traj_id_{0};
   std::uint64_t active_request_id_{0};
+  std::uint64_t active_task_id_{0};
+  std::uint64_t active_task_version_{0};
+  std::pair<std::uint64_t, std::uint64_t> retired_task_{0, 0};
   Eigen::Vector3d odom_pos_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d odom_vel_{Eigen::Vector3d::Zero()};
   double odom_yaw_{0.0};

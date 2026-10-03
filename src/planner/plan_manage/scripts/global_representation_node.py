@@ -201,6 +201,9 @@ class GlobalRepresentationNode(Node):
             request_id = int(evidence.request_id)
             constraint = {
                 "request_id": request_id,
+                "task_id": int(evidence.task_id),
+                "task_version": int(evidence.task_version),
+                "failed_object_id": int(evidence.failed_object_id),
                 "trajectory_id": int(evidence.trajectory_id),
                 "x": float(position.x),
                 "y": float(position.y),
@@ -211,8 +214,19 @@ class GlobalRepresentationNode(Node):
                 "reason": str(evidence.reason),
                 "source_map_revision": int(self.last_map_revision),
             }
-            if self.viewpoint_constraints.get(request_id) != constraint:
-                self.viewpoint_constraints[request_id] = constraint
+            # Repeated path requests for one rejected task/viewpoint must not
+            # create independent constraints or let request IDs define identity.
+            object_key = ((int(evidence.task_id), int(evidence.task_version),
+                           int(evidence.failed_object_id))
+                          if evidence.task_id and evidence.failed_object_id
+                          else request_id)
+            previous = self.viewpoint_constraints.get(object_key)
+            semantic_keys = tuple(key for key in constraint
+                                  if key not in ("request_id", "trajectory_id",
+                                                 "source_map_revision"))
+            if (previous is None or any(previous.get(key) != constraint[key]
+                                        for key in semantic_keys)):
+                self.viewpoint_constraints[object_key] = constraint
                 while (len(self.viewpoint_constraints)
                        > self.max_viewpoint_constraints):
                     oldest = next(iter(self.viewpoint_constraints))

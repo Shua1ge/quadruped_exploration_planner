@@ -3,6 +3,9 @@ uint8 STATUS_REJECTED=2
 
 builtin_interfaces/Time stamp
 uint64 request_id
+uint64 task_id
+uint64 task_version
+uint64 candidate_id
 int64 trajectory_id
 uint8 status
 string reason

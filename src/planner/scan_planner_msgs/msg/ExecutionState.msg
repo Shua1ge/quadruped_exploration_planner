@@ -7,6 +7,8 @@ uint8 STATE_FINISHED=5
 uint8 STATE_STALLED=6
 
 uint64 request_id
+uint64 task_id
+uint64 task_version
 int64 trajectory_id
 uint8 state
 float64 execution_time

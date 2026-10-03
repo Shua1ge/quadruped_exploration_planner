@@ -44,6 +44,7 @@ def make_node():
 def evidence(request_id=42, scope=None, x=4.1, y=2.0):
     return SimpleNamespace(
         request_id=request_id,
+        task_id=0, task_version=0, failed_object_id=0,
         trajectory_id=8,
         failure_scope=(MODULE.FailureEvidence.SCOPE_VIEWPOINT
                        if scope is None else scope),
@@ -51,6 +52,18 @@ def evidence(request_id=42, scope=None, x=4.1, y=2.0):
         required_clearance=0.1,
         stage="STRUCTURED_LOCAL_REPAIR",
         reason="FINITE_CANDIDATE_FAMILY_EXHAUSTED")
+
+
+def test_same_task_viewpoint_is_idempotent_across_path_requests():
+    node = make_node()
+    first = evidence(42)
+    first.task_id, first.task_version, first.failed_object_id = 100, 1, 7
+    node.failure_evidence_callback(first)
+    second = evidence(43)
+    second.task_id, second.task_version, second.failed_object_id = 100, 1, 7
+    node.failure_evidence_callback(second)
+    assert node.route_constraint_revision == 1
+    assert len(node.viewpoint_constraints) == 1
 
 
 def test_viewpoint_failure_becomes_graph_constraint_before_forwarding():

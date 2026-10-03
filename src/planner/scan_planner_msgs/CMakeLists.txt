@@ -15,6 +15,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FailureEvidence.msg"
   "msg/LocalMapPatch.msg"
   "msg/LocomotionState.msg"
+  "msg/ObservationTask.msg"
+  "msg/ObservationFeedback.msg"
   "msg/TopoNode.msg"
   "msg/TopoEdge.msg"
   "msg/TopoGraphDelta.msg"

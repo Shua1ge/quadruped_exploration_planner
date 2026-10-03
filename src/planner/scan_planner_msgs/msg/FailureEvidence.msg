@@ -11,6 +11,10 @@ uint8 SCOPE_REGION=4
 
 builtin_interfaces/Time stamp
 uint64 request_id
+uint64 task_id
+uint64 task_version
+# Stable topology ID for PORTAL / REGION; task-local stable ID for VIEWPOINT.
+uint64 failed_object_id
 int64 trajectory_id
 string stage
 string reason

@@ -208,6 +208,9 @@ class ExplorationGrid:
         # immediately useful to the planner, while repeated misses can revoke
         # a transient or time-misaligned wall return.
         self.evidence = np.zeros((self.height, self.width), dtype=np.int16)
+        # Last accepted sensor revision per cell (not robot-centred seeding).
+        self.sensor_observed = np.zeros((self.height, self.width), dtype=np.uint64)
+        self.sensor_revision = 0
         self.occupied_threshold = 1
         self.free_threshold = -1
         # An occupied cell remains inflated until three consecutive valid free
@@ -235,6 +238,8 @@ class ExplorationGrid:
             self.origin_y)
         result.data = self.data.copy()
         result.evidence = self.evidence.copy()
+        result.sensor_observed = self.sensor_observed.copy()
+        result.sensor_revision = self.sensor_revision
         result.occupied_threshold = self.occupied_threshold
         result.free_threshold = self.free_threshold
         result.occupied_clear_threshold = self.occupied_clear_threshold
@@ -263,7 +268,9 @@ class ExplorationGrid:
 
     def _apply_evidence(self, free_cells: Set[Cell], occupied_cells: Set[Cell]):
         """Apply one scan's evidence with hysteresis and reversible occupancy."""
+        self.sensor_revision += 1
         for x, y in free_cells - occupied_cells:
+            self.sensor_observed[y, x] = self.sensor_revision
             evidence = int(self.evidence[y, x]) - 1
             self.evidence[y, x] = max(-self.evidence_limit, evidence)
             if (self.data[y, x] == OCCUPIED
@@ -274,6 +281,7 @@ class ExplorationGrid:
             elif self.evidence[y, x] < self.occupied_threshold:
                 self.data[y, x] = UNKNOWN
         for x, y in occupied_cells:
+            self.sensor_observed[y, x] = self.sensor_revision
             evidence = int(self.evidence[y, x]) + 1
             self.evidence[y, x] = min(self.evidence_limit, evidence)
             if self.evidence[y, x] >= self.occupied_threshold:
@@ -344,7 +352,9 @@ class ExplorationGrid:
         xs = np.floor((points[:, 0] - self.origin_x) / self.resolution).astype(int)
         ys = np.floor((points[:, 1] - self.origin_y) / self.resolution).astype(int)
         valid = ((xs >= 0) & (xs < self.width) & (ys >= 0) & (ys < self.height))
+        self.sensor_revision += 1
         for x, y in zip(xs[valid].tolist(), ys[valid].tolist()):
+            self.sensor_observed[y, x] = self.sensor_revision
             evidence = min(self.evidence_limit, int(self.evidence[y, x]) + 1)
             self.evidence[y, x] = evidence
             if evidence >= self.occupied_threshold:

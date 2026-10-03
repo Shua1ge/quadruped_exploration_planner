@@ -27,6 +27,15 @@ class ObservationTask:
     completion_reason: str = "none"
     last_evaluated_update: int = -1
     preparation_started: bool = False
+    task_id: int = 0
+    task_version: int = 1
+    lifecycle: str = "ACTIVE"
+    # Legacy objectives retain their old denominator. Task mode requires
+    # actual sensor evidence, never robot-centred free-space seeding.
+    require_sensor_evidence: bool = False
+    sensor_observed_cells: int = 0
+    initial_sensor_revision: int = 0
+    station_adjustments: int = 0
 
 
 def evaluate_observation(
@@ -40,6 +49,14 @@ def evaluate_observation(
     observed, _, ratio = observation_progress(
         grid, task.target_cells, active_goal_cell)
     task.observed_cells = observed
+    task.sensor_observed_cells = sum(
+        1 for x, y in task.target_cells
+        if grid.in_bounds((x, y))
+        and grid.sensor_observed[y, x] > task.initial_sensor_revision)
+    if task.require_sensor_evidence:
+        observed = task.sensor_observed_cells
+        ratio = observed / max(1, len(task.target_cells))
+        task.observed_cells = observed
     task.progress = ratio
     task.last_evaluated_update = map_update_count
     task.completion_streak = advance_completion_streak(
@@ -55,7 +72,9 @@ def evaluate_observation(
         0 if frontier_present else task.frontier_missing_streak + 1)
     if task.completion_streak >= done_updates:
         task.completion_reason = "visible_information_resolved"
-    elif task.frontier_missing_streak >= closure_updates:
+    elif (task.frontier_missing_streak >= closure_updates
+          and (not task.require_sensor_evidence
+               or task.sensor_observed_cells > 0)):
         # This objective exists to resolve its frozen frontier cluster.  Once
         # that cluster has remained absent for a confirmed run, its purpose is
         # complete even if not every neighbouring unknown became observable.
@@ -71,7 +90,9 @@ def observation_is_complete(
     """Complete on positive information or confirmed boundary closure."""
     return bool(task is not None and (
         task.completion_streak >= done_updates
-        or task.frontier_missing_streak >= closure_updates))
+        or (task.frontier_missing_streak >= closure_updates
+            and (not task.require_sensor_evidence
+                 or task.sensor_observed_cells > 0))))
 
 
 def observation_completion_record(
