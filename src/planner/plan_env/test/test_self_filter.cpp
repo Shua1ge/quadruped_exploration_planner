@@ -4,9 +4,29 @@
 #include <cmath>
 
 #include "plan_env/grid_map.h"
+#include "plan_env/raycast.h"
 
 namespace
 {
+TEST(RaycastOcclusion, ForwardTraversalCannotClearBehindFirstWall)
+{
+  RayCaster ray;
+  ASSERT_TRUE(ray.setInput(Eigen::Vector3d(0.5, 0.5, 0.5),
+                           Eigen::Vector3d(6.5, 0.5, 0.5)));
+  Eigen::Vector3d cell;
+  int free_observations = 0;
+  int furthest_cell = -1;
+  while (ray.step(cell))
+  {
+    furthest_cell = static_cast<int>(cell.x());
+    ++free_observations;
+    if (plan_env::rayTraversalStopsAtOccupied(furthest_cell == 2))
+      break;
+  }
+  EXPECT_EQ(furthest_cell, 2);
+  EXPECT_EQ(free_observations, 3);
+}
+
 constexpr double kRadius = 0.35;
 constexpr double kOffset = 0.18;
 constexpr double kZDown = 0.45;
@@ -132,5 +152,21 @@ TEST(LocalPatchHeightReference, FollowsSustainedSlopeWithinRateLimit)
 
   EXPECT_GT(reference, 0.75);
   EXPECT_LT(reference, 0.81);
+}
+
+TEST(RaycastOcclusion, StopsAtHistoricalOccupiedEvidence)
+{
+  EXPECT_TRUE(plan_env::rayTraversalStopsAtOccupied(true));
+  EXPECT_FALSE(plan_env::rayTraversalStopsAtOccupied(false));
+}
+
+TEST(RaycastOcclusion, RequiresRepeatedMissesBeforeWallDecay)
+{
+  EXPECT_FALSE(plan_env::occupiedMissHasEnoughConfirmation(0, 3));
+  EXPECT_FALSE(plan_env::occupiedMissHasEnoughConfirmation(1, 3));
+  EXPECT_FALSE(plan_env::occupiedMissHasEnoughConfirmation(2, 3));
+  EXPECT_TRUE(plan_env::occupiedMissHasEnoughConfirmation(3, 3));
+  EXPECT_TRUE(plan_env::occupiedMissHasEnoughConfirmation(4, 3));
+  EXPECT_FALSE(plan_env::occupiedMissHasEnoughConfirmation(3, 0));
 }
 }  // namespace

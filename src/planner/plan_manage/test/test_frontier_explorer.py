@@ -17,6 +17,253 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def candidate_test_explorer():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(12.0, 8.0, 1.0, 0.0, 0.0)
+    explorer.grid.data.fill(MODULE.FREE)
+    explorer.position = explorer.grid.cell_to_world((1, 2))
+    explorer.map_content_revision = 1
+    explorer.dense_invalid_region_revisions = {}
+    explorer.last_candidate_rejections = dict.fromkeys([
+        "no_safe_viewpoint", "insufficient_gain", "too_close", "blacklisted",
+        "cooldown", "excluded", "astar_unreachable", "accepted",
+        "final_validation_failed"], 0)
+    explorer.viewpoint_standoff = 1.0
+    explorer.terminal_candidate_limit = 8
+    explorer.terminal_clearance_search_radius = 2.0
+    explorer.viewpoint_relaxation = 0.0
+    explorer.footprint_radius = 0.0
+    explorer.footprint_offset = 0.0
+    explorer.observation_radius = 3.0
+    explorer.min_expected_observation_cells = 1
+    explorer.min_goal_distance = 0.0
+    explorer.blacklist_radius = 0.4
+    explorer.is_blacklisted = lambda goal: False
+    explorer.is_goal_on_failure_cooldown = lambda goal: False
+    explorer.terminal_clearance = lambda cell, inflated: 2.0
+    explorer.get_logger = lambda: SimpleNamespace(
+        info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    explorer.sparse_route_estimates = lambda start, cells, inflated, edges: (
+        [None] * len(cells), ["no_graph"] * len(cells))
+    explorer.ensure_sparse_miss_counters = lambda: None
+    explorer.accumulate_sparse_miss_reasons = lambda *args: None
+    explorer.sparse_candidate_miss_reasons = {}
+    explorer.last_sparse_candidate_miss_reasons = {}
+    for name in ("last_sparse_candidate_ms", "sparse_candidate_queries",
+                 "sparse_candidate_hits", "sparse_candidate_fallbacks",
+                 "last_sparse_candidate_hits", "last_sparse_candidate_fallbacks",
+                 "last_candidate_tree_ms", "candidate_tree_searches",
+                 "last_candidate_tree_searches", "expanded_grid_cells",
+                 "last_expanded_grid_cells"):
+        setattr(explorer, name, 0)
+    return explorer
+
+
+def test_same_frontier_filters_all_terminals_before_ranking(monkeypatch):
+    explorer = candidate_test_explorer()
+    terminals = [(6, 2), (6, 3), (6, 4), (7, 4), (7, 5)]
+    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [(8, 2)])
+    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **k: terminals)
+    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *a: {(9, 2)})
+    explorer.is_goal_on_failure_cooldown = lambda goal: goal == explorer.grid.cell_to_world(terminals[0])
+    explorer.is_blacklisted = lambda goal: goal == explorer.grid.cell_to_world(terminals[1])
+    explorer.grid.data[5, 7] = MODULE.UNKNOWN
+    explorer.grid.data[2, 9] = MODULE.UNKNOWN
+    region = MODULE.FrontierRegion(3, [[(8, 2)]], (8, 2), 1)
+    records = explorer.build_frontier_candidates(
+        (1, 2), [region], set(), set(),
+        [explorer.grid.cell_to_world(terminals[2])])
+    assert len(records) == 1
+    assert records[0].cell == terminals[3]
+    assert records[0].terminal_cells == (terminals[3],)
+
+
+def test_same_frontier_reuses_frozen_high_progress_targets(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2), (9, 3)}, frontier_cell=(8, 2),
+        observed_cells=1, progress=0.5)
+    explorer.grid.data[2, 9] = MODULE.UNKNOWN
+    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [(8, 2)])
+    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **k: [(6, 2), (6, 3)])
+    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *a: set())
+    explorer.is_goal_on_failure_cooldown = lambda goal: goal == (6.5, 2.5)
+    records = explorer.build_frontier_candidates(
+        (1, 2), [MODULE.FrontierRegion(3, [[(8, 2)]], (8, 2), 1)], set(), set())
+    assert len(records) == 1
+    assert records[0].cell == (6, 3)
+    assert records[0].observation_cells == {(9, 2), (9, 3)}
+    assert explorer.active_observation.progress == 0.5
+    assert records[0].observation_progress == 0.5
+
+
+def test_same_frontier_rejects_sibling_with_no_visible_remaining_targets(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2)}, frontier_cell=(8, 2), progress=0.9)
+    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [(8, 2)])
+    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **k: [(6, 2)])
+    monkeypatch.setattr(MODULE, "segment_known_free", lambda *a: True)
+    explorer.grid.data[2, 9] = MODULE.UNKNOWN
+    explorer.grid.data[2, 7] = MODULE.OCCUPIED
+    records = explorer.build_frontier_candidates(
+        (1, 2), [MODULE.FrontierRegion(3, [[(8, 2)]], (8, 2), 1)], set(), set())
+    assert records == []
+    assert explorer.last_candidate_rejections["insufficient_gain"] >= 1
+
+
+def test_sparse_sibling_skips_failed_footprint_and_cooled_terminal(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.dense_final_validation_searches = 0
+    explorer.sparse_final_validation_failures = 0
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2)}, frontier_cell=(8, 2), progress=0.9)
+    explorer.grid.data[2, 9] = MODULE.UNKNOWN
+    explorer.is_goal_on_failure_cooldown = lambda goal: goal == (6.5, 3.5)
+    explorer.add_goal_failure_cooldown = lambda *a: None
+    monkeypatch.setattr(MODULE, "double_cylinder_path_free",
+                        lambda grid, path, cell, *a: cell != (6, 2))
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 2), (8, 2), (6.5, 2.5), [], 5.0, 1, 1, 0.0, {(9, 2)},
+        terminal_cells=((6, 2), (6, 3), (6, 4)))
+    result = explorer.materialize_sparse_candidate((1, 2), candidate, set(), set())
+    assert result.cell == (6, 4)
+    assert result.observation_cells == explorer.active_observation.target_cells
+    assert explorer.active_observation.progress == 0.9
+
+
+def test_sparse_sibling_skips_terminal_that_cannot_see_remaining_target(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.dense_final_validation_searches = 0
+    explorer.sparse_final_validation_failures = 0
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2)}, frontier_cell=(8, 2), progress=0.9)
+    explorer.grid.data[2, 9] = MODULE.UNKNOWN
+    explorer.grid.data[3, 7] = MODULE.OCCUPIED
+    explorer.add_goal_failure_cooldown = lambda *a: None
+    monkeypatch.setattr(MODULE, "double_cylinder_path_free",
+                        lambda grid, path, cell, *a: cell != (6, 2))
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 2), (8, 2), (6.5, 2.5), [], 5.0, 1, 1, 0.0, {(9, 2)},
+        terminal_cells=((6, 2), (6, 4)))
+    result = explorer.materialize_sparse_candidate((1, 2), candidate, set(), set())
+    assert result is None
+
+
+def test_publish_sibling_keeps_progress_but_new_frontier_starts_task():
+    explorer = candidate_test_explorer()
+    task = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2), (9, 3)}, frontier_cell=(8, 2),
+        observed_cells=1, progress=0.5, completion_streak=2,
+        last_evaluated_update=9)
+    explorer.active_observation = task
+    explorer.map_update_count = 9
+    explorer.inflation_radius = 0.0
+    explorer.paths_published = explorer.short_paths_published = 0
+    explorer.preferred_goal_path_length = 0.0
+    explorer.selection_strategy = "hierarchical"
+    explorer.publish_reference_path = lambda cells: None
+    explorer.publish_goal = explorer.publish_status = lambda value: None
+    explorer.approach_clearance = lambda *a: 2.0
+    explorer.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=123))
+    candidate = MODULE.FrontierCandidate(
+        3, (6, 3), (8, 2), (6.5, 3.5), [(1, 2), (6, 3)],
+        5.0, 1, 1, 0.0, {(10, 2)}, terminal_cells=((6, 3),))
+    explorer.publish_path(candidate.path, candidate)
+    assert explorer.active_observation is task
+    assert task.target_cells == {(9, 2), (9, 3)}
+    assert (task.progress, task.observed_cells, task.completion_streak,
+            task.last_evaluated_update) == (0.5, 1, 2, 9)
+    assert task.goal == candidate.goal
+    candidate.frontier_cell = (8, 3)
+    explorer.publish_path(candidate.path, candidate)
+    assert explorer.active_observation is not task
+    assert explorer.active_observation.target_cells == {(10, 2)}
+    assert explorer.active_observation.progress == 0.0
+
+
+def test_scoped_selection_never_releases_on_dense_failure(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.sparse_router = SimpleNamespace(topology_attachment=lambda *a: None)
+    explorer.sparse_attachment_radius = explorer.sparse_attachment_limit = 1
+    explorer.region_size = 3.0
+    explorer.region_max_path_ratio = explorer.region_max_detour_ratio = 2.0
+    explorer.map_update_count = 1
+    explorer.active_region_id = 3
+    explorer.active_commitment_scope = ("safe_region", 77)
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2)}, frontier_cell=(8, 2), progress=0.9)
+    explorer.map_preprocess_calls = explorer.planning_events = 0
+    explorer.cumulative_planning_ms = 0.0
+    explorer.selection_strategy = "hierarchical"
+    explorer.region_tracker = SimpleNamespace(update=lambda *a: [])
+    explorer.safe_region_connectivity = SimpleNamespace(hypothesis=lambda *a: None)
+    explorer.attach_safe_region_commitment_scopes = lambda *a: None
+    explorer.choose_greedy_candidate = lambda options: options[0] if options else None
+    foreign = MODULE.FrontierCandidate(
+        4, (5, 2), (7, 2), (5.5, 2.5), [(1, 2), (5, 2)], 4.0, 100, 1, 0.0,
+        {(9, 3)}, commitment_scope=("safe_region", 88))
+    sibling = MODULE.FrontierCandidate(
+        3, (6, 3), (8, 2), (6.5, 3.5), [], 5.0, 1, 1, 0.0,
+        {(9, 2)}, commitment_scope=("safe_region", 77))
+    same_scope = MODULE.FrontierCandidate(
+        5, (7, 3), (8, 3), (7.5, 3.5), [(1, 2), (7, 3)], 5.0, 100, 1, 0.0,
+        {(9, 3)}, commitment_scope=("safe_region", 77))
+    explorer.build_frontier_candidates = lambda *a: [foreign, same_scope, sibling]
+    attempts = []
+    def materialize(start, candidate, inflated, edges):
+        attempts.append(candidate)
+        return None
+    explorer.materialize_sparse_candidate = materialize
+    explorer.handle_dense_invalid_region = lambda *a: (_ for _ in ()).throw(AssertionError("released"))
+    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **k: [(6, 2)])
+    result = explorer.choose_frontier(
+        (1, 2), [[(8, 2)]], set(), set(), required_scope=("safe_region", 77),
+        allow_region_release=False)
+    assert attempts == [sibling]
+    assert result is same_scope
+    assert explorer.active_commitment_scope == ("safe_region", 77)
+    explorer.build_frontier_candidates = lambda *a: [foreign, sibling]
+    assert explorer.choose_frontier(
+        (1, 2), [[(8, 2)]], set(), set(), required_scope=("safe_region", 77),
+        allow_region_release=False) is None
+    assert explorer.active_region_id == 3
+
+
+def test_frozen_high_progress_does_not_admit_unsafe_terminals(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2)}, frontier_cell=(8, 2),
+        frontier_cluster_cells={(8, 2), (8, 3)}, progress=0.95)
+    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [(8, 3)])
+    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **k: [(6, 2), (6, 3)])
+    explorer.grid.data[2, 6] = MODULE.OCCUPIED
+    explorer.grid.data[3, 6] = MODULE.UNKNOWN
+    records = explorer.build_frontier_candidates(
+        (1, 2), [MODULE.FrontierRegion(3, [[(8, 3)]], (8, 3), 1)], set(), set())
+    assert records == []
+    assert explorer.active_observation.progress == 0.95
+
+
+def test_frozen_task_keeps_sibling_when_frontier_sampling_changes(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.active_observation = MODULE.ObservationTask(
+        3, (6.5, 2.5), {(9, 2)}, frontier_cell=(8, 2),
+        frontier_cluster_cells={(8, 2), (8, 3)},
+        terminal_cells=((6, 2), (6, 3)), progress=0.9)
+    explorer.grid.data[2, 9] = MODULE.UNKNOWN
+    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [(8, 3)])
+    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **k: [(6, 2)])
+    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *a: set())
+    explorer.is_goal_on_failure_cooldown = lambda goal: goal == (6.5, 2.5)
+    records = explorer.build_frontier_candidates(
+        (1, 2), [MODULE.FrontierRegion(3, [[(8, 3)]], (8, 3), 1)], set(), set())
+    assert len(records) == 1
+    assert records[0].frontier_cell == (8, 2)
+    assert records[0].cell == (6, 3)
+    assert records[0].observation_progress == 0.9
+
+
 def test_pose_interpolation_uses_sensor_timestamp_not_latest_pose():
     history = [
         (1_000_000_000, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0),
@@ -148,7 +395,7 @@ def test_height_filtered_return_is_non_clearing_not_no_return():
     north_bin = 6
     assert ranges[east_bin] == 2.0
     assert math.isnan(ranges[north_bin])
-    assert math.isinf(ranges[0])
+    assert math.isnan(ranges[0])
 
     grid = MODULE.ExplorationGrid(10.0, 10.0, 0.2)
     north_angle = -math.pi + (north_bin + 0.5) * (2.0 * math.pi / 8.0)
@@ -161,6 +408,58 @@ def test_height_filtered_return_is_non_clearing_not_no_return():
         (0.0, 0.0), ranges, 3.0, no_return_range=3.0)
 
     assert grid.value(north_cell) == MODULE.OCCUPIED
+
+
+def test_pitched_xyz_sampling_holes_never_become_no_return():
+    from explorer_core.grid import rpy_rotation_matrix
+    angles = np.linspace(-math.pi, math.pi, 720, endpoint=False)
+    points = np.column_stack((2 * np.cos(angles), 2 * np.sin(angles), np.zeros(720)))
+    for roll, pitch in ((0.2, 0.15), (0.4, 0.3), (-0.4, -0.3)):
+        transformed = points @ rpy_rotation_matrix(roll, pitch, 0.12).T
+        ranges = MODULE.classify_planar_ranges(
+            transformed[:, 0], transformed[:, 1], transformed[:, 2],
+            0.08, 0.85, 0.35, 12.0, 720, 3)
+        assert not np.any(np.isinf(ranges))
+    empty = MODULE.classify_planar_ranges(
+        np.array([]), np.array([]), np.array([]), .08, .85, .35, 12., 720, 3)
+    assert np.all(np.isnan(empty))
+    grid = MODULE.ExplorationGrid(10., 10., .2)
+    wall = grid.world_to_cell(1., 0.)
+    grid.data[wall[1], wall[0]] = MODULE.OCCUPIED
+    grid.evidence[wall[1], wall[0]] = 1
+    for _ in range(20):
+        grid.integrate_ranges((0., 0.), empty, 12., no_return_range=3.)
+    assert grid.value(wall) == MODULE.OCCUPIED
+    assert grid.evidence[wall[1], wall[0]] == 1
+
+
+def test_finite_far_hit_cannot_clear_behind_history_wall_in_same_scan():
+    grid = MODULE.ExplorationGrid(10., 10., .1)
+    angle = -math.pi + 36.5 * (2 * math.pi / 72)
+    wall = grid.world_to_cell(math.cos(angle), math.sin(angle))
+    behind = grid.world_to_cell(1.5 * math.cos(angle), 1.5 * math.sin(angle))
+    grid.data[wall[1], wall[0]] = MODULE.OCCUPIED
+    grid.evidence[wall[1], wall[0]] = 1
+    ranges = [math.nan] * 72
+    ranges[36] = 2.0
+    grid.integrate_ranges((0., 0.), ranges, 3.)
+    assert grid.value(behind) == MODULE.UNKNOWN
+    assert grid.evidence[wall[1], wall[0]] == 0
+    for _ in range(2):
+        grid.integrate_ranges((0., 0.), ranges, 3.)
+        assert grid.value(behind) == MODULE.UNKNOWN
+    grid.integrate_ranges((0., 0.), ranges, 3.)
+    assert grid.value(behind) == MODULE.FREE
+
+
+def test_robot_seed_does_not_overwrite_known_wall():
+    grid = MODULE.ExplorationGrid(10., 10., .1)
+    wall = grid.world_to_cell(.2, 0.)
+    grid.data[wall[1], wall[0]] = MODULE.OCCUPIED
+    grid.evidence[wall[1], wall[0]] = 5
+    grid.integrate_ranges((0., 0.), [math.nan] * 72, 3.)
+    assert grid.value(wall) == MODULE.OCCUPIED
+    assert grid.evidence[wall[1], wall[0]] == 5
 
 
 def test_cloud_pose_wait_only_expires_after_pose_watermark_passes_timeout():
@@ -362,6 +661,38 @@ def test_double_cylinder_footprint_rotates_with_viewpoint_yaw():
         grid, center, 0.0, inflated, radius=0.35, offset=0.18)
     assert MODULE.double_cylinder_footprint_free(
         grid, center, math.pi / 2.0, inflated, radius=0.35, offset=0.18)
+
+
+def test_position_only_path_keeps_incoming_terminal_tangent():
+    grid = MODULE.ExplorationGrid(20.0, 20.0, 0.2, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    path = [(50, 48), (50, 49), (50, 50)]
+    terminal = path[-1]
+    frontier = (52, 50)
+    # Facing the frontier would put the front cylinder in this cell, while the
+    # incoming northward path tangent is free. ReferencePath has no terminal
+    # yaw field, so Explorer must not invent a final in-place rotation.
+    inflated = {(51, 50)}
+
+    assert not MODULE.double_cylinder_footprint_free(
+        grid, terminal, 0.0, inflated, radius=0.35, offset=0.18)
+    assert MODULE.double_cylinder_path_free(
+        grid, path, terminal, frontier, inflated,
+        radius=0.35, offset=0.18)
+
+
+def test_rotation_sweep_can_collide_when_both_endpoint_yaws_are_free():
+    grid = MODULE.ExplorationGrid(20.0, 20.0, 0.2, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    center = (50, 50)
+    diagonal_obstacle = {(51, 51)}
+
+    assert MODULE.double_cylinder_footprint_free(
+        grid, center, 0.0, diagonal_obstacle, 0.35, 0.18)
+    assert MODULE.double_cylinder_footprint_free(
+        grid, center, math.pi / 2.0, diagonal_obstacle, 0.35, 0.18)
+    assert not MODULE.double_cylinder_footprint_free(
+        grid, center, math.pi / 4.0, diagonal_obstacle, 0.35, 0.18)
 
 
 def test_safe_viewpoint_outputs_only_capsule_valid_poses():
@@ -1264,11 +1595,19 @@ def test_viewpoint_local_rejection_preserves_region_when_sibling_exists():
     explorer.add_region_failure_cooldown = (
         lambda region, reason: region_cooldowns.append((region, reason)))
     explorer.terminate_region_option = lambda reason: terminations.append(reason)
-    explorer.plan_from_current_position = lambda excluded_goals=(): True
+    explorer.active_commitment_scope = ("safe_region", 77)
+    planning_options = []
+    def select_sibling(excluded_goals=(), **options):
+        planning_options.append(options)
+        return True
+    explorer.plan_from_current_position = select_sibling
     explorer.publish_status = statuses.append
 
     explorer.planning_status_callback(
         SimpleNamespace(data="VIEWPOINT_LOCAL_REJECTED request_id=42"))
+    assert planning_options == [{
+        "required_scope": ("safe_region", 77), "allow_region_release": False}]
+    assert explorer.active_observation is not None
 
     assert goal_cooldowns == [
         ((32.1, 0.7), "VIEWPOINT_LOCAL_REJECTED")]
@@ -1276,6 +1615,14 @@ def test_viewpoint_local_rejection_preserves_region_when_sibling_exists():
     assert region_cooldowns == []
     assert terminations == []
     assert statuses == ["VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED"]
+    assert explorer.route_constraint_revision == 8
+    # Old/duplicate terminal reports cannot retire the replacement request.
+    explorer.active_path_request_generation = 43
+    for request in (42, 41, 42):
+        explorer.planning_status_callback(SimpleNamespace(
+            data=f"VIEWPOINT_LOCAL_REJECTED request_id={request}"))
+    assert len(planning_options) == 1
+    assert explorer.local_repair_exhausted_count == 1
     assert explorer.route_constraint_revision == 8
 
 
@@ -1303,6 +1650,8 @@ def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted(
     terminations = []
     statuses = []
     planning_calls = []
+    planning_options = []
+    explorer.active_commitment_scope = ("safe_region", 77)
 
     explorer.get_logger = lambda: SimpleNamespace(
         warning=lambda *args, **kwargs: None)
@@ -1318,8 +1667,9 @@ def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted(
 
     explorer.terminate_region_option = terminate
 
-    def plan_from_current_position(excluded_goals=()):
+    def plan_from_current_position(excluded_goals=(), **options):
         planning_calls.append(tuple(excluded_goals))
+        planning_options.append(options)
         return len(planning_calls) == 2
 
     explorer.plan_from_current_position = plan_from_current_position
@@ -1330,6 +1680,8 @@ def test_viewpoint_local_rejection_changes_region_only_after_siblings_exhausted(
     assert goal_cooldowns == [
         ((32.1, 0.7), "VIEWPOINT_LOCAL_REJECTED")]
     assert planning_calls == [((32.1, 0.7),), ((32.1, 0.7),)]
+    assert planning_options == [
+        {"required_scope": ("safe_region", 77), "allow_region_release": False}, {}]
     assert region_cooldowns == [
         (12, "VIEWPOINT_ALTERNATIVES_EXHAUSTED")]
     assert terminations == ["viewpoint_alternatives_exhausted"]
@@ -1434,7 +1786,7 @@ def test_viewpoint_terminal_does_not_double_apply_graph_constraint():
         warning=lambda *args, **kwargs: None)
     explorer.add_goal_failure_cooldown = (
         lambda goal, reason: cooldowns.append((goal, reason)))
-    explorer.plan_from_current_position = lambda excluded_goals=(): True
+    explorer.plan_from_current_position = lambda excluded_goals=(), **options: True
     explorer.publish_status = statuses.append
 
     explorer.planning_status_callback(

@@ -79,16 +79,21 @@ namespace scan_planner
     double tracking_match_forward_time_{0.80};
     double planning_clearance_margin_{0.10};
     double preferred_clearance_margin_{0.20};
-    double clearance_limited_max_forward_speed_{0.25};
+    double clearance_limited_max_forward_speed_{0.30};
+    double min_forward_command_{0.30};
+    double min_forward_effective_speed_{0.165};
     double clearance_limited_max_lateral_speed_{0.08};
     double clearance_limited_max_yaw_rate_{0.50};
     double clearance_limited_max_tracking_correction_{0.08};
+    double clearance_limited_execution_grace_{1.00};
+    double clearance_limited_no_progress_timeout_{2.00};
+    double clearance_limited_min_progress_{0.05};
     bool enable_holonomic_lateral_repair_{false};
     double local_repair_anchor_min_distance_{0.45};
     double local_repair_anchor_max_distance_{0.90};
     double local_repair_anchor_step_{0.15};
     double local_repair_max_backtrack_{0.60};
-    double local_repair_max_speed_{0.25};
+    double local_repair_max_speed_{0.30};
     double local_repair_time_margin_{1.20};
     int local_repair_max_candidates_{6};
     int local_repair_max_segments_per_transaction_{3};
@@ -103,6 +108,7 @@ namespace scan_planner
     double guaranteed_braking_deceleration_{0.32};
     double command_stop_latency_{0.30};
     double trajectory_ack_timeout_{0.75};
+    double trajectory_ack_reconciliation_timeout_{0.75};
     int pose_free_release_cycles_{3};
     int local_hold_release_cycles_{3};
     double goal_tolerance_;
@@ -158,6 +164,7 @@ namespace scan_planner
     std::atomic<bool> structured_local_repair_executing_{false};
     std::atomic<bool> structured_local_repair_finished_{false};
     std::atomic<bool> structured_local_repair_rejoin_pending_{false};
+    std::atomic<bool> structured_local_repair_interrupted_{false};
     std::atomic<uint64_t> structured_local_repair_request_id_{0};
     std::atomic<int64_t> structured_local_repair_trajectory_id_{0};
     std::atomic<int> structured_local_repair_segments_committed_{0};
@@ -173,6 +180,7 @@ namespace scan_planner
       UniformBspline position;
       rclcpp::Time start_time;
       double duration{0.0};
+      double controller_execution_time{0.0};
       uint64_t request_id{0};
       int64_t trajectory_id{0};
       bool clearance_escape_active{false};
@@ -185,10 +193,14 @@ namespace scan_planner
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
       uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
+      std::chrono::steady_clock::time_point accepted_at{};
+      Eigen::Vector3d accepted_position{Eigen::Vector3d::Zero()};
       bool valid{false};
     };
     std::mutex execution_snapshot_mutex_;
     ExecutionTrajectorySnapshot execution_snapshot_;
+    PredictedCollisionInterval predicted_collision_interval_;
+    std::atomic<bool> collision_interval_replan_requested_{false};
     struct PendingTrajectoryHandoff
     {
       LocalTrajData candidate;
@@ -208,8 +220,15 @@ namespace scan_planner
       bool structured_repair_segment{false};
       bool structured_repair_rejoin{false};
       bool reference_path_update{false};
+      bool collision_interval_repair{false};
+      uint64_t collision_interval_request_id{0};
+      int64_t collision_interval_trajectory_id{0};
+      uint64_t collision_interval_map_revision{0};
       uint64_t reference_request_id{0};
       std::chrono::steady_clock::time_point submitted_at{};
+      std::chrono::steady_clock::time_point timeout_hold_issued_at{};
+      bool timeout_hold_issued{false};
+      bool timeout_candidate_rejected{false};
       bool valid{false};
     };
     std::mutex pending_handoff_mutex_;
@@ -290,11 +309,21 @@ namespace scan_planner
     bool callReboundReplan(
         bool flag_use_poly_init, bool flag_randomPolyTraj,
         const Eigen::Vector3d *local_target_override = nullptr,
-        bool low_speed_local_repair = false); // front-end and back-end method
+        bool low_speed_local_repair = false,
+        const std::vector<Eigen::Vector3d> *seed_path = nullptr,
+        const Eigen::Vector3d *local_target_velocity_override = nullptr,
+        const Eigen::Vector3d *local_target_acceleration_override = nullptr,
+        const Eigen::Vector3d *seed_start_velocity_override = nullptr,
+        const Eigen::Vector3d *seed_start_acceleration_override = nullptr,
+        double seed_sample_interval = 0.0,
+        const PredictedCollisionInterval *seed_interval = nullptr,
+        double seed_base_time = 0.0,
+        bool fixed_body_yaw_repair = true); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
     bool tryStructuredLocalRepair();
     void setStartStateFromOdomOrCurrentTraj();
+    double executionProgressTime(const LocalTrajData &info);
     void refreshPlanningOdomFromSafety();
     void alignStartStateToReferencePath();
 

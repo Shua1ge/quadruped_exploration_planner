@@ -2,10 +2,12 @@
 
 import heapq
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from .grid import ExplorationGrid, FREE, OCCUPIED, UNKNOWN
 from .path_planning import astar_known, path_length_cells
@@ -53,62 +55,32 @@ def thin_free_space(free_mask: np.ndarray) -> np.ndarray:
     while changed:
         changed = False
         for first_step in (True, False):
-            remove = []
-            for y in range(1, image.shape[0] - 1):
-                for x in range(1, image.shape[1] - 1):
-                    if image[y, x] == 0:
-                        continue
-                    p2, p3, p4 = image[y - 1, x], image[y - 1, x + 1], image[y, x + 1]
-                    p5, p6, p7 = (
-                        image[y + 1, x + 1], image[y + 1, x],
-                        image[y + 1, x - 1])
-                    p8, p9 = image[y, x - 1], image[y - 1, x - 1]
-                    ring = (p2, p3, p4, p5, p6, p7, p8, p9)
-                    count = int(sum(ring))
-                    transitions = sum(
-                        ring[index] == 0 and ring[(index + 1) % 8] == 1
-                        for index in range(8))
-                    if not 2 <= count <= 6 or transitions != 1:
-                        continue
-                    if first_step:
-                        keep_a = p2 * p4 * p6 == 0
-                        keep_b = p4 * p6 * p8 == 0
-                    else:
-                        keep_a = p2 * p4 * p8 == 0
-                        keep_b = p2 * p6 * p8 == 0
-                    if keep_a and keep_b:
-                        remove.append((x, y))
-            if remove:
+            p2, p3, p4 = image[:-2, 1:-1], image[:-2, 2:], image[1:-1, 2:]
+            p5, p6, p7 = image[2:, 2:], image[2:, 1:-1], image[2:, :-2]
+            p8, p9 = image[1:-1, :-2], image[:-2, :-2]
+            ring = (p2, p3, p4, p5, p6, p7, p8, p9)
+            count = sum(ring)
+            transitions = sum(
+                ((ring[index] == 0) & (ring[(index + 1) % 8] == 1)).astype(np.uint8)
+                for index in range(8))
+            if first_step:
+                keep_a, keep_b = p2 * p4 * p6 == 0, p4 * p6 * p8 == 0
+            else:
+                keep_a, keep_b = p2 * p4 * p8 == 0, p2 * p6 * p8 == 0
+            remove = ((image[1:-1, 1:-1] != 0) & (count >= 2) &
+                      (count <= 6) & (transitions == 1) & keep_a & keep_b)
+            if np.any(remove):
                 changed = True
-                for x, y in remove:
-                    image[y, x] = 0
+                image[1:-1, 1:-1][remove] = 0
     return image.astype(bool)
 
 
 def clearance_field(free_mask: np.ndarray, resolution: float) -> np.ndarray:
-    """Conservative 8-neighbour distance to non-free space."""
+    """Exact Euclidean cell-centre distance to non-free (including unknown)."""
     free = np.asarray(free_mask, dtype=bool)
-    distance = np.full(free.shape, np.inf, dtype=np.float64)
-    queue = []
-    for y, x in np.argwhere(~free):
-        distance[y, x] = 0.0
-        heapq.heappush(queue, (0.0, int(x), int(y)))
-    if not queue:
-        distance.fill(max(free.shape) * resolution)
-        return distance
-    while queue:
-        current, x, y = heapq.heappop(queue)
-        if current != distance[y, x]:
-            continue
-        for dx, dy in NEIGHBOURS_8:
-            nx, ny = x + dx, y + dy
-            if not (0 <= nx < free.shape[1] and 0 <= ny < free.shape[0]):
-                continue
-            candidate = current + math.hypot(dx, dy) * resolution
-            if candidate < distance[ny, nx]:
-                distance[ny, nx] = candidate
-                heapq.heappush(queue, (candidate, nx, ny))
-    return distance
+    if np.all(free):
+        return np.full(free.shape, max(free.shape) * resolution, dtype=np.float64)
+    return distance_transform_edt(free, sampling=resolution)
 
 
 def stable_node_id(cell: Cell, origin: Tuple[float, float], resolution: float) -> int:
@@ -138,12 +110,16 @@ def skeleton_neighbours(cell: Cell, skeleton: Set[Cell]) -> List[Cell]:
 
 def extract_topology(occupancy: np.ndarray, resolution: float,
                      origin: Tuple[float, float],
-                     shared_clearance: Optional[np.ndarray] = None
+                     shared_clearance: Optional[np.ndarray] = None,
+                     timings: Optional[Dict[str, float]] = None
                      ) -> TopologyGraph:
     """Extract endpoints/junctions and compress degree-two skeleton chains."""
     values = np.asarray(occupancy, dtype=np.int16)
     free = values == FREE
+    thinning_started = time.perf_counter()
     skeleton_mask = thin_free_space(free)
+    thinning_ms = (time.perf_counter() - thinning_started) * 1000.0
+    compression_started = time.perf_counter()
     skeleton = {(int(x), int(y)) for y, x in np.argwhere(skeleton_mask)}
     clearance = (clearance_field(free, resolution)
                  if shared_clearance is None
@@ -196,6 +172,9 @@ def extract_topology(occupancy: np.ndarray, resolution: float,
             previous_edge = edges.get(edge_id)
             if previous_edge is None or candidate.length < previous_edge.length:
                 edges[edge_id] = candidate
+    if timings is not None:
+        timings.update(thinning_ms=thinning_ms,
+                       graph_compression_ms=(time.perf_counter() - compression_started) * 1000.0)
     return TopologyGraph(nodes, edges, skeleton)
 
 

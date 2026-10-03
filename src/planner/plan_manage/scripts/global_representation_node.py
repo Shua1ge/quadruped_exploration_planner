@@ -245,14 +245,20 @@ class GlobalRepresentationNode(Node):
         dense_free = int(np.count_nonzero(occupancy == 0))
         destructive_updates_allowed = (
             dense_free >= self.min_free_cells_for_destructive_update)
+        clearance_started = time.perf_counter()
         shared_clearance = clearance_field(
             occupancy == 0, float(patch.resolution))
+        stage_timings = {
+            "clearance_ms": (time.perf_counter() - clearance_started) * 1000.0}
         local_graph = extract_topology(
             occupancy, float(patch.resolution),
-            (patch.origin.x, patch.origin.y), shared_clearance)
+            (patch.origin.x, patch.origin.y), shared_clearance, stage_timings)
+        oracle_started = time.perf_counter()
         metrics = oracle_metrics(
             occupancy, float(patch.resolution), local_graph,
             self.max_oracle_queries)
+        stage_timings["topology_oracle_ms"] = (
+            time.perf_counter() - oracle_started) * 1000.0
         sample_safe_region = (
             self.safe_region_shadow_enabled
             and (self.graph_revision == 0
@@ -472,6 +478,7 @@ class GlobalRepresentationNode(Node):
             "node_compression_ratio": (
                 1.0 - len(local_graph.nodes) / dense_free if dense_free else 0.0),
         })
+        metrics.update(stage_timings)
         metrics_msg = String()
         metrics_msg.data = json.dumps(metrics, separators=(",", ":"))
         self.metrics_pub.publish(metrics_msg)
@@ -485,7 +492,11 @@ class GlobalRepresentationNode(Node):
             f"dense={dense_free} nodes={len(local_graph.nodes)} "
             f"edges={len(local_graph.edges)} recall="
             f"{metrics['connectivity_recall']:.3f} cost_error="
-            f"{metrics['mean_cost_error']:.3f} processing={processing_ms:.1f}ms",
+            f"{metrics['mean_cost_error']:.3f} processing={processing_ms:.1f}ms "
+            f"clearance_ms={stage_timings['clearance_ms']:.2f} "
+            f"thinning_ms={stage_timings['thinning_ms']:.2f} "
+            f"graph_compression_ms={stage_timings['graph_compression_ms']:.2f} "
+            f"oracle_ms={stage_timings['topology_oracle_ms']:.2f}",
             throttle_duration_sec=2.0)
         if sample_safe_region:
             self.get_logger().info(

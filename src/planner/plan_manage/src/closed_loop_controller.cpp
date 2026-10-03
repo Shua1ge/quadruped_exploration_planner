@@ -236,6 +236,13 @@ private:
         !std::isfinite(msg->max_lateral_speed) ||
         !std::isfinite(msg->max_yaw_rate) ||
         !std::isfinite(msg->max_tracking_correction) ||
+        !std::isfinite(msg->min_forward_command) ||
+        !std::isfinite(msg->min_forward_effective_speed) ||
+        msg->min_forward_command < 0.0 ||
+        msg->min_forward_effective_speed < 0.0 ||
+        (msg->min_forward_command > 0.0 &&
+         (msg->min_forward_effective_speed <= 0.0 ||
+          msg->min_forward_command > std::min(max_vx_, msg->max_forward_speed))) ||
         msg->max_forward_speed < 0.0 || msg->max_lateral_speed < 0.0 ||
         msg->max_yaw_rate < 0.0 || msg->max_tracking_correction < 0.0)
     {
@@ -402,6 +409,8 @@ private:
     trajectory_yaw_ = candidate_body_yaw;
     active_execution_mode_ = msg->execution_mode;
     active_max_vx_ = candidate_max_vx;
+    active_min_forward_command_ = msg->min_forward_command;
+    active_min_forward_effective_speed_ = msg->min_forward_effective_speed;
     active_max_vy_ = candidate_max_vy;
     active_max_vyaw_ = candidate_max_vyaw;
     active_max_tracking_correction_ =
@@ -410,6 +419,7 @@ private:
     last_update_time_ = now();
     receive_traj_ = true;
     terminal_event_reported_ = false;
+    spatial_terminal_reached_ = false;
     terminal_best_error_ = std::numeric_limits<double>::infinity();
     terminal_last_progress_time_ = now();
     resetHeadingFreezeState();
@@ -597,9 +607,54 @@ private:
     }
     double dt = (current_time - last_update_time_).seconds();
     if (dt < 0.0 || dt > 0.2) dt = 0.0;
-    const double t_eval = std::min(exec_time_, traj_duration_);
+    const bool spatial_gait = active_min_forward_command_ > 0.0;
+    if (spatial_gait && spatial_terminal_reached_)
+    {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
+                            "TERMINAL_REACHED");
+      publishStop();
+      last_update_time_ = current_time;
+      return;
+    }
+    double spatial_target_time = exec_time_;
+    if (spatial_gait)
+    {
+      // Match actual progress, not a reference clock that advances while the
+      // calibrated gait is slower than its command. Never chase a past point.
+      double best_distance = (traj_[0].evaluateDeBoorT(exec_time_) - odom_pos_).head<2>().squaredNorm();
+      const double search_end = std::min(traj_duration_, exec_time_ + 2.0);
+      for (double t = exec_time_; t <= search_end + 1e-9; t += 0.05)
+      {
+        const double distance = (traj_[0].evaluateDeBoorT(t) - odom_pos_).head<2>().squaredNorm();
+        if (distance < best_distance)
+        {
+          best_distance = distance;
+          spatial_target_time = t;
+        }
+      }
+      exec_time_ = spatial_target_time;
+      spatial_target_time = forwardGaitLookaheadTime(exec_time_, traj_duration_,
+          [&](double t) { return traj_[0].evaluateDeBoorT(t); });
+      const double endpoint_error = (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm();
+      if (spatial_target_time >= traj_duration_ && endpoint_error < finish_dist_)
+      {
+        exec_time_ = traj_duration_;
+        terminal_event_reported_ = true;
+        spatial_terminal_reached_ = true;
+        publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
+                              "TERMINAL_REACHED", endpoint_error, true);
+        publishExecutionEvent("LOCAL_TRAJECTORY_FINISHED", endpoint_error);
+        publishStop();
+        last_update_time_ = current_time;
+        return;
+      }
+    }
+    const double t_eval = std::min(spatial_gait ? spatial_target_time : exec_time_, traj_duration_);
     Eigen::Vector3d pos_des = traj_[0].evaluateDeBoorT(t_eval);
-    const double yaw_error = normalizeAngle(estimateDesiredYaw(t_eval, pos_des) - odom_yaw_);
+    const double desired_yaw = spatial_gait
+        ? std::atan2(pos_des.y() - odom_pos_.y(), pos_des.x() - odom_pos_.x())
+        : estimateDesiredYaw(t_eval, pos_des);
+    const double yaw_error = normalizeAngle(desired_yaw - odom_yaw_);
     std_msgs::msg::Float64 heading_error_msg;
     heading_error_msg.data = yaw_error;
     heading_error_pub_->publish(heading_error_msg);
@@ -653,7 +708,8 @@ private:
     }
 
     resetHeadingFreezeState();
-    exec_time_ = std::min(traj_duration_, exec_time_ + dt);
+    if (!spatial_gait)
+      exec_time_ = std::min(traj_duration_, exec_time_ + dt);
     last_update_time_ = current_time;
     pos_des = traj_[0].evaluateDeBoorT(exec_time_);
     const Eigen::Vector3d vel_des = traj_[1].evaluateDeBoorT(exec_time_);
@@ -669,10 +725,20 @@ private:
     command.linear.x = std::clamp(
         c * vel_world.x() + s * vel_world.y(),
         -active_max_vx_, active_max_vx_);
+    command.linear.x = calibratedForwardGaitCommand(
+        command.linear.x, active_min_forward_command_,
+        active_min_forward_effective_speed_, active_max_vx_);
     command.linear.y = std::clamp(
         -s * vel_world.x() + c * vel_world.y(),
         -active_max_vy_, active_max_vy_);
     command.angular.z = yaw_command;
+    if (spatial_gait)
+    {
+      // This policy has no calibrated reverse/strafe primitive. Steer toward
+      // the forward target; do not alternate tiny reverse and minimum forward.
+      command.linear.x = active_min_forward_command_;
+      command.linear.y = 0.0;
+    }
     const double terminal_error = pos_error.norm();
     if (exec_time_ >= traj_duration_ && terminal_error < finish_dist_)
     {
@@ -764,6 +830,8 @@ private:
   uint8_t active_execution_mode_{
       scan_planner_msgs::msg::Bspline::MODE_NORMAL};
   double active_max_vx_{0.0};
+  double active_min_forward_command_{0.0};
+  double active_min_forward_effective_speed_{0.0};
   double active_max_vy_{0.0};
   double active_max_vyaw_{0.0};
   double active_max_tracking_correction_{0.0};
@@ -782,6 +850,7 @@ private:
   bool heading_frozen_{false};
   bool heading_stall_reported_{false};
   bool terminal_event_reported_{false};
+  bool spatial_terminal_reached_{false};
   double terminal_best_error_{std::numeric_limits<double>::infinity()};
   rclcpp::Time terminal_last_progress_time_{0, 0, RCL_ROS_TIME};
   uint8_t last_execution_state_{std::numeric_limits<uint8_t>::max()};

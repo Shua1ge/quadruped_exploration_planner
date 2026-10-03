@@ -91,7 +91,11 @@ namespace scan_planner
                                         double initialization_speed_limit,
                                         double minimum_initial_duration,
                                         double collision_yaw_override,
-                                        double planning_clearance_margin)
+                                        double planning_clearance_margin,
+                                        const std::vector<Eigen::Vector3d> *seed_path,
+                                        double end_acc_x, double end_acc_y,
+                                        double end_acc_z,
+                                        double seed_sample_interval)
   {
 
     grid_map_->usePlanningClearanceMarginForCurrentThread(
@@ -143,6 +147,12 @@ namespace scan_planner
     double ts = (start_pt - local_target_pt).norm() > 0.1
                     ? pp_.ctrl_pt_dist / initialization_speed * 1.2
                     : pp_.ctrl_pt_dist / initialization_speed * 5;
+    if (seed_path)
+    {
+      if (!std::isfinite(seed_sample_interval) || seed_sample_interval <= 0.0)
+        return false;
+      ts = seed_sample_interval;
+    }
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
     static bool flag_first_call = true, flag_force_polynomial = false;
     bool flag_regenerate = false;
@@ -152,7 +162,21 @@ namespace scan_planner
       start_end_derivatives.clear();
       flag_regenerate = false;
 
-      if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
+      if (seed_path)
+      {
+        flag_first_call = false;
+        if (seed_path->size() < 7 ||
+            !std::all_of(seed_path->begin(), seed_path->end(),
+                         [](const Eigen::Vector3d &point) {
+                           return point.allFinite();
+                         }))
+          return false;
+        point_set = *seed_path;
+        start_end_derivatives = {
+            start_vel, local_target_vel, start_acc,
+            Eigen::Vector3d(end_acc_x, end_acc_y, end_acc_z)};
+      }
+      else if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
       {
         flag_first_call = false;
         flag_force_polynomial = false;
@@ -318,7 +342,8 @@ namespace scan_planner
       }
     } while (flag_regenerate);
 
-    applyLinearZReference(point_set, start_pt(2), local_target_pt(2));
+    if (!seed_path)
+      applyLinearZReference(point_set, start_pt(2), local_target_pt(2));
 
     Eigen::MatrixXd ctrl_pts;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);

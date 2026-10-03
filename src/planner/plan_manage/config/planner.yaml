@@ -31,10 +31,20 @@ scan_planner_node:
     # when no wider corridor exists, installs a controller-enforced slow
     # execution profile instead of waiting for a hard-margin violation.
     fsm.preferred_clearance_margin: 0.20
-    fsm.clearance_limited_max_forward_speed: 0.25
+    # Measured ONNX forward gait: command 0.30 -> mean motion 0.165 m/s.
+    fsm.min_forward_command: 0.30
+    fsm.min_forward_effective_speed: 0.165
+    fsm.clearance_limited_max_forward_speed: 0.30
     fsm.clearance_limited_max_lateral_speed: 0.08
     fsm.clearance_limited_max_yaw_rate: 0.50
     fsm.clearance_limited_max_tracking_correction: 0.08
+    # Once Controller ACKs a hard-safe fallback, do not replace it with the
+    # same fallback every time startup tracking error crosses 0.10 m. Preserve
+    # one execution version long enough to observe real odometry progress;
+    # bounded no-progress becomes local recovery, never another clock reset.
+    fsm.clearance_limited_execution_grace: 1.00
+    fsm.clearance_limited_no_progress_timeout: 2.00
+    fsm.clearance_limited_min_progress: 0.05
     # Only after ordinary rolling repair fails, try short local anchors that
     # move away from the hard planning belt before rejoining the unchanged
     # Explorer reference path. These bounds keep recovery local and cheap.
@@ -50,7 +60,7 @@ scan_planner_node:
     # Short escape segments start and end at rest. Keep their initialization
     # slow enough that spline fitting does not turn a safe 0.45 m sidestep into
     # a dynamically infeasible normal-speed maneuver.
-    fsm.local_repair_max_speed: 0.25
+    fsm.local_repair_max_speed: 0.30
     fsm.local_repair_time_margin: 1.20
     # Arbitrary fixed-yaw strafing is a holonomic-base assumption and is not a
     # certified Go2 RL locomotion primitive.  Keep it disabled until a bounded
@@ -83,6 +93,9 @@ scan_planner_node:
     # Candidate publication is only phase one.  SCAN keeps the old execution
     # snapshot and safety latches until the controller accepts this version.
     fsm.trajectory_ack_timeout: 0.75
+    # After the first ACK timeout, Controller receives a versioned HOLD.  This
+    # second deadline bounds how long SCAN waits for the exact execution state.
+    fsm.trajectory_ack_reconciliation_timeout: 0.75
     # A new Explorer path cannot clear a physical pose-occupied latch.  Require
     # consecutive free Local-map observations before planning resumes.
     fsm.pose_free_release_cycles: 3
@@ -152,6 +165,9 @@ scan_planner_node:
     grid_map.p_max: 0.98
     grid_map.p_occ: 0.80
     grid_map.max_ray_length: 5.0
+    # A historical wall must receive repeated explicit free observations
+    # before a miss is allowed to reduce its occupancy probability.
+    grid_map.occupied_miss_confirmation_frames: 3
     grid_map.vis_height: 0.3
     grid_map.show_occ_time: false
     # Shadow global-representation input. After a fusion revision completes, it

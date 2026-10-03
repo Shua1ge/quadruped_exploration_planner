@@ -19,3 +19,6 @@ float64 max_forward_speed
 float64 max_lateral_speed
 float64 max_yaw_rate
 float64 max_tracking_correction
+# Explicit planner-authorized forward gait calibration; zero disables it.
+float64 min_forward_command
+float64 min_forward_effective_speed

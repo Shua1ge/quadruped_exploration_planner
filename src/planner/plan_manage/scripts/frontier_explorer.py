@@ -117,6 +117,8 @@ class FrontierCandidate:
     provisional_portal: Optional[Tuple[int, int]] = None
     commitment_scope: Optional[Tuple[str, int]] = None
     option_target_cells: Set[Cell] = field(default_factory=set)
+    excluded_goals: Tuple[Point2, ...] = ()
+    observation_progress: float = 0.0
 
 
 class FrontierExplorer(Node):
@@ -1405,7 +1407,9 @@ class FrontierExplorer(Node):
             connectivity_gain=candidate.connectivity_gain,
             provisional_portal=candidate.provisional_portal,
             commitment_scope=candidate.commitment_scope,
-            option_target_cells=set(candidate.option_target_cells))
+            option_target_cells=set(candidate.option_target_cells),
+            excluded_goals=candidate.excluded_goals,
+            observation_progress=candidate.observation_progress)
         if not self.directional_candidate_allowed(refreshed, candidate_scope):
             self.prepared_candidate = None
             self.get_logger().info(
@@ -2041,13 +2045,15 @@ class FrontierExplorer(Node):
             self.pending_path_request_generation = None
             self.active_path_request_generation = None
             failed_region = self.active_region_id
+            failed_scope = (getattr(self, "active_commitment_scope", None)
+                            or ("region", failed_region))
             previous_goal = self.active_goal
             if previous_goal is not None and not constraint_preapplied:
                 self.add_goal_failure_cooldown(
                     previous_goal, "VIEWPOINT_LOCAL_REJECTED")
             self.active_goal = None
             self.active_goal_cell = None
-            self.active_observation = None
+            # Retain the frozen information objective while trying terminals.
             self.active_raw_path = []
             self.active_path_progress_index = 0
             self.pending_blocked_edge = None
@@ -2056,7 +2062,9 @@ class FrontierExplorer(Node):
             self.last_active_goal_clear_reason = "VIEWPOINT_LOCAL_REJECTED"
             excluded_goals = ((previous_goal,)
                               if previous_goal is not None else ())
-            if self.plan_from_current_position(excluded_goals=excluded_goals):
+            if self.plan_from_current_position(
+                    excluded_goals=excluded_goals, required_scope=failed_scope,
+                    allow_region_release=False):
                 self.publish_status(
                     "VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED")
                 return
@@ -2358,7 +2366,9 @@ class FrontierExplorer(Node):
         self.plan_from_current_position()
 
     def plan_from_current_position(
-            self, excluded_goals: Sequence[Point2] = ()) -> bool:
+            self, excluded_goals: Sequence[Point2] = (),
+            required_scope: Optional[Tuple[str, int]] = None,
+            allow_region_release: bool = True) -> bool:
         """Select and publish a new terminal frontier from the robot position."""
         if self.position is None:
             return False
@@ -2419,6 +2429,8 @@ class FrontierExplorer(Node):
         best = self.choose_frontier(
             start, clusters, inflated, blocked_edges,
             excluded_goals=excluded_goals,
+            required_scope=required_scope,
+            allow_region_release=allow_region_release,
             map_preprocess_prefix_ms=preprocess_ms)
         if best is None:
             status = ("EXPLORATION_COMPLETE" if not filtered_frontiers
@@ -2456,7 +2468,8 @@ class FrontierExplorer(Node):
                         allow_region_release: bool = True,
                         allow_cross_region_preparation: bool = False,
                         update_region_prediction: bool = False,
-                        map_preprocess_prefix_ms: float = 0.0):
+                        map_preprocess_prefix_ms: float = 0.0,
+                        required_scope: Optional[Tuple[str, int]] = None):
         selection_started = time.perf_counter()
         self.last_candidate_tree_ms = 0.0
         self.last_region_sequence_ms = 0.0
@@ -2545,6 +2558,17 @@ class FrontierExplorer(Node):
                 hypothesis.source_id, hypothesis.target_id)
 
         def select_candidate(options: Sequence[FrontierCandidate]):
+            if required_scope is not None:
+                options = [candidate for candidate in options
+                           if candidate.commitment_scope == required_scope]
+                # This is a bounded sibling attempt, not a region ownership
+                # decision. Prefer the frozen task before other same-scope tasks.
+                task = getattr(self, "active_observation", None)
+                same_task = [candidate for candidate in options
+                             if isinstance(task, ObservationTask)
+                             and candidate.frontier_cell == task.frontier_cell
+                             and candidate.region_id == task.region_id]
+                return self.choose_greedy_candidate(same_task or options)
             if self.selection_strategy == "greedy":
                 return self.choose_greedy_candidate(options)
             return self.choose_hierarchical_candidate(
@@ -2576,8 +2600,9 @@ class FrontierExplorer(Node):
                     throttle_duration_sec=2.0)
             candidates = [candidate for candidate in candidates
                           if candidate is not result]
-            self.handle_dense_invalid_region(
-                rejected_region_id, candidates)
+            if allow_region_release and required_scope is None:
+                self.handle_dense_invalid_region(
+                    rejected_region_id, candidates)
             result = select_candidate(candidates)
 
         self.last_global_plan_ms = (
@@ -2588,6 +2613,9 @@ class FrontierExplorer(Node):
             f"[GLOBAL_PLAN_BASELINE] revision={self.map_update_count} "
             f"regions={len(regions)} candidates={len(candidates)} "
             f"map_preprocess_ms={self.last_map_preprocess_ms:.1f} "
+            f"inflation_ms={self.grid.last_inflation_ms:.2f} "
+            f"inflation_cache_hits={self.grid.inflation_cache_hits} "
+            f"inflation_cache_misses={self.grid.inflation_cache_misses} "
             f"region_partition_ms={self.last_region_partition_ms:.1f} "
             f"sparse_candidate_ms={self.last_sparse_candidate_ms:.1f} "
             f"candidate_tree_ms={self.last_candidate_tree_ms:.1f} "
@@ -2650,82 +2678,75 @@ class FrontierExplorer(Node):
             ) -> Optional[FrontierCandidate]:
         """Use a safe sparse route, falling back to dense search when needed."""
         self.dense_final_validation_searches += 1
-        path = None
         selected_cell = candidate.cell
         selected_goal = candidate.goal
         selected_clearance = candidate.terminal_clearance
-        terminal_changed = False
-        if candidate.sparse_route and candidate.sparse_route.polyline:
-            sparse_cells = [
-                self.grid.world_to_cell(*point)
-                for point in candidate.sparse_route.polyline]
-            if sparse_cells:
-                sparse_cells[0] = start
-                sparse_cells[-1] = candidate.cell
-                recovered: List[Cell] = []
+        path = None
+        task = getattr(self, "active_observation", None)
+        same_task = (isinstance(task, ObservationTask)
+                     and task.region_id == candidate.region_id
+                     and task.frontier_cell == candidate.frontier_cell)
+        observation_cells = (set(task.target_cells) if same_task
+                             else candidate.observation_cells)
+        terminals = tuple(dict.fromkeys((candidate.cell,) + candidate.terminal_cells))
+        for cell in terminals:
+            if candidate.terminal_cells and self.terminal_rejection_reason(
+                    cell, inflated, candidate.excluded_goals) is not None:
+                continue
+            trial = None
+            if cell == candidate.cell and candidate.sparse_route and candidate.sparse_route.polyline:
+                sparse_cells = [self.grid.world_to_cell(*point)
+                                for point in candidate.sparse_route.polyline]
+                sparse_cells[0], sparse_cells[-1] = start, cell
+                recovered = []
                 for first, second in zip(sparse_cells[:-1], sparse_cells[1:]):
                     segment = bresenham(first, second)
                     if recovered and segment and recovered[-1] == segment[0]:
                         segment = segment[1:]
                     recovered.extend(segment)
-                if (len(sparse_cells) == 1
-                        and sparse_cells[0] == candidate.cell):
+                if len(sparse_cells) == 1 and start == cell:
                     recovered = [start]
-                if adjacent_grid_path_is_valid(
-                        self.grid, recovered, inflated, blocked_edges):
-                    path = recovered
-
-        # Sparse supplies long-range structure, but it is never authoritative
-        # over the current dense safety map.  A stale/invalid connector or
-        # corridor therefore falls back to the original complete dense search.
-        if path is None:
-            path = astar_known(
-                self.grid, start, candidate.cell, inflated, blocked_edges)
-        if not path and candidate.terminal_cells:
-            alternatives = {
-                cell for cell in candidate.terminal_cells
-                if cell != candidate.cell
-                and self.grid.planning_free(cell, inflated)}
-            tree = build_shortest_path_tree(
-                self.grid, start, inflated, blocked_edges, alternatives)
-            for cell in candidate.terminal_cells:
-                alternative_path = tree.path_to(cell)
-                if cell != candidate.cell and alternative_path:
-                    selected_cell = cell
-                    selected_goal = self.grid.cell_to_world(cell)
-                    selected_clearance = self.terminal_clearance(cell, inflated)
-                    path = alternative_path
-                    terminal_changed = True
-                    break
+                if adjacent_grid_path_is_valid(self.grid, recovered, inflated, blocked_edges):
+                    trial = recovered
+            if not trial:
+                trial = astar_known(self.grid, start, cell, inflated, blocked_edges)
+            if not trial:
+                continue
+            if not double_cylinder_path_free(
+                    self.grid, trial, cell, candidate.frontier_cell, inflated,
+                    getattr(self, "footprint_radius", 0.0),
+                    getattr(self, "footprint_offset", 0.0)):
+                self.last_candidate_rejections["final_validation_failed"] += 1
+                continue
+            targets = observation_cells
+            if same_task:
+                visible_remaining = sum(
+                    self.grid.value(target) == UNKNOWN and
+                    not any(self.grid.value(ray) == OCCUPIED
+                            for ray in bresenham(cell, target)[1:-1])
+                    for target in targets)
+                if visible_remaining == 0:
+                    continue
+            elif cell != candidate.cell:
+                targets = observation_target_cells(
+                    self.grid, candidate.frontier_cell, self.observation_radius, cell)
+                if len(targets) < self.min_expected_observation_cells:
+                    continue
+            selected_cell, path = cell, trial
+            selected_goal = self.grid.cell_to_world(cell)
+            if cell != candidate.cell:
+                selected_clearance = self.terminal_clearance(cell, inflated)
+            observation_cells = targets
+            break
         if not path:
             self.sparse_final_validation_failures += 1
             self.add_goal_failure_cooldown(
                 candidate.goal, "DENSE_FINAL_VALIDATION_FAILED")
             self.get_logger().warning(
-                f"[SPARSE_ROUTE_REJECTED] graph_revision="
-                f"{self.sparse_router.graph_revision} goal="
-                f"({candidate.goal[0]:.2f},{candidate.goal[1]:.2f}); "
-                "dense final validation found no route",
+                f"[SPARSE_ROUTE_REJECTED] goal={candidate.goal}; all eligible "
+                "terminals failed dense/footprint validation",
                 throttle_duration_sec=2.0)
             return None
-        if not double_cylinder_path_free(
-                self.grid, path, selected_cell, candidate.frontier_cell,
-                inflated, getattr(self, "footprint_radius", 0.0),
-                getattr(self, "footprint_offset", 0.0)):
-            self.last_candidate_rejections["final_validation_failed"] += 1
-            self.sparse_final_validation_failures += 1
-            self.get_logger().warning(
-                "[FOOTPRINT_PATH_REJECTED] dense path is point-free but the "
-                "yawed double-cylinder footprint intersects the planning map",
-                throttle_duration_sec=2.0)
-            return None
-        observation_cells = candidate.observation_cells
-        if terminal_changed:
-            observation_cells = observation_target_cells(
-                self.grid, candidate.frontier_cell, self.observation_radius,
-                selected_cell)
-            if len(observation_cells) < self.min_expected_observation_cells:
-                return None
         return FrontierCandidate(
             candidate.region_id, selected_cell, candidate.frontier_cell,
             selected_goal, path,
@@ -2739,7 +2760,28 @@ class FrontierExplorer(Node):
             connectivity_gain=candidate.connectivity_gain,
             provisional_portal=candidate.provisional_portal,
             commitment_scope=candidate.commitment_scope,
-            option_target_cells=set(candidate.option_target_cells))
+            option_target_cells=set(candidate.option_target_cells),
+            excluded_goals=candidate.excluded_goals,
+            observation_progress=candidate.observation_progress)
+
+    def terminal_rejection_reason(
+            self, cell: Cell, inflated: Set[Cell],
+            excluded_goals: Sequence[Point2] = ()) -> Optional[str]:
+        """Apply the same pose constraints to primary and sibling terminals."""
+        if not self.grid.planning_free(cell, inflated):
+            return "no_safe_viewpoint"
+        goal = self.grid.cell_to_world(cell)
+        if any(math.hypot(goal[0] - point[0], goal[1] - point[1])
+               < self.blacklist_radius for point in excluded_goals):
+            return "excluded"
+        if self.is_blacklisted(goal):
+            return "blacklisted"
+        if self.is_goal_on_failure_cooldown(goal):
+            return "cooldown"
+        if (math.hypot(goal[0] - self.position[0], goal[1] - self.position[1])
+                < self.min_goal_distance):
+            return "too_close"
+        return None
 
     def build_frontier_candidates(self, start: Cell,
                                   regions: Sequence[FrontierRegion],
@@ -2759,7 +2801,17 @@ class FrontierExplorer(Node):
                 continue
             for cluster in region.clusters:
                 used_viewpoints: Set[Cell] = set()
-                for frontier in candidate_cells(cluster):
+                task = getattr(self, "active_observation", None)
+                frontiers = list(candidate_cells(cluster))
+                # Sampling may change as a boundary shrinks. Keep the frozen
+                # task represented while its cluster still belongs to this region.
+                if (isinstance(task, ObservationTask)
+                        and task.region_id == region.region_id
+                        and task.frontier_cell is not None
+                        and (task.frontier_cell in cluster
+                             or task.frontier_cluster_cells.intersection(cluster))):
+                    frontiers = list(dict.fromkeys([task.frontier_cell] + frontiers))
+                for frontier in frontiers:
                     viewpoints = safe_viewpoint_cells(
                         self.grid, frontier, inflated, self.viewpoint_standoff,
                         limit=self.terminal_candidate_limit,
@@ -2768,47 +2820,58 @@ class FrontierExplorer(Node):
                         relaxation=self.viewpoint_relaxation,
                         footprint_radius=self.footprint_radius,
                         footprint_offset=self.footprint_offset)
+                    same_task = (isinstance(task, ObservationTask)
+                                 and task.frontier_cell == frontier
+                                 and task.region_id == region.region_id)
+                    if same_task:
+                        # Previously safe terminals are frozen task alternatives,
+                        # not trusted geometry: recheck LOS, pose and route below.
+                        retained = [cell for cell in task.terminal_cells
+                                    if segment_known_free(
+                                        self.grid, cell, frontier, inflated)]
+                        viewpoints = list(dict.fromkeys(viewpoints + retained))
                     if not viewpoints:
                         rejected["no_safe_viewpoint"] += 1
                         continue
-                    target_cells = observation_target_cells(
-                        self.grid, frontier, self.observation_radius,
-                        viewpoints[0])
-                    unknown_gain = len(target_cells)
-                    if unknown_gain < self.min_expected_observation_cells:
-                        rejected["insufficient_gain"] += 1
-                        continue
-                    # One frontier is one task.  Only its safest terminal enters
-                    # global competition; other poses remain alternatives of
-                    # the same frozen observation objective.
-                    for viewpoint in viewpoints[:1]:
+                    # Filter every terminal before sparse/dense routing. A rejected
+                    # safest pose must not hide a safe sibling of this frontier.
+                    terminals = []
+                    for viewpoint in viewpoints:
+                        reason = self.terminal_rejection_reason(
+                            viewpoint, inflated, excluded_goals)
+                        if reason is not None:
+                            if reason in rejected:
+                                rejected[reason] += 1
+                            continue
+                        terminals.append(viewpoint)
+                    for viewpoint in terminals:
                         if viewpoint in used_viewpoints:
                             continue
                         used_viewpoints.add(viewpoint)
-                        goal_xy = self.grid.cell_to_world(viewpoint)
-                        direct_distance = math.hypot(
-                            goal_xy[0] - self.position[0],
-                            goal_xy[1] - self.position[1])
-                        excluded = any(
-                            math.hypot(goal_xy[0] - point[0], goal_xy[1] - point[1])
-                            < self.blacklist_radius for point in excluded_goals)
-                        if direct_distance < self.min_goal_distance:
-                            rejected["too_close"] += 1
-                            continue
-                        if self.is_blacklisted(goal_xy):
-                            rejected["blacklisted"] += 1
-                            continue
-                        if self.is_goal_on_failure_cooldown(goal_xy):
-                            rejected["cooldown"] += 1
-                            continue
-                        if excluded:
-                            rejected["excluded"] += 1
+                        target_cells = (set(task.target_cells) if same_task else
+                                        observation_target_cells(
+                                            self.grid, frontier,
+                                            self.observation_radius, viewpoint))
+                        unknown_gain = sum(self.grid.value(cell) == UNKNOWN
+                                           for cell in target_cells)
+                        if same_task:
+                            visible_remaining = sum(
+                                self.grid.value(cell) == UNKNOWN and
+                                not any(self.grid.value(ray) == OCCUPIED
+                                        for ray in bresenham(viewpoint, cell)[1:-1])
+                                for cell in target_cells)
+                            if visible_remaining == 0:
+                                rejected["insufficient_gain"] += 1
+                                continue
+                        if (not same_task and unknown_gain
+                                < self.min_expected_observation_cells):
+                            rejected["insufficient_gain"] += 1
                             continue
                         proposals.append((
                             region.region_id, region_commitment_scope(region),
-                            viewpoint, frontier, goal_xy,
+                            viewpoint, frontier, self.grid.cell_to_world(viewpoint),
                             unknown_gain, len(cluster), target_cells,
-                            tuple(viewpoints),
+                            tuple(terminals),
                             self.terminal_clearance(viewpoint, inflated),
                             set(cluster)))
 
@@ -2846,6 +2909,8 @@ class FrontierExplorer(Node):
             self.expanded_grid_cells += tree.expanded_cells
             self.last_expanded_grid_cells += tree.expanded_cells
         records = []
+        task = getattr(self, "active_observation", None)
+        recorded_tasks = set()
         for (region_id, commitment_scope, viewpoint, frontier, goal_xy,
              unknown_gain, cluster_size, target_cells, terminal_cells,
              terminal_clearance, frontier_cluster_cells) in proposals:
@@ -2853,42 +2918,36 @@ class FrontierExplorer(Node):
             if estimate is None:
                 path = tree.path_to(viewpoint)
                 if not path:
-                    # If the safest pose is isolated by newly known geometry,
-                    # reuse the already completed search tree for another pose
-                    # of the same task.  This does not launch another A*.
-                    replacement = None
-                    for cell in terminal_cells:
-                        if cell == viewpoint:
-                            continue
-                        alternative_path = tree.path_to(cell)
-                        if alternative_path:
-                            replacement = (cell, alternative_path)
-                            break
-                    if replacement is None:
-                        rejected["astar_unreachable"] += 1
-                        continue
-                    viewpoint, path = replacement
-                    goal_xy = self.grid.cell_to_world(viewpoint)
-                    terminal_clearance = self.terminal_clearance(
-                        viewpoint, inflated)
-                    target_cells = observation_target_cells(
-                        self.grid, frontier, self.observation_radius, viewpoint)
-                    unknown_gain = len(target_cells)
-                    if unknown_gain < self.min_expected_observation_cells:
-                        continue
+                    rejected["astar_unreachable"] += 1
+                    continue
+                if not double_cylinder_path_free(
+                        self.grid, path, viewpoint, frontier, inflated,
+                        self.footprint_radius, self.footprint_offset):
+                    rejected["final_validation_failed"] += 1
+                    continue
                 path_length = path_length_cells(path, self.grid.resolution)
                 turn_cost = path_turn_cost(path)
             else:
                 path = []
                 path_length = estimate.distance
                 turn_cost = estimate.turn_cost
+            # One frontier remains one ranked objective, with its safest
+            # usable terminal first. Dense fallback has already checked siblings.
+            if (region_id, frontier) in recorded_tasks:
+                continue
+            recorded_tasks.add((region_id, frontier))
             records.append(FrontierCandidate(
                 region_id, viewpoint, frontier, goal_xy, path,
                 path_length, unknown_gain, cluster_size, turn_cost, target_cells,
                 sparse_route=estimate, terminal_cells=terminal_cells,
                 terminal_clearance=terminal_clearance,
                 frontier_cluster_cells=frontier_cluster_cells,
-                commitment_scope=commitment_scope))
+                commitment_scope=commitment_scope,
+                excluded_goals=tuple(excluded_goals),
+                observation_progress=(
+                    task.progress if isinstance(task, ObservationTask)
+                    and task.region_id == region_id
+                    and task.frontier_cell == frontier else 0.0)))
             rejected["accepted"] += 1
         self.get_logger().info(
             f"[FRONTIER_CANDIDATE_SUMMARY] {rejected}",
@@ -3410,14 +3469,21 @@ class FrontierExplorer(Node):
         self.last_active_path_validation_update = self.map_update_count
         self.pending_blocked_edge = None
         self.replacement_pending = False
-        self.active_observation = ObservationTask(
-            region_id=region_id,
-            goal=goal_xy,
-            target_cells=set(candidate.observation_cells),
-            frontier_cell=candidate.frontier_cell,
-            frontier_cluster_cells=set(candidate.frontier_cluster_cells),
-            terminal_cells=(candidate.terminal_cells
-                            if candidate.terminal_cells else (candidate.cell,)))
+        task = self.active_observation
+        if (isinstance(task, ObservationTask)
+                and task.region_id == region_id
+                and task.frontier_cell == candidate.frontier_cell):
+            task.goal = goal_xy
+            task.terminal_cells = candidate.terminal_cells or (candidate.cell,)
+        else:
+            self.active_observation = ObservationTask(
+                region_id=region_id,
+                goal=goal_xy,
+                target_cells=set(candidate.observation_cells),
+                frontier_cell=candidate.frontier_cell,
+                frontier_cluster_cells=set(candidate.frontier_cluster_cells),
+                terminal_cells=(candidate.terminal_cells
+                                if candidate.terminal_cells else (candidate.cell,)))
         self.last_terminal_candidate_count = len(
             self.active_observation.terminal_cells)
         inflated = self.grid.inflated_obstacles(self.inflation_radius)

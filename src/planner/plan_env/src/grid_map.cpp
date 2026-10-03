@@ -114,6 +114,18 @@ int plan_env::endpointObservation(bool self_filter_enabled, bool inside_self_fil
   return self_filter_enabled && inside_self_filter ? 0 : 1;
 }
 
+bool plan_env::rayTraversalStopsAtOccupied(bool historically_occupied)
+{
+  return historically_occupied;
+}
+
+bool plan_env::occupiedMissHasEnoughConfirmation(
+    uint8_t consecutive_miss_frames, int required_frames)
+{
+  return required_frames > 0 &&
+         static_cast<int>(consecutive_miss_frames) >= required_frames;
+}
+
 thread_local const GridMap* GridMap::tls_snapshot_owner_ = nullptr;
 thread_local GridMap::InflatedOccupancySnapshotPtr GridMap::tls_snapshot_ = nullptr;
 thread_local const GridMap* GridMap::tls_clearance_owner_ = nullptr;
@@ -267,6 +279,12 @@ void GridMap::initMap(
   load_parameter(node_, "grid_map.p_max", mp_.p_max_, -1.0);
   load_parameter(node_, "grid_map.p_occ", mp_.p_occ_, -1.0);
   load_parameter(node_, "grid_map.max_ray_length", mp_.max_ray_length_, -0.1);
+  load_parameter(node_, "grid_map.occupied_miss_confirmation_frames",
+                 mp_.occupied_miss_confirmation_frames_, 3);
+  if (mp_.occupied_miss_confirmation_frames_ <= 0 ||
+      mp_.occupied_miss_confirmation_frames_ > 255)
+    throw std::invalid_argument(
+        "grid_map.occupied_miss_confirmation_frames must be in [1, 255]");
 
   load_parameter(node_, "grid_map.vis_height", mp_.vis_height_, 0.3);
   load_parameter(node_, "grid_map.show_occ_time", mp_.show_occ_time_, false);
@@ -382,6 +400,7 @@ void GridMap::initMap(
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_cnt_ = vector<int>(buffer_size, 0);
+  md_.occupied_miss_confirmation_count_ = vector<uint8_t>(buffer_size, 0);
   rebuildInflationOffsets();
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
@@ -505,6 +524,8 @@ void GridMap::resetAllMapData()
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
   std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
   std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
+  std::fill(md_.occupied_miss_confirmation_count_.begin(),
+            md_.occupied_miss_confirmation_count_.end(), 0);
   std::fill(md_.count_hit_and_miss_.begin(), md_.count_hit_and_miss_.end(), 0);
   std::fill(md_.count_hit_.begin(), md_.count_hit_.end(), 0);
   std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), -1);
@@ -582,6 +603,7 @@ void GridMap::resetCellByAddress(int addr)
     updateInflation(id_g, -1);
 
   md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
+  md_.occupied_miss_confirmation_count_[addr] = 0;
   md_.count_hit_[addr] = 0;
   md_.count_hit_and_miss_[addr] = 0;
   md_.flag_rayend_[addr] = -1;
@@ -683,6 +705,7 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
     md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
     md_.occupancy_buffer_inflate_cnt_[addr] = 0;
     md_.occupancy_buffer_inflate_[addr] = 0;
+    md_.occupied_miss_confirmation_count_[addr] = 0;
     md_.count_hit_[addr] = 0;
     md_.count_hit_and_miss_[addr] = 0;
     md_.flag_rayend_[addr] = -1;
@@ -865,7 +888,7 @@ void GridMap::raycastProcess()
       {
         pt_w = (pt_w - md_.ray_pos_) / length * mp_.max_ray_length_ + md_.ray_pos_;
       }
-      vox_idx = setCacheOccupancy(pt_w, 0);
+      vox_idx = INVALID_IDX;
     }
     else
     {
@@ -874,7 +897,7 @@ void GridMap::raycastProcess()
       if (length > mp_.max_ray_length_)
       {
         pt_w = (pt_w - md_.ray_pos_) / length * mp_.max_ray_length_ + md_.ray_pos_;
-        vox_idx = setCacheOccupancy(pt_w, 0);
+        vox_idx = INVALID_IDX;
       }
       else
       {
@@ -906,26 +929,51 @@ void GridMap::raycastProcess()
       }
     }
 
-    raycaster.setInput(pt_w / mp_.resolution_, md_.ray_pos_ / mp_.resolution_);
+    raycaster.setInput(md_.ray_pos_ / mp_.resolution_, pt_w / mp_.resolution_);
 
     while (raycaster.step(ray_pt))
     {
       Eigen::Vector3d tmp = (ray_pt + half) * mp_.resolution_;
       length = (tmp - md_.ray_pos_).norm();
 
+      Eigen::Vector3i traversal_id;
+      posToIndex(tmp, traversal_id);
+      const bool historically_occupied =
+          isInMap(traversal_id) &&
+          md_.occupancy_buffer_[toAddress(traversal_id)] >
+              mp_.min_occupancy_log_;
+      // Forward rays share cells near the sensor. Deduplicate their evidence,
+      // but keep traversing so each ray can reach its own visible endpoint.
+      const int traversal_addr = isInMap(traversal_id)
+                                     ? toAddress(traversal_id)
+                                     : INVALID_IDX;
+      if (traversal_addr != INVALID_IDX &&
+          md_.flag_traverse_[traversal_addr] == md_.raycast_num_)
+      {
+        if (plan_env::rayTraversalStopsAtOccupied(historically_occupied))
+          break;
+        continue;
+      }
       vox_idx = setCacheOccupancy(tmp, 0);
 
       if (vox_idx != INVALID_IDX)
       {
         if (md_.flag_traverse_[vox_idx] == md_.raycast_num_)
         {
-          break;
+          continue;
         }
         else
         {
           md_.flag_traverse_[vox_idx] = md_.raycast_num_;
         }
       }
+
+      // A ray may challenge the first historical wall cell, but it cannot use
+      // that same observation to clear unknown space behind the wall.  Only a
+      // later frame, after the wall cell has accumulated enough explicit free
+      // evidence to become non-occupied, may continue beyond it.
+      if (plan_env::rayTraversalStopsAtOccupied(historically_occupied))
+        break;
     }
   }
 
@@ -962,10 +1010,31 @@ void GridMap::raycastProcess()
     int idx_ctns = toAddress(idx);
     md_.cache_voxel_.pop();
 
-    double log_odds_update =
-        md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns] ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
+    const bool hit_wins =
+        md_.count_hit_[idx_ctns] >=
+        md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns];
+    double log_odds_update = hit_wins ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
 
     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
+
+    if (hit_wins)
+    {
+      md_.occupied_miss_confirmation_count_[idx_ctns] = 0;
+    }
+    else if (md_.occupancy_buffer_[idx_ctns] > mp_.min_occupancy_log_)
+    {
+      uint8_t &confirmations =
+          md_.occupied_miss_confirmation_count_[idx_ctns];
+      if (confirmations < 255)
+        ++confirmations;
+      if (!plan_env::occupiedMissHasEnoughConfirmation(
+              confirmations, mp_.occupied_miss_confirmation_frames_))
+        continue;
+    }
+    else
+    {
+      md_.occupied_miss_confirmation_count_[idx_ctns] = 0;
+    }
 
     if (log_odds_update >= 0 && md_.occupancy_buffer_[idx_ctns] >= mp_.clamp_max_log_)
     {

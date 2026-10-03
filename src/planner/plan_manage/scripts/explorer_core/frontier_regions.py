@@ -299,11 +299,12 @@ def double_cylinder_path_free(
     for index, cell in enumerate(path):
         if index + 1 < len(path):
             target = path[index + 1]
-        elif cell == terminal:
-            target = frontier
         elif index > 0:
-            target = cell
+            # The path message carries positions, not a terminal body yaw.
+            # Preserve the incoming tangent here instead of pretending that
+            # Controller will rotate toward the frontier at the endpoint.
             cell = path[index - 1]
+            target = path[index]
         else:
             target = frontier
         yaw = math.atan2(target[1] - cell[1], target[0] - cell[0])

@@ -1,4 +1,37 @@
 #include <gtest/gtest.h>
+#include <plan_manage/replan_fsm_utils.h>
+
+TEST(ForwardGaitTracking, SharesSpatialLookaheadAndBoundsStationaryTail)
+{
+  using scan_planner::forwardGaitLookaheadTime;
+  const auto line = [](double t) { return Eigen::Vector3d(.165 * t, 0., 0.); };
+  const double target = forwardGaitLookaheadTime(1., 10., line);
+  EXPECT_GE(.165 * (target - 1.), .15);
+  EXPECT_LT(.165 * (target - 1.), .16);
+  EXPECT_DOUBLE_EQ(forwardGaitLookaheadTime(9.9, 10., line), 10.);
+  const auto stopped = [](double) { return Eigen::Vector3d::Zero().eval(); };
+  EXPECT_DOUBLE_EQ(forwardGaitLookaheadTime(1., 1000., stopped), 3.);
+}
+
+TEST(StructuredRepair, FailedRejoinCannotPurchaseAnotherEscape)
+{
+  using scan_planner::structuredRepairMayStartAnotherEscape;
+  EXPECT_TRUE(structuredRepairMayStartAnotherEscape(false, 0));
+  EXPECT_TRUE(structuredRepairMayStartAnotherEscape(false, 1));
+  EXPECT_FALSE(structuredRepairMayStartAnotherEscape(true, 1));
+  EXPECT_FALSE(structuredRepairMayStartAnotherEscape(true, 3));
+}
+
+TEST(ForwardGaitProfile, MapsMeasuredResponseWithoutChangingStopOrReverse)
+{
+  using scan_planner::calibratedForwardGaitCommand;
+  EXPECT_DOUBLE_EQ(calibratedForwardGaitCommand(0.0, .30, .165, .30), 0.0);
+  EXPECT_DOUBLE_EQ(calibratedForwardGaitCommand(-.10, .30, .165, .30), -.10);
+  EXPECT_DOUBLE_EQ(calibratedForwardGaitCommand(.01, .30, .165, .30), .30);
+  EXPECT_DOUBLE_EQ(calibratedForwardGaitCommand(.165, .30, .165, .30), .30);
+  EXPECT_DOUBLE_EQ(calibratedForwardGaitCommand(.50, .30, .165, .30), .30);
+  EXPECT_DOUBLE_EQ(calibratedForwardGaitCommand(.10, 0.0, 0.0, .75), .10);
+}
 
 #include <cstdint>
 #include <limits>
@@ -7,6 +40,282 @@
 
 namespace scan_planner
 {
+
+TEST(TrackingDeviation, NormalTrajectoryRequestsRollingReplan)
+{
+  EXPECT_EQ(classifyTrackingDeviation(
+                false, false, 0.11, 0.10, 0.30,
+                0.55, 1.0, 2.0, 0.0, 0.05),
+            TrackingDeviationAction::ROLLING_REPLAN);
+}
+
+TEST(TrackingDeviation, NoProgressIsNotHiddenBySmallReferenceError)
+{
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, false, .01, .10, .30, 2.1, 1.0, 2.0, 0.0, .05),
+            TrackingDeviationAction::LOCAL_REPAIR);
+}
+
+TEST(TrackingDeviation, ClearanceLimitedTrajectoryKeepsExecutionOwnership)
+{
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, false, 0.11, 0.10, 0.30,
+                0.55, 1.0, 2.0, 0.0, 0.05),
+            TrackingDeviationAction::KEEP_EXECUTING);
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, false, 0.14, 0.10, 0.30,
+                3.0, 1.0, 2.0, 0.20, 0.05),
+            TrackingDeviationAction::ROLLING_REPLAN);
+}
+
+TEST(TrackingDeviation, ClearanceLimitedNoProgressEscalatesOnce)
+{
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, false, 0.12, 0.10, 0.30,
+                1.99, 1.0, 2.0, 0.0, 0.05),
+            TrackingDeviationAction::KEEP_EXECUTING);
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, false, 0.12, 0.10, 0.30,
+                2.0, 1.0, 2.0, 0.0, 0.05),
+            TrackingDeviationAction::LOCAL_REPAIR);
+}
+
+TEST(TrackingDeviation, HarderDeviationBypassesExecutionOwnership)
+{
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, true, 0.12, 0.10, 0.30,
+                0.2, 1.0, 2.0, 0.0, 0.05),
+            TrackingDeviationAction::LOCAL_REPAIR);
+  EXPECT_EQ(classifyTrackingDeviation(
+                true, false, 0.31, 0.10, 0.30,
+                0.2, 1.0, 2.0, 0.0, 0.05),
+            TrackingDeviationAction::LOCAL_REPAIR);
+}
+
+TEST(PredictedCollisionInterval, ExpandsRiskWindowForDynamicHandoff)
+{
+  const auto interval = makePredictedCollisionInterval(
+      7, 12, 42, CollisionRiskKind::HARD_MARGIN,
+      5.0, 6.0, 1.0, 0.5, 0.4, 0.2, 0.15, 2.0, 10.0);
+
+  ASSERT_TRUE(interval.valid);
+  EXPECT_EQ(interval.request_id, 7U);
+  EXPECT_EQ(interval.trajectory_id, 12);
+  EXPECT_EQ(interval.map_revision, 42U);
+  EXPECT_NEAR(interval.entry_time, 5.0, 1e-9);
+  EXPECT_NEAR(interval.exit_time, 6.0, 1e-9);
+  EXPECT_NEAR(interval.repair_start_time, 2.4, 1e-9);
+  EXPECT_NEAR(interval.rejoin_time, 6.15, 1e-9);
+}
+
+TEST(PredictedCollisionInterval, ClampsRepairWindowToTrajectoryBounds)
+{
+  const auto interval = makePredictedCollisionInterval(
+      1, 2, 3, CollisionRiskKind::PREFERRED_MARGIN,
+      0.2, 1.0, 2.0, 2.0, 0.1, 0.1, 0.5, 0.0, 2.0);
+
+  ASSERT_TRUE(interval.valid);
+  EXPECT_DOUBLE_EQ(interval.repair_start_time, 0.0);
+  EXPECT_DOUBLE_EQ(interval.rejoin_time, 1.5);
+}
+
+TEST(PredictedCollisionInterval, RejectsInvalidOrMismatchedIntervals)
+{
+  EXPECT_FALSE(makePredictedCollisionInterval(
+      0, 1, 1, CollisionRiskKind::HARD_MARGIN,
+      1.0, 2.0, 0.1, 0.1, 0.0, 0.0, 0.2, 0.0, 3.0).valid);
+  EXPECT_FALSE(makePredictedCollisionInterval(
+      1, 1, 1, CollisionRiskKind::HARD_MARGIN,
+      2.0, 1.0, 0.1, 0.1, 0.0, 0.0, 0.2, 0.0, 3.0).valid);
+  const auto valid = makePredictedCollisionInterval(
+      1, 2, 3, CollisionRiskKind::HARD_MARGIN,
+      1.0, 1.5, 0.1, 1.0, 0.1, 0.1, 0.2, 0.0, 3.0);
+  EXPECT_FALSE(collisionIntervalMatchesExecution(valid, 1, 2, 4));
+  EXPECT_TRUE(collisionIntervalMatchesExecution(valid, 1, 2, 3));
+}
+
+TEST(PredictedCollisionInterval, RequiresARejoinableWindowWithContext)
+{
+  auto interval = makePredictedCollisionInterval(
+      7, 12, 42, CollisionRiskKind::HARD_MARGIN,
+      5.0, 6.0, 0.4, 1.0, 0.2, 0.1, 0.5, 2.0, 10.0);
+  interval.exit_known = true;
+  interval.rejoin_position = Eigen::Vector3d(3.0, 0.0, 0.4);
+  EXPECT_TRUE(localPatchSeedIsUsable(
+      interval, 2.0, 10.0, 0.1, 0.5, 0.5, 42));
+  EXPECT_FALSE(localPatchSeedIsUsable(
+      interval, 2.0, 10.0, 0.1, 0.5, 0.5, 43));
+
+  auto unknown_exit = interval;
+  unknown_exit.exit_known = false;
+  EXPECT_FALSE(localPatchSeedIsUsable(
+      unknown_exit, 2.0, 10.0, 0.1, 0.5, 0.5));
+  EXPECT_FALSE(localPatchSeedIsUsable(
+      interval, 4.8, 10.0, 0.1, 0.5, 0.5));
+  EXPECT_FALSE(localPatchSeedIsUsable(
+      interval, 2.0, 6.2, 0.1, 0.5, 0.5));
+}
+
+TEST(TrajectoryHandoff, ReconcilesTimedOutHoldOnlyByExactExecutionVersion)
+{
+  EXPECT_EQ(reconcileTimedOutHandoff(
+                true, true, true, 8, 21, 8, 21, 8, 20),
+            TimedOutHandoffExecution::CANDIDATE_HELD);
+  EXPECT_EQ(reconcileTimedOutHandoff(
+                true, true, true, 8, 20, 8, 21, 8, 20),
+            TimedOutHandoffExecution::PREVIOUS_HELD);
+  EXPECT_EQ(reconcileTimedOutHandoff(
+                true, true, true, 8, 19, 8, 21, 8, 20),
+            TimedOutHandoffExecution::UNCONFIRMED);
+  EXPECT_EQ(reconcileTimedOutHandoff(
+                true, true, false, 8, 21, 8, 21, 8, 20),
+            TimedOutHandoffExecution::UNCONFIRMED);
+  EXPECT_EQ(reconcileTimedOutHandoff(
+                false, true, true, 8, 21, 8, 21, 8, 20),
+            TimedOutHandoffExecution::UNCONFIRMED);
+}
+
+TEST(TrajectoryHandoff, ReconciliationHasASecondBoundedDeadline)
+{
+  EXPECT_FALSE(trajectoryHandoffReconciliationTimedOut(
+      false, true, 10.0, 0.75));
+  EXPECT_FALSE(trajectoryHandoffReconciliationTimedOut(
+      true, false, 10.0, 0.75));
+  EXPECT_FALSE(trajectoryHandoffReconciliationTimedOut(
+      true, true, 0.74, 0.75));
+  EXPECT_TRUE(trajectoryHandoffReconciliationTimedOut(
+      true, true, 0.75, 0.75));
+  EXPECT_FALSE(trajectoryHandoffReconciliationTimedOut(
+      true, true, std::numeric_limits<double>::quiet_NaN(), 0.75));
+}
+
+TEST(TrajectoryHandoff, ReservesAmbiguousCandidateVersionWithoutOverflow)
+{
+  EXPECT_EQ(reserveTrajectoryIdAfterAmbiguousHandoff(20, 21), 21);
+  EXPECT_EQ(reserveTrajectoryIdAfterAmbiguousHandoff(22, 21), 22);
+  EXPECT_EQ(reserveTrajectoryIdAfterAmbiguousHandoff(
+                20, std::numeric_limits<int64_t>::max()),
+            std::numeric_limits<int>::max());
+  EXPECT_EQ(reserveTrajectoryIdAfterAmbiguousHandoff(
+                20, std::numeric_limits<int64_t>::min()),
+            20);
+}
+
+TEST(TrajectoryHandoff, ExhaustivelyBoundsBothAcknowledgementPhases)
+{
+  const std::vector<double> ages = {
+      -1.0, 0.0, 0.749, 0.75, 2.0,
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()};
+  for (const bool pending : {false, true})
+    for (const bool hold_issued : {false, true})
+      for (const double age : ages)
+      {
+        const bool first_phase = trajectoryHandoffTimedOut(
+            pending && !hold_issued, age, 0.75);
+        const bool second_phase = trajectoryHandoffReconciliationTimedOut(
+            pending, hold_issued, age, 0.75);
+        EXPECT_FALSE(first_phase && second_phase)
+            << "pending=" << pending << " hold=" << hold_issued
+            << " age=" << age;
+        if (pending && std::isfinite(age) && age >= 0.75)
+        {
+          EXPECT_TRUE(first_phase || second_phase)
+              << "pending handoff has no bounded phase at age=" << age;
+        }
+      }
+}
+
+TEST(LocalPatchSeed, UsesUniformTimeAndExactEndpoint)
+{
+  EXPECT_DOUBLE_EQ(uniformSeedSampleTime(2.0, 6.0, 0, 5), 2.0);
+  EXPECT_DOUBLE_EQ(uniformSeedSampleTime(2.0, 6.0, 2, 5), 4.0);
+  EXPECT_DOUBLE_EQ(uniformSeedSampleTime(2.0, 6.0, 4, 5), 6.0);
+  EXPECT_TRUE(std::isnan(uniformSeedSampleTime(2.0, 6.0, 5, 5)));
+}
+
+TEST(LocalPatchSeed, RequiresFinitePointsAndMatchingEndpoints)
+{
+  std::vector<Eigen::Vector3d> seed;
+  for (int index = 0; index < 7; ++index)
+    seed.emplace_back(0.1 * index, 0.0, 0.4);
+  EXPECT_TRUE(trajectorySeedMatchesBoundaries(
+      seed, seed.front(), seed.back(), 1e-6));
+  EXPECT_FALSE(trajectorySeedMatchesBoundaries(
+      seed, seed.front(), Eigen::Vector3d(2.0, 0.0, 0.4), 0.02));
+  seed[3].x() = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(trajectorySeedMatchesBoundaries(
+      seed, seed.front(), seed.back(), 1e-6));
+}
+
+TEST(LocalPatchSeed, RequiresPositionVelocityAndAccelerationContinuity)
+{
+  const Eigen::Vector3d point(1.0, 2.0, 0.4);
+  const Eigen::Vector3d velocity(0.3, 0.0, 0.0);
+  const Eigen::Vector3d acceleration(0.0, 0.0, 0.0);
+  EXPECT_TRUE(localPatchBoundaryIsContinuous(
+      point, velocity, acceleration, point, velocity, acceleration,
+      0.02, 0.05, 0.1));
+  EXPECT_FALSE(localPatchBoundaryIsContinuous(
+      point + Eigen::Vector3d(0.1, 0.0, 0.0), velocity, acceleration,
+      point, velocity, acceleration, 0.02, 0.05, 0.1));
+  EXPECT_FALSE(localPatchBoundaryIsContinuous(
+      point, velocity + Eigen::Vector3d(0.2, 0.0, 0.0), acceleration,
+      point, velocity, acceleration, 0.02, 0.05, 0.1));
+}
+
+TEST(LocalPatchSeed, RejectsStaleMapAndUnobservedExit)
+{
+  auto interval = makePredictedCollisionInterval(
+      5, 9, 15, CollisionRiskKind::HARD_MARGIN,
+      4.0, 4.5, 0.5, 1.0, 0.2, 0.1, 0.0, 1.0, 8.0, 5.0);
+  interval.exit_known = true;
+  interval.rejoin_position = Eigen::Vector3d(2.0, 0.0, 0.4);
+  interval.entry_position = Eigen::Vector3d(1.0, 0.0, 0.4);
+  interval.exit_position = Eigen::Vector3d(1.5, 0.0, 0.4);
+  EXPECT_TRUE(localPatchSeedIsUsable(interval, 1.0, 8.0, 0.1, 0.3, 0.2, 15));
+  EXPECT_FALSE(localPatchSeedIsUsable(interval, 1.0, 8.0, 0.1, 0.3, 0.2, 16));
+  interval.exit_known = false;
+  EXPECT_FALSE(localPatchSeedIsUsable(interval, 1.0, 8.0, 0.1, 0.3, 0.2, 15));
+}
+
+TEST(TrajectoryHandoff, SamplesPureRotationAndCombinedMotion)
+{
+  constexpr double pi = 3.14159265358979323846;
+  EXPECT_EQ(planarHandoffSweepSampleCount(
+                0.0, 0.0, 0.05, 5.0 * pi / 180.0), 0);
+  EXPECT_EQ(planarHandoffSweepSampleCount(
+                0.0, pi / 2.0, 0.05, 5.0 * pi / 180.0), 18);
+  EXPECT_EQ(planarHandoffSweepSampleCount(
+                0.21, 0.0, 0.05, 5.0 * pi / 180.0), 5);
+  EXPECT_EQ(planarHandoffSweepSampleCount(
+                0.21, pi, 0.05, 5.0 * pi / 180.0), 36);
+  EXPECT_EQ(planarHandoffSweepSampleCount(
+                -1.0, pi, 0.05, 5.0 * pi / 180.0), 0);
+}
+
+TEST(TrajectoryHandoff, SweepResolutionIsNeverWeakerThanEitherAxis)
+{
+  constexpr double pi = 3.14159265358979323846;
+  constexpr double distance_step = 0.05;
+  constexpr double yaw_step = 5.0 * pi / 180.0;
+  for (int distance_index = 0; distance_index <= 20; ++distance_index)
+    for (int degree = -180; degree <= 180; degree += 5)
+    {
+      const double distance = 0.025 * distance_index;
+      const double yaw = degree * pi / 180.0;
+      const int samples = planarHandoffSweepSampleCount(
+          distance, yaw, distance_step, yaw_step);
+      EXPECT_GE(samples, static_cast<int>(std::ceil(
+                             distance / distance_step - 1e-12)));
+      EXPECT_GE(samples, static_cast<int>(std::ceil(
+                             std::abs(yaw) / yaw_step - 1e-12)));
+      if (distance == 0.0 && degree != 0)
+      {
+        EXPECT_GT(samples, 0) << "degree=" << degree;
+      }
+    }
+}
 
 TEST(ReferencePathProgress, LookaheadMovesContinuouslyAlongSparseSegment)
 {
@@ -85,6 +394,37 @@ TEST(ClearanceEscape, AllowsOnlyNonWorseningNonPhysicalPrefix)
       true, false, false, 0.76, 0.75, 1, 3));
   EXPECT_FALSE(clearanceViolationAllowedDuringEscape(
       false, false, false, 0.20, 0.75, 0, 0));
+}
+
+TEST(DisturbanceRecapture, HandoffUsesTheSameNonWorseningContract)
+{
+  EXPECT_TRUE(handoffClearanceViolationIsAdmissible(
+      true, true, false, false, 3, 3));
+  EXPECT_TRUE(handoffClearanceViolationIsAdmissible(
+      true, true, false, false, 2, 3));
+  EXPECT_FALSE(handoffClearanceViolationIsAdmissible(
+      true, false, false, false, 1, 0));
+  EXPECT_FALSE(handoffClearanceViolationIsAdmissible(
+      true, true, false, false, 4, 3));
+  EXPECT_FALSE(handoffClearanceViolationIsAdmissible(
+      true, true, true, false, 1, 3));
+  EXPECT_FALSE(handoffClearanceViolationIsAdmissible(
+      true, true, false, true, 1, 3));
+  EXPECT_FALSE(handoffClearanceViolationIsAdmissible(
+      false, true, false, false, 1, 3));
+}
+
+TEST(StructuredLocalRepair, SafetyInterruptionRetriesOnlyOwnedPrimitive)
+{
+  constexpr uint8_t recovery_mode = 2;
+  EXPECT_TRUE(structuredRepairSafetyInterruptionRequiresRetry(
+      true, true, recovery_mode, recovery_mode));
+  EXPECT_FALSE(structuredRepairSafetyInterruptionRequiresRetry(
+      false, true, recovery_mode, recovery_mode));
+  EXPECT_FALSE(structuredRepairSafetyInterruptionRequiresRetry(
+      true, false, recovery_mode, recovery_mode));
+  EXPECT_FALSE(structuredRepairSafetyInterruptionRequiresRetry(
+      true, true, 0, recovery_mode));
 }
 
 TEST(ClearanceContract, DistinguishesPhysicalMarginAndEscapeFailures)

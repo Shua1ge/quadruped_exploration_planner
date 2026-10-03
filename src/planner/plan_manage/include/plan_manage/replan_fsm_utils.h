@@ -12,6 +12,31 @@
 namespace scan_planner
 {
 
+// Shared by calibrated-gait execution and candidate certification. The
+// bounded horizon also handles stationary spline tails without a full scan.
+template <typename SamplePosition>
+inline double forwardGaitLookaheadTime(
+    double progress, double duration, SamplePosition sample)
+{
+  double target = std::clamp(progress, 0.0, duration);
+  const double end = std::min(duration, target + 2.0);
+  Eigen::Vector3d previous = sample(target);
+  double length = 0.0;
+  while (target < end && length < 0.15)
+  {
+    target = std::min(end, target + 0.05);
+    const Eigen::Vector3d point = sample(target);
+    length += (point - previous).head<2>().norm();
+    previous = point;
+  }
+  return target;
+}
+
+inline bool structuredRepairMayStartAnotherEscape(bool rejoin_pending, int committed)
+{
+  return !rejoin_pending || committed == 0;
+}
+
 inline bool normalizeFiniteQuaternion(
     Eigen::Quaterniond *quaternion,
     double minimum_squared_norm = 1e-12,
@@ -26,6 +51,167 @@ inline bool normalizeFiniteQuaternion(
     return false;
   quaternion->normalize();
   return quaternion->coeffs().allFinite();
+}
+
+enum class CollisionRiskKind : uint8_t
+{
+  NONE = 0,
+  PREFERRED_MARGIN = 1,
+  HARD_MARGIN = 2,
+};
+
+struct PredictedCollisionInterval
+{
+  bool valid{false};
+  uint64_t request_id{0};
+  int64_t trajectory_id{0};
+  uint64_t map_revision{0};
+  CollisionRiskKind kind{CollisionRiskKind::NONE};
+  double entry_time{0.0};
+  double exit_time{0.0};
+  double repair_start_time{0.0};
+  double rejoin_time{0.0};
+  double minimum_clearance{std::numeric_limits<double>::quiet_NaN()};
+  Eigen::Vector3d entry_position{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d exit_position{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d rejoin_position{Eigen::Vector3d::Zero()};
+  bool exit_known{false};
+  bool braking_window{false};
+};
+
+inline PredictedCollisionInterval makePredictedCollisionInterval(
+    uint64_t request_id, int64_t trajectory_id, uint64_t map_revision,
+    CollisionRiskKind kind, double entry_time, double exit_time,
+    double speed, double guaranteed_deceleration, double reaction_time,
+    double planning_time, double rejoin_margin, double current_time,
+    double trajectory_duration, double confirmed_rejoin_time = -1.0)
+{
+  PredictedCollisionInterval interval;
+  if (request_id == 0 || trajectory_id <= 0 || map_revision == 0 ||
+      kind == CollisionRiskKind::NONE || !std::isfinite(entry_time) ||
+      !std::isfinite(exit_time) || !std::isfinite(speed) ||
+      !std::isfinite(guaranteed_deceleration) ||
+      !std::isfinite(reaction_time) || !std::isfinite(planning_time) ||
+      !std::isfinite(rejoin_margin) || !std::isfinite(current_time) ||
+      !std::isfinite(trajectory_duration) ||
+      std::isnan(confirmed_rejoin_time) || current_time < 0.0 ||
+      entry_time < current_time || exit_time < entry_time || speed < 0.0 ||
+      guaranteed_deceleration <= 0.0 || reaction_time < 0.0 ||
+      planning_time < 0.0 || rejoin_margin < 0.0 ||
+      trajectory_duration <= 0.0 || entry_time > trajectory_duration)
+    return interval;
+
+  const double lead_time = reaction_time + planning_time +
+                           speed / guaranteed_deceleration;
+  interval.request_id = request_id;
+  interval.trajectory_id = trajectory_id;
+  interval.map_revision = map_revision;
+  interval.kind = kind;
+  interval.entry_time = entry_time;
+  interval.exit_time = std::min(exit_time, trajectory_duration);
+  interval.repair_start_time = std::max(
+      current_time, entry_time - lead_time);
+  interval.rejoin_time = confirmed_rejoin_time >= 0.0
+      ? confirmed_rejoin_time
+      : std::min(trajectory_duration,
+                 interval.exit_time + rejoin_margin);
+  interval.valid = interval.exit_time > interval.entry_time &&
+                   interval.repair_start_time < interval.entry_time &&
+                   interval.rejoin_time > interval.exit_time &&
+                   interval.rejoin_time <= trajectory_duration;
+  return interval;
+}
+
+inline bool collisionIntervalMatchesExecution(
+    const PredictedCollisionInterval &interval,
+    uint64_t request_id, int64_t trajectory_id, uint64_t map_revision)
+{
+  return interval.valid && interval.request_id == request_id &&
+         interval.trajectory_id == trajectory_id &&
+         interval.map_revision == map_revision;
+}
+
+inline bool localPatchSeedIsUsable(
+    const PredictedCollisionInterval &interval, double current_time,
+    double trajectory_duration, double minimum_prefix,
+    double minimum_suffix, double minimum_risk_span,
+    uint64_t current_map_revision = 0)
+{
+  return interval.valid && interval.exit_known && !interval.braking_window &&
+         (current_map_revision == 0 ||
+          current_map_revision == interval.map_revision) &&
+         std::isfinite(current_time) && std::isfinite(trajectory_duration) &&
+         std::isfinite(minimum_prefix) && std::isfinite(minimum_suffix) &&
+         std::isfinite(minimum_risk_span) && current_time >= 0.0 &&
+         trajectory_duration > current_time && minimum_prefix >= 0.0 &&
+         minimum_suffix >= 0.0 && minimum_risk_span > 0.0 &&
+         interval.repair_start_time >= current_time + minimum_prefix &&
+         interval.rejoin_time <= trajectory_duration - minimum_suffix &&
+         interval.rejoin_time - interval.repair_start_time >= minimum_risk_span &&
+         interval.entry_time >= interval.repair_start_time &&
+         interval.exit_time <= interval.rejoin_time &&
+         interval.entry_position.allFinite() &&
+         interval.exit_position.allFinite() &&
+         interval.rejoin_position.allFinite();
+}
+
+inline double uniformSeedSampleTime(
+    double start_time, double end_time, size_t sample_index,
+    size_t sample_count)
+{
+  if (!std::isfinite(start_time) || !std::isfinite(end_time) ||
+      end_time <= start_time || sample_count < 2 ||
+      sample_index >= sample_count)
+    return std::numeric_limits<double>::quiet_NaN();
+  return start_time + (end_time - start_time) *
+      static_cast<double>(sample_index) / static_cast<double>(sample_count - 1);
+}
+
+inline bool trajectorySeedMatchesBoundaries(
+    const std::vector<Eigen::Vector3d> &seed,
+    const Eigen::Vector3d &start, const Eigen::Vector3d &end,
+    double position_tolerance)
+{
+  return seed.size() >= 7 && start.allFinite() && end.allFinite() &&
+         std::isfinite(position_tolerance) && position_tolerance >= 0.0 &&
+         std::all_of(seed.begin(), seed.end(),
+                     [](const Eigen::Vector3d &point) {
+                       return point.allFinite();
+                     }) &&
+         (seed.front() - start).norm() <= position_tolerance &&
+         (seed.back() - end).norm() <= position_tolerance;
+}
+
+struct LocalPatchBoundary
+{
+  Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d acceleration{Eigen::Vector3d::Zero()};
+  double position_tolerance{0.0};
+  double velocity_tolerance{0.0};
+  double acceleration_tolerance{0.0};
+};
+
+inline bool localPatchBoundaryIsContinuous(
+    const Eigen::Vector3d &patch_position,
+    const Eigen::Vector3d &patch_velocity,
+    const Eigen::Vector3d &patch_acceleration,
+    const Eigen::Vector3d &reference_position,
+    const Eigen::Vector3d &reference_velocity,
+    const Eigen::Vector3d &reference_acceleration,
+    double position_tolerance, double velocity_tolerance,
+    double acceleration_tolerance)
+{
+  return patch_position.allFinite() && patch_velocity.allFinite() &&
+         patch_acceleration.allFinite() && reference_position.allFinite() &&
+         reference_velocity.allFinite() && reference_acceleration.allFinite() &&
+         std::isfinite(position_tolerance) && position_tolerance >= 0.0 &&
+         std::isfinite(velocity_tolerance) && velocity_tolerance >= 0.0 &&
+         std::isfinite(acceleration_tolerance) && acceleration_tolerance >= 0.0 &&
+         (patch_position - reference_position).norm() <= position_tolerance &&
+         (patch_velocity - reference_velocity).norm() <= velocity_tolerance &&
+         (patch_acceleration - reference_acceleration).norm() <=
+             acceleration_tolerance;
 }
 
 struct ReferencePathLookahead
@@ -226,6 +412,29 @@ inline bool clearanceViolationAllowedDuringEscape(
          current_violations <= initial_violations;
 }
 
+inline bool handoffClearanceViolationIsAdmissible(
+    bool recovery_primitive, bool started_inside_clearance,
+    bool already_exited_clearance, bool physical_collision,
+    size_t current_violations, size_t previous_violations)
+{
+  // Handoff and runtime safety use the same rule: a recovery may start inside
+  // the hard planning belt only when every swept pose remains physically free
+  // and the number of violated clearance samples never increases.  A pose
+  // that started clear receives no exception merely because it belongs to a
+  // recovery primitive.
+  return recovery_primitive && started_inside_clearance &&
+         !already_exited_clearance && !physical_collision &&
+         current_violations <= previous_violations;
+}
+
+inline bool structuredRepairSafetyInterruptionRequiresRetry(
+    bool structured_repair_active, bool structured_repair_executing,
+    uint8_t execution_mode, uint8_t recovery_execution_mode)
+{
+  return structured_repair_active && structured_repair_executing &&
+         execution_mode == recovery_execution_mode;
+}
+
 inline bool clearanceEscapeConfirmedAtActualPose(
     bool escape_active, bool actual_clearance_blocked,
     bool clearance_improved, double actual_displacement,
@@ -359,11 +568,98 @@ inline bool ordinaryRollingReplanAllowed(
   return !structured_repair_executing && replan_requested;
 }
 
+enum class TrackingDeviationAction : uint8_t
+{
+  KEEP_EXECUTING = 0,
+  ROLLING_REPLAN = 1,
+  LOCAL_REPAIR = 2,
+};
+
+inline TrackingDeviationAction classifyTrackingDeviation(
+    bool clearance_limited_execution, bool recovery_corridor_blocked,
+    double tracking_error, double degraded_error,
+    double recovery_error, double execution_age,
+    double execution_grace_period, double no_progress_timeout,
+    double odometry_progress, double minimum_progress)
+{
+  if (!std::isfinite(tracking_error) ||
+      !std::isfinite(degraded_error) || degraded_error < 0.0 ||
+      !std::isfinite(recovery_error) || recovery_error <= degraded_error ||
+      !std::isfinite(execution_age) || execution_age < 0.0 ||
+      !std::isfinite(execution_grace_period) || execution_grace_period < 0.0 ||
+      !std::isfinite(no_progress_timeout) ||
+      no_progress_timeout < execution_grace_period ||
+      !std::isfinite(odometry_progress) || odometry_progress < 0.0 ||
+      !std::isfinite(minimum_progress) || minimum_progress < 0.0)
+    return TrackingDeviationAction::LOCAL_REPAIR;
+
+  if (clearance_limited_execution && execution_age >= no_progress_timeout &&
+      odometry_progress < minimum_progress)
+    return TrackingDeviationAction::LOCAL_REPAIR;
+  if (tracking_error <= degraded_error)
+    return TrackingDeviationAction::KEEP_EXECUTING;
+  if (recovery_corridor_blocked || tracking_error > recovery_error)
+    return TrackingDeviationAction::LOCAL_REPAIR;
+  if (!clearance_limited_execution)
+    return TrackingDeviationAction::ROLLING_REPLAN;
+
+  // A hard-safe clearance-limited trajectory is an explicitly accepted
+  // fallback, not a provisional normal trajectory. Give the controller a
+  // bounded interval in which to accelerate and correct moderate error. If
+  // the physical robot still has not moved when that interval expires, hand
+  // ownership to local recovery instead of publishing an equivalent fallback
+  // and resetting the controller's trajectory clock.
+  if (execution_age >= no_progress_timeout &&
+      odometry_progress < minimum_progress)
+    return TrackingDeviationAction::LOCAL_REPAIR;
+  if (execution_age < execution_grace_period ||
+      odometry_progress < minimum_progress)
+    return TrackingDeviationAction::KEEP_EXECUTING;
+  return TrackingDeviationAction::ROLLING_REPLAN;
+}
+
+inline double calibratedForwardGaitCommand(
+    double desired_effective_speed, double minimum_command,
+    double measured_effective_speed, double maximum_command)
+{
+  if (minimum_command <= 0.0 || desired_effective_speed <= 0.0)
+    return desired_effective_speed;
+  return std::clamp(desired_effective_speed * minimum_command /
+                        measured_effective_speed,
+                    minimum_command, maximum_command);
+}
+
 inline bool holdCommandAlreadyIssuedForVersion(
     uint64_t request, int64_t trajectory,
     uint64_t previous_request, int64_t previous_trajectory)
 {
   return request == previous_request && trajectory == previous_trajectory;
+}
+
+enum class TimedOutHandoffExecution : uint8_t
+{
+  UNCONFIRMED,
+  CANDIDATE_HELD,
+  PREVIOUS_HELD,
+};
+
+inline TimedOutHandoffExecution reconcileTimedOutHandoff(
+    bool timeout_hold_issued, bool controller_soft_hold,
+    bool matching_hold_reason, uint64_t state_request,
+    int64_t state_trajectory, uint64_t candidate_request,
+    int64_t candidate_trajectory, uint64_t previous_request,
+    int64_t previous_trajectory)
+{
+  if (!timeout_hold_issued || !controller_soft_hold ||
+      !matching_hold_reason)
+    return TimedOutHandoffExecution::UNCONFIRMED;
+  if (state_request == candidate_request &&
+      state_trajectory == candidate_trajectory)
+    return TimedOutHandoffExecution::CANDIDATE_HELD;
+  if (state_request == previous_request &&
+      state_trajectory == previous_trajectory)
+    return TimedOutHandoffExecution::PREVIOUS_HELD;
+  return TimedOutHandoffExecution::UNCONFIRMED;
 }
 
 inline bool trajectoryHandoffTimedOut(
@@ -372,6 +668,26 @@ inline bool trajectoryHandoffTimedOut(
   return pending && std::isfinite(elapsed_seconds) &&
          std::isfinite(timeout_seconds) && timeout_seconds > 0.0 &&
          elapsed_seconds >= timeout_seconds;
+}
+
+inline bool trajectoryHandoffReconciliationTimedOut(
+    bool pending, bool timeout_hold_issued,
+    double elapsed_since_hold_seconds, double timeout_seconds)
+{
+  return pending && timeout_hold_issued &&
+         std::isfinite(elapsed_since_hold_seconds) &&
+         std::isfinite(timeout_seconds) && timeout_seconds > 0.0 &&
+         elapsed_since_hold_seconds >= timeout_seconds;
+}
+
+inline int reserveTrajectoryIdAfterAmbiguousHandoff(
+    int current_trajectory_id, int64_t ambiguous_trajectory_id)
+{
+  const int bounded_ambiguous_id = static_cast<int>(std::clamp<int64_t>(
+      ambiguous_trajectory_id,
+      static_cast<int64_t>(std::numeric_limits<int>::min()),
+      static_cast<int64_t>(std::numeric_limits<int>::max())));
+  return std::max(current_trajectory_id, bounded_ambiguous_id);
 }
 
 inline bool validBsplineStructure(
@@ -630,6 +946,24 @@ inline double normalizePlanarAngle(double angle)
   if (!std::isfinite(angle))
     return std::numeric_limits<double>::quiet_NaN();
   return std::remainder(angle, 2.0 * M_PI);
+}
+
+inline int planarHandoffSweepSampleCount(
+    double translation_distance, double yaw_delta,
+    double translation_step, double yaw_step)
+{
+  if (!std::isfinite(translation_distance) || translation_distance < 0.0 ||
+      !std::isfinite(yaw_delta) || !std::isfinite(translation_step) ||
+      translation_step <= 0.0 || !std::isfinite(yaw_step) || yaw_step <= 0.0)
+    return 0;
+  const double normalized_delta = normalizePlanarAngle(yaw_delta);
+  if (!std::isfinite(normalized_delta))
+    return 0;
+  const int translation_samples = static_cast<int>(
+      std::ceil(translation_distance / translation_step));
+  const int yaw_samples = static_cast<int>(
+      std::ceil(std::abs(normalized_delta) / yaw_step));
+  return std::max(translation_samples, yaw_samples);
 }
 
 inline double interpolatePlanarYaw(

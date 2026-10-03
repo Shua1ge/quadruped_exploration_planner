@@ -76,6 +76,9 @@ bool pointInsideDoubleCylinder(
     const Eigen::Quaterniond& orientation, double radius, double offset,
     double z_down, double z_up);
 int endpointObservation(bool self_filter_enabled, bool inside_self_filter);
+bool rayTraversalStopsAtOccupied(bool historically_occupied);
+bool occupiedMissHasEnoughConfirmation(
+    uint8_t consecutive_miss_frames, int required_frames);
 }
 
 // voxel hashing
@@ -126,6 +129,7 @@ struct MappingParameters {
   double prob_hit_log_, prob_miss_log_, clamp_min_log_, clamp_max_log_,
       min_occupancy_log_;                   // logit of occupancy probability
   double min_ray_length_, max_ray_length_;  // range of doing raycasting
+  int occupied_miss_confirmation_frames_;
 
   /* visualization and computation time display */
   double vis_height_, ground_height_;
@@ -153,6 +157,7 @@ struct MappingData {
   std::vector<double> occupancy_buffer_;
   std::vector<char> occupancy_buffer_inflate_;
   std::vector<int> occupancy_buffer_inflate_cnt_;
+  std::vector<uint8_t> occupied_miss_confirmation_count_;
   vector<Eigen::Vector3i> inflate_offsets_;
 
   // raycast origin and sensor pose data

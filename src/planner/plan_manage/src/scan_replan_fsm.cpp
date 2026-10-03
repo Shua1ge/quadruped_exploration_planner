@@ -70,13 +70,27 @@ namespace scan_planner
     preferred_clearance_margin_ = load_parameter<double>(
         node_, "fsm.preferred_clearance_margin", 0.20);
     clearance_limited_max_forward_speed_ = load_parameter<double>(
-        node_, "fsm.clearance_limited_max_forward_speed", 0.25);
+        node_, "fsm.clearance_limited_max_forward_speed", 0.30);
+    min_forward_command_ = load_parameter<double>(
+        node_, "fsm.min_forward_command", 0.30);
+    min_forward_effective_speed_ = load_parameter<double>(
+        node_, "fsm.min_forward_effective_speed", 0.165);
+    if (!std::isfinite(min_forward_command_) || min_forward_command_ <= 0.0 ||
+        !std::isfinite(min_forward_effective_speed_) || min_forward_effective_speed_ <= 0.0 ||
+        clearance_limited_max_forward_speed_ < min_forward_command_)
+      throw std::invalid_argument("invalid measured forward gait profile");
     clearance_limited_max_lateral_speed_ = load_parameter<double>(
         node_, "fsm.clearance_limited_max_lateral_speed", 0.08);
     clearance_limited_max_yaw_rate_ = load_parameter<double>(
         node_, "fsm.clearance_limited_max_yaw_rate", 0.50);
     clearance_limited_max_tracking_correction_ = load_parameter<double>(
         node_, "fsm.clearance_limited_max_tracking_correction", 0.08);
+    clearance_limited_execution_grace_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_execution_grace", 1.00);
+    clearance_limited_no_progress_timeout_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_no_progress_timeout", 2.00);
+    clearance_limited_min_progress_ = load_parameter<double>(
+        node_, "fsm.clearance_limited_min_progress", 0.05);
     local_repair_anchor_min_distance_ = load_parameter<double>(
         node_, "fsm.local_repair_anchor_min_distance", 0.45);
     local_repair_anchor_max_distance_ = load_parameter<double>(
@@ -90,7 +104,7 @@ namespace scan_planner
     local_repair_max_segments_per_transaction_ = load_parameter<int>(
         node_, "fsm.local_repair_max_segments_per_transaction", 3);
     local_repair_max_speed_ = load_parameter<double>(
-        node_, "fsm.local_repair_max_speed", 0.25);
+        node_, "fsm.local_repair_max_speed", 0.30);
     local_repair_time_margin_ = load_parameter<double>(
         node_, "fsm.local_repair_time_margin", 1.20);
     enable_holonomic_lateral_repair_ = load_parameter<bool>(
@@ -117,6 +131,8 @@ namespace scan_planner
         node_, "fsm.command_stop_latency", 0.30);
     trajectory_ack_timeout_ = load_parameter<double>(
         node_, "fsm.trajectory_ack_timeout", 0.75);
+    trajectory_ack_reconciliation_timeout_ = load_parameter<double>(
+        node_, "fsm.trajectory_ack_reconciliation_timeout", 0.75);
     pose_free_release_cycles_ = load_parameter<int>(
         node_, "fsm.pose_free_release_cycles", 3);
     local_hold_release_cycles_ = load_parameter<int>(
@@ -133,6 +149,10 @@ namespace scan_planner
         clearance_limited_max_lateral_speed_ < 0.0 ||
         clearance_limited_max_yaw_rate_ <= 0.0 ||
         clearance_limited_max_tracking_correction_ <= 0.0 ||
+        clearance_limited_execution_grace_ < 0.0 ||
+        clearance_limited_no_progress_timeout_ <
+            clearance_limited_execution_grace_ ||
+        clearance_limited_min_progress_ < 0.0 ||
         local_repair_anchor_min_distance_ <= 0.2 ||
         local_repair_anchor_max_distance_ <
             local_repair_anchor_min_distance_ ||
@@ -153,6 +173,7 @@ namespace scan_planner
         guaranteed_braking_deceleration_ <= 0.0 ||
         command_stop_latency_ < 0.0 ||
         trajectory_ack_timeout_ <= 0.0 ||
+        trajectory_ack_reconciliation_timeout_ <= 0.0 ||
         pose_free_release_cycles_ <= 0 ||
         local_hold_release_cycles_ <= 0)
       throw std::runtime_error(
@@ -211,13 +232,15 @@ namespace scan_planner
     // or holding the mapper's write lock.
     planning_clearance_offsets_.clear();
     const double resolution = planner_manager_->grid_map_->getResolution();
+    const double maximum_clearance_margin = std::max(
+        planning_clearance_margin_, preferred_clearance_margin_);
     const int clearance_cells = static_cast<int>(
-        std::ceil(planning_clearance_margin_ / resolution));
+        std::ceil(maximum_clearance_margin / resolution));
     for (int x = -clearance_cells; x <= clearance_cells; ++x)
       for (int y = -clearance_cells; y <= clearance_cells; ++y)
       {
         const Eigen::Vector2d offset(x * resolution, y * resolution);
-        if (offset.norm() <= planning_clearance_margin_ + 1e-9)
+        if (offset.norm() <= maximum_clearance_margin + 1e-9)
           planning_clearance_offsets_.push_back(offset);
       }
     if (planning_clearance_offsets_.empty())
@@ -668,6 +691,7 @@ namespace scan_planner
     structured_local_repair_executing_.store(false);
     structured_local_repair_finished_.store(false);
     structured_local_repair_rejoin_pending_.store(false);
+    structured_local_repair_interrupted_.store(false);
     structured_local_repair_request_id_.store(0);
     structured_local_repair_trajectory_id_.store(0);
     structured_local_repair_segments_committed_.store(0);
@@ -847,6 +871,7 @@ namespace scan_planner
     structured_local_repair_executing_.store(false);
     structured_local_repair_finished_.store(false);
     structured_local_repair_rejoin_pending_.store(false);
+    structured_local_repair_interrupted_.store(false);
     structured_local_repair_request_id_.store(0);
     structured_local_repair_trajectory_id_.store(0);
     structured_local_repair_segments_committed_.store(0);
@@ -1075,6 +1100,67 @@ namespace scan_planner
   void SCANReplanFSM::executionStateCallback(
       const scan_planner_msgs::msg::ExecutionState::ConstSharedPtr &msg)
   {
+    {
+      std::unique_lock<std::mutex> pending_lock(pending_handoff_mutex_);
+      if (pending_handoff_.valid && pending_handoff_.timeout_hold_issued)
+      {
+        uint64_t previous_request = 0;
+        int64_t previous_trajectory = 0;
+        {
+          std::lock_guard<std::mutex> execution_lock(execution_snapshot_mutex_);
+          if (execution_snapshot_.valid)
+          {
+            previous_request = execution_snapshot_.request_id;
+            previous_trajectory = execution_snapshot_.trajectory_id;
+          }
+        }
+        const auto outcome = reconcileTimedOutHandoff(
+            true,
+            msg->state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
+            msg->reason == "CONTROLLER_ACK_UNKNOWN",
+            msg->request_id, msg->trajectory_id,
+            pending_handoff_.request_id,
+            pending_handoff_.trajectory_id,
+            previous_request, previous_trajectory);
+        if (outcome == TimedOutHandoffExecution::CANDIDATE_HELD ||
+            (outcome == TimedOutHandoffExecution::PREVIOUS_HELD &&
+             pending_handoff_.timeout_candidate_rejected))
+        {
+          const PendingTrajectoryHandoff handoff = pending_handoff_;
+          if (outcome == TimedOutHandoffExecution::CANDIDATE_HELD)
+          {
+            planner_manager_->local_data_ = handoff.candidate;
+            updateExecutionTrajectorySnapshot(
+                handoff.candidate, handoff.request_id,
+                handoff.clearance_escape_active,
+                handoff.clearance_escape_deadline,
+                handoff.initial_clearance_violations,
+                handoff.fixed_body_yaw, handoff.body_yaw,
+                handoff.execution_mode);
+          }
+          else
+          {
+            planner_manager_->local_data_ = handoff.previous;
+          }
+          pending_handoff_.valid = false;
+          pending_lock.unlock();
+          safety_stop_active_.store(true);
+          stopped_local_repair_pending_.store(true);
+          predictive_replan_requested_.store(false);
+          collision_interval_replan_requested_.store(false);
+          {
+            std::lock_guard<std::mutex> interval_lock(execution_snapshot_mutex_);
+            predicted_collision_interval_.valid = false;
+          }
+          RCLCPP_ERROR(
+              node_->get_logger(),
+              "[TRAJECTORY_ACK_TIMEOUT_RECONCILED_HOLD] request=%llu trajectory=%lld candidate_installed=%d; stopped recovery required",
+              static_cast<unsigned long long>(msg->request_id),
+              static_cast<long long>(msg->trajectory_id),
+              outcome == TimedOutHandoffExecution::CANDIDATE_HELD);
+        }
+      }
+    }
     uint64_t executing_request = 0;
     int64_t executing_trajectory = 0;
     bool valid = false;
@@ -1107,6 +1193,14 @@ namespace scan_planner
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP);
+    if (std::isfinite(msg->execution_time))
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      if (execution_snapshot_.valid && execution_snapshot_.request_id == msg->request_id &&
+          execution_snapshot_.trajectory_id == msg->trajectory_id)
+        execution_snapshot_.controller_execution_time = std::clamp(
+            msg->execution_time, 0.0, execution_snapshot_.duration);
+    }
 
     if (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED &&
         msg->reason == "TERMINAL_NO_PROGRESS")
@@ -1166,11 +1260,31 @@ namespace scan_planner
       return;
     }
     handoff = pending_handoff_;
+    if (handoff.timeout_hold_issued)
+    {
+      if (msg->status == scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED)
+        pending_handoff_.timeout_candidate_rejected = true;
+      RCLCPP_ERROR(
+          node_->get_logger(),
+          "[LATE_TRAJECTORY_ACK_UNCONFIRMED] request=%llu trajectory=%lld status=%u; preserving timeout HOLD until execution-state reconciliation",
+          static_cast<unsigned long long>(msg->request_id),
+          static_cast<long long>(msg->trajectory_id),
+          static_cast<unsigned int>(msg->status));
+      return;
+    }
 
     if (msg->status != scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED)
     {
       planner_manager_->local_data_ = handoff.previous;
-      predictive_replan_requested_.store(true);
+      if (handoff.collision_interval_repair)
+      {
+        collision_interval_replan_requested_.store(true);
+        predictive_replan_requested_.store(true);
+      }
+      else
+      {
+        predictive_replan_requested_.store(true);
+      }
       const bool recovery_handoff =
           handoff.structured_repair_segment ||
           handoff.structured_repair_rejoin;
@@ -1211,6 +1325,19 @@ namespace scan_planner
     }
 
     planner_manager_->local_data_ = handoff.candidate;
+    if (handoff.collision_interval_repair)
+    {
+      std::lock_guard<std::mutex> interval_lock(execution_snapshot_mutex_);
+      if (collisionIntervalMatchesExecution(
+              predicted_collision_interval_,
+              handoff.collision_interval_request_id,
+              handoff.collision_interval_trajectory_id,
+              handoff.collision_interval_map_revision))
+      {
+        predicted_collision_interval_.valid = false;
+        collision_interval_replan_requested_.store(false);
+      }
+    }
     updateExecutionTrajectorySnapshot(
         handoff.candidate, handoff.request_id,
         handoff.clearance_escape_active,
@@ -1224,6 +1351,7 @@ namespace scan_planner
       structured_local_repair_executing_.store(true);
       structured_local_repair_finished_.store(false);
       structured_local_repair_rejoin_pending_.store(false);
+      structured_local_repair_interrupted_.store(false);
       structured_local_repair_request_id_.store(handoff.request_id);
       structured_local_repair_trajectory_id_.store(handoff.trajectory_id);
       stopped_local_repair_pending_.store(false);
@@ -1257,6 +1385,7 @@ namespace scan_planner
       structured_local_repair_executing_.store(false);
       structured_local_repair_finished_.store(false);
       structured_local_repair_rejoin_pending_.store(false);
+      structured_local_repair_interrupted_.store(false);
       structured_local_repair_request_id_.store(0);
       structured_local_repair_trajectory_id_.store(0);
       structured_local_repair_segments_committed_.store(0);
@@ -1584,10 +1713,13 @@ namespace scan_planner
     last_fsm_callback_wall_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     fsm_callback_stall_reported_.store(false);
-    std::shared_ptr<scan_planner_msgs::msg::TrajectoryAck> timeout_ack;
+    uint64_t timed_out_request = 0;
+    int64_t timed_out_trajectory = 0;
+    bool reconciliation_timed_out = false;
+    PendingTrajectoryHandoff unresolved_handoff;
     {
       std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
-      if (pending_handoff_.valid)
+      if (pending_handoff_.valid && !pending_handoff_.timeout_hold_issued)
       {
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() -
@@ -1595,18 +1727,77 @@ namespace scan_planner
         if (trajectoryHandoffTimedOut(
                 true, elapsed, trajectory_ack_timeout_))
         {
-          timeout_ack =
-              std::make_shared<scan_planner_msgs::msg::TrajectoryAck>();
-          timeout_ack->request_id = pending_handoff_.request_id;
-          timeout_ack->trajectory_id = pending_handoff_.trajectory_id;
-          timeout_ack->status =
-              scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED;
-          timeout_ack->reason = "CONTROLLER_ACK_TIMEOUT";
+          pending_handoff_.timeout_hold_issued = true;
+          pending_handoff_.timeout_hold_issued_at =
+              std::chrono::steady_clock::now();
+          timed_out_request = pending_handoff_.request_id;
+          timed_out_trajectory = pending_handoff_.trajectory_id;
+        }
+      }
+      else if (pending_handoff_.valid &&
+               pending_handoff_.timeout_hold_issued)
+      {
+        const double elapsed_since_hold = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() -
+            pending_handoff_.timeout_hold_issued_at).count();
+        if (trajectoryHandoffReconciliationTimedOut(
+                true, true, elapsed_since_hold,
+                trajectory_ack_reconciliation_timeout_))
+        {
+          unresolved_handoff = pending_handoff_;
+          pending_handoff_.valid = false;
+          reconciliation_timed_out = true;
         }
       }
     }
-    if (timeout_ack)
-      trajectoryAckCallback(timeout_ack);
+    if (timed_out_request != 0)
+    {
+      scan_planner_msgs::msg::ExecutionCommand command;
+      command.command = scan_planner_msgs::msg::ExecutionCommand::COMMAND_HOLD;
+      command.request_id = timed_out_request;
+      command.trajectory_id = timed_out_trajectory;
+      command.reason = "CONTROLLER_ACK_UNKNOWN";
+      execution_command_pub_->publish(command);
+      RCLCPP_ERROR(node_->get_logger(),
+                   "[TRAJECTORY_ACK_UNKNOWN_HOLD] request=%llu trajectory=%lld; awaiting controller state",
+                   static_cast<unsigned long long>(timed_out_request),
+                   static_cast<long long>(timed_out_trajectory));
+    }
+    if (reconciliation_timed_out)
+    {
+      // The timeout HOLD targets the candidate version and therefore stops
+      // either possible execution owner.  Once Controller fails to report an
+      // exact version within the second bounded window, discard the candidate
+      // transaction and recover from live odometry instead of occupying the
+      // planning FSM forever.
+      LocalTrajData recovery_base = unresolved_handoff.previous;
+      // The Controller may have accepted the candidate even though both ACK
+      // and execution-state confirmation were lost.  Reserve that trajectory
+      // id so the next recovery candidate is strictly newer in either case.
+      recovery_base.traj_id_ = reserveTrajectoryIdAfterAmbiguousHandoff(
+          recovery_base.traj_id_, unresolved_handoff.trajectory_id);
+      planner_manager_->local_data_ = recovery_base;
+      scan_planner_msgs::msg::ExecutionCommand command;
+      command.command =
+          scan_planner_msgs::msg::ExecutionCommand::COMMAND_HOLD;
+      command.request_id = unresolved_handoff.request_id;
+      command.trajectory_id = unresolved_handoff.trajectory_id;
+      command.reason = "CONTROLLER_ACK_UNRESOLVED";
+      execution_command_pub_->publish(command);
+      safety_stop_active_.store(true);
+      stopped_local_repair_pending_.store(true);
+      predictive_replan_requested_.store(true);
+      collision_interval_replan_requested_.store(false);
+      {
+        std::lock_guard<std::mutex> interval_lock(execution_snapshot_mutex_);
+        predicted_collision_interval_.valid = false;
+      }
+      RCLCPP_ERROR(
+          node_->get_logger(),
+          "[TRAJECTORY_ACK_RECONCILIATION_TIMEOUT] request=%llu trajectory=%lld; candidate transaction aborted, HOLD retained, recovery will restart from live odometry",
+          static_cast<unsigned long long>(unresolved_handoff.request_id),
+          static_cast<long long>(unresolved_handoff.trajectory_id));
+    }
     {
       std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
       if (pending_handoff_.valid)
@@ -1921,8 +2112,7 @@ namespace scan_planner
       else
       {
         const auto *info = &planner_manager_->local_data_;
-        const double t_cur = std::clamp(
-            (node_->now() - info->start_time_).seconds(), 0.0, info->duration_);
+        const double t_cur = executionProgressTime(*info);
         const double remaining_time = std::max(0.0, info->duration_ - t_cur);
         if (shouldKeepExecutingAfterRollingReplanFailure(
                 reference_path_active_, reference_path_update_pending_,
@@ -1962,7 +2152,7 @@ namespace scan_planner
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
       rclcpp::Time time_now = node_->now();
-      double t_cur = (time_now - info->start_time_).seconds();
+      double t_cur = executionProgressTime(*info);
       t_cur = min(info->duration_, t_cur);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
@@ -2143,6 +2333,7 @@ namespace scan_planner
         structured_local_repair_executing_.store(false);
         structured_local_repair_finished_.store(false);
         structured_local_repair_rejoin_pending_.store(false);
+        structured_local_repair_interrupted_.store(false);
         structured_local_repair_request_id_.store(0);
         structured_local_repair_trajectory_id_.store(0);
         replan_fail_count_ = 0;
@@ -2206,7 +2397,7 @@ namespace scan_planner
     refreshPlanningOdomFromSafety();
     LocalTrajData *info = &planner_manager_->local_data_;
     rclcpp::Time time_now = node_->now();
-    double t_cur = (time_now - info->start_time_).seconds();
+    double t_cur = executionProgressTime(*info);
     t_cur = std::min(std::max(t_cur, 0.0), info->duration_);
 
     const bool trajectory_valid =
@@ -2217,6 +2408,180 @@ namespace scan_planner
         ? (info->position_traj_.evaluateDeBoorT(t_cur).head<2>() -
            odom_pos_.head<2>()).norm()
         : std::numeric_limits<double>::infinity();
+    if (collision_interval_replan_requested_.load() && trajectory_valid)
+    {
+      PredictedCollisionInterval interval;
+      {
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        interval = predicted_collision_interval_;
+      }
+      const uint64_t current_request = active_reference_request_id_.load();
+      const uint64_t current_map_revision =
+          planner_manager_->grid_map_->getMapRevision();
+      if (interval.kind == CollisionRiskKind::HARD_MARGIN &&
+          interval.valid && interval.request_id == current_request &&
+          interval.trajectory_id == info->traj_id_ &&
+          localPatchSeedIsUsable(
+              interval, t_cur, info->duration_, 0.12, 0.30, 0.20,
+              current_map_revision) &&
+          tracking_error <= rolling_replan_max_start_error_ &&
+          (interval.rejoin_position -
+           info->position_traj_.evaluateDeBoorT(interval.rejoin_time).head<3>())
+                  .head<2>().norm() <= 0.08)
+      {
+        const double splice_start = interval.repair_start_time;
+        const double splice_end = interval.rejoin_time;
+        const double remaining_duration = info->duration_ - t_cur;
+        const int sample_count = std::max(
+            7, static_cast<int>(std::ceil(
+                remaining_duration / std::max(
+                    0.04, planner_manager_->pp_.ctrl_pt_dist /
+                              std::max(0.10, planner_manager_->pp_.max_vel_)))) + 1);
+        const double sample_step = remaining_duration / (sample_count - 1);
+        const Eigen::Vector3d matched_start =
+            info->position_traj_.evaluateDeBoorT(t_cur).head<3>();
+        if ((odom_pos_ - matched_start).head<2>().norm() >
+            rolling_replan_max_start_error_)
+        {
+          collision_interval_replan_requested_.store(false);
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "[LOCAL_INTERVAL_REPAIR_STALE_START] odom_to_trajectory=%.3fm limit=%.3fm",
+              (odom_pos_ - matched_start).head<2>().norm(),
+              rolling_replan_max_start_error_);
+          return false;
+        }
+        const Eigen::Vector3d patch_start =
+            info->position_traj_.evaluateDeBoorT(splice_start).head<3>();
+        const Eigen::Vector3d rejoin = interval.rejoin_position;
+        const double patch_length = (rejoin - patch_start).norm();
+        const double minimum_patch_duration = std::max(
+            patch_length / std::max(0.10, planner_manager_->pp_.max_vel_),
+            std::sqrt(patch_length /
+                      std::max(0.10, planner_manager_->pp_.max_acc_)));
+        if (splice_end - splice_start < minimum_patch_duration)
+        {
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "[LOCAL_INTERVAL_REPAIR_REJECTED] duration=%.2f minimum=%.2f",
+              splice_end - splice_start, minimum_patch_duration);
+          collision_interval_replan_requested_.store(false);
+          return false;
+        }
+        std::vector<Eigen::Vector3d> seed;
+        seed.reserve(sample_count);
+        for (int index = 0; index < sample_count; ++index)
+        {
+          const double t = uniformSeedSampleTime(
+              t_cur, info->duration_, static_cast<size_t>(index),
+              static_cast<size_t>(sample_count));
+          if (index == 0)
+          {
+            seed.push_back(odom_pos_);
+            continue;
+          }
+          if (t <= splice_start || t >= splice_end)
+          {
+            seed.push_back(info->position_traj_.evaluateDeBoorT(t).head<3>());
+            continue;
+          }
+          const double ratio = (t - splice_start) /
+                               (splice_end - splice_start);
+          seed.push_back(patch_start + ratio * (rejoin - patch_start));
+        }
+        const Eigen::Vector3d final_position =
+            info->position_traj_.evaluateDeBoorT(info->duration_).head<3>();
+
+        std::vector<Eigen::Vector3d> derivatives = {
+            info->velocity_traj_.evaluateDeBoorT(t_cur).head<3>(),
+            info->velocity_traj_.evaluateDeBoorT(info->duration_).head<3>(),
+            info->acceleration_traj_.evaluateDeBoorT(t_cur).head<3>(),
+            info->acceleration_traj_.evaluateDeBoorT(info->duration_).head<3>()};
+        const Eigen::Vector3d saved_start = start_pt_;
+        const Eigen::Vector3d saved_velocity = start_vel_;
+        const Eigen::Vector3d saved_acceleration = start_acc_;
+        const Eigen::Vector3d saved_goal = end_pt_;
+        const Eigen::Vector3d saved_target = local_target_pt_;
+        const Eigen::Vector3d saved_target_velocity = local_target_vel_;
+        start_pt_ = odom_pos_;
+        // The seed begins at the measured pose, so its derivatives must come
+        // from the same measured state.  safety_odom_vel_ is already filtered
+        // in the world frame; using the old reference derivatives here would
+        // create a position-continuous but dynamically discontinuous handoff.
+        const Eigen::Vector3d measured_start_velocity = odom_vel_;
+        const Eigen::Vector3d measured_start_acceleration =
+            Eigen::Vector3d::Zero();
+        start_vel_ = measured_start_velocity;
+        start_acc_ = measured_start_acceleration;
+        end_pt_ = info->position_traj_.evaluateDeBoorT(info->duration_).head<3>();
+        local_target_pt_ = end_pt_;
+        local_target_vel_ = derivatives[1];
+        const bool patch_success = trajectorySeedMatchesBoundaries(
+            seed, odom_pos_, final_position, 0.02) &&
+            callReboundReplan(
+                true, false, &local_target_pt_, false, &seed,
+                &local_target_vel_, &derivatives[3],
+                &measured_start_velocity, &measured_start_acceleration,
+                sample_step,
+                &interval, t_cur);
+        start_pt_ = saved_start;
+        start_vel_ = saved_velocity;
+        start_acc_ = saved_acceleration;
+        end_pt_ = saved_goal;
+        local_target_pt_ = saved_target;
+        local_target_vel_ = saved_target_velocity;
+        if (patch_success)
+        {
+          bool handoff_pending = false;
+          {
+            std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+            handoff_pending = pending_handoff_.valid &&
+                pending_handoff_.collision_interval_repair &&
+                pending_handoff_.collision_interval_request_id ==
+                    interval.request_id &&
+                pending_handoff_.collision_interval_trajectory_id ==
+                    interval.trajectory_id &&
+                pending_handoff_.collision_interval_map_revision ==
+                    interval.map_revision;
+          }
+          RCLCPP_INFO(
+              node_->get_logger(),
+              "[LOCAL_INTERVAL_REPAIR_SUBMITTED] request=%llu base_trajectory=%lld map_revision=%llu interval=[%.2f,%.2f] rejoin=%.2f seed_points=%zu ack_pending=%d",
+              static_cast<unsigned long long>(interval.request_id),
+              static_cast<long long>(interval.trajectory_id),
+              static_cast<unsigned long long>(interval.map_revision),
+              interval.entry_time, interval.exit_time, interval.rejoin_time,
+              seed.size(), handoff_pending);
+          return handoff_pending;
+        }
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "[LOCAL_INTERVAL_REPAIR_FAILED] request=%llu trajectory=%lld; trying ordinary rolling replanning",
+            static_cast<unsigned long long>(interval.request_id),
+            static_cast<long long>(interval.trajectory_id));
+      }
+      else
+      {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "[LOCAL_INTERVAL_REPAIR_SKIPPED] valid=%d exit_known=%d braking=%d map_revision=%llu current_map_revision=%llu current_t=%.2f",
+            interval.valid, interval.exit_known, interval.braking_window,
+            static_cast<unsigned long long>(interval.map_revision),
+            static_cast<unsigned long long>(current_map_revision), t_cur);
+      }
+      bool interval_handoff_pending = false;
+      {
+        std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+        interval_handoff_pending = pending_handoff_.valid &&
+                                   pending_handoff_.collision_interval_repair;
+      }
+      if (!interval_handoff_pending)
+      {
+        collision_interval_replan_requested_.store(false);
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        predicted_collision_interval_.valid = false;
+      }
+    }
     const bool reuse_suffix = shouldReuseCurrentTrajectorySuffix(
         reference_path_update_pending_, trajectory_valid, remaining_time,
         tracking_error, rolling_replan_max_start_error_) &&
@@ -2309,25 +2674,6 @@ namespace scan_planner
         !have_target_)
       return false;
 
-    if (!enable_holonomic_lateral_repair_)
-    {
-      // The former anchor family held body yaw fixed while translating in an
-      // arbitrary clearance direction.  That is a holonomic-base assumption,
-      // not a certified Go2 RL locomotion primitive.  Preserve recovery
-      // ownership so finishProcess() produces a viewpoint-scoped terminal
-      // instead of silently downgrading this to a generic BLOCKED retry.
-      structured_local_repair_active_.store(true);
-      stopped_local_repair_active_.store(true);
-      structured_local_repair_segments_committed_.store(0);
-      replan_fail_count_ = max_replan_fail_count_;
-      RCLCPP_ERROR_THROTTLE(
-          node_->get_logger(), *node_->get_clock(), 1000,
-          "[HOLONOMIC_LOCAL_REPAIR_DISABLED] request_id=%llu; ordinary same-goal path candidates are exhausted, rejecting the exact viewpoint instead of commanding fixed-yaw lateral motion",
-          static_cast<unsigned long long>(
-              active_reference_request_id_.load()));
-      return false;
-    }
-
     // From this point until a validated candidate succeeds (or the bounded
     // retry budget is exhausted), SCAN owns the request as LOCAL_REPAIR.  A
     // failed optimizer call must not silently downgrade it to generic
@@ -2335,10 +2681,22 @@ namespace scan_planner
     const bool new_recovery_transaction =
         !structured_local_repair_active_.exchange(true);
     if (new_recovery_transaction)
+    {
       structured_local_repair_segments_committed_.store(0);
+      structured_local_repair_interrupted_.store(false);
+    }
 
     const int committed_segments =
         structured_local_repair_segments_committed_.load();
+    if (!structuredRepairMayStartAnotherEscape(
+            structured_local_repair_rejoin_pending_.load(), committed_segments))
+    {
+      replan_fail_count_ = max_replan_fail_count_;
+      RCLCPP_ERROR(node_->get_logger(),
+          "[STRUCTURED_REJOIN_EXHAUSTED] request=%llu; no repeated escape after a failed rejoin",
+          static_cast<unsigned long long>(active_reference_request_id_.load()));
+      return false;
+    }
     if (!structuredRepairSegmentBudgetAvailable(
             committed_segments,
             local_repair_max_segments_per_transaction_))
@@ -2408,6 +2766,11 @@ namespace scan_planner
     const auto snapshot = map->captureInflatedOccupancySnapshot();
     map->useInflatedOccupancySnapshotForCurrentThread(snapshot);
     const double actual_yaw = getOdomYaw();
+    const bool fixed_body_yaw_repair = enable_holonomic_lateral_repair_;
+    if (!fixed_body_yaw_repair)
+      RCLCPP_INFO_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 1000,
+          "[DISTURBANCE_RECAPTURE] using turn-then-drive primitives; fixed-yaw lateral translation remains disabled");
 
     for (size_t direction_index = 0;
          direction_index < directions.size(); ++direction_index)
@@ -2431,12 +2794,50 @@ namespace scan_planner
         violation_counts.reserve(samples + 1);
         bool physical_collision = false;
         const double target_yaw = std::atan2(direction.y(), direction.x());
+
+        // A non-holonomic recovery is two motions, not a diagonal strafe:
+        // first rotate in place while the physical footprint remains free,
+        // then drive along the candidate direction.  The planning belt may
+        // already be violated at the disturbed start pose, but the physical
+        // footprint is never relaxed during either phase.
+        if (!fixed_body_yaw_repair)
+        {
+          constexpr double yaw_step = 5.0 * M_PI / 180.0;
+          const double yaw_delta = normalizePlanarAngle(
+              target_yaw - actual_yaw);
+          const int yaw_samples = std::max(
+              1, static_cast<int>(std::ceil(
+                     std::abs(yaw_delta) / yaw_step)));
+          for (int yaw_sample = 0; yaw_sample <= yaw_samples; ++yaw_sample)
+          {
+            const double ratio =
+                static_cast<double>(yaw_sample) / yaw_samples;
+            const double rotation_yaw = interpolatePlanarYaw(
+                actual_yaw, target_yaw, ratio);
+            if (!std::isfinite(rotation_yaw) ||
+                map->getInflateOccupancy(start_pt_, rotation_yaw) != 0)
+            {
+              physical_collision = true;
+              break;
+            }
+            size_t rotation_violations = 0;
+            footprintOccupiedWithMargin(
+                map, start_pt_, rotation_yaw,
+                planning_clearance_margin_, nullptr,
+                &rotation_violations);
+            violation_counts.push_back(rotation_violations);
+          }
+        }
+
         for (int sample = 0; sample <= samples; ++sample)
         {
+          if (physical_collision)
+            break;
           const double ratio = static_cast<double>(sample) / samples;
           const Eigen::Vector3d point = start_pt_ + ratio * (anchor - start_pt_);
-          const double yaw = interpolatePlanarYaw(
-              actual_yaw, target_yaw, ratio);
+          const double yaw = fixed_body_yaw_repair
+                                 ? actual_yaw
+                                 : target_yaw;
           if (!std::isfinite(yaw))
           {
             physical_collision = true;
@@ -2446,7 +2847,11 @@ namespace scan_planner
           footprintOccupiedWithMargin(
               map, point, yaw, planning_clearance_margin_, nullptr,
               &violations);
-          violation_counts.push_back(violations);
+          // The target-yaw start pose was already appended by the rotation
+          // sweep. Avoid double-counting it while preserving the complete
+          // monotonic sequence for fixed-yaw legacy repair.
+          if (fixed_body_yaw_repair || sample > 0)
+            violation_counts.push_back(violations);
           if (map->getInflateOccupancy(point, yaw) != 0)
           {
             physical_collision = true;
@@ -2457,6 +2862,33 @@ namespace scan_planner
             !recoveryClearanceEvidenceIsNonWorsening(violation_counts))
           continue;
 
+        // Reject an escape that has no certified next step toward the same
+        // reference. This is a bounded connector check, not a guarantee that
+        // subsequent optimization will succeed.
+        const auto rejoin = projectReferencePathLookahead(
+            reference_path_, anchor, reference_progress_idx_,
+            reference_progress_ratio_, 0.50);
+        if (!rejoin.valid)
+          continue;
+        const Eigen::Vector3d connector = rejoin.target - anchor;
+        const double rejoin_yaw = std::atan2(connector.y(), connector.x());
+        bool reconnect_free = true;
+        const int turn_samples = std::max(1, static_cast<int>(std::ceil(
+            std::abs(normalizePlanarAngle(rejoin_yaw - target_yaw)) / (5.0 * M_PI / 180.0))));
+        for (int i = 0; i <= turn_samples; ++i)
+          if (footprintOccupiedWithMargin(map, anchor,
+                  interpolatePlanarYaw(target_yaw, rejoin_yaw,
+                      static_cast<double>(i) / turn_samples),
+                  planning_clearance_margin_))
+            reconnect_free = false;
+        const int connector_samples = std::max(1, static_cast<int>(std::ceil(connector.head<2>().norm() / 0.05)));
+        for (int i = 0; reconnect_free && i <= connector_samples; ++i)
+          if (footprintOccupiedWithMargin(map,
+                  anchor + connector * (static_cast<double>(i) / connector_samples),
+                  rejoin_yaw, planning_clearance_margin_))
+            reconnect_free = false;
+        if (!reconnect_free)
+          continue;
         anchors.push_back({anchor, direction_index, distance});
         accepted_direction = true;
         break;
@@ -2496,7 +2928,10 @@ namespace scan_planner
           anchor.point.x(), anchor.point.y(), anchor.point.z(),
           anchor.distance, local_repair_max_speed_, minimum_duration,
           end_pt_.x(), end_pt_.y(), end_pt_.z());
-      if (callReboundReplan(true, false, &anchor.point, true))
+      if (callReboundReplan(
+              true, false, &anchor.point, true, nullptr, nullptr, nullptr,
+              nullptr, nullptr, 0.0, nullptr, 0.0,
+              fixed_body_yaw_repair))
       {
         start_vel_ = saved_start_velocity;
         start_acc_ = saved_start_acceleration;
@@ -2520,6 +2955,17 @@ namespace scan_planner
     return false;
   }
 
+  double SCANReplanFSM::executionProgressTime(const LocalTrajData &info)
+  {
+    std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+    if (execution_snapshot_.valid && execution_snapshot_.trajectory_id == info.traj_id_ &&
+        min_forward_command_ > 0.0 && execution_snapshot_.execution_mode !=
+            scan_planner_msgs::msg::Bspline::MODE_NORMAL)
+      return execution_snapshot_.controller_execution_time;
+    return std::clamp((node_->now() - info.start_time_).seconds(),
+                      0.0, std::max(0.0, info.duration_));
+  }
+
   void SCANReplanFSM::setStartStateFromOdomOrCurrentTraj()
   {
     refreshPlanningOdomFromSafety();
@@ -2528,6 +2974,18 @@ namespace scan_planner
     start_acc_.setZero();
 
     LocalTrajData *info = &planner_manager_->local_data_;
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      if (execution_snapshot_.valid && min_forward_command_ > 0.0 &&
+          execution_snapshot_.execution_mode != scan_planner_msgs::msg::Bspline::MODE_NORMAL)
+      {
+        // Spatial gait does not follow wall-clock spline derivatives. Seed
+        // replacements with measured velocity rather than fictitious progress.
+        if (reference_path_active_)
+          alignStartStateToReferencePath();
+        return;
+      }
+    }
     if (info->start_time_.seconds() < 1e-5 || info->duration_ <= 1e-5)
     {
       if (reference_path_active_)
@@ -2589,10 +3047,25 @@ namespace scan_planner
       size_t initial_clearance_violations, bool fixed_body_yaw,
       double body_yaw, uint8_t execution_mode)
   {
+    Eigen::Vector3d accepted_position =
+        info.position_traj_.evaluateDeBoorT(0.0);
+    {
+      std::lock_guard<std::mutex> safety_lock(safety_odom_mutex_);
+      if (safety_have_odom_ && safety_odom_pos_.allFinite())
+        accepted_position = safety_odom_pos_;
+    }
     std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+    const bool preserve_progress = execution_snapshot_.valid &&
+        execution_snapshot_.request_id == request_id &&
+        execution_snapshot_.execution_mode ==
+            scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED &&
+        execution_mode == scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED;
+    const auto progress_started = execution_snapshot_.accepted_at;
+    const auto progress_position = execution_snapshot_.accepted_position;
     execution_snapshot_.position = info.position_traj_;
     execution_snapshot_.start_time = info.start_time_;
     execution_snapshot_.duration = info.duration_;
+    execution_snapshot_.controller_execution_time = 0.0;
     execution_snapshot_.request_id = request_id;
     execution_snapshot_.trajectory_id = info.traj_id_;
     execution_snapshot_.clearance_escape_active = clearance_escape_active;
@@ -2616,6 +3089,10 @@ namespace scan_planner
     execution_snapshot_.fixed_body_yaw = fixed_body_yaw;
     execution_snapshot_.body_yaw = body_yaw;
     execution_snapshot_.execution_mode = execution_mode;
+    execution_snapshot_.accepted_at = preserve_progress
+        ? progress_started : std::chrono::steady_clock::now();
+    execution_snapshot_.accepted_position = preserve_progress
+        ? progress_position : accepted_position;
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
     terminal_repair_requested_.store(false);
     terminal_repair_error_.store(0.0);
@@ -3040,6 +3517,33 @@ namespace scan_planner
         }
         if (clearance_blocked)
         {
+          if (structuredRepairSafetyInterruptionRequiresRetry(
+                  structured_local_repair_active_.load(),
+                  structured_local_repair_executing_.load(),
+                  trajectory.execution_mode,
+                  scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE))
+          {
+            // The recovery transaction still owns the global request, but the
+            // current segment is terminally unusable. Transfer ownership back
+            // to the stopped candidate search instead of leaving Explorer and
+            // SCAN waiting forever on an executing segment that Controller has
+            // already held.
+            structured_local_repair_executing_.store(false);
+            structured_local_repair_finished_.store(false);
+            structured_local_repair_rejoin_pending_.store(false);
+            structured_local_repair_interrupted_.store(true);
+            stopped_local_repair_pending_.store(true);
+            stopped_local_repair_active_.store(false);
+            predictive_replan_requested_.store(true);
+            setLocalRecoveryState(
+                LocalRecoveryState::LOCAL_REPAIR, 0.0,
+                "structured_repair_interrupted_by_safety");
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "[STRUCTURED_LOCAL_REPAIR_INTERRUPTED] request_id=%llu trajectory=%lld; retrying the remaining bounded candidates after stop",
+                static_cast<unsigned long long>(trajectory.request_id),
+                static_cast<long long>(trajectory.trajectory_id));
+          }
           predictive_hold_release_cycles_.store(0);
           latchLocalSafetyHold(
               "PREDICTED_BRAKING_HOLD", predictive_hold_latched_);
@@ -3055,6 +3559,9 @@ namespace scan_planner
     }
 
     double t_cur = (node_->now() - trajectory.start_time).seconds();
+    if (min_forward_command_ > 0.0 && trajectory.execution_mode !=
+        scan_planner_msgs::msg::Bspline::MODE_NORMAL)
+      t_cur = trajectory.controller_execution_time;
     t_cur = std::min(std::max(t_cur, 0.0), trajectory.duration);
     // Match the physical robot to a nearby point on the active trajectory.
     // The raw time-indexed error is not an executable recovery trajectory.
@@ -3127,18 +3634,100 @@ namespace scan_planner
         }
       }
 
-      // A blocked recovery corridor requests local rolling repair.  It does
-      // not prove that the Explorer route is unreachable, because this
-      // connector is only a state-alignment diagnostic.
-      predictive_replan_requested_.store(true);
-      setLocalRecoveryState(
-          recovery_corridor_blocked ||
-                  connector_length > tracking_recovery_max_error_
-              ? LocalRecoveryState::LOCAL_REPAIR
-              : LocalRecoveryState::TRACKING_DEGRADED,
-          connector_length,
-          recovery_corridor_blocked ? "recovery_corridor_blocked"
-                                    : "tracking_error");
+      const double execution_age = std::max(
+          0.0, std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() -
+                   trajectory.accepted_at).count());
+      const double odometry_progress =
+          (odom_pos.head<2>() -
+           trajectory.accepted_position.head<2>()).norm();
+      const bool clearance_limited_execution =
+          trajectory.execution_mode ==
+          scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED;
+      if (clearance_limited_execution &&
+          odometry_progress >= clearance_limited_min_progress_)
+      {
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        if (execution_snapshot_.valid &&
+            execution_snapshot_.request_id == trajectory.request_id &&
+            execution_snapshot_.trajectory_id == trajectory.trajectory_id)
+        {
+          execution_snapshot_.accepted_at = std::chrono::steady_clock::now();
+          execution_snapshot_.accepted_position = odom_pos;
+        }
+      }
+      const TrackingDeviationAction tracking_action =
+          classifyTrackingDeviation(
+              clearance_limited_execution, recovery_corridor_blocked,
+              connector_length, tracking_degraded_error_,
+              tracking_recovery_max_error_, execution_age,
+              clearance_limited_execution_grace_,
+              clearance_limited_no_progress_timeout_, odometry_progress,
+              clearance_limited_min_progress_);
+
+      if (tracking_action == TrackingDeviationAction::ROLLING_REPLAN)
+      {
+        predictive_replan_requested_.store(true);
+        setLocalRecoveryState(
+            LocalRecoveryState::TRACKING_DEGRADED, connector_length,
+            "tracking_error");
+      }
+      else if (tracking_action == TrackingDeviationAction::LOCAL_REPAIR)
+      {
+        predictive_replan_requested_.store(false);
+        const bool clearance_limited_no_progress =
+            clearance_limited_execution && !recovery_corridor_blocked &&
+            execution_age >= clearance_limited_no_progress_timeout_ &&
+            odometry_progress < clearance_limited_min_progress_;
+        if (clearance_limited_no_progress)
+        {
+          // Replanning another copy of the same hard-safe fallback would only
+          // restart the controller clock. Enter the existing bounded stopped
+          // recovery transaction; if its finite candidate family is exhausted,
+          // it returns VIEWPOINT_LOCAL_REJECTED to Explorer.
+          terminal_repair_requested_.store(false);
+          stopped_local_repair_pending_.store(true);
+          if (!safety_stop_active_.exchange(true))
+          {
+            safety_generation_.fetch_add(1);
+            requestExecutionStop("CLEARANCE_LIMITED_NO_PROGRESS", false);
+          }
+          RCLCPP_ERROR_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 500,
+              "[CLEARANCE_LIMITED_NO_PROGRESS] request=%llu trajectory=%lld age=%.2fs tracking_error=%.3fm odom_progress=%.3fm/%.3fm; entering bounded stopped recovery without publishing an equivalent fallback",
+              static_cast<unsigned long long>(trajectory.request_id),
+              static_cast<long long>(trajectory.trajectory_id), execution_age,
+              connector_length, odometry_progress,
+              clearance_limited_min_progress_);
+        }
+        else
+        {
+          terminal_repair_error_.store(connector_length);
+          terminal_repair_requested_.store(true);
+        }
+        setLocalRecoveryState(
+            LocalRecoveryState::LOCAL_REPAIR, connector_length,
+            recovery_corridor_blocked ? "recovery_corridor_blocked"
+                : (clearance_limited_no_progress
+                       ? "clearance_limited_no_progress"
+                       : "tracking_recovery_error_exceeded"));
+      }
+      else
+      {
+        // MODE_CLEARANCE_LIMITED was selected precisely because no preferred
+        // clearance route exists. While the hard corridor remains free, keep
+        // this ACKed execution version instead of replacing it with an
+        // equivalent fallback and starving physical execution.
+        setLocalRecoveryState(
+            LocalRecoveryState::TRACKING_DEGRADED, connector_length,
+            "clearance_limited_execution_owned");
+        RCLCPP_INFO_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 500,
+            "[CLEARANCE_LIMITED_EXECUTION_OWNED] request=%llu trajectory=%lld age=%.2fs tracking_error=%.3fm odom_progress=%.3fm; hard corridor remains free",
+            static_cast<unsigned long long>(trajectory.request_id),
+            static_cast<long long>(trajectory.trajectory_id), execution_age,
+            connector_length, odometry_progress);
+      }
       if (recovery_corridor_blocked)
       {
         RCLCPP_WARN_THROTTLE(
@@ -3227,8 +3816,17 @@ namespace scan_planner
     bool runtime_escape_exited_clearance = false;
     size_t previous_runtime_violations =
         trajectory.initial_clearance_violations;
+    double speed = odom_vel.head<2>().norm();
     double first_preferred_conflict_time =
         std::numeric_limits<double>::infinity();
+    double first_hard_time = std::numeric_limits<double>::infinity();
+    double last_hard_time = -1.0;
+    Eigen::Vector3d first_hard_position = Eigen::Vector3d::Zero();
+    Eigen::Vector3d last_hard_position = Eigen::Vector3d::Zero();
+    int consecutive_hard_free_after_risk = 0;
+    bool hard_exit_known = false;
+    double hard_rejoin_time = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Vector3d hard_rejoin_position = Eigen::Vector3d::Zero();
     for (double t = matched_time; t < trajectory.duration; t += time_step)
     {
       const Eigen::Vector3d pos = trajectory.position.evaluateDeBoorT(t);
@@ -3243,6 +3841,16 @@ namespace scan_planner
           &clearance_violations);
       if (!clearance_blocked)
       {
+        if (std::isfinite(first_hard_time) && !hard_exit_known)
+        {
+          ++consecutive_hard_free_after_risk;
+          if (consecutive_hard_free_after_risk >= 5)
+          {
+            hard_exit_known = true;
+            hard_rejoin_time = t;
+            hard_rejoin_position = pos;
+          }
+        }
         const bool preferred_clearance_blocked =
             trajectory.execution_mode ==
                 scan_planner_msgs::msg::Bspline::MODE_NORMAL &&
@@ -3285,6 +3893,15 @@ namespace scan_planner
       if (clearance_blocked)
       {
         const double time_to_hit = std::max(0.0, t - matched_time);
+        if (!std::isfinite(first_hard_time))
+        {
+          first_hard_time = time_to_hit;
+          first_hard_position = pos;
+        }
+        last_hard_time = time_to_hit;
+        consecutive_hard_free_after_risk = 0;
+        hard_exit_known = false;
+        hard_rejoin_time = std::numeric_limits<double>::quiet_NaN();
         double speed = 0.0;
         {
           std::lock_guard<std::mutex> lock(safety_odom_mutex_);
@@ -3305,16 +3922,81 @@ namespace scan_planner
                       "[REALTIME_SAFETY_STOP] reason=trajectory_blocked time_to_hit=%.2fs hard_stop_time=%.2fs speed=%.2fm/s hit=(%.2f,%.2f) map_age=%.1fms",
                       time_to_hit, hard_stop_time, speed, pos.x(), pos.y(),
                       map_age * 1000.0);
+          return;
         }
         else
         {
           predictive_replan_requested_.store(true);
           RCLCPP_WARN_THROTTLE(
               node_->get_logger(), *node_->get_clock(), 500,
-              "[PREDICTIVE_COLLISION_WARNING] time_to_hit=%.2fs hard_stop_time=%.2fs speed=%.2fm/s hit=(%.2f,%.2f); requesting rolling replan",
+              "[PREDICTIVE_COLLISION_WARNING] time_to_hit=%.2fs hard_stop_time=%.2fs speed=%.2fm/s hit=(%.2f,%.2f); scanning interval for local repair",
               time_to_hit, hard_stop_time, speed, pos.x(), pos.y());
         }
-        return;
+        continue;
+      }
+    }
+
+    const bool has_hard_interval = std::isfinite(first_hard_time) &&
+                                   hard_exit_known &&
+                                   last_hard_time > first_hard_time;
+    const bool has_preferred_interval =
+        std::isfinite(first_preferred_conflict_time);
+    if (has_hard_interval || has_preferred_interval)
+    {
+      const CollisionRiskKind kind = has_hard_interval
+          ? CollisionRiskKind::HARD_MARGIN
+          : CollisionRiskKind::PREFERRED_MARGIN;
+      const double entry_time = matched_time +
+          (has_hard_interval ? first_hard_time : first_preferred_conflict_time);
+      const double exit_time = matched_time +
+          (has_hard_interval ? last_hard_time
+                             : first_preferred_conflict_time + time_step);
+      PredictedCollisionInterval interval = makePredictedCollisionInterval(
+          trajectory.request_id, trajectory.trajectory_id, map_snapshot->revision,
+          kind, std::max(matched_time, entry_time - time_step), exit_time,
+          speed, guaranteed_braking_deceleration_, command_stop_latency_,
+          predictive_replan_reaction_time_, 0.0, matched_time,
+          trajectory.duration,
+          has_hard_interval ? hard_rejoin_time : -1.0);
+      if (interval.valid)
+      {
+        if (has_hard_interval)
+          interval.entry_position = first_hard_position;
+        else
+          interval.entry_position = trajectory.position.evaluateDeBoorT(
+              entry_time).head<3>();
+        interval.exit_position = has_hard_interval
+            ? last_hard_position : interval.entry_position;
+        interval.rejoin_position = has_hard_interval
+            ? hard_rejoin_position : Eigen::Vector3d::Zero();
+        interval.rejoin_time = has_hard_interval
+            ? hard_rejoin_time : interval.rejoin_time;
+        interval.exit_known = has_hard_interval;
+        interval.braking_window = false;
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        if (execution_snapshot_.valid &&
+            safetyResultMatchesExecution(
+                trajectory.request_id, trajectory.trajectory_id,
+                execution_snapshot_.request_id,
+                execution_snapshot_.trajectory_id) &&
+            (!predicted_collision_interval_.valid ||
+             !collision_interval_replan_requested_.load() ||
+             predicted_collision_interval_.request_id != trajectory.request_id ||
+             predicted_collision_interval_.trajectory_id != trajectory.trajectory_id))
+        {
+          predicted_collision_interval_ = interval;
+          collision_interval_replan_requested_.store(true);
+          predictive_replan_requested_.store(true);
+          RCLCPP_WARN_THROTTLE(
+              node_->get_logger(), *node_->get_clock(), 500,
+              "[PREDICTED_COLLISION_INTERVAL] request=%llu trajectory=%lld map_revision=%llu risk=[%.2f,%.2f] repair=[%.2f,%.2f] exit_known=%d",
+              static_cast<unsigned long long>(interval.request_id),
+              static_cast<long long>(interval.trajectory_id),
+              static_cast<unsigned long long>(interval.map_revision),
+              interval.entry_time, interval.exit_time,
+              interval.repair_start_time, interval.rejoin_time,
+              interval.exit_known);
+        }
       }
     }
     // Preferred clearance is a replanning trigger, never a reason to skip the
@@ -3349,12 +4031,38 @@ namespace scan_planner
   bool SCANReplanFSM::callReboundReplan(
       bool flag_use_poly_init, bool flag_randomPolyTraj,
       const Eigen::Vector3d *local_target_override,
-      bool low_speed_local_repair)
+      bool low_speed_local_repair,
+      const std::vector<Eigen::Vector3d> *seed_path,
+      const Eigen::Vector3d *local_target_velocity_override,
+      const Eigen::Vector3d *local_target_acceleration_override,
+      const Eigen::Vector3d *seed_start_velocity_override,
+      const Eigen::Vector3d *seed_start_acceleration_override,
+      double seed_sample_interval,
+      const PredictedCollisionInterval *seed_interval,
+      double seed_base_time,
+      bool fixed_body_yaw_repair)
   {
     auto map = planner_manager_->grid_map_;
     const uint64_t planning_request_id = active_reference_request_id_.load();
     const double local_repair_body_yaw =
         low_speed_local_repair ? getOdomYaw() : 0.0;
+    struct TargetStateRestore
+    {
+      SCANReplanFSM *fsm;
+      bool enabled;
+      Eigen::Vector3d end_pt;
+      Eigen::Vector3d local_target_pt;
+      Eigen::Vector3d local_target_vel;
+      ~TargetStateRestore()
+      {
+        if (!enabled)
+          return;
+        fsm->end_pt_ = end_pt;
+        fsm->local_target_pt_ = local_target_pt;
+        fsm->local_target_vel_ = local_target_vel;
+      }
+    } target_state_restore{this, seed_path != nullptr, end_pt_,
+                           local_target_pt_, local_target_vel_};
     // reboundReplan commits its successful result to local_data_ before the
     // real-time publication checks below.  Preserve the trajectory that the
     // controller is actually executing so every rejected result is atomic.
@@ -3370,12 +4078,18 @@ namespace scan_planner
     if (local_target_override)
     {
       local_target_pt_ = *local_target_override;
-      local_target_vel_.setZero();
+      local_target_vel_ = local_target_velocity_override
+                              ? *local_target_velocity_override
+                              : Eigen::Vector3d::Zero();
     }
     else
     {
       getLocalTarget();
     }
+    const Eigen::Vector3d target_acceleration =
+        local_target_acceleration_override
+            ? *local_target_acceleration_override
+            : Eigen::Vector3d::Zero();
 
     double initialization_speed_limit = -1.0;
     double minimum_initial_duration = 0.0;
@@ -3386,17 +4100,33 @@ namespace scan_planner
           (local_target_pt_ - start_pt_).norm(), local_repair_max_speed_,
           planner_manager_->pp_.max_acc_, local_repair_time_margin_);
     }
+    else if (seed_path)
+    {
+      double seed_length = 0.0;
+      for (size_t i = 1; i < seed_path->size(); ++i)
+        seed_length += ((*seed_path)[i] - (*seed_path)[i - 1]).norm();
+      minimum_initial_duration = std::max(
+          seed_length / std::max(0.10, planner_manager_->pp_.max_vel_),
+          std::sqrt(seed_length / std::max(0.10, planner_manager_->pp_.max_acc_)));
+    }
     const bool initialize_from_polynomial =
         have_new_target_ || flag_use_poly_init;
     const auto plan_with_margin = [&](double clearance_margin) {
+      const Eigen::Vector3d seed_start_velocity =
+          seed_start_velocity_override ? *seed_start_velocity_override : start_vel_;
+      const Eigen::Vector3d seed_start_acceleration =
+          seed_start_acceleration_override ? *seed_start_acceleration_override : start_acc_;
       return planner_manager_->reboundReplan(
-          start_pt_, start_vel_, start_acc_, local_target_pt_,
-          local_target_vel_, initialize_from_polynomial,
+          start_pt_, seed_start_velocity, seed_start_acceleration,
+          local_target_pt_, local_target_vel_, initialize_from_polynomial,
           flag_randomPolyTraj, initialization_speed_limit,
           minimum_initial_duration,
-          low_speed_local_repair ? local_repair_body_yaw
-                                 : std::numeric_limits<double>::quiet_NaN(),
-          clearance_margin);
+          low_speed_local_repair && fixed_body_yaw_repair
+              ? local_repair_body_yaw
+              : std::numeric_limits<double>::quiet_NaN(),
+          clearance_margin, seed_path,
+          target_acceleration.x(), target_acceleration.y(),
+          target_acceleration.z(), seed_sample_interval);
     };
 
     // Generate normal candidates against the preferred belt first, so A* and
@@ -3471,12 +4201,78 @@ namespace scan_planner
       }
 
       auto info = &planner_manager_->local_data_;
+      if (seed_path)
+      {
+        if (!seed_interval || !seed_interval->valid)
+          return reject_planned_trajectory();
+        {
+          std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+          if (!execution_snapshot_.valid ||
+              !safetyResultMatchesExecution(
+                  seed_interval->request_id, seed_interval->trajectory_id,
+                  execution_snapshot_.request_id,
+                  execution_snapshot_.trajectory_id))
+            return reject_planned_trajectory();
+        }
+        const PredictedCollisionInterval &interval = *seed_interval;
+        const double candidate_entry_time =
+            std::max(0.0, interval.repair_start_time - seed_base_time);
+        const double candidate_rejoin_time =
+            std::max(0.0, interval.rejoin_time - seed_base_time);
+        if (candidate_entry_time >= candidate_rejoin_time ||
+            candidate_rejoin_time > info->duration_)
+          return reject_planned_trajectory();
+        const bool entry_continuous = localPatchBoundaryIsContinuous(
+            info->position_traj_.evaluateDeBoorT(candidate_entry_time).head<3>(),
+            info->velocity_traj_.evaluateDeBoorT(candidate_entry_time).head<3>(),
+            info->acceleration_traj_.evaluateDeBoorT(candidate_entry_time).head<3>(),
+            executing_trajectory.position_traj_.evaluateDeBoorT(
+                interval.repair_start_time).head<3>(),
+            executing_trajectory.velocity_traj_.evaluateDeBoorT(
+                interval.repair_start_time).head<3>(),
+            executing_trajectory.acceleration_traj_.evaluateDeBoorT(
+                interval.repair_start_time).head<3>(),
+            0.08, 0.20, 0.50);
+        const Eigen::Vector3d patch_position =
+            info->position_traj_.evaluateDeBoorT(candidate_rejoin_time).head<3>();
+        const Eigen::Vector3d patch_velocity =
+            info->velocity_traj_.evaluateDeBoorT(candidate_rejoin_time).head<3>();
+        const Eigen::Vector3d patch_acceleration =
+            info->acceleration_traj_.evaluateDeBoorT(candidate_rejoin_time).head<3>();
+        const Eigen::Vector3d reference_velocity =
+            executing_trajectory.velocity_traj_.evaluateDeBoorT(
+                interval.rejoin_time).head<3>();
+        const Eigen::Vector3d reference_acceleration =
+            executing_trajectory.acceleration_traj_.evaluateDeBoorT(
+                interval.rejoin_time).head<3>();
+        const double candidate_time_scale =
+            info->duration_ / std::max(
+                1e-6, executing_trajectory.duration_ - seed_base_time);
+        const bool rejoin_continuous = localPatchBoundaryIsContinuous(
+            patch_position, patch_velocity, patch_acceleration,
+            executing_trajectory.position_traj_.evaluateDeBoorT(
+                interval.rejoin_time).head<3>(),
+            reference_velocity, reference_acceleration,
+            0.08, 0.20, 0.50);
+        if (std::abs(candidate_time_scale - 1.0) > 0.05 ||
+            !entry_continuous || !rejoin_continuous)
+        {
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "[LOCAL_INTERVAL_SPLICE_REJECTED] time_scale=%.3f p_error=%.3fm v_error=%.3fm/s a_error=%.3fm/s2",
+              candidate_time_scale,
+              (patch_position - interval.rejoin_position).norm(),
+              (patch_velocity - reference_velocity).norm(),
+              (patch_acceleration - reference_acceleration).norm());
+          return reject_planned_trajectory();
+        }
+      }
 
       // The optimizer is not the final safety authority.  Sample the complete
       // B-spline again immediately before publishing it to the controller so a
       // successful solver result can never authorize an occupied trajectory.
       constexpr double validation_dt = 0.02;
-      const double clearance_escape_deadline =
+      double clearance_escape_deadline =
           low_speed_local_repair && minimum_initial_duration > 0.0
               ? minimum_initial_duration
               : 0.75;
@@ -3491,13 +4287,13 @@ namespace scan_planner
             std::min(t + validation_dt, info->duration_));
         Eigen::Vector3d blocked_point;
         size_t clearance_violations = 0;
-        // A quadruped can translate laterally during a short rest-to-rest
-        // escape. Do not reinterpret that translation tangent as an
-        // instantaneous body rotation; keep the measured body yaw while the
-        // robot leaves the planning belt.
-        const double candidate_yaw = low_speed_local_repair
-                                         ? local_repair_body_yaw
-                                         : estimateYawFromSegment(pos, pos_next);
+        // Legacy opt-in lateral repair keeps the measured body yaw. The
+        // default disturbance recapture follows the candidate tangent, so
+        // the controller aligns in place before it advances.
+        const double candidate_yaw =
+            low_speed_local_repair && fixed_body_yaw_repair
+                ? local_repair_body_yaw
+                : estimateYawFromSegment(pos, pos_next);
         const bool clearance_blocked = footprintOccupiedWithMargin(
                 map, pos, candidate_yaw,
                 planning_clearance_margin_, &blocked_point,
@@ -3557,10 +4353,138 @@ namespace scan_planner
         return reject_planned_trajectory();
       }
 
+      if (candidate_requires_clearance_limited_profile || low_speed_local_repair)
+      {
+        // Retiming a splice would invalidate its already checked join times.
+        // Fall back to a full candidate instead of silently changing a patch.
+        if (seed_path || (low_speed_local_repair && fixed_body_yaw_repair) ||
+            (low_speed_local_repair && local_repair_max_speed_ < min_forward_command_))
+          return reject_planned_trajectory();
+        // The measured gait is not capable of following an arbitrarily slow
+        // reference. Retiming limits reference speed to its observed response;
+        // the separately authorized command floor is checked conservatively.
+        double speed_bound = 0.0;
+        const auto velocity_points = info->velocity_traj_.getControlPoint();
+        for (int i = 0; i < velocity_points.cols(); ++i)
+          speed_bound = std::max(speed_bound, velocity_points.col(i).head<2>().norm());
+        const double scale = std::max(1.0, speed_bound / min_forward_effective_speed_);
+        if (scale > 1.0)
+        {
+          Eigen::VectorXd retimed_knots = info->position_traj_.getKnot();
+          const double time_origin = retimed_knots(3);
+          retimed_knots = (retimed_knots.array() - time_origin) * scale + time_origin;
+          info->position_traj_.setKnot(retimed_knots);
+          info->velocity_traj_ = info->position_traj_.getDerivative();
+          info->acceleration_traj_ = info->velocity_traj_.getDerivative();
+          info->duration_ = info->position_traj_.getTimeSum();
+          clearance_escape_deadline *= scale;
+        }
+        for (double t = 0.0; t <= info->duration_; t += 0.10)
+        {
+          const Eigen::Vector3d origin = info->position_traj_.evaluateDeBoorT(t);
+          const Eigen::Vector3d before = info->position_traj_.evaluateDeBoorT(
+              std::max(0.0, t - 0.05));
+          const Eigen::Vector3d next = info->position_traj_.evaluateDeBoorT(
+              std::min(t + 0.05, info->duration_));
+          const double yaw = estimateYawFromSegment(before, next);
+          const double target_time = forwardGaitLookaheadTime(t, info->duration_,
+              [&](double sample_time) { return info->position_traj_.evaluateDeBoorT(sample_time); });
+          const Eigen::Vector3d target = info->position_traj_.evaluateDeBoorT(target_time);
+          const double steering_yaw = (target - origin).head<2>().norm() > 1e-6
+              ? estimateYawFromSegment(origin, target) : yaw;
+          const double turn = normalizePlanarAngle(steering_yaw - yaw);
+          const int turn_samples = std::max(1, static_cast<int>(std::ceil(
+              std::abs(turn) / (5.0 * M_PI / 180.0))));
+          for (int i = 0; i <= turn_samples; ++i)
+          {
+            const double body_yaw = interpolatePlanarYaw(yaw, steering_yaw,
+                static_cast<double>(i) / turn_samples);
+            size_t violations = 0;
+            const bool blocked = footprintOccupiedWithMargin(map, origin,
+                body_yaw, planning_clearance_margin_, nullptr, &violations);
+            if (blocked && !handoffClearanceViolationIsAdmissible(
+                    low_speed_local_repair, candidate_started_inside_clearance,
+                    t > clearance_escape_deadline,
+                    map->getInflateOccupancy(origin, body_yaw) != 0,
+                    violations, initial_clearance_violations))
+              return reject_planned_trajectory();
+          }
+          // Certify the controller's steering direction and bounded turning
+          // braking paths, not only the theoretical spline tangent.
+          const double reaction = command_stop_latency_ + predictive_replan_reaction_time_;
+          const double horizon = reaction + min_forward_command_ / guaranteed_braking_deceleration_;
+          for (double rate : {-clearance_limited_max_yaw_rate_, 0.0, clearance_limited_max_yaw_rate_})
+          {
+            PlanarBrakingState sweep;
+            sweep.position = origin.head<2>();
+            sweep.yaw = steering_yaw;
+            size_t previous_count = 0;
+            const bool initially_blocked = footprintOccupiedWithMargin(map, origin,
+                sweep.yaw, planning_clearance_margin_, nullptr, &previous_count);
+            bool sweep_exited = !initially_blocked;
+            double elapsed = 0.0;
+            while (elapsed < horizon)
+            {
+              const double dt = std::min(0.05, horizon - elapsed);
+              advancePlanarBrakingState(&sweep, min_forward_command_, steering_yaw,
+                  steering_yaw, rate, guaranteed_braking_deceleration_, reaction, elapsed, dt);
+              elapsed += dt;
+              const Eigen::Vector3d point(sweep.position.x(), sweep.position.y(), origin.z());
+              size_t count = 0;
+              const bool blocked = footprintOccupiedWithMargin(map, point, sweep.yaw,
+                  planning_clearance_margin_, nullptr, &count);
+              if (blocked && !handoffClearanceViolationIsAdmissible(
+                      low_speed_local_repair, initially_blocked, sweep_exited,
+                      map->getInflateOccupancy(point, sweep.yaw) != 0, count, previous_count))
+              {
+                RCLCPP_WARN(node_->get_logger(),
+                    "[FORWARD_GAIT_STEERING_REJECTED] t=%.2f yaw_rate=%.2f", t, rate);
+                return reject_planned_trajectory();
+              }
+              sweep_exited = sweep_exited || !blocked;
+              previous_count = count;
+            }
+          }
+          const double stopping_distance = min_forward_command_ *
+              (command_stop_latency_ + predictive_replan_reaction_time_) +
+              min_forward_command_ * min_forward_command_ / (2.0 * guaranteed_braking_deceleration_);
+          size_t previous = 0;
+          const bool starts_inside = footprintOccupiedWithMargin(
+              map, origin, yaw, planning_clearance_margin_, nullptr, &previous);
+          bool exited = !starts_inside;
+          for (double distance = 0.02; distance <= stopping_distance + 0.02; distance += 0.02)
+          {
+            const Eigen::Vector3d point = origin + std::min(distance, stopping_distance) *
+                Eigen::Vector3d(std::cos(yaw), std::sin(yaw), 0.0);
+            size_t violations = 0;
+            const bool blocked = footprintOccupiedWithMargin(
+                map, point, yaw, planning_clearance_margin_, nullptr, &violations);
+            if (blocked && !handoffClearanceViolationIsAdmissible(
+                    low_speed_local_repair, starts_inside, exited,
+                    map->getInflateOccupancy(point, yaw) != 0, violations, previous))
+            {
+              RCLCPP_WARN(node_->get_logger(),
+                          "[FORWARD_GAIT_SWEEP_REJECTED] command=%.3f effective=%.3f t=%.2f; trying another local candidate",
+                          min_forward_command_, min_forward_effective_speed_, t);
+              return reject_planned_trajectory();
+            }
+            exited = exited || !blocked;
+            previous = violations;
+          }
+        }
+        RCLCPP_INFO(node_->get_logger(),
+                    "[FORWARD_GAIT_PROFILE] command_min=%.3f reference_max=%.3f time_scale=%.2f duration=%.2fs",
+                    min_forward_command_, min_forward_effective_speed_, scale, info->duration_);
+      }
+
       Eigen::Vector3d live_odom;
       Eigen::Vector3d live_velocity = Eigen::Vector3d::Zero();
       Eigen::Quaterniond live_orient = Eigen::Quaterniond::Identity();
       bool have_live_odom = false;
+      bool handoff_started_inside_clearance =
+          candidate_started_inside_clearance;
+      size_t handoff_initial_clearance_violations =
+          initial_clearance_violations;
       {
         std::lock_guard<std::mutex> lock(safety_odom_mutex_);
         have_live_odom = safety_have_odom_;
@@ -3614,50 +4538,101 @@ namespace scan_planner
           requestExecutionStop("HANDOFF_PREDICTED_UNSAFE");
           return reject_planned_trajectory();
         }
-        if (connector_length > 0.05)
+        const double actual_yaw = std::atan2(
+            2.0 * (live_orient.w() * live_orient.z() +
+                   live_orient.x() * live_orient.y()),
+            1.0 - 2.0 * (live_orient.y() * live_orient.y() +
+                         live_orient.z() * live_orient.z()));
+        const double tangent_before_time = std::max(
+            0.0, matched_time - handoff_sample_dt);
+        const double tangent_after_time = std::min(
+            info->duration_, matched_time + handoff_sample_dt);
+        const Eigen::Vector3d tangent_before =
+            info->position_traj_.evaluateDeBoorT(tangent_before_time);
+        const Eigen::Vector3d tangent_after =
+            info->position_traj_.evaluateDeBoorT(tangent_after_time);
+        const double trajectory_yaw =
+            low_speed_local_repair && fixed_body_yaw_repair
+                ? local_repair_body_yaw
+                : estimateYawFromSegment(tangent_before, tangent_after);
+        size_t previous_handoff_violations = 0;
+        const bool actual_clearance_blocked = footprintOccupiedWithMargin(
+            map, live_odom, actual_yaw, planning_clearance_margin_, nullptr,
+            &previous_handoff_violations);
+        handoff_started_inside_clearance = actual_clearance_blocked;
+        handoff_initial_clearance_violations = previous_handoff_violations;
+        bool handoff_exited_clearance = !actual_clearance_blocked;
+
+        const auto validate_handoff_pose =
+            [&](const Eigen::Vector3d &point, double yaw,
+                const char *phase) -> bool
         {
-          const int samples = std::max(1, static_cast<int>(std::ceil(connector_length / 0.05)));
-          const double actual_yaw = std::atan2(
-              2.0 * (live_orient.w() * live_orient.z() +
-                     live_orient.x() * live_orient.y()),
-              1.0 - 2.0 * (live_orient.y() * live_orient.y() +
-                           live_orient.z() * live_orient.z()));
-          const double tangent_before_time = std::max(
-              0.0, matched_time - handoff_sample_dt);
-          const double tangent_after_time = std::min(
-              info->duration_, matched_time + handoff_sample_dt);
-          const Eigen::Vector3d tangent_before =
-              info->position_traj_.evaluateDeBoorT(tangent_before_time);
-          const Eigen::Vector3d tangent_after =
-              info->position_traj_.evaluateDeBoorT(tangent_after_time);
-          const double trajectory_yaw = low_speed_local_repair
-                                            ? local_repair_body_yaw
-                                            : estimateYawFromSegment(
-                                                  tangent_before,
-                                                  tangent_after);
-          for (int sample = 1; sample <= samples; ++sample)
+          if (!std::isfinite(yaw))
           {
-            const double ratio = static_cast<double>(sample) / samples;
-            const Eigen::Vector3d point = live_odom + ratio * connector;
-            const double recovery_yaw = interpolatePlanarYaw(
-                actual_yaw, trajectory_yaw, ratio);
-            if (!std::isfinite(recovery_yaw))
-            {
-              RCLCPP_ERROR(
-                  node_->get_logger(),
-                  "[PLAN_RESULT_DISCARDED] candidate recovery corridor has a non-finite yaw; preserving active trajectory");
-              return reject_planned_trajectory();
-            }
-            if (footprintOccupiedWithMargin(
-                    map, point, recovery_yaw,
-                    planning_clearance_margin_))
-            {
-              RCLCPP_ERROR(node_->get_logger(),
-                           "[PLAN_RESULT_DISCARDED] candidate recovery corridor is blocked error=%.2fm matched_t=%.2fs hit=(%.2f,%.2f); preserving active trajectory",
-                           connector_length, matched_time, point.x(), point.y());
-              return reject_planned_trajectory();
-            }
+            RCLCPP_ERROR(node_->get_logger(),
+                         "[PLAN_RESULT_DISCARDED] handoff %s has non-finite yaw",
+                         phase);
+            return false;
           }
+          const bool physical_collision =
+              map->getInflateOccupancy(point, yaw) != 0;
+          size_t clearance_violations = 0;
+          const bool clearance_blocked = footprintOccupiedWithMargin(
+              map, point, yaw, planning_clearance_margin_, nullptr,
+              &clearance_violations);
+          if (!clearance_blocked)
+          {
+            handoff_exited_clearance = true;
+            previous_handoff_violations = 0;
+            return true;
+          }
+          const bool admissible = handoffClearanceViolationIsAdmissible(
+              low_speed_local_repair, handoff_started_inside_clearance,
+              handoff_exited_clearance, physical_collision,
+              clearance_violations, previous_handoff_violations);
+          if (!admissible)
+          {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "[PLAN_RESULT_DISCARDED] handoff %s is blocked point=(%.2f,%.2f) physical=%d violations=%zu previous=%zu started_inside=%d",
+                phase, point.x(), point.y(), physical_collision ? 1 : 0,
+                clearance_violations, previous_handoff_violations,
+                handoff_started_inside_clearance ? 1 : 0);
+            return false;
+          }
+          previous_handoff_violations = clearance_violations;
+          return true;
+        };
+
+        // Match Controller execution: first align the body at the live pose,
+        // then traverse the connector.  Coupling rotation and translation in
+        // one interpolation missed the pure-rotation footprint that caused
+        // the runtime braking sweep to veto an accepted candidate.
+        constexpr double handoff_yaw_step = 5.0 * M_PI / 180.0;
+        const double yaw_delta = normalizePlanarAngle(
+            trajectory_yaw - actual_yaw);
+        const int yaw_samples = std::max(
+            1, static_cast<int>(std::ceil(
+                   std::abs(yaw_delta) / handoff_yaw_step)));
+        for (int sample = 1; sample <= yaw_samples; ++sample)
+        {
+          const double ratio = static_cast<double>(sample) / yaw_samples;
+          if (!validate_handoff_pose(
+                  live_odom,
+                  interpolatePlanarYaw(actual_yaw, trajectory_yaw, ratio),
+                  "rotation"))
+            return reject_planned_trajectory();
+        }
+        const int translation_samples = std::max(
+            1, static_cast<int>(std::ceil(connector_length / 0.05)));
+        for (int sample = 1; sample <= translation_samples; ++sample)
+        {
+          const double ratio =
+              static_cast<double>(sample) / translation_samples;
+          if (!validate_handoff_pose(
+                  live_odom + ratio * connector, trajectory_yaw,
+                  "translation"))
+            return reject_planned_trajectory();
         }
       }
 
@@ -3677,6 +4652,52 @@ namespace scan_planner
             static_cast<unsigned long long>(active_reference_request_id_.load()));
         return reject_planned_trajectory();
       }
+      if (seed_path)
+      {
+        bool same_interval = false;
+        {
+          std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+          same_interval = seed_interval && collisionIntervalMatchesExecution(
+              predicted_collision_interval_, seed_interval->request_id,
+              seed_interval->trajectory_id, seed_interval->map_revision) &&
+              predicted_collision_interval_.entry_time == seed_interval->entry_time &&
+              predicted_collision_interval_.exit_time == seed_interval->exit_time &&
+              predicted_collision_interval_.rejoin_time == seed_interval->rejoin_time;
+        }
+        if (!same_interval)
+          return reject_planned_trajectory();
+        const auto latest_snapshot = map->captureInflatedOccupancySnapshot();
+        if (latest_snapshot->revision != validation_snapshot->revision)
+        {
+          map->useInflatedOccupancySnapshotForCurrentThread(latest_snapshot);
+          for (double t = 0.0; t <= info->duration_ + 1e-6;
+               t += validation_dt)
+          {
+            const double sample_time = std::min(t, info->duration_);
+            const Eigen::Vector3d position =
+                info->position_traj_.evaluateDeBoorT(sample_time);
+            const Eigen::Vector3d next =
+                info->position_traj_.evaluateDeBoorT(
+                    std::min(sample_time + validation_dt, info->duration_));
+            const double yaw = estimateYawFromSegment(position, next);
+            if (footprintOccupiedWithMargin(
+                    map, position, yaw, planning_clearance_margin_))
+            {
+              RCLCPP_WARN(
+                  node_->get_logger(),
+                  "[LOCAL_INTERVAL_REPAIR_STALE_MAP_BLOCKED] revision=%llu t=%.2f",
+                  static_cast<unsigned long long>(latest_snapshot->revision),
+                  sample_time);
+              return reject_planned_trajectory();
+            }
+          }
+          RCLCPP_INFO(
+              node_->get_logger(),
+              "[LOCAL_INTERVAL_REPAIR_REVALIDATED] original_revision=%llu latest_revision=%llu",
+              static_cast<unsigned long long>(validation_snapshot->revision),
+              static_cast<unsigned long long>(latest_snapshot->revision));
+        }
+      }
 
       /* publish traj */
       scan_planner_msgs::msg::Bspline bspline;
@@ -3692,6 +4713,8 @@ namespace scan_planner
       if (bspline.execution_mode !=
           scan_planner_msgs::msg::Bspline::MODE_NORMAL)
       {
+        bspline.min_forward_command = min_forward_command_;
+        bspline.min_forward_effective_speed = min_forward_effective_speed_;
         bspline.max_forward_speed = low_speed_local_repair
             ? local_repair_max_speed_
             : clearance_limited_max_forward_speed_;
@@ -3722,11 +4745,10 @@ namespace scan_planner
         bspline.knots.push_back(knots(i));
       }
 
-      // A structured clearance escape was validated with the robot retaining
-      // its measured body heading.  Carry that contract to the controller so
-      // it strafes along the short escape instead of rotating the capsule to
-      // the translation tangent and executing an unvalidated footprint.
-      if (low_speed_local_repair)
+      // Only the legacy lateral-repair mode has a fixed-yaw contract. Default
+      // disturbance recapture leaves yaw_pts empty so the controller follows
+      // the validated tangent-yaw profile.
+      if (low_speed_local_repair && fixed_body_yaw_repair)
       {
         bspline.yaw_pts.push_back(local_repair_body_yaw);
         bspline.yaw_dt = info->duration_;
@@ -3743,11 +4765,12 @@ namespace scan_planner
         pending_handoff_.request_id = planning_request_id;
         pending_handoff_.trajectory_id = info->traj_id_;
         pending_handoff_.clearance_escape_active =
-            candidate_started_inside_clearance;
+            handoff_started_inside_clearance;
         pending_handoff_.clearance_escape_deadline = clearance_escape_deadline;
         pending_handoff_.initial_clearance_violations =
-            initial_clearance_violations;
-        pending_handoff_.fixed_body_yaw = low_speed_local_repair;
+            handoff_initial_clearance_violations;
+        pending_handoff_.fixed_body_yaw =
+            low_speed_local_repair && fixed_body_yaw_repair;
         pending_handoff_.body_yaw = local_repair_body_yaw;
         pending_handoff_.execution_mode = bspline.execution_mode;
         pending_handoff_.structured_repair_segment =
@@ -3758,9 +4781,22 @@ namespace scan_planner
             structured_local_repair_rejoin_pending_.load();
         pending_handoff_.reference_path_update =
             reference_path_update_pending_;
+        pending_handoff_.collision_interval_repair = seed_path != nullptr;
+        if (pending_handoff_.collision_interval_repair)
+        {
+          pending_handoff_.collision_interval_request_id =
+              seed_interval->request_id;
+          pending_handoff_.collision_interval_trajectory_id =
+              seed_interval->trajectory_id;
+          pending_handoff_.collision_interval_map_revision =
+              seed_interval->map_revision;
+        }
         pending_handoff_.reference_request_id =
             pending_reference_request_id_;
         pending_handoff_.submitted_at = std::chrono::steady_clock::now();
+        pending_handoff_.timeout_hold_issued_at = {};
+        pending_handoff_.timeout_hold_issued = false;
+        pending_handoff_.timeout_candidate_rejected = false;
         pending_handoff_.valid = true;
       }
       bspline_pub_->publish(bspline);
