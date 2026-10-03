@@ -40,6 +40,9 @@ namespace scan_planner
 
     /*  fsm param  */
     navi_mode_ = load_parameter<int>(node_, "fsm.navi_mode", -1);
+    task_mode_ = load_parameter<bool>(node_, "fsm.task_mode", false);
+    if (task_mode_ && navi_mode_ != NAVI_MODE::REFERENCE_PATH)
+      throw std::runtime_error("fsm.task_mode requires reference-path navigation mode");
     replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_replan", -1.0);
     no_replan_thresh_ = load_parameter<double>(node_, "fsm.thresh_no_replan", -1.0);
     planning_horizon_ = load_parameter<double>(node_, "fsm.planning_horizon", -1.0);
@@ -301,6 +304,12 @@ namespace scan_planner
     failure_evidence_pub_ = node_->create_publisher<scan_planner_msgs::msg::FailureEvidence>(
         "planning/failure_evidence", rclcpp::QoS(20).reliable());
     status_pub_ = node_->create_publisher<std_msgs::msg::String>("planning/status", 10);
+    task_feedback_pub_ = node_->create_publisher<scan_planner_msgs::msg::ObservationFeedback>(
+        "planning/observation_feedback", rclcpp::QoS(20).reliable());
+    if (task_mode_)
+      task_sub_ = node_->create_subscription<scan_planner_msgs::msg::ObservationTask>(
+          "observation_task", rclcpp::QoS(20).reliable(),
+          std::bind(&SCANReplanFSM::observationTaskCallback, this, std::placeholders::_1), planning_options);
     publishStatus("IDLE");
 
     if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
@@ -308,11 +317,13 @@ namespace scan_planner
           "move_base_simple/goal", 1,
           std::bind(&SCANReplanFSM::rvizGoalCallback, this, std::placeholders::_1),
           planning_options);
-    else if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    else if (navi_mode_ == NAVI_MODE::REFERENCE_PATH && !task_mode_)
       path_sub_ = node_->create_subscription<nav_msgs::msg::Path>(
           "initial_path", 1,
           std::bind(&SCANReplanFSM::pathCallback, this, std::placeholders::_1),
           planning_options);
+    else if (navi_mode_ == NAVI_MODE::REFERENCE_PATH && task_mode_)
+      RCLCPP_INFO(node_->get_logger(), "Observation task mode enabled; legacy initial_path input disabled");
     else if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
       RCLCPP_INFO(node_->get_logger(), "Preset waypoint mode will start after the first odometry message");
     else
@@ -654,7 +665,7 @@ namespace scan_planner
                   static_cast<unsigned long long>(active_request_id));
       return;
     }
-    if (recoveryTransactionOwnsReferenceRequest())
+    if (!task_mode_ && recoveryTransactionOwnsReferenceRequest())
     {
       bool retained = false;
       {
@@ -764,7 +775,7 @@ namespace scan_planner
         odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_,
         Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
-    if (success && !adjustGlobalTargetIfOccupied())
+    if (success && !task_mode_ && !adjustGlobalTargetIfOccupied())
       success = false;
 
     if (success)
@@ -860,6 +871,25 @@ namespace scan_planner
 
   void SCANReplanFSM::finishGoalReached(const char *source)
   {
+    if (task_mode_ && observation_task_)
+    {
+      if (!task_station_target_ || (odom_pos_-task_station_).head<2>().norm()>0.20)
+      {
+        changeFSMExecState(REPLAN_TRAJ, "OBSERVATION_CONTINUES");
+        return;
+      }
+      if (task_terminal_request_ == active_reference_request_id_.load()) return;
+      task_terminal_request_ = active_reference_request_id_.load();
+      ++task_station_adjustments_;
+      task_rejected_stations_.push_back(odom_pos_.head<2>());
+      have_target_=false; reference_path_active_=false;
+      reference_path_update_pending_=false; predictive_replan_requested_.store(false);
+      requestExecutionStop("OBSERVATION_STATION_REACHED", false);
+      publishObservationFeedback(scan_planner_msgs::msg::ObservationFeedback::STATION_REACHED,
+                                 "ACTUAL_STATION_REACHED_NOT_TASK_COMPLETE");
+      changeFSMExecState(WAIT_TARGET, source);
+      return;
+    }
     const uint64_t completed_request = active_reference_request_id_.load();
     const bool recovery_was_active =
         structured_local_repair_active_.exchange(false) ||
@@ -1100,6 +1130,9 @@ namespace scan_planner
   void SCANReplanFSM::executionStateCallback(
       const scan_planner_msgs::msg::ExecutionState::ConstSharedPtr &msg)
   {
+    if (task_mode_ && (task_retirement_pending_ ||
+        TaskVersion{msg->task_id,msg->task_version} != TaskVersion{task_id_.load(),task_version_.load()}))
+      return;
     {
       std::unique_lock<std::mutex> pending_lock(pending_handoff_mutex_);
       if (pending_handoff_.valid && pending_handoff_.timeout_hold_issued)
@@ -1232,6 +1265,15 @@ namespace scan_planner
   void SCANReplanFSM::trajectoryAckCallback(
       const scan_planner_msgs::msg::TrajectoryAck::ConstSharedPtr &msg)
   {
+    if (task_mode_ && msg->status == scan_planner_msgs::msg::TrajectoryAck::STATUS_TASK_RETIRED)
+    {
+      std::lock_guard<std::mutex> lock(task_event_mutex_);
+      task_retirement_confirmation_={msg->task_id,msg->task_version};
+      return;
+    }
+    if (task_mode_ && (task_retirement_pending_ ||
+        TaskVersion{msg->task_id,msg->task_version} != TaskVersion{task_id_.load(),task_version_.load()}))
+      return;
     PendingTrajectoryHandoff handoff;
     std::unique_lock<std::mutex> handoff_lock(pending_handoff_mutex_);
     if (!pending_handoff_.valid ||
@@ -1260,6 +1302,8 @@ namespace scan_planner
       return;
     }
     handoff = pending_handoff_;
+    if (task_mode_ && (handoff.task_id != msg->task_id || handoff.task_version != msg->task_version ||
+                      handoff.candidate_id != msg->candidate_id)) return;
     if (handoff.timeout_hold_issued)
     {
       if (msg->status == scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED)
@@ -1275,6 +1319,12 @@ namespace scan_planner
 
     if (msg->status != scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED)
     {
+      if (task_mode_)
+      {
+        std::lock_guard<std::mutex> lock(task_event_mutex_);
+        task_failed_goals_.push_back({{handoff.task_id,handoff.task_version},
+            handoff.candidate.position_traj_.evaluateDeBoorT(handoff.candidate.duration_).head<2>()});
+      }
       planner_manager_->local_data_ = handoff.previous;
       if (handoff.collision_interval_repair)
       {
@@ -1405,6 +1455,7 @@ namespace scan_planner
     }
     else if (!structured_local_repair_active_.load())
     {
+      if (task_mode_) stopped_local_repair_active_.store(false);
       predictive_replan_requested_.store(false);
       tracking_recovery_active_ = false;
       replan_fail_count_ = 0;
@@ -1486,7 +1537,9 @@ namespace scan_planner
       publishStatus(status);
       return;
     }
-    publishStatus(status + " request_id=" + std::to_string(request_id));
+    publishStatus(status + " request_id=" + std::to_string(request_id) +
+        (task_mode_ ? " task_id=" + std::to_string(task_id_.load()) +
+                      " task_version=" + std::to_string(task_version_.load()) : ""));
   }
 
   void SCANReplanFSM::publishFailureEvidence(
@@ -1499,6 +1552,9 @@ namespace scan_planner
     scan_planner_msgs::msg::FailureEvidence evidence;
     evidence.stamp = node_->now();
     evidence.request_id = request_id;
+    evidence.task_id = task_id_.load();
+    evidence.task_version = task_version_.load();
+    evidence.failed_object_id = task_candidate_id_.load();
     evidence.trajectory_id = trajectory_id;
     evidence.stage = stage;
     evidence.reason = reason;
@@ -1545,6 +1601,7 @@ namespace scan_planner
     scan_planner_msgs::msg::ExecutionCommand msg;
     msg.command = scan_planner_msgs::msg::ExecutionCommand::COMMAND_HOLD;
     msg.reason = reason;
+    msg.task_id = task_id_.load(); msg.task_version = task_version_.load();
     {
       std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
       if (execution_snapshot_.valid)
@@ -1713,6 +1770,7 @@ namespace scan_planner
     last_fsm_callback_wall_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     fsm_callback_stall_reported_.store(false);
+    if (processObservationTaskTransitions()) return;
     uint64_t timed_out_request = 0;
     int64_t timed_out_trajectory = 0;
     bool reconciliation_timed_out = false;
@@ -2066,7 +2124,7 @@ namespace scan_planner
       // candidates instead of repeatedly accepting an ordinary trajectory
       // whose future prefix merely promises to leave the clearance belt.
       const bool stopped_structured_repair =
-          stopped_local_repair_active_.load();
+          stopped_local_repair_active_.load() && !task_mode_;
       bool success = stopped_structured_repair
                          ? tryStructuredLocalRepair()
                          : callReboundReplan(true, flag_random_poly_init);
@@ -2312,6 +2370,12 @@ namespace scan_planner
 
   void SCANReplanFSM::finishProcess()
   {
+    if (task_mode_ && replan_fail_count_ >= max_replan_fail_count_)
+    {
+      observationTaskRejected("LOCAL_CANDIDATE_FAMILY_EXHAUSTED");
+      replan_fail_count_ = 0;
+      return;
+    }
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
       const bool stopped_repair_owned =
@@ -2670,6 +2734,7 @@ namespace scan_planner
 
   bool SCANReplanFSM::tryStructuredLocalRepair()
   {
+    if (task_mode_) return false; // No uncertified fixed-yaw lateral escape in task mode.
     if (!reference_path_active_ || reference_path_.size() < 2 ||
         !have_target_)
       return false;
@@ -3021,6 +3086,7 @@ namespace scan_planner
 
   void SCANReplanFSM::alignStartStateToReferencePath()
   {
+    if (task_mode_) return; // Task route is guidance, not a velocity constraint.
     if (!reference_path_active_ || reference_path_.size() < 2)
       return;
 
@@ -3068,6 +3134,9 @@ namespace scan_planner
     execution_snapshot_.controller_execution_time = 0.0;
     execution_snapshot_.request_id = request_id;
     execution_snapshot_.trajectory_id = info.traj_id_;
+    execution_snapshot_.task_id = task_id_.load();
+    execution_snapshot_.task_version = task_version_.load();
+    execution_snapshot_.candidate_id = task_candidate_id_.load();
     execution_snapshot_.clearance_escape_active = clearance_escape_active;
     execution_snapshot_.clearance_escape_deadline = clearance_escape_deadline;
     execution_snapshot_.initial_clearance_violations =
@@ -4069,6 +4138,11 @@ namespace scan_planner
     const LocalTrajData executing_trajectory = planner_manager_->local_data_;
     const auto reject_planned_trajectory = [&]() {
       planner_manager_->local_data_ = executing_trajectory;
+      if (task_mode_ && task_goal_available_ && !local_target_override && !seed_path)
+      {
+        task_rejected_stations_.push_back(local_target_pt_.head<2>());
+        task_goal_available_ = false;
+      }
       return false;
     };
     const auto map_snapshot = map->captureInflatedOccupancySnapshot();
@@ -4085,6 +4159,7 @@ namespace scan_planner
     else
     {
       getLocalTarget();
+      if (task_mode_ && !task_goal_available_) return reject_planned_trajectory();
     }
     const Eigen::Vector3d target_acceleration =
         local_target_acceleration_override
@@ -4111,6 +4186,33 @@ namespace scan_planner
     }
     const bool initialize_from_polynomial =
         have_new_target_ || flag_use_poly_init;
+    std::vector<Eigen::Vector3d> task_seed;
+    double task_seed_interval = 0.0;
+    if (task_mode_ && !local_target_override && !seed_path && task_approach_.size() > 1)
+    {
+      // The task selector returns geometry, whereas reboundReplan expects
+      // uniformly timed samples (at least seven), not raw BFS vertices.
+      std::vector<double> lengths(task_approach_.size(), 0.0);
+      for (size_t i = 1; i < lengths.size(); ++i)
+        lengths[i] = lengths[i - 1] + (task_approach_[i] - task_approach_[i - 1]).norm();
+      const double length = lengths.back();
+      if (length <= 1e-6) return reject_planned_trajectory();
+      const size_t count = std::max<size_t>(7, static_cast<size_t>(std::ceil(length / 0.2)) + 1);
+      const double duration = std::max(length / std::max(0.10, planner_manager_->pp_.max_vel_),
+          restToRestMinimumDuration(length, planner_manager_->pp_.max_vel_,
+              planner_manager_->pp_.max_acc_, 1.0));
+      task_seed_interval = duration / (count - 1);
+      size_t segment = 1;
+      for (size_t i = 0; i < count; ++i)
+      {
+        const double distance = length * i / (count - 1);
+        while (segment + 1 < lengths.size() && lengths[segment] < distance) ++segment;
+        const double ratio = (distance - lengths[segment - 1]) /
+            std::max(1e-9, lengths[segment] - lengths[segment - 1]);
+        task_seed.push_back(task_approach_[segment - 1] +
+            ratio * (task_approach_[segment] - task_approach_[segment - 1]));
+      }
+    }
     const auto plan_with_margin = [&](double clearance_margin) {
       const Eigen::Vector3d seed_start_velocity =
           seed_start_velocity_override ? *seed_start_velocity_override : start_vel_;
@@ -4124,9 +4226,9 @@ namespace scan_planner
           low_speed_local_repair && fixed_body_yaw_repair
               ? local_repair_body_yaw
               : std::numeric_limits<double>::quiet_NaN(),
-          clearance_margin, seed_path,
+          clearance_margin, seed_path ? seed_path : (task_seed.empty() ? nullptr : &task_seed),
           target_acceleration.x(), target_acceleration.y(),
-          target_acceleration.z(), seed_sample_interval);
+          target_acceleration.z(), task_seed.empty() ? seed_sample_interval : task_seed_interval);
     };
 
     // Generate normal candidates against the preferred belt first, so A* and
@@ -4272,6 +4374,7 @@ namespace scan_planner
       // B-spline again immediately before publishing it to the controller so a
       // successful solver result can never authorize an occupied trajectory.
       constexpr double validation_dt = 0.02;
+      const LocalTaskDomain task_domain = task_mode_ ? observationTaskDomain() : LocalTaskDomain{};
       double clearance_escape_deadline =
           low_speed_local_repair && minimum_initial_duration > 0.0
               ? minimum_initial_duration
@@ -4282,6 +4385,9 @@ namespace scan_planner
       size_t initial_clearance_violations = 0;
       for (double t = 0.0; t <= info->duration_; t += validation_dt)
       {
+        if (task_mode_ && !taskDomainContains(task_domain,
+              info->position_traj_.evaluateDeBoorT(t).head<2>()))
+          return reject_planned_trajectory();
         const Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t);
         const Eigen::Vector3d pos_next = info->position_traj_.evaluateDeBoorT(
             std::min(t + validation_dt, info->duration_));
@@ -4705,6 +4811,8 @@ namespace scan_planner
       bspline.start_time = info->start_time_;
       bspline.traj_id = info->traj_id_;
       bspline.request_id = planning_request_id;
+      bspline.task_id = task_id_.load(); bspline.task_version = task_version_.load();
+      bspline.candidate_id = task_candidate_id_.load();
       bspline.execution_mode = low_speed_local_repair
           ? scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE
           : (candidate_requires_clearance_limited_profile
@@ -4763,6 +4871,9 @@ namespace scan_planner
         pending_handoff_.candidate = *info;
         pending_handoff_.previous = executing_trajectory;
         pending_handoff_.request_id = planning_request_id;
+        pending_handoff_.task_id = bspline.task_id;
+        pending_handoff_.task_version = bspline.task_version;
+        pending_handoff_.candidate_id = bspline.candidate_id;
         pending_handoff_.trajectory_id = info->traj_id_;
         pending_handoff_.clearance_escape_active =
             handoff_started_inside_clearance;
@@ -4830,7 +4941,7 @@ namespace scan_planner
                   map->getMapAgeSeconds() * 1000.0);
     }
 
-    return plan_success;
+    return plan_success ? true : reject_planned_trajectory();
   }
 
   bool SCANReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
@@ -4847,6 +4958,8 @@ namespace scan_planner
     bspline.traj_id = info->traj_id_;
     const uint64_t stop_request_id = active_reference_request_id_.load();
     bspline.request_id = stop_request_id;
+    bspline.task_id = task_id_.load(); bspline.task_version = task_version_.load();
+    bspline.candidate_id = task_candidate_id_.load();
 
     Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
     bspline.pos_pts.reserve(pos_pts.cols());
@@ -4985,6 +5098,11 @@ namespace scan_planner
 
   void SCANReplanFSM::getReferencePathLocalTarget()
   {
+    if (task_mode_)
+    {
+      selectObservationTaskTarget();
+      return;
+    }
     if (reference_path_.size() < 2)
     {
       local_target_pt_ = end_pt_;

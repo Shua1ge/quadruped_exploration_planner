@@ -18,6 +18,10 @@ struct LocalTaskDomain {
   Eigen::Vector2d observation_center = Eigen::Vector2d::Zero();
   double corridor_radius = 1.0;
   double observation_radius = 2.0;
+  bool has_directional_gate = false;
+  Eigen::Vector2d gate_origin = Eigen::Vector2d::Zero();
+  Eigen::Vector2d gate_direction = Eigen::Vector2d::UnitX();
+  double gate_min_progress = 0.0;
 };
 
 struct LocalTaskCandidate {
@@ -42,6 +46,11 @@ inline bool taskDomainContains(const LocalTaskDomain& domain,
       !std::isfinite(domain.corridor_radius) || domain.corridor_radius < 0.0 ||
       !std::isfinite(domain.observation_radius) || domain.observation_radius < 0.0)
     return false;
+  if (domain.has_directional_gate &&
+      (!domain.gate_origin.allFinite() || !domain.gate_direction.allFinite() ||
+       !std::isfinite(domain.gate_min_progress) || domain.gate_direction.norm()<1e-6 ||
+       (p-domain.gate_origin).dot(domain.gate_direction.normalized()) < domain.gate_min_progress))
+    return false;
   if ((p-domain.observation_center).norm() <= domain.observation_radius)
     return true;
   for (size_t i = 1; i < domain.route.size(); ++i)
@@ -61,7 +70,8 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const std::function<bool(const Eigen::Vector2d&, const Eigen::Vector2d&)>& edge_safe,
     const std::function<bool(const Eigen::Vector2d&)>& visible,
     double step = 0.2, double window = 4.0, size_t max_expansions = 2048,
-    size_t max_candidates = 8) {
+    size_t max_candidates = 8,
+    const std::function<bool(const Eigen::Vector2d&)>& goal_allowed = {}) {
   std::vector<LocalTaskCandidate> result;
   if (!start.allFinite() || !preferred.allFinite() || !edge_safe || !visible ||
       !std::isfinite(step) || step <= 0.0 || !std::isfinite(window) ||
@@ -81,7 +91,7 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const size_t index = open.front(); open.pop();
     const Node current = nodes[index];
     const Eigen::Vector2d p = point(current);
-    if (index > 0) {
+    if (index > 0 && (!goal_allowed || goal_allowed(p))) {
       const bool station = (p-domain.observation_center).norm() <=
           domain.observation_radius && visible(p);
       LocalTaskCandidate candidate;

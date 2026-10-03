@@ -36,6 +36,7 @@ set(scan_planner_dependencies
 add_executable(scan_planner_node
   src/scan_planner_node.cpp
   src/scan_replan_fsm.cpp
+  src/observation_task_adapter.cpp
   src/planner_manager.cpp)
 target_include_directories(scan_planner_node PRIVATE include)
 ament_target_dependencies(scan_planner_node ${scan_planner_dependencies})
@@ -90,6 +91,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_global_astar test/test_global_astar.py)
   ament_add_pytest_test(test_frontier_explorer test/test_frontier_explorer.py)
   ament_add_pytest_test(test_observation_task_contract test/test_observation_task_contract.py)
+  ament_add_pytest_test(test_observation_task_bridge test/test_observation_task_bridge.py)
   ament_add_pytest_test(test_sparse_routing test/test_sparse_routing.py)
   ament_add_pytest_test(test_region_commitment test/test_region_commitment.py)
   ament_add_pytest_test(test_topology test/test_topology.py)
@@ -105,6 +107,9 @@ if(BUILD_TESTING)
   add_test(NAME test_locomotion_supervisor
     COMMAND ${PYTHON_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test/test_locomotion_supervisor.py)
+  add_test(NAME test_observation_task_runtime
+    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_observation_task_runtime.py)
+  set_tests_properties(test_observation_task_runtime PROPERTIES TIMEOUT 40)
   ament_add_gtest(test_replan_fsm_utils test/test_replan_fsm_utils.cpp)
   ament_add_gtest(test_local_task_planner test/test_local_task_planner.cpp)
   if(TARGET test_local_task_planner)

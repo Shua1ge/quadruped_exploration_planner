@@ -1,5 +1,6 @@
 uint8 STATUS_ACCEPTED=1
 uint8 STATUS_REJECTED=2
+uint8 STATUS_TASK_RETIRED=3
 
 builtin_interfaces/Time stamp
 uint64 request_id

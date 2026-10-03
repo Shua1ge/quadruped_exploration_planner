@@ -28,6 +28,9 @@ def _setup(context):
     locomotion_mode = LaunchConfiguration("locomotion_mode").perform(context)
     keypoints_file = LaunchConfiguration("keypoints_file").perform(context)
     navi_mode = int(LaunchConfiguration("navi_mode").perform(context))
+    task_mode = _as_bool(LaunchConfiguration("task_mode").perform(context))
+    if task_mode and (navi_mode != 3 or controller_mode != "closed_loop"):
+        raise RuntimeError("task_mode requires navi_mode=3 and controller_mode=closed_loop")
     if sensor_type not in ("lidar", "depth"):
         raise RuntimeError("sensor_type must be 'lidar' or 'depth'")
     if controller_mode not in ("open_loop", "closed_loop"):
@@ -99,6 +102,7 @@ def _setup(context):
         **common,
         **intrinsics,
         "fsm.navi_mode": navi_mode,
+        "fsm.task_mode": task_mode,
         "grid_map.sensor_type": sensor_type,
         "grid_map.cloud_is_world": cloud_is_world,
         "grid_map.need_extrinsic": need_extrinsic,
@@ -349,6 +353,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("is_real_world", default_value="false"),
             DeclareLaunchArgument("navi_mode", default_value="1"),
+            DeclareLaunchArgument("task_mode", default_value="false"),
             DeclareLaunchArgument("sensor_type", default_value="lidar"),
             DeclareLaunchArgument("controller_mode", default_value="closed_loop"),
             DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),

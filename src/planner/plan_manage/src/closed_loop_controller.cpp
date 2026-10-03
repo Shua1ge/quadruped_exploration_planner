@@ -492,6 +492,13 @@ private:
         publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
                               soft_hold_reason_, 0.0, true);
       }
+      scan_planner_msgs::msg::TrajectoryAck ack;
+      ack.stamp = now();
+      ack.task_id = msg->task_id;
+      ack.task_version = msg->task_version;
+      ack.status = scan_planner_msgs::msg::TrajectoryAck::STATUS_TASK_RETIRED;
+      ack.reason = "TASK_RETIRED";
+      trajectory_ack_pub_->publish(ack);
       return;
     }
     if (taskExecutionIsRetired({active_task_id_, active_task_version_}, retired_task_))

@@ -22,3 +22,8 @@ float64 resolution
 uint32 representative_selection_version
 geometry_msgs/Point[] terminal_cells
 uint32 max_station_adjustments
+# Optional world-space no-return gate inherited from region commitment.
+bool has_directional_gate
+geometry_msgs/Point gate_origin
+geometry_msgs/Vector3 gate_direction
+float64 gate_min_progress

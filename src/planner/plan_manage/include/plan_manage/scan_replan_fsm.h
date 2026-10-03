@@ -26,6 +26,10 @@
 #include <scan_planner_msgs/msg/execution_state.hpp>
 #include <scan_planner_msgs/msg/failure_evidence.hpp>
 #include <scan_planner_msgs/msg/trajectory_ack.hpp>
+#include <scan_planner_msgs/msg/observation_task.hpp>
+#include <scan_planner_msgs/msg/observation_feedback.hpp>
+#include <plan_manage/local_task_planner.h>
+#include <plan_manage/task_protocol.h>
 #include <plan_manage/planner_manager.h>
 #include <plan_manage/replan_fsm_utils.h>
 #include <traj_utils/planning_visualization.h>
@@ -143,6 +147,33 @@ namespace scan_planner
     Eigen::Vector3d local_target_pt_, local_target_vel_;                     // local target state
     std::vector<Eigen::Vector3d> active_waypoints_;
     std::vector<Eigen::Vector3d> reference_path_;
+    bool task_mode_{false};
+    scan_planner_msgs::msg::ObservationTask::ConstSharedPtr observation_task_;
+    scan_planner_msgs::msg::ObservationTask::ConstSharedPtr deferred_task_;
+    rclcpp::Subscription<scan_planner_msgs::msg::ObservationTask>::SharedPtr task_sub_;
+    rclcpp::Publisher<scan_planner_msgs::msg::ObservationFeedback>::SharedPtr task_feedback_pub_;
+    std::atomic<uint64_t> task_id_{0}, task_version_{0}, task_candidate_id_{0};
+    TaskVersion retired_task_{0, 0};
+    TaskVersion retiring_task_{0, 0};
+    std::atomic<bool> task_retirement_pending_{false};
+    std::mutex task_event_mutex_;
+    TaskVersion task_retirement_confirmation_{0,0};
+    std::vector<std::pair<TaskVersion,Eigen::Vector2d>> task_failed_goals_;
+    int64_t last_task_retirement_ns_{0};
+    uint64_t task_terminal_request_{0};
+    bool task_station_target_{false}, task_goal_available_{false};
+    Eigen::Vector3d task_station_{Eigen::Vector3d::Zero()};
+    std::vector<Eigen::Vector2d> task_rejected_stations_;
+    std::vector<Eigen::Vector3d> task_approach_;
+    LocalTaskDomain observationTaskDomain() const;
+    uint32_t task_station_adjustments_{0};
+    void observationTaskCallback(const scan_planner_msgs::msg::ObservationTask::ConstSharedPtr &msg);
+    bool processObservationTaskTransitions();
+    void retireObservationTask(TaskVersion version);
+    void confirmObservationTaskRetirement(TaskVersion version);
+    bool selectObservationTaskTarget();
+    void observationTaskRejected(const std::string &reason);
+    void publishObservationFeedback(uint8_t state, const std::string &reason);
     size_t reference_progress_idx_{0};
     double reference_progress_ratio_{0.0};
     bool reference_path_active_{false};
@@ -182,6 +213,7 @@ namespace scan_planner
       double duration{0.0};
       double controller_execution_time{0.0};
       uint64_t request_id{0};
+      uint64_t task_id{0}, task_version{0}, candidate_id{0};
       int64_t trajectory_id{0};
       bool clearance_escape_active{false};
       double clearance_escape_deadline{0.0};
@@ -206,6 +238,7 @@ namespace scan_planner
       LocalTrajData candidate;
       LocalTrajData previous;
       uint64_t request_id{0};
+      uint64_t task_id{0}, task_version{0}, candidate_id{0};
       int64_t trajectory_id{0};
       bool clearance_escape_active{false};
       double clearance_escape_deadline{0.0};

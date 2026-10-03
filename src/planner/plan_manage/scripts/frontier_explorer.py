@@ -26,6 +26,8 @@ from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
 from scan_planner_msgs.msg import FailureEvidence, LocomotionState, TopoGraphDelta
+from scan_planner_msgs.msg import ObservationTask as TaskMessage, ObservationFeedback
+from explorer_core.observation_task_bridge import ObservationTaskBridge
 
 from explorer_core.frontier_regions import (
     FrontierRegion, PersistentRegionTracker, RegionCommitmentUpdate,
@@ -121,7 +123,7 @@ class FrontierCandidate:
     observation_progress: float = 0.0
 
 
-class FrontierExplorer(Node):
+class FrontierExplorer(ObservationTaskBridge, Node):
     @property
     def grid(self) -> ExplorationGrid:
         coordinator = getattr(self, "_planning_coordinator", None)
@@ -352,6 +354,19 @@ class FrontierExplorer(Node):
         self.metrics_file = str(self.declare_parameter("metrics_file", "").value)
         self.observation_preplanning_enabled = bool(
             self.declare_parameter("observation_preplanning_enabled", True).value)
+        self.task_mode = bool(self.declare_parameter("task_mode", False).value)
+        self.task_corridor_radius = float(self.declare_parameter("task_corridor_radius", 0.8).value)
+        self.task_representative_limit = int(self.declare_parameter("task_representative_limit", 64).value)
+        self.task_max_station_adjustments = int(self.declare_parameter("task_max_station_adjustments", 4).value)
+        if (not math.isfinite(self.task_corridor_radius) or not 0 < self.task_corridor_radius <= 10
+                or not 1 <= self.task_representative_limit <= 256
+                or not 1 <= self.task_max_station_adjustments <= 32):
+            raise ValueError("invalid observation task bounds")
+        self.last_observation_task_id = 0
+        self.tasks_created = self.task_requests_published = self.task_cancellations = 0
+        self.task_stations_reached = self.task_local_rejections = self.task_stale_feedback = 0
+        self.task_feedback_seen = deque(maxlen=256)
+        self.pending_observation_station = None
         self.planning_period = float(
             self.declare_parameter("planning_period", 0.25).value)
         self.observation_radius = float(
@@ -688,6 +703,10 @@ class FrontierExplorer(Node):
             self.safe_region_snapshot_callback, transient_qos,
             callback_group=self.planning_callback_group)
         self.path_pub = self.create_publisher(Path, "initial_path", 10)
+        self.observation_task_pub = self.create_publisher(TaskMessage, "observation_task", 20)
+        self.create_subscription(ObservationFeedback, "planning/observation_feedback",
+                                 self.observation_feedback_callback, 20,
+                                 callback_group=self.planning_callback_group)
         self.path_vis_pub = self.create_publisher(Path, "explorer/path", transient_qos)
         self.map_pub = self.create_publisher(OccupancyGrid, "explorer/map", transient_qos)
         self.map_updates_pub = self.create_publisher(
@@ -731,6 +750,10 @@ class FrontierExplorer(Node):
         change route scoring/cooldown, but it never clears the active request.
         """
         self.failure_evidence_received += 1
+        if getattr(self, "task_mode", False):
+            task = self.active_observation
+            if task is None or msg.task_id != task.task_id or msg.task_version != task.task_version:
+                return
         if (self.active_path_request_generation is None
                 or int(msg.request_id) !=
                 int(self.active_path_request_generation)):
@@ -1896,6 +1919,9 @@ class FrontierExplorer(Node):
             "waiting for the coordinator to continue or complete the option")
 
     def handle_local_execution_finish(self) -> bool:
+        if getattr(self, "task_mode", False):
+            self.pending_local_execution_finish = None
+            return False
         event = self.pending_local_execution_finish
         if event is None:
             return False
@@ -1931,6 +1957,20 @@ class FrontierExplorer(Node):
 
     def planning_status_callback(self, msg: String):
         status, request_generation = parse_planning_status(msg.data)
+        if getattr(self, "task_mode", False):
+            if status in ("REACHED", "WAIT_TARGET"):
+                return  # Only measured typed station feedback may end motion.
+            task = self.active_observation
+            fields = dict(part.split("=", 1) for part in msg.data.split() if "=" in part)
+            if request_generation is not None and task is not None:
+                if (fields.get("task_id") != str(task.task_id)
+                        or fields.get("task_version") != str(task.task_version)):
+                    self.task_stale_feedback += 1
+                    return
+            if status in ("BLOCKED", "TRACKING_RECOVERY_FAILED", "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
+                # Terminal errors may originate before Local target selection
+                # (e.g. occupied start). They still enter same-scope arbitration.
+                status = "VIEWPOINT_LOCAL_REJECTED"
         # WAIT_TARGET is a heartbeat.  Once this request has completed, later
         # repeats only reaffirm that SCAN is idle; they must not re-run the
         # completion transition or be reported as stale after the active task
@@ -2317,12 +2357,17 @@ class FrontierExplorer(Node):
                     + ("" if request_id is None
                        else f" request_id={request_id}")
                     + " reason=TIMEOUT")
+                if getattr(self, "task_mode", False) and self.active_observation is not None:
+                    task = self.active_observation
+                    timeout.data += f" task_id={task.task_id} task_version={task.task_version}"
                 self.planning_status_callback(timeout)
                 return
             self.get_logger().info(
                 f"[PATH_REQUEST_IN_FLIGHT] age={request_age:.2f}s; "
                 "waiting for SCAN before publishing another reference path",
                 throttle_duration_sec=2.0)
+            return
+        if getattr(self, "task_mode", False) and self.continue_observation_station():
             return
         if self.handle_local_execution_finish():
             return
@@ -2611,6 +2656,7 @@ class FrontierExplorer(Node):
         self.cumulative_planning_ms += self.last_global_plan_ms
         self.get_logger().info(
             f"[GLOBAL_PLAN_BASELINE] revision={self.map_update_count} "
+            f"task_id={getattr(self.active_observation, 'task_id', 0)} "
             f"regions={len(regions)} candidates={len(candidates)} "
             f"map_preprocess_ms={self.last_map_preprocess_ms:.1f} "
             f"inflation_ms={self.grid.last_inflation_ms:.2f} "
@@ -3449,7 +3495,10 @@ class FrontierExplorer(Node):
             pose.pose.orientation.z = math.sin(0.5 * yaw)
             pose.pose.orientation.w = math.cos(0.5 * yaw)
             msg.poses.append(pose)
-        self.path_pub.publish(msg)
+        if getattr(self, "task_mode", False):
+            self.publish_observation_task(msg, request_generation)
+        else:
+            self.path_pub.publish(msg)
         self.path_vis_pub.publish(msg)
         self.pending_path_publish_ns = now_ns
         self.pending_path_deferred = False
@@ -3461,7 +3510,8 @@ class FrontierExplorer(Node):
     def publish_path(self, cells: Sequence[Cell], candidate: FrontierCandidate):
         goal_xy = candidate.goal
         region_id = candidate.region_id
-        self.publish_reference_path(cells)
+        if not getattr(self, "task_mode", False):
+            self.publish_reference_path(cells)
         self.active_goal = goal_xy
         self.active_goal_cell = cells[-1]
         self.active_raw_path = list(candidate.path)
@@ -3486,6 +3536,8 @@ class FrontierExplorer(Node):
                                 if candidate.terminal_cells else (candidate.cell,)))
         self.last_terminal_candidate_count = len(
             self.active_observation.terminal_cells)
+        if getattr(self, "task_mode", False):
+            self.publish_reference_path(cells)
         inflated = self.grid.inflated_obstacles(self.inflation_radius)
         self.last_terminal_clearance = self.terminal_clearance(
             candidate.cell, inflated)
@@ -3637,6 +3689,14 @@ class FrontierExplorer(Node):
             "observations_satisfied": self.observations_satisfied,
             "observation_motion_released_count": (
                 self.observation_motion_released_count),
+            "task_mode": getattr(self, "task_mode", False),
+            "task_id": getattr(self.active_observation, "task_id", 0),
+            "task_version": getattr(self.active_observation, "task_version", 0),
+            "tasks_created": getattr(self, "tasks_created", 0),
+            "task_requests_published": getattr(self, "task_requests_published", 0),
+            "task_stations_reached": getattr(self, "task_stations_reached", 0),
+            "task_local_rejections": getattr(self, "task_local_rejections", 0),
+            "task_stale_feedback": getattr(self, "task_stale_feedback", 0),
             "last_observation_released_reason": (
                 self.last_observation_released_reason),
             "last_observation_released_progress": (

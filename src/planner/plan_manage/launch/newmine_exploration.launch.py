@@ -10,6 +10,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 MAP_SIZE = 280.0
@@ -98,6 +99,7 @@ def generate_launch_description():
         DeclareLaunchArgument("headless", default_value="false"),
         DeclareLaunchArgument("show_rviz", default_value="true"),
         DeclareLaunchArgument("auto_start", default_value="true"),
+        DeclareLaunchArgument("task_mode", default_value="false"),
         DeclareLaunchArgument("selection_strategy", default_value="hierarchical"),
         DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
         # "policy" lets the zero-command ONNX policy perform the lying-to-stand;
@@ -114,6 +116,7 @@ def generate_launch_description():
                 os.path.join(scan_share, "launch", "run.launch.py")),
             launch_arguments={
                 "navi_mode": "3",
+                "task_mode": LaunchConfiguration("task_mode"),
                 "sensor_type": "lidar",
                 "controller_mode": "closed_loop",
                 "locomotion_mode": LaunchConfiguration("locomotion_mode"),
@@ -236,6 +239,7 @@ def generate_launch_description():
                 # apart from a finished exploration (frontier_cells == 0).
                 "stall_detection_seconds": 30.0,
                 "observation_preplanning_enabled": True,
+                "task_mode": ParameterValue(LaunchConfiguration("task_mode"), value_type=bool),
                 "observation_radius": 3.0,
                 "observation_prepare_ratio": 0.60,
                 "observation_done_ratio": 0.80,

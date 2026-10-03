@@ -63,3 +63,26 @@ TEST(LocalTaskPlanner, BoundedSearchAndInvalidInput) {
   EXPECT_TRUE(selectLocalTaskCandidates(domain,{0,0},{1,0},safe,visible,
       0,4,5,3).empty());
 }
+
+TEST(LocalTaskPlanner, NoReturnGateRejectsBackwardGoalsInsideObservationDisk) {
+  LocalTaskDomain domain;
+  domain.observation_radius=10;
+  domain.has_directional_gate=true;
+  domain.gate_origin={0,0}; domain.gate_direction={1,0}; domain.gate_min_progress=0;
+  auto candidates=selectLocalTaskCandidates(domain,{0,0},{-2,0},
+      [](const Eigen::Vector2d&,const Eigen::Vector2d&) {return true;},
+      [](const Eigen::Vector2d&) {return true;});
+  ASSERT_FALSE(candidates.empty());
+  for(const auto& candidate:candidates) EXPECT_GE(candidate.goal.x(),0);
+}
+
+TEST(LocalTaskPlanner, ExcludedStationDoesNotPreventLeavingIt) {
+  LocalTaskDomain domain;
+  domain.observation_radius=10;
+  auto candidates=selectLocalTaskCandidates(domain,{0,0},{0,0},
+      [](const Eigen::Vector2d&,const Eigen::Vector2d&) {return true;},
+      [](const Eigen::Vector2d&) {return true;},.2,4,128,8,
+      [](const Eigen::Vector2d& p) {return p.norm()>.4;});
+  ASSERT_FALSE(candidates.empty());
+  for(const auto& candidate:candidates) EXPECT_GT(candidate.goal.norm(),.4);
+}
