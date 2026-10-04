@@ -70,7 +70,7 @@ def generate_launch_description():
                 "global_reroute_failure_updates": 3,
                 "max_replans_per_context": 2,
                 "replan_retry_updates": 10,
-                "map_update_period": 0.5,
+                "map_update_period": 0.25,
                 "goal_timeout": 120.0,
                 "region_size": 8.0,
                 "region_max_path_ratio": 1.5,

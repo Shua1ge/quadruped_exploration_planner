@@ -557,6 +557,8 @@ def test_incremental_map_update_uses_changed_cell_bounds():
     node.changed_cells = {(2, 1), (3, 3)}
     node.map_published = True
     node.frame_id = "world"
+    node.last_planning_map_ns = None
+    node.planning_map_publish_period = 2.0
     published = []
     node.map_updates_pub = SimpleNamespace(publish=published.append)
     node.map_pub = SimpleNamespace(publish=lambda _: None)

@@ -290,6 +290,18 @@ class ExplorationGrid:
     def integrate_ranges(self, position: Point2, ranges: Sequence[float],
                          max_range: float, min_range: float = 0.35,
                          no_return_range: Optional[float] = None):
+        """Fuse one planar scan.
+
+        The batched implementation below is cell-for-cell equivalent to
+        ``_integrate_ranges_reference``; equivalence is locked by
+        test_grid_vectorized.py.
+        """
+        return self._integrate_ranges_vectorized(
+            position, ranges, max_range, min_range, no_return_range)
+
+    def _integrate_ranges_reference(self, position: Point2, ranges: Sequence[float],
+                                    max_range: float, min_range: float = 0.35,
+                                    no_return_range: Optional[float] = None):
         origin = self.world_to_cell(*position)
         if not self.in_bounds(origin):
             return
@@ -344,6 +356,136 @@ class ExplorationGrid:
                         self.evidence[cell[1], cell[0]], self.free_threshold)
                     self.data[cell[1], cell[0]] = FREE
 
+    def _integrate_ranges_vectorized(self, position: Point2, ranges: Sequence[float],
+                                     max_range: float, min_range: float = 0.35,
+                                     no_return_range: Optional[float] = None):
+        """Exact batched port of _integrate_ranges_reference.
+
+        The integer-Bresenham recurrence runs as a short loop over ray steps
+        and is vectorised across rays; the evidence update is fully
+        vectorised.  Equivalence with the reference implementation is locked
+        by test_grid_vectorized.py.
+        """
+        origin = self.world_to_cell(*position)
+        if not self.in_bounds(origin):
+            return
+        ray_count = len(ranges)
+        if ray_count == 0:
+            return
+        ranges_arr = np.asarray(ranges, dtype=np.float64)
+        is_nan = np.isnan(ranges_arr)
+        # NaN is an observed but deliberately ignored 3-D return: neither an
+        # obstacle hit in the 2-D projection nor free-space evidence.  A
+        # genuine no-return ray is an infinity (or any finite range at/over
+        # max_range) and frees up to miss_range.
+        hit = ~is_nan & (ranges_arr < max_range)
+        miss = ~is_nan & ~hit
+        miss_range = (max_range if no_return_range is None
+                      else min(max_range, no_return_range))
+        ray_range = np.where(hit, np.minimum(ranges_arr, max_range), miss_range)
+        valid = (hit | miss) & (ray_range >= min_range)
+        if not valid.any():
+            return
+        idx = np.nonzero(valid)[0]
+        is_hit = hit[idx]
+        angles = -math.pi + (idx + 0.5) * (2.0 * math.pi / ray_count)
+        ex = position[0] + ray_range[idx] * np.cos(angles)
+        ey = position[1] + ray_range[idx] * np.sin(angles)
+        x1 = np.floor((ex - self.origin_x) / self.resolution).astype(np.int64)
+        y1 = np.floor((ey - self.origin_y) / self.resolution).astype(np.int64)
+        x0 = np.full(idx.size, origin[0], dtype=np.int64)
+        y0 = np.full(idx.size, origin[1], dtype=np.int64)
+        dx = np.abs(x1 - x0)
+        dy = np.abs(y1 - y0)
+        sx = np.where(x0 < x1, 1, -1).astype(np.int64)
+        sy = np.where(y0 < y1, 1, -1).astype(np.int64)
+        error = dx - dy
+        steps = int(np.max(np.maximum(dx, dy))) + 1
+        # -1 sentinel: finished rays stop recording, and the sentinel cell can
+        # never pass the in-bounds test below.
+        px = np.full((steps, idx.size), -1, dtype=np.int64)
+        py = np.full((steps, idx.size), -1, dtype=np.int64)
+        active = np.ones(idx.size, dtype=bool)
+        cx, cy = x0.copy(), y0.copy()
+        for k in range(steps):
+            px[k, active] = cx[active]
+            py[k, active] = cy[active]
+            active &= ~((cx == x1) & (cy == y1))
+            if not active.any():
+                break
+            twice = 2 * error
+            x_adv = active & (twice > -dy)
+            y_adv = active & (twice < dx)
+            error[x_adv] -= dy[x_adv]
+            cx[x_adv] += sx[x_adv]
+            error[y_adv] += dx[y_adv]
+            cy[y_adv] += sy[y_adv]
+        in_bounds = ((px >= 0) & (px < self.width) &
+                     (py >= 0) & (py < self.height))
+        any_inb = in_bounds.any(axis=0)
+        k_axis = np.arange(steps, dtype=np.int64)[:, None]
+        # The reference filters the whole path to in-bounds cells and uses
+        # line[-1] as the hit endpoint, so the endpoint of a hit ray is its
+        # last *in-bounds* cell, not necessarily the Bresenham terminus.
+        last_ib = np.max(np.where(in_bounds, k_axis, -1), axis=0)
+        occ_lookup = (self.data == OCCUPIED).reshape(-1)
+        flat = np.where(in_bounds, py * self.width + px, 0)
+        occ_along = np.zeros_like(in_bounds)
+        occ_along[in_bounds] = occ_lookup[flat[in_bounds]]
+        # Hit rays free everything except their endpoint cell.
+        free_mask = in_bounds & np.where(is_hit[None, :],
+                                         k_axis < last_ib[None, :], True)
+        # A missing return is free-space evidence only up to the first wall
+        # already present when this scan began; the wall cell itself keeps one
+        # weakening step and cells behind it are untouched in this scan.
+        first_occ = np.argmax(free_mask & occ_along, axis=0)
+        has_occ = (free_mask & occ_along).any(axis=0)
+        free_mask &= np.where(has_occ[None, :],
+                              k_axis <= first_occ[None, :], True)
+        free_flat = np.unique(flat[free_mask])
+        occ_mask = np.zeros_like(in_bounds)
+        hit_rays = np.nonzero(is_hit & any_inb)[0]
+        occ_mask[last_ib[hit_rays], hit_rays] = True
+        occ_flat = np.unique(flat[occ_mask])
+        free_apply = np.setdiff1d(free_flat, occ_flat)
+
+        self.sensor_revision += 1
+        data_flat = self.data.reshape(-1)
+        ev_flat = self.evidence.reshape(-1)
+        seen_flat = self.sensor_observed.reshape(-1)
+        if free_apply.size:
+            new_ev = np.maximum(ev_flat[free_apply].astype(np.int64) - 1,
+                                -self.evidence_limit)
+            d = data_flat[free_apply]
+            keep_occ = (d == OCCUPIED) & (new_ev > self.occupied_clear_threshold)
+            to_free = (~keep_occ) & (new_ev <= self.free_threshold)
+            to_unknown = (~keep_occ) & ~to_free & (new_ev < self.occupied_threshold)
+            ev_flat[free_apply] = new_ev
+            seen_flat[free_apply] = self.sensor_revision
+            data_flat[free_apply[to_free]] = FREE
+            data_flat[free_apply[to_unknown]] = UNKNOWN
+        if occ_flat.size:
+            new_ev = np.minimum(ev_flat[occ_flat].astype(np.int64) + 1,
+                                self.evidence_limit)
+            ev_flat[occ_flat] = new_ev
+            seen_flat[occ_flat] = self.sensor_revision
+            data_flat[occ_flat[new_ev >= self.occupied_threshold]] = OCCUPIED
+
+        seed_radius = max(1, int(math.ceil(0.35 / self.resolution)))
+        span = np.arange(-seed_radius, seed_radius + 1)
+        gx = origin[0] + span
+        gy = origin[1] + span
+        mx = (gx >= 0) & (gx < self.width)
+        my = (gy >= 0) & (gy < self.height)
+        yy, xx = np.meshgrid(gy[my], gx[mx], indexing="ij")
+        disk = np.hypot(xx - origin[0], yy - origin[1]) <= seed_radius
+        yy, xx = yy[disk], xx[disk]
+        not_occ = self.data[yy, xx] != OCCUPIED
+        yy, xx = yy[not_occ], xx[not_occ]
+        self.evidence[yy, xx] = np.minimum(self.evidence[yy, xx],
+                                           self.free_threshold)
+        self.data[yy, xx] = FREE
+
     def mark_occupied_points(self, points_xy: np.ndarray):
         """Add one hit of evidence per raw endpoint; never latch occupancy directly."""
         points = np.asarray(points_xy, dtype=np.float64).reshape((-1, 2))
@@ -377,22 +519,35 @@ class ExplorationGrid:
         ys, xs = np.nonzero(inflated)
         result = frozenset(zip(xs.tolist(), ys.tolist()))
         occupied.flags.writeable = False
-        self._inflation_cache[0] = (key, occupied, result)
+        self._inflation_cache[0] = (key, occupied, result, inflated)
         self.inflation_cache_misses += 1
         self.last_inflation_ms = (time.perf_counter() - started) * 1000.0
         return result
+
+    def inflated_mask(self, radius: float) -> np.ndarray:
+        """Boolean inflated-occupancy mask sharing the inflated_obstacles
+        cache; lets vectorised consumers skip the per-cell frozenset."""
+        self.inflated_obstacles(radius)
+        return self._inflation_cache[0][3]
 
     def planning_free(self, cell: Cell, inflated: Set[Cell]) -> bool:
         return self.in_bounds(cell) and self.value(cell) == FREE and cell not in inflated
 
     def frontier_cells(self, inflated: Set[Cell]) -> Set[Cell]:
+        """FREE cells with an UNKNOWN 4-neighbour, minus the inflated set.
+
+        Candidate cells come from array shifts; inflated membership (a set
+        lookup) is only tested on the small candidate set."""
+        free = self.data == FREE
+        unknown = self.data == UNKNOWN
+        has_unknown_neighbour = np.zeros_like(free)
+        has_unknown_neighbour[1:, :] |= unknown[:-1, :]
+        has_unknown_neighbour[:-1, :] |= unknown[1:, :]
+        has_unknown_neighbour[:, 1:] |= unknown[:, :-1]
+        has_unknown_neighbour[:, :-1] |= unknown[:, 1:]
+        ys, xs = np.nonzero(free & has_unknown_neighbour)
         result = set()
-        for y, x in np.argwhere(self.data == FREE):
-            cell = (int(x), int(y))
-            if cell in inflated:
-                continue
-            neighbours = ((cell[0] - 1, cell[1]), (cell[0] + 1, cell[1]),
-                          (cell[0], cell[1] - 1), (cell[0], cell[1] + 1))
-            if any(self.in_bounds(n) and self.value(n) == UNKNOWN for n in neighbours):
-                result.add(cell)
+        for x, y in zip(xs.tolist(), ys.tolist()):
+            if (x, y) not in inflated:
+                result.add((x, y))
         return result
