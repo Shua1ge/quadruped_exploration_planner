@@ -1367,7 +1367,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         active_scope = getattr(self, "active_commitment_scope", None)
         cross_scope = (active_scope is not None
                        and candidate_scope != active_scope)
-        if cross_scope and self.commitment_state == "COMMITTED":
+        if (cross_scope and self.commitment_state == "COMMITTED"
+                and not allow_commitment_transfer):
             # A standby route is speculative while the old task is running.
             # A completed-task handoff may transfer commitment, but only after
             # this method has validated and spliced the replacement route.
@@ -1967,10 +1968,31 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                         or fields.get("task_version") != str(task.task_version)):
                     self.task_stale_feedback += 1
                     return
+            if status == "REFERENCE_PATH_REJECTED" and fields.get("reason") == "INVALID_TASK_CONTRACT":
+                if request_generation != self.pending_path_request_generation:
+                    self.task_stale_feedback += 1
+                    return
+                self.pending_path_publish_ns = 0
+                self.pending_path_deferred = False
+                self.pending_path_request_generation = None
+                self.scan_reference_rejected_count += 1
+                self.get_logger().error(
+                    f"[TASK_CONTRACT_REJECTED] request={request_generation} "
+                    f"field={fields.get('field', 'unknown')}; retaining observation and region")
+                self.publish_status("TASK_CONTRACT_REJECTED")
+                self.blocked_execution_context = self.local_execution_context()
+                return
             if status in ("BLOCKED", "TRACKING_RECOVERY_FAILED", "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
-                # Terminal errors may originate before Local target selection
-                # (e.g. occupied start). They still enter same-scope arbitration.
-                status = "VIEWPOINT_LOCAL_REJECTED"
+                if not planning_status_matches_request(status, request_generation,
+                        self.pending_path_request_generation, self.active_path_request_generation):
+                    self.task_stale_feedback += 1
+                    return
+                self.pending_path_publish_ns = 0
+                self.pending_path_request_generation = None
+                self.pending_path_deferred = False
+                self.blocked_execution_context = self.local_execution_context()
+                self.publish_status("LOCAL_EXECUTION_BLOCKED")
+                return
         # WAIT_TARGET is a heartbeat.  Once this request has completed, later
         # repeats only reaffirm that SCAN is idle; they must not re-run the
         # completion transition or be reported as stale after the active task
@@ -2335,6 +2357,13 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self.healthy_task_elapsed += dt
         if not self.auto_start or self.position is None or self.map_update_count < 2:
             return
+        # Information completion owns task handoff. Neither an outstanding
+        # Local request nor repair of G1's obsolete route may postpone G2.
+        if self.active_goal is not None:
+            task = self.evaluate_active_observation()
+            if self.observation_complete(task):
+                self.handoff_satisfied_observation("OBSERVATION_HANDOFF_COMPLETE")
+                return
         if self.pending_path_publish_ns:
             if self.pending_path_deferred:
                 self.get_logger().info(
@@ -2366,6 +2395,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 f"[PATH_REQUEST_IN_FLIGHT] age={request_age:.2f}s; "
                 "waiting for SCAN before publishing another reference path",
                 throttle_duration_sec=2.0)
+            return
+        if getattr(self, "task_mode", False) and self.continue_blocked_execution():
             return
         if getattr(self, "task_mode", False) and self.continue_observation_station():
             return

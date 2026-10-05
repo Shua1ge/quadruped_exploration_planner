@@ -63,6 +63,7 @@ class TestTaskRuntime(unittest.TestCase):
             QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
         cls.pose_x=0.0
+        cls.pose_yaw=0.0
         cls.cloud_counter=0
 
     @classmethod
@@ -86,7 +87,8 @@ class TestTaskRuntime(unittest.TestCase):
             odom.header.frame_id="world"
             odom.pose.pose.position.x=self.pose_x
             odom.pose.pose.position.z=.4
-            odom.pose.pose.orientation.w=1.
+            odom.pose.pose.orientation.w=math.cos(self.pose_yaw/2)
+            odom.pose.pose.orientation.z=math.sin(self.pose_yaw/2)
             self.odom_pub.publish(odom)
             self.sensor_pose_pub.publish(odom)
             self.cloud_counter+=1
@@ -138,6 +140,14 @@ class TestTaskRuntime(unittest.TestCase):
     def test_retirement_fences_delayed_ack_and_candidate(self):
         self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and
                         self.spline_pub.get_subscription_count()>0)
+        invalid = self.task(99)
+        invalid.target_cell_count = 0
+        self.task_pub.publish(invalid)
+        self.spin_until(lambda:any("REFERENCE_PATH_REJECTED" in s and
+            f"request_id={invalid.request_id}" in s and "task_id=99" in s and
+            "field=target_cells_size" in s for s in self.statuses))
+        self.assertFalse(any("PATH_ACCEPTED" in s and
+            f"request_id={invalid.request_id}" in s for s in self.statuses))
         first=self.task(100)
         self.task_pub.publish(first)
         self.spin_until(lambda:any("PATH_ACCEPTED" in s and f"request_id={first.request_id}" in s
@@ -149,6 +159,19 @@ class TestTaskRuntime(unittest.TestCase):
         self.ack_pub.publish(planned)
         self.spin_until(lambda:any("PATH_TRAJECTORY_READY" in s and f"request_id={first.request_id}" in s
                                    for s in self.statuses))
+        # Replay a robot turning in place. The acknowledged execution remains
+        # owned while Controller aligns; FSM may not replace it with siblings.
+        self.pose_yaw=math.pi
+        self.spin_until(lambda:any(s.request_id==first.request_id and
+            s.trajectory_id==planned.trajectory_id and
+            s.state==ExecutionState.STATE_HEADING_FROZEN for s in self.states))
+        aligned_acks=len([a for a in self.acks if a.request_id==first.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED])
+        until=time.monotonic()+1.2
+        self.spin_until(lambda:time.monotonic()>=until)
+        self.assertEqual(aligned_acks,len([a for a in self.acks if a.request_id==first.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED]))
+        self.pose_yaw=0.
         old=self.stationary(100,first.request_id,1000)
         self.spline_pub.publish(old)
         self.spin_until(lambda:any(a.task_id==100 and a.trajectory_id==1000 and
@@ -200,11 +223,44 @@ class TestTaskRuntime(unittest.TestCase):
         self.assertAlmostEqual(reached.station.x,2.0)
         self.assertFalse(any("REACHED request_id="+str(station_task.request_id) in s
                              for s in self.statuses))
+        no_gain=self.task(102)
+        no_gain.coarse_route = [no_gain.goal]
+        no_gain.max_station_adjustments=3
+        self.task_pub.publish(no_gain)
+        self.spin_until(lambda:any(a.task_id==102 and a.request_id==no_gain.request_id and
+                                  a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks))
+        self.assertFalse(any(f.task_id==102 and f.request_id==no_gain.request_id and
+                             f.reason=="NO_NEW_OBSERVATION_STATION" for f in self.feedback))
+        self.ack_pub.publish(next(a for a in self.acks if a.task_id==102 and
+                                 a.request_id==no_gain.request_id and
+                                 a.status==TrajectoryAck.STATUS_ACCEPTED))
+        self.spin_until(lambda:any("PATH_TRAJECTORY_READY" in s and
+                                  f"request_id={no_gain.request_id}" in s for s in self.statuses))
         retry=self.task(102)
         retry.max_station_adjustments=1
         self.task_pub.publish(retry)
         self.spin_until(lambda:any(f.task_id==102 and f.request_id==retry.request_id and
                                   f.state==ObservationFeedback.TASK_EXHAUSTED for f in self.feedback))
+
+        # Controller-only mid-segment probe: measured pose remains exactly on
+        # the curve, spatial progress stays near zero, duration is ten seconds.
+        # The FSM has no pending candidate for this deliberately newer version.
+        moving=self.stationary(102,retry.request_id+1,2000)
+        moving.pos_pts=[Point(x=x,y=0.,z=.4) for x in (1.5,2.,2.5,3.)]
+        moving.knots=[-30.,-20.,-10.,0.,10.,20.,30.,40.]
+        moving.execution_mode=Bspline.MODE_CLEARANCE_LIMITED
+        moving.max_forward_speed=.3
+        moving.min_forward_command=.3
+        moving.min_forward_effective_speed=.165
+        self.spline_pub.publish(moving)
+        self.spin_until(lambda:any(a.trajectory_id==2000 and a.status==TrajectoryAck.STATUS_ACCEPTED
+                                  for a in self.acks))
+        self.spin_until(lambda:any(s.trajectory_id==2000 and s.state==ExecutionState.STATE_STALLED
+                                  and s.reason=="EXECUTION_NO_PROGRESS" for s in self.states),timeout=5)
+        stalled=next(s for s in self.states if s.trajectory_id==2000 and
+                     s.reason=="EXECUTION_NO_PROGRESS")
+        self.assertLess(stalled.execution_time,stalled.duration)
+        self.assertAlmostEqual(stalled.duration,10.)
 
 
 if __name__=="__main__": unittest.main()

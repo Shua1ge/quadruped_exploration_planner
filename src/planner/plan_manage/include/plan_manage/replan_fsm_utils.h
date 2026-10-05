@@ -12,6 +12,35 @@
 namespace scan_planner
 {
 
+inline bool shouldPreserveHeadingAlignment(bool task_mode, bool aligning,
+    bool stalled, bool safety_stop, bool replacement_pending)
+{
+  return task_mode && aligning && !stalled && !safety_stop && !replacement_pending;
+}
+
+// A sliding physical-progress window, independent of reference-clock progress
+// and lateral tracking error. HOLD/alignment do not count as failed walking.
+struct PhysicalProgressWindow
+{
+  bool initialized{false};
+  double last_progress{0.0};
+  Eigen::Vector2d anchor{Eigen::Vector2d::Zero()};
+
+  void reset() { initialized = false; }
+  bool stalled(double time, const Eigen::Vector2d& position, bool commanded,
+               double timeout, double minimum_displacement)
+  {
+    if (!std::isfinite(time) || !position.allFinite() || !commanded ||
+        !std::isfinite(timeout) || timeout <= 0.0 ||
+        !std::isfinite(minimum_displacement) || minimum_displacement <= 0.0)
+    { reset(); return false; }
+    if (!initialized || time < last_progress ||
+        (position-anchor).norm() >= minimum_displacement)
+    { initialized = true; last_progress = time; anchor = position; return false; }
+    return time-last_progress >= timeout;
+  }
+};
+
 // Shared by calibrated-gait execution and candidate certification. The
 // bounded horizon also handles stationary spline tails without a full scan.
 template <typename SamplePosition>

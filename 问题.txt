@@ -1,0 +1,172 @@
+以下是可直接保存的完整摘要(所有行号以当前各分支工作树为准，已完成项标注了分支位置)。
+
+---
+
+# SCAN-Planner 问题与改动摘要(2026-10-04)
+
+图例:🔴 待修(主线)· ✅ 已完成(`perf/fusion-stage1-4` 分支,提交 `0c20728`)· 🟡 已设计待实施 · ⚪ 待实测验证
+
+## A. 确定性 bug(P0,主线立即可修)
+
+| 问题 | 证据 | 改动 | 收益 |
+|---|---|---|---|
+| A* 无穷常量写成整数右移 | `dyn_a_star.h:10` `1 >> 20` = 1024 | 改 `1e20` 或 `std::numeric_limits` | 消除大地图埋雷 |
+| A* 池仅 ±5m,长段必 INIT_ERR | `planner_manager.cpp:78`(100³×0.05m) | 池按 `planning_horizon` 动态或扩容 | 长走廊 rebound 可用 |
+| 无 locomotion_state 发布者时点云被静默丢弃 | `grid_map.cpp:1452-1457` | 启动自检 + 显式 WARN/latch | 消除部署静默故障 |
+| CMake 无构建类型兜底 | plan_env/bspline_opt/plan_manage 的 CMakeLists | 默认 Release + `-march=native`(ARM 加 NEON) | 防换机退化成无优化 |
+| `evaluateDeBoor` 每调用堆分配 | `uniform_bspline.cpp:75-80` | 复用缓冲/栈数组 | 100Hz 控制路径减分配 |
+| refine 只验证前 2/3 轨迹 | `bspline_optimizer.cpp:1147` | 与 rebound 一致的全程验证 | 消除验证缺口 |
+| goal_timeout 不释放承诺 scope | `frontier_explorer.py` exploration_timer 的 goal_timeout 分支 | 补 release 调用 | 超时后不再压制反向候选 |
+| 静态地图冷却永不释放 | 冷却释放要求 revision 前进(:2235-2250) | 加时间兜底(与 revision 条件取或) | 死角停滞不再锁死 |
+| 仓库卫生 | 死仓 `quadruped_exploration_planner/`、214MB 大文件、文档落后 | 删/瘦身/更新 | 可维护性 |
+
+## B. 感知-决策链性能 ✅(perf 分支，已实测)
+
+**问题**：融合+发布单拍 **598.9ms > 0.5s 周期**——感知回调组被连续占满(单核 ~120%)。大头是 planning map 全量 `tolist()`(~100-300ms)+ 膨胀集 Python 循环 + 逐格 Python 积分。
+
+**改动**:`occupancy_message` 改 `tobytes()` + 膨胀布olean掩膜缓存;planning_map 降为 2s 一拍(仓库内无消费者);`integrate_ranges` 批处理精确移植(Bresenham 递推按步循环、跨射线向量化、证据全向量化)；决策拍按 `map_content_revision` 门控;`map_update_period` 0.5→0.25s。
+
+**收益**：单拍 **598.9 → 1.4ms(约 400×)**;感知-决策延迟最坏 0.75s→0.5s;感知链 CPU 120%→~2%;决策纪元与融合事件 1:1,时序防御降级为保险。
+
+**验证**：254 测试全过(8 个 tunnel 环境错误 A/B 确认为基线固有)；等价性属性测试 33 项锁定；基准 `tools/fusion_bench.py`。**⚪ 待做**:perf 工作区 colcon build 后 live 跑 quad_exploration 确认。
+
+## C. 规划拍剩余热点(阶段 4 余量，先计时再动)
+
+- `observation_target_cells` 每候选全量重算(自己文档 backlog #1);`safe_viewpoint_cells` 方位环预计算(#2)
+- 稠密 A* 回退收候选走廊子图(增长栅格下必需)
+- 机器人静止时的融合空转门(位姿+扫描相似度)
+- 验收：目标硬件上活跃探索期整拍 ≤100ms 持续
+
+## D. 长程表示(P2-①)🟡
+
+**问题**：Explorer 栅格固定声明尺寸、越界=墙(`grid.py:261-263`);`blacklist`/`completed_goals` 无界线性扫描；O(声明面积) 的每拍扫描。
+**改动**：32×32 格(6.4m)chunk 世界坐标编址、惰性分配；增量 frontier 集(只重判变更格+邻域)；稠密 A* 回退收走廊子图;blacklist 有界化。
+**收益**：内存/算力随**探索面积**而非**声明面积**增长(1km² ≈ 75MB,Jetson 可承受)；chunk 兼作开阔地带的区域承诺单元(身份与几何形态解耦，TARE 全局层同思想)。
+**验证**：API 不变 → 120 测试原样通过；NewMine 上规划耗时不随已探索面积增长;`PersistentRegionTracker` 的 region churn 计数(开阔场景)显著下降。
+
+## E. 承诺系统升级 🟡
+
+**现状**(设计已相当成熟):`PersistentRegionTracker` IoU+质心匹配造身份 → `("lineage", id)` 承诺键 → `ResidualCommitmentGate` 半 MDP 残值门 + 去抖 + 方向门 + 完成驱动转移。G2 任务内承诺(站位迟滞/可见性新颖性/NO_NEW_OBSERVATION_STATION 升级/guide tube)已在你的分支实现。
+**问题**：身份锚在无内在身份的格级簇上(IoU 匹配是软肋);`region_commitment_scope` docstring 已自证：稀疏图 component 跨 revision 无身份，“**must not become commitment identities until they have their own persistent tracker**"。
+**改动**：给稀疏图分量建持久 tracker(把 PersistentRegionTracker 的全局配对模式套到分量上，输入用世界量化 stable_node_id 而非格 IoU)→ 承诺键升级为 branch ID → IoU 层对挂接成功区域退役。释放条件全部证据化(观测解析/封锁 3 确认，已有机制)。
+**收益**：承诺从“靠匹配维持”变“靠身份保持”；开阔地带不再依赖易碎的 IoU;与 D 项的 chunk 单元天然衔接。
+**验证**：region churn 数字(D 项)为立项依据；迁移后 lineage 断链率为零。
+
+## F. 地形代价通道(P2-②)🟡
+
+**问题**：决策层对坡度/粗糙度/**负障碍完全不可见**(z 带投影 + C++ 侧单 z 圆盘检查 `grid_map.h:484-521`);负障碍是安全级盲区。2026 文献已有同向工作可引(planetary 2609.35493 的本体+外感融合、RAEM 的混合可通行性表示)。
+**改动**(轻量三原则，不建独立管线)：①融合同一遍里对射线端点格累积 per-cell z 摘要(一个 float16+uint8 数组)；②代价**惰性求值**(只对候选/走廊格算 3×3 梯度)；③本体修正搭便车(supervisor 的速度跟踪比/能耗代理 → 写回 visited 格)。C++ 侧：轨迹 z 锚定地形(替换端点线性插值 `dyn_a_star.cpp:184-195`)、机体带检查、terrain 代价项。
+**收益**：负障碍可见(安全)；roboterrain 类场景决策质量；C++ 局部规划在坡道双向失效(假阻塞/假悬空)修复。
+**验证**：roboterrain A/B(blocked_segment 率、执行失败率)；合成坡道+坑洞单元实验。**若指标不动，停止投入。**
+
+## G. 增量骨架(P2-③)🟡
+
+**问题**:global_representation 每 0.5s 对每 patch 纯 Python 重算(Zhang-Suen 逐像素 + heapq Dijkstra clearance,`topology.py:45-111`)——0.25s 化的最后障碍。
+**改动**：双轨——Lau 式增量 GVD(变更格传播，~200 行 C++ 按论文自写)+ STGPlanner 式波前骨架增量(**clean-room**:STGPlanner 无许可证、TGH 是 GPL-3.0,均只借思想)；骨架源更换会漂移稳定节点 ID,靠挂接半径+兼容测试过渡，不行就骨架保持现状只换 clearance。
+**收益**:global_representation 可与融合同拍;距离场免费产出 ESDF;包络剪枝(TGH 思想)在隧道里剪低间隙分支。
+**验证**:per-patch 耗时对比 + 骨架节点/边与全量重算的 IoU 一致性。
+
+## H. 实验与论文 🟡
+
+- **对比阵型**:LRAE(地形轴，可跑)+ DARE(ICRA 2025)/ARiADNE(RA-L 2024,**Humble 原生分支**，接入最便宜)+ TARE(经典锚)+ 内部消融(task contract / chunk / 增量骨架)；RAEM(2026-08)代码放出即加。矿井边缘(2603.04470,先图后航)与 Unified Autonomy Stack(2026 蓝图)进动机引用。
+- **公平口径**：所有基线 cmd_vel 过同一 supervisor;min-command 映射两种口径都记录。
+- **差异化指标**(文献缺口即贡献):per-tick CPU、内存增长曲线、time-to-information(基线无此语义)。
+- **叙事主轴**：从“覆盖建图”到“信息任务”的转向——你是少数给出机制(三 ID、观测关闭、两级承诺)的工作；死区标定(0.30 命令/0.165 有效速度，`min_speed_probe`)是 locomotion-感知耦合的独有贡献。
+- **许可证红线**:TGH=GPL-3.0、STGPlanner/CMU 栈无许可证——全部只借思想、clean-room 实现。
+
+## 建议顺序
+
+**P0**:主线收尾 G2 提交 → A 表 bug 清单(半天量级)→ perf 分支 live 验证后合回。
+**P1**:D(chunk 栅格，含开阔地带块级承诺)→ H-ARiADNE 接入(第一个真基线)→ C 按实测。
+**P2**:F(地形通道，先合成实验定严重性)→ G(增量骨架)→ E(分量 tracker)。
+
+---
+
+两条贯穿性结论：①性能问题的大头不是算法而是**序列化和逐格 Python 循环**(599ms 里 tolist 占 ~600 倍于必要值)，已证；②三个表示层缺口(长程栅格、地形、增量化)与 2025–2026 文献的问题陈述一一对应——RAEM 抱怨全局稠密维护、planetary 做本体地形、SAR-prioritization 做多因素排序，但**没有人做承诺机制与任务契约**，这是你的叙事空位。
+
+
+# 0.25s / 0.5s 时序问题摘要
+
+## 问题在哪
+
+系统里有三个不同步的节拍，层级如下：
+
+```
+点云 10Hz
+  ├─ Explorer 融合:0.5s 节流        ← 节流的真实原因:单次融合+发布 598.9ms,跑不快
+  ├─ Explorer 决策拍:0.25s          ← 与融合交错,隔拍看到"没变的地图"
+  └─ C++ LocalMapPatch:0.5s → 骨架链(提取+增量+镜像)→ Explorer 侧标签滞后 ~1s+
+```
+
+具体四个问题：
+
+1. **融合超支**：单拍 598.9ms(全图 `tolist()` 序列化 + 膨胀集 Python 循环 + 逐格积分)超过 0.5s 周期，感知回调组被连续占满(单核 ~120%)——0.5s 节流不是设计选择，是被性能逼的。
+2. **决策拍空转**：0.25s 拍里隔拍看到未变化的地图，每两拍浪费一次全量重算的前置工作；所有消费点被迫加防御(残值门幂等缓存、释放评估去重、ReplanGate revision 上下文)。
+3. **标签滞后**：骨架 branch_id 要经 patch→骨架→增量→镜像的链条，比格子旧 ~1s——挂接可能用到过期拓扑(已有“信格子不信骨架”的回退兜底，但时差是根源)。
+4. **延迟**：新 frontier 从出现到进入决策，最坏 0.5s(等融合)+ 0.25s(等拍)= 0.75s。
+
+## 怎么改(已在 `perf/fusion-stage1-4` 分支实现，提交 `0c20728`)
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 序列化改字节:planning map `tolist()` → `tobytes()`;膨胀叠加改布尔掩膜缓存(替代 frozenset 循环) | `frontier_explorer.py` `occupancy_message` |
+| 2 | planning map 降为 2s 一拍(仓库内无消费者，RViz 显示的是 `explorer/map`,其本体是首帧全量+增量，不受影响) | `publish_maps` |
+| 3 | 积分批处理:Bresenham 递推按步数短循环、跨射线 numpy 向量化；证据更新全向量化；语义逐条镜像(hit 端点=最后界内格、first-occluder 含墙格一步弱化) | `grid.py` `_integrate_ranges_vectorized`,参考实现保留为 `_integrate_ranges_reference` |
+| 4 | `map_update_period` 0.5 → **0.25s** | `quad_exploration.launch.py:73` |
+| 5 | 决策拍按 `map_content_revision` 门控:revision 未推进 → 空操作(**放在停滞计时器累加之后**，否则静止时 stall 检测停摆——已踩过并修正) | `exploration_timer` 开头 |
+| 6 | LocalMapPatch **保持 0.5s 不动**：它的消费者是 Python 骨架提取(P2-③ 热点)，现在提速会把 CPU 吃回去；增量化(波前/Lau)完成后挂上同一 0.25s 融合事件 | — |
+
+质量关：等价性属性测试 33 项(随机场景逐格比对 data/evidence/sensor_observed,曾抓到 padding 哨兵 bug)+ 全套件 **254 过 0 败**(8 个 tunnel 错误 A/B 确认为基线固有)。
+
+## 收益(实测，NewMine 规模 1.96M 格)
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| 融合+发布单拍 | **598.9ms(超支 0.5s 周期，单核 ~120%)** | **1.4ms(0.25s 预算的 0.6%)** |
+| 序列化单次 | ~597.9ms(tolist + frozenset 循环) | ~1.0ms(tobytes + 掩膜，578×) |
+| 积分单次 | 0.95ms | 0.36ms(隧道场景 2.7×,开阔场景比值更大) |
+| 感知→决策最坏延迟 | 0.75s | 0.5s |
+| 决策纪元与融合事件 | 2:1 交错 | **1:1 对齐**(防御机制降级为保险) |
+| 证据收敛速率 | 1× | 2×(墙确认/撤销更快达判定阈值) |
+
+## 状态与后续
+
+- ✅ 已在 `perf/fusion-stage1-4` 完成，主线工作区未动(你的 G2 未提交改动完好)。
+- ⚪ 待验证:`colcon build` 后 live 跑 quad_exploration,确认 0.25s 下每拍有新数据(10Hz 点云每拍 2-3 帧，无空拍)。
+- 🟡 后续:P2-③ 增量骨架完成后，LocalMapPatch 与骨架并入同一 0.25s 融合事件，届时三个时序归一；机器人静止时的融合空转门(位姿+扫描相似度)是可选的进一步优化。
+
+
+好问题——先核验再答，因为它直接关系到我上一轮建议的成立性。查一下 `planning/status` 的发布点到底是不是周期性的：
+
+查完了，给你准确答案，同时**修正我上一轮的一个不严谨说法**。
+
+## “心跳”指什么
+
+指 SCAN 在 `/planning/status` 话题上周期性地广播“**我活着，我当前在什么状态**”——即使没有任何新事件发生也照发。这是分布式系统里的标准构件：事件消息(“发生了 X”)只在事情发生时才有，收不到事件分不清“没事发生”还是“对方死了”；心跳则每秒都在响，停了才知道对方死了。
+
+## 现状核验:`planning/status` 现在不是完整的心跳
+
+读代码(`scan_replan_fsm.cpp:2113-2131`)后的准确事实：
+
+- `/planning/status` 的发布**绝大部分是事件驱动**——`PATH_ACCEPTED`、`REACHED`、`BLOCKED`、`VIEWPOINT_LOCAL_REJECTED` 这些，状态一变才发一条(`publishStatus`/`publishReferenceStatus`,`:1528-1545`);
+- **唯一的周期性重发**在 WAIT_TARGET 态里，且条件苛刻：只在没有目标、且有一单“已完成待认领”时，每 0.5 秒重发一次 `WAIT_TARGET request_id=...`。注释原话说得很清楚：
+
+```cpp
+// REACHED is a one-shot event.  WAIT_TARGET is its durable state and is
+// repeated at low rate so Explorer can recover a missed completion.
+```
+
+也就是说，这个 0.5 秒重发的存在理由是：**REACHED 是一次性事件，Explorer 万一没收到，永远错过**——所以把“完成”这个事实转成持久的 WAIT_TARGET 态，低频重播，Explorer 任何时候上线/丢包都能补认领。这本质上是“事件可靠性补丁”，不是全状态心跳。
+
+## 这对上一轮建议的修正
+
+我之前说“改用 SCAN 现成的 0.5s 状态心跳做活性判断”——**前提不成立**：现在只在 WAIT_TARGET 一态有周期重发，而执行态(EXEC_TRAJ,恰好是长程任务里时间占比最高的状态)是安静的——没有状态转换就没有任何消息。如果直接把超时改成“5 秒没 status 就算死”，机器人在正常长直道执行时反而会被误杀(执行期本来就没事件)。
+
+所以完整的改法是两步，而不是一步：
+
+1. **把 status 升级为真心跳**：FSM 里加一个小节流(0.5–1s),把**当前状态名**(`EXEC_TRAJ`/`REPLAN_TRAJ`/`GEN_NEW_TRAJ`…)周期性重发——不发任务语义，只发“活着+在哪态”，消息量可忽略；
+2. **Explorer 的超时改成活性判断**：心跳在流 → 永远等(哪怕我这一单被 defer 了 60 秒)；心跳停了 5 秒 → 链路死 → 同单重发 → 再失败才放弃。
+
+第 1 步大约十几行(一个节流变量 + 在 execFSMCallback 尾部调用)，第 2 步改 pending 检查十几行，加起来就是你上次问的“超时自救理想化”问题的完整解。
+
+**总结**：心跳 = “周期性广播我活着+我的状态”，与“事件=发生了什么”互补；你的 `planning/status` 目前只有 WAIT_TARGET 一态有重发(为补 REACHED 丢包设计)，要做长程可靠的活性判断，先把它升级成全状态心跳——这也顺手解决了 REACHED 那个“一次性事件怕丢”的老问题。

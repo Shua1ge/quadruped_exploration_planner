@@ -360,6 +360,9 @@ namespace scan_planner
     t_start = std::chrono::steady_clock::now();
 
     /*** STEP 2: OPTIMIZE ***/
+    // A seed is a verified geometric guide, not merely an initialization.
+    // Clear it explicitly for legacy unseeded rolling plans.
+    bspline_optimizer_rebound_->setGuidePath(seed_path ? *seed_path : std::vector<Eigen::Vector3d>{});
     bool flag_step_1_success = bspline_optimizer_rebound_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
     cout << "first_optimize_step_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)

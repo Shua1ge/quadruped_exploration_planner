@@ -4,6 +4,67 @@
 
 using namespace scan_planner;
 
+TEST(LocalTaskPlanner, ExhaustedSuffixMustRegenerateFromMeasuredMotion) {
+  EXPECT_FALSE(taskSuffixHasUsefulHorizon(.02));
+  EXPECT_FALSE(taskSuffixHasUsefulHorizon(0));
+  EXPECT_FALSE(taskSuffixHasUsefulHorizon(.3));
+  EXPECT_TRUE(taskSuffixHasUsefulHorizon(.5));
+  EXPECT_FALSE(taskSuffixHasUsefulHorizon(std::numeric_limits<double>::infinity()));
+}
+
+TEST(LocalTaskPlanner, SeedStopsSmoothlyInsteadOfUniformEndpointMotion) {
+  double previous=0;
+  for(int i=0;i<=100;++i) {
+    const double s=taskSeedArcDistance(2,0.6,0,i/100.0);
+    EXPECT_GE(s,previous-1e-9); EXPECT_LE(s,2+1e-9); previous=s;
+  }
+  const double h=1e-5;
+  EXPECT_NEAR(taskSeedArcDistance(2,.6,0,h)/h,.6,1e-4);
+  EXPECT_NEAR((2-taskSeedArcDistance(2,.6,0,1-h))/h,0,1e-4);
+  EXPECT_NEAR(taskSeedArcDistance(2,.6,0,1),2,1e-9);
+}
+
+TEST(LocalTaskPlanner, ShapeFailureExplainsRejectedCandidate) {
+  auto result=taskShapeResult({{0,0},{.5,.3},{1,-.3},{1.5,.3},{2,0}},{{0,0},{2,0}});
+  EXPECT_FALSE(result.valid); EXPECT_STREQ(result.reason,"turn");
+  EXPECT_GT(result.turn,result.guide_turn+.8);
+  auto deviation=taskShapeResult({{0,.5},{2,.5}},{{0,0},{2,0}});
+  EXPECT_STREQ(deviation.reason,"guide_deviation");
+}
+
+TEST(LocalTaskPlanner, ShapeAllowsNecessaryCornerButRejectsShortZigzag) {
+  const std::vector<Eigen::Vector2d> straight{{0,0},{2,0}};
+  EXPECT_TRUE(taskShapeFollowsGuide({{0,0},{1,0.1},{2,0}},straight));
+  EXPECT_FALSE(taskShapeFollowsGuide({{0,0},{.5,.3},{1,-.3},{1.5,.3},{2,0}},straight));
+  EXPECT_FALSE(taskShapeFollowsGuide({{0,0},{1,0},{.5,0},{2,0}},straight));
+  const std::vector<Eigen::Vector2d> corner{{0,0},{1,0},{1,1}};
+  EXPECT_TRUE(taskShapeFollowsGuide(corner,corner));
+  EXPECT_NEAR(taskRouteProgress(corner,{1,.5}),1.5,1e-6);
+}
+
+TEST(LocalTaskPlanner, SimplificationNeverShortcutsAcrossObstacle) {
+  const std::vector<Eigen::Vector2d> path{{0,0},{.5,0},{1,0},{1,1}};
+  auto open=simplifyTaskApproach(path,[](const auto&,const auto&){return true;});
+  EXPECT_EQ(open.size(),2u);
+  auto constrained=simplifyTaskApproach(path,[](const auto& a,const auto& b){return a.x()==b.x() || a.y()==b.y();});
+  EXPECT_EQ(constrained.size(),3u);
+}
+
+TEST(LocalTaskPlanner, VisiblePassingPointDoesNotForceStop) {
+  LocalTaskDomain domain;
+  domain.observation_center={3,0}; domain.observation_radius=3;
+  EXPECT_FALSE(taskNeedsDwell(domain,{1,0},true));
+  EXPECT_TRUE(taskNeedsDwell(domain,{3,0},true));
+  EXPECT_FALSE(taskNeedsDwell(domain,{3,0},false));
+}
+
+TEST(LocalTaskPlanner, MovingHandoffCannotReverseButRestCanAlign) {
+  EXPECT_TRUE(taskRollingDirectionAllowed({1,0},0,0.2));
+  EXPECT_FALSE(taskRollingDirectionAllowed({-1,0},0,0.2));
+  EXPECT_FALSE(taskRollingDirectionAllowed({0,1},0,0.2));
+  EXPECT_TRUE(taskRollingDirectionAllowed({-1,0},0,0));
+}
+
 TEST(TaskProtocol, RetirementRejectsLateCandidatesNotNewVersions) {
   EXPECT_TRUE(taskCandidateIsLive({0,0},{100,2}));
   EXPECT_FALSE(taskCandidateIsLive({0,1},{0,0}));
@@ -33,6 +94,37 @@ TEST(LocalTaskPlanner, CannotJumpAcrossWallToEquivalentGoal) {
     EXPECT_FALSE(c.observation_station);
     EXPECT_EQ(c.approach.front(),Eigen::Vector2d(0,0));
   }
+}
+
+TEST(LocalTaskPlanner, StraightCorridorDoesNotInventAlternatingTurns) {
+  LocalTaskDomain domain;
+  domain.route={{0,0},{2,0}}; domain.observation_center={2,0};
+  domain.corridor_radius=.8; domain.observation_radius=.8;
+  auto candidates=selectLocalTaskCandidates(domain,{0,0},{2,0},
+      [](const Eigen::Vector2d&,const Eigen::Vector2d&){return true;},
+      [](const Eigen::Vector2d&){return true;},.2,3,1024,8,{},0.0);
+  ASSERT_FALSE(candidates.empty());
+  const auto& path=candidates.front().approach;
+  for(size_t i=1;i<path.size();++i) {
+    EXPECT_GT(path[i].x(),path[i-1].x());
+    EXPECT_NEAR(path[i].y(),0.0,1e-8);
+  }
+}
+
+TEST(LocalTaskPlanner, PrefersClearanceDetourToBoundaryHuggingShortestPath) {
+  LocalTaskDomain domain;
+  domain.route={{0,0},{2,0}}; domain.observation_center={2,0};
+  domain.corridor_radius=.8; domain.observation_radius=.8;
+  auto candidates=selectLocalTaskCandidates(domain,{0,0},{2,0},
+      [](const Eigen::Vector2d&,const Eigen::Vector2d&){return true;},
+      [](const Eigen::Vector2d&){return true;},.2,3,1024,8,{},0.0,
+      [](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
+        return b.x()>.2 && b.x()<1.8 && std::abs(b.y())<.3 ? 8*(b-a).norm() : 0.;
+      });
+  ASSERT_FALSE(candidates.empty());
+  double lateral=0;
+  for(const auto& p:candidates.front().approach) lateral=std::max(lateral,std::abs(p.y()));
+  EXPECT_GE(lateral,.39);
 }
 
 TEST(LocalTaskPlanner, CanSelectOffPolylineWithoutLeavingTaskDomain) {

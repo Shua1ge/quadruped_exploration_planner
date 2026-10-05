@@ -284,14 +284,7 @@ namespace scan_planner
         "planning/trajectory_ack", rclcpp::QoS(20).reliable(),
         std::bind(&SCANReplanFSM::trajectoryAckCallback, this, std::placeholders::_1),
         control_feedback_options);
-    go2_heading_stalled_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
-        "planning/go2_heading_stalled", 10,
-        std::bind(&SCANReplanFSM::go2HeadingStalledCallback, this, std::placeholders::_1),
-        control_feedback_options);
-    go2_heading_error_sub_ = node_->create_subscription<std_msgs::msg::Float64>(
-        "planning/go2_heading_error", 10,
-        std::bind(&SCANReplanFSM::go2HeadingErrorCallback, this, std::placeholders::_1),
-        control_feedback_options);
+    // Bool/Float heading topics are diagnostics, not execution authority.
 
     bspline_pub_ = node_->create_publisher<scan_planner_msgs::msg::Bspline>("planning/bspline", 10);
     data_disp_pub_ = node_->create_publisher<scan_planner_msgs::msg::DataDisp>("planning/data_display", 100);
@@ -753,6 +746,13 @@ namespace scan_planner
         waypoints.push_back(wp);
     }
 
+    if (waypoints.size() < 2 && task_mode_ && observation_task_ &&
+        (odom_pos_.head<2>()-Eigen::Vector2d(observation_task_->goal.x,observation_task_->goal.y)).norm() <=
+            observation_task_->observation_radius)
+    {
+      waypoints = {odom_pos_, Eigen::Vector3d(observation_task_->goal.x,
+          observation_task_->goal.y, odom_pos_.z())};
+    }
     if (waypoints.size() < 2)
     {
       RCLCPP_ERROR(node_->get_logger(), "Reference path must contain at least two distinct poses");
@@ -771,7 +771,7 @@ namespace scan_planner
     reference_path_active_ = true;
     end_pt_ = reference_path_.back();
 
-    bool success = planner_manager_->planGlobalTraj(
+    bool success = task_mode_ || planner_manager_->planGlobalTraj(
         odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_,
         Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
@@ -881,7 +881,7 @@ namespace scan_planner
       if (task_terminal_request_ == active_reference_request_id_.load()) return;
       task_terminal_request_ = active_reference_request_id_.load();
       ++task_station_adjustments_;
-      task_rejected_stations_.push_back(odom_pos_.head<2>());
+      task_visited_stations_.push_back(odom_pos_.head<2>());
       have_target_=false; reference_path_active_=false;
       reference_path_update_pending_=false; predictive_replan_requested_.store(false);
       requestExecutionStop("OBSERVATION_STATION_REACHED", false);
@@ -1222,6 +1222,10 @@ namespace scan_planner
           static_cast<unsigned int>(msg->state));
       return;
     }
+    go2_heading_aligning_.store(
+        msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN);
+    go2_heading_stalled_.store(msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN &&
+                              msg->reason == "HEADING_STALLED");
     go2_execution_frozen_.store(
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD ||
@@ -1236,10 +1240,18 @@ namespace scan_planner
     }
 
     if (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED &&
-        msg->reason == "TERMINAL_NO_PROGRESS")
+        (msg->reason == "TERMINAL_NO_PROGRESS" || msg->reason == "EXECUTION_NO_PROGRESS"))
     {
-      terminal_repair_error_.store(msg->terminal_error);
-      terminal_repair_requested_.store(true);
+      if (last_stalled_trajectory_.exchange(msg->trajectory_id) != msg->trajectory_id)
+      {
+        if (task_mode_ && task_execution_stalls_.fetch_add(1) + 1 >= 3)
+          task_execution_exhausted_.store(true);
+        else
+        {
+          terminal_repair_error_.store(msg->terminal_error);
+          terminal_repair_requested_.store(true);
+        }
+      }
     }
 
     const bool structured_feedback_terminal =
@@ -1888,6 +1900,11 @@ namespace scan_planner
       }
     }
     updateLocalTrajTimeFreeze();
+    if (task_mode_ && task_execution_exhausted_.exchange(false))
+    {
+      observationTaskRejected("LOCAL_EXECUTION_NO_PROGRESS_EXHAUSTED");
+      return;
+    }
     if (!go2_heading_stalled_.load())
       heading_stall_handled_ = false;
 
@@ -1939,6 +1956,22 @@ namespace scan_planner
       RCLCPP_INFO_THROTTLE(
           node_->get_logger(), *node_->get_clock(), 1000,
           "[SAFETY_LATCHED] waiting for a validated replacement trajectory");
+      return;
+    }
+
+    // Alignment is execution of the acknowledged candidate, not a new
+    // planning problem. Keep its objective and spline until Controller exits
+    // alignment. The independent safety timer still vetoes unsafe rotation;
+    // a real safety stop, new reference, or heading stall bypasses this gate.
+    if ((exec_state_ == EXEC_TRAJ || exec_state_ == REPLAN_TRAJ) && have_target_ &&
+        shouldPreserveHeadingAlignment(task_mode_, go2_heading_aligning_.load(),
+            go2_heading_stalled_.load(), safety_stop_active_.load(),
+            reference_path_update_pending_))
+    {
+      if (exec_state_ == REPLAN_TRAJ)
+        changeFSMExecState(EXEC_TRAJ, "HEADING_ALIGNMENT_OWNED");
+      RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+          "[HEADING_ALIGNMENT_OWNED] retaining the acknowledged trajectory and local objective");
       return;
     }
 
@@ -2127,7 +2160,7 @@ namespace scan_planner
           stopped_local_repair_active_.load() && !task_mode_;
       bool success = stopped_structured_repair
                          ? tryStructuredLocalRepair()
-                         : callReboundReplan(true, flag_random_poly_init);
+                         : callReboundReplan(true, task_mode_ ? false : flag_random_poly_init);
       if (!success && !stopped_structured_repair && flag_random_poly_init &&
           reference_path_active_ &&
           (emergency_path_pending_ || safety_stop_active_.load()))
@@ -2372,7 +2405,7 @@ namespace scan_planner
   {
     if (task_mode_ && replan_fail_count_ >= max_replan_fail_count_)
     {
-      observationTaskRejected("LOCAL_CANDIDATE_FAMILY_EXHAUSTED");
+      observationTaskRejected(task_departure_blocked_ ? "DEPARTURE_UNSAFE" : "LOCAL_PATH_FAMILY_EXHAUSTED");
       replan_fail_count_ = 0;
       return;
     }
@@ -2649,12 +2682,13 @@ namespace scan_planner
     const bool reuse_suffix = shouldReuseCurrentTrajectorySuffix(
         reference_path_update_pending_, trajectory_valid, remaining_time,
         tracking_error, rolling_replan_max_start_error_) &&
-        !predictive_replan_requested_.load();
+        !predictive_replan_requested_.load() &&
+        (!task_mode_ || taskSuffixHasUsefulHorizon(remaining_time));
 
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
     start_pt_ = odom_pos_;
-    if (trajectory_valid)
+    if (trajectory_valid && !task_mode_)
     {
       // A rolling replacement must preserve the command state of the
       // trajectory currently being executed.  Quadruped odometry velocity
@@ -2679,7 +2713,7 @@ namespace scan_planner
     }
 
     const Eigen::Vector2d to_goal = end_pt_.head<2>() - odom_pos_.head<2>();
-    if (to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
+    if (!task_mode_ && to_goal.norm() > 1e-3 && start_vel_.head<2>().dot(to_goal) < 0.0)
     {
       start_vel_.setZero();
       start_acc_.setZero();
@@ -2717,6 +2751,15 @@ namespace scan_planner
     success = callReboundReplan(true, false);
     if (success)
       return true;
+
+    if (task_mode_)
+    {
+      // A failed seeded path excludes only its local station, not the task.
+      // Select bounded siblings rather than randomizing the same seed again.
+      for (int sibling = 0; sibling < 2 && have_target_; ++sibling)
+        if (callReboundReplan(true, false)) return true;
+      return false;
+    }
 
     RCLCPP_WARN(node_->get_logger(),
                 "[ROLLING_REPLAN_FALLBACK] deterministic regeneration failed; trying randomized initialization");
@@ -3038,6 +3081,10 @@ namespace scan_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
+    // Task candidates start from filtered world-frame measured motion, not
+    // a nearly exhausted spline's derivatives or an imagined zero velocity.
+    if (task_mode_) return;
+
     LocalTrajData *info = &planner_manager_->local_data_;
     {
       std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
@@ -3168,6 +3215,7 @@ namespace scan_planner
     // Frozen is versioned feedback.  Never carry the previous trajectory's
     // frozen bit across a handoff while waiting for the new state heartbeat.
     go2_execution_frozen_.store(false);
+    go2_heading_aligning_.store(false);
   }
 
   void SCANReplanFSM::setLocalRecoveryState(
@@ -4136,17 +4184,18 @@ namespace scan_planner
     // real-time publication checks below.  Preserve the trajectory that the
     // controller is actually executing so every rejected result is atomic.
     const LocalTrajData executing_trajectory = planner_manager_->local_data_;
+    const uint64_t safety_generation_before = safety_generation_.load();
     const auto reject_planned_trajectory = [&]() {
       planner_manager_->local_data_ = executing_trajectory;
       if (task_mode_ && task_goal_available_ && !local_target_override && !seed_path)
       {
-        task_rejected_stations_.push_back(local_target_pt_.head<2>());
+        if (safety_generation_.load() == safety_generation_before)
+          task_rejected_stations_.push_back(local_target_pt_.head<2>());
         task_goal_available_ = false;
       }
       return false;
     };
     const auto map_snapshot = map->captureInflatedOccupancySnapshot();
-    const uint64_t safety_generation_before = safety_generation_.load();
     const auto planning_started = std::chrono::steady_clock::now();
     map->useInflatedOccupancySnapshotForCurrentThread(map_snapshot);
     if (local_target_override)
@@ -4198,14 +4247,30 @@ namespace scan_planner
       const double length = lengths.back();
       if (length <= 1e-6) return reject_planned_trajectory();
       const size_t count = std::max<size_t>(7, static_cast<size_t>(std::ceil(length / 0.2)) + 1);
-      const double duration = std::max(length / std::max(0.10, planner_manager_->pp_.max_vel_),
-          restToRestMinimumDuration(length, planner_manager_->pp_.max_vel_,
-              planner_manager_->pp_.max_acc_, 1.0));
+      const double duration = task_station_target_
+          ? restToRestMinimumDuration(length, planner_manager_->pp_.max_vel_,
+              planner_manager_->pp_.max_acc_, 1.0)
+          : std::max(length / std::max(0.10, planner_manager_->pp_.max_vel_),
+              std::sqrt(length / std::max(0.10, planner_manager_->pp_.max_acc_)));
       task_seed_interval = duration / (count - 1);
       size_t segment = 1;
       for (size_t i = 0; i < count; ++i)
       {
-        const double distance = length * i / (count - 1);
+        // Uniform arc-length at uniform time contradicts zero endpoint
+        // velocity and forces the spline fit to fold near a dwell station.
+        // Quintic arc-length uses the same endpoint velocities as the fit.
+        const double u = static_cast<double>(i) / (count - 1);
+        const Eigen::Vector3d first_direction =
+            (task_approach_[1] - task_approach_[0]).normalized();
+        const Eigen::Vector3d last_direction =
+            (task_approach_.back() - task_approach_[task_approach_.size()-2]).normalized();
+        const double v0 = std::max(0.0, start_vel_.dot(first_direction)) * duration;
+        const double v1 = std::max(0.0, local_target_vel_.dot(last_direction)) * duration;
+        const double distance = taskSeedArcDistance(length, v0, v1, u);
+        if (!std::isfinite(distance) || distance < -1e-6 || distance > length + 1e-6 ||
+            (i > 0 && distance + 1e-6 < taskSeedArcDistance(length, v0, v1,
+                static_cast<double>(i-1)/(count-1))))
+          return reject_planned_trajectory();
         while (segment + 1 < lengths.size() && lengths[segment] < distance) ++segment;
         const double ratio = (distance - lengths[segment - 1]) /
             std::max(1e-9, lengths[segment] - lengths[segment - 1]);
@@ -4303,6 +4368,35 @@ namespace scan_planner
       }
 
       auto info = &planner_manager_->local_data_;
+      if(task_mode_ && !seed_path && task_approach_.size()>1) {
+        std::vector<Eigen::Vector2d> guide,curve;
+        for(const auto& point:task_approach_) guide.push_back(point.head<2>());
+        const int samples=std::clamp(static_cast<int>(std::ceil(info->duration_*planner_manager_->pp_.max_vel_/0.08)),8,256);
+        for(int i=0;i<=samples;++i)
+          curve.push_back(info->position_traj_.evaluateDeBoorT(info->duration_*i/samples).head<2>());
+        const auto shape = taskShapeResult(curve,guide);
+        if(!shape.valid) {
+          RCLCPP_WARN(node_->get_logger(),"[TASK_PATH_SHAPE_REJECTED] reason=%s length=%.3f guide_length=%.3f turn=%.3f guide_turn=%.3f deviation=%.3f regression=%.3f; trying a local sibling, not rejecting task",
+              shape.reason,shape.length,shape.guide_length,shape.turn,shape.guide_turn,
+              shape.deviation,shape.regression);
+          publishFailureEvidence(planning_request_id,executing_trajectory.traj_id_,
+              "LOCAL_PATH_SHAPE",shape.reason,start_pt_,1,planning_clearance_margin_,
+              ClearanceFailure::NONE,scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
+          return reject_planned_trajectory();
+        }
+      }
+      if (task_mode_ && start_vel_.head<2>().norm() > 0.05)
+      {
+        const Eigen::Vector2d displacement =
+            (info->position_traj_.evaluateDeBoorT(std::min(0.3, info->duration_)) -
+             start_pt_).head<2>();
+        if (!taskRollingDirectionAllowed(displacement,getOdomYaw(),start_vel_.head<2>().norm()))
+        {
+          RCLCPP_WARN(node_->get_logger(),
+              "[TASK_ROLLING_DIRECTION_REJECTED] candidate turns across the active heading; retaining the local objective");
+          return reject_planned_trajectory();
+        }
+      }
       if (seed_path)
       {
         if (!seed_interval || !seed_interval->valid)
@@ -4545,6 +4639,7 @@ namespace scan_planner
               {
                 RCLCPP_WARN(node_->get_logger(),
                     "[FORWARD_GAIT_STEERING_REJECTED] t=%.2f yaw_rate=%.2f", t, rate);
+                if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
                 return reject_planned_trajectory();
               }
               sweep_exited = sweep_exited || !blocked;

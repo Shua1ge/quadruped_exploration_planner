@@ -1,6 +1,24 @@
 #include <gtest/gtest.h>
 #include <plan_manage/replan_fsm_utils.h>
 
+TEST(PhysicalProgress, MidTrajectoryStallDoesNotNeedTrackingError) {
+  scan_planner::PhysicalProgressWindow window;
+  EXPECT_FALSE(window.stalled(0,{0,0},true,3,.05));
+  EXPECT_FALSE(window.stalled(2.9,{.01,0},true,3,.05));
+  EXPECT_TRUE(window.stalled(3,{.01,0},true,3,.05));
+}
+
+TEST(PhysicalProgress, SlidingWindowDetectsStallAfterEarlierProgress) {
+  scan_planner::PhysicalProgressWindow window;
+  EXPECT_FALSE(window.stalled(0,{0,0},true,3,.05));
+  EXPECT_FALSE(window.stalled(1,{.2,0},true,3,.05));
+  EXPECT_FALSE(window.stalled(3.9,{.21,0},true,3,.05));
+  EXPECT_TRUE(window.stalled(4,{.21,0},true,3,.05));
+  EXPECT_FALSE(window.stalled(5,{.21,0},false,3,.05));
+  EXPECT_FALSE(window.stalled(100,{.21,0},true,3,.05));
+  EXPECT_FALSE(window.stalled(1,{.21,0},true,3,.05));
+}
+
 TEST(ForwardGaitTracking, SharesSpatialLookaheadAndBoundsStationaryTail)
 {
   using scan_planner::forwardGaitLookaheadTime;
@@ -954,6 +972,16 @@ TEST(TrackingRecovery, AngleNormalizationRejectsNonFiniteAndBoundsHugeValues)
       std::numeric_limits<double>::quiet_NaN())));
   EXPECT_TRUE(std::isnan(interpolatePlanarYaw(
       0.0, std::numeric_limits<double>::infinity(), 0.5)));
+}
+
+TEST(HeadingAlignment, KeepsRollingCandidateButNotSafetyOrReplacement)
+{
+  EXPECT_TRUE(shouldPreserveHeadingAlignment(true, true, false, false, false));
+  EXPECT_FALSE(shouldPreserveHeadingAlignment(true, false, false, false, false));
+  EXPECT_FALSE(shouldPreserveHeadingAlignment(true, true, true, false, false));
+  EXPECT_FALSE(shouldPreserveHeadingAlignment(true, true, false, true, false));
+  EXPECT_FALSE(shouldPreserveHeadingAlignment(true, true, false, false, true));
+  EXPECT_FALSE(shouldPreserveHeadingAlignment(false, true, false, false, false));
 }
 
 TEST(OdometryValidation, NormalizesOnlyFiniteNonDegenerateQuaternions)

@@ -67,7 +67,7 @@ namespace scan_planner
     void setCollisionYawOverride(bool enabled, double yaw = 0.0);
 
     // optional inputs
-    void setGuidePath(const vector<Eigen::Vector3d> &guide_pt);
+    void setGuidePath(const vector<Eigen::Vector3d> &guide_pt) { guide_pts_ = guide_pt; }
     void setWaypoints(const vector<Eigen::Vector3d> &waypts,
                       const vector<int> &waypt_idx); // N-2 constraints at most
 

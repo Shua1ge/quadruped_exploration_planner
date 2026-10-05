@@ -1198,6 +1198,29 @@ namespace scan_planner
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance +
                               lambda3_ * g_feasibility;
     grad_3D.row(2).setZero();
+    // Soft guide tube: preserve lateral clearance freedom inside 0.20 m,
+    // but discourage rebound optimization from inventing another route.
+    if (guide_pts_.size()>1) {
+      const double weight=std::max(1.0,lambda4_);
+      for(int i=order_;i<cps_.size-order_;++i) {
+        const Eigen::Vector2d p=cps_.points.col(i).head<2>();
+        Eigen::Vector2d residual=Eigen::Vector2d::Zero();
+        double best=std::numeric_limits<double>::infinity();
+        for(size_t j=1;j<guide_pts_.size();++j) {
+          const Eigen::Vector2d a=guide_pts_[j-1].head<2>();
+          const Eigen::Vector2d d=(guide_pts_[j]-guide_pts_[j-1]).head<2>();
+          const double ratio=d.squaredNorm()>1e-12 ? std::clamp((p-a).dot(d)/d.squaredNorm(),0.0,1.0) : 0;
+          const Eigen::Vector2d r=p-a-ratio*d;
+          if(r.squaredNorm()<best) {best=r.squaredNorm();residual=r;}
+        }
+        const double distance=std::sqrt(best);
+        if(distance>0.20) {
+          const double excess=distance-0.20;
+          f_combine+=weight*excess*excess;
+          grad_3D.col(i).head<2>()+=2*weight*excess*residual/distance;
+        }
+      }
+    }
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 

@@ -1362,6 +1362,33 @@ def test_reference_status_generation_rejects_late_previous_request():
         "BLOCKED", 202, pending_generation=202, active_generation=202)
 
 
+def test_invalid_task_contract_ends_request_without_viewpoint_constraint():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    task = SimpleNamespace(task_id=100, task_version=1)
+    explorer.task_mode = True
+    explorer.active_observation = task
+    explorer.active_goal = (2., 0.)
+    explorer.pending_path_request_generation = 202
+    explorer.active_path_request_generation = 101
+    explorer.pending_path_publish_ns = 10
+    explorer.pending_path_deferred = True
+    explorer.scan_reference_rejected_count = 0
+    explorer.task_stale_feedback = 0
+    messages = []
+    explorer.get_logger = lambda: SimpleNamespace(error=lambda *args: None)
+    explorer.publish_status = messages.append
+    explorer.local_execution_context = lambda: (0,0,0,())
+    explorer.planning_status_callback(SimpleNamespace(data=
+        "REFERENCE_PATH_REJECTED reason=INVALID_TASK_CONTRACT field=coarse_route_size "
+        "request_id=202 task_id=100 task_version=1"))
+    assert explorer.pending_path_request_generation is None
+    assert explorer.pending_path_publish_ns == 0
+    assert explorer.active_path_request_generation == 101
+    assert explorer.active_observation is task
+    assert explorer.active_goal == (2., 0.)
+    assert messages == ["TASK_CONTRACT_REJECTED"]
+
+
 def test_ready_status_must_match_pending_not_only_active_request():
     assert not MODULE.planning_status_matches_request(
         "PATH_TRAJECTORY_READY", 101,
@@ -2138,6 +2165,68 @@ def test_completed_task_handoff_allows_commitment_transfer():
     assert explorer.activate_or_prepare_next_observation(
         allow_commitment_transfer=True)
     assert transfer_arguments == [True]
+
+
+def test_real_cross_scope_activation_validates_before_commit(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.active_commitment_scope = ("lineage", 0)
+    explorer.active_region_id = 0
+    explorer.commitment_state = "COMMITTED"
+    explorer.inflation_radius = 0.0
+    explorer.current_blocked_edges = lambda: set()
+    explorer.prepared_candidate = MODULE.FrontierCandidate(
+        4, (6, 2), (7, 2), (6.5, 2.5), [(1, 2), (6, 2)],
+        5.0, 2, 2, 0.0, {(7, 2)}, commitment_scope=("lineage", 3))
+    activated = []
+    explorer.directional_candidate_allowed = lambda *args: True
+    explorer.activate_candidate = lambda path, candidate: activated.append(candidate)
+    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *args: {(7, 2)})
+    monkeypatch.setattr(MODULE, "splice_prepared_path", lambda *args: [(1, 2), (6, 2)])
+    monkeypatch.setattr(MODULE, "simplify_known_path", lambda grid, path, *args: path)
+    monkeypatch.setattr(MODULE, "segment_known_free", lambda *args: True)
+    assert not explorer.activate_prepared_observation(False)
+    assert explorer.prepared_candidate is not None
+    assert explorer.activate_prepared_observation(True)
+    assert len(activated) == 1
+    assert activated[0].commitment_scope == ("lineage", 3)
+
+
+def test_completed_cross_scope_invalid_route_preserves_commitment(monkeypatch):
+    explorer = candidate_test_explorer()
+    explorer.active_commitment_scope = ("lineage", 0)
+    explorer.active_region_id = 0
+    explorer.commitment_state = "COMMITTED"
+    explorer.inflation_radius = 0.0
+    explorer.current_blocked_edges = lambda: set()
+    explorer.prepared_candidate = MODULE.FrontierCandidate(
+        4, (6, 2), (7, 2), (6.5, 2.5), [(1, 2), (6, 2)],
+        5.0, 2, 2, 0.0, {(7, 2)}, commitment_scope=("lineage", 3))
+    explorer.activate_candidate = lambda *args: (_ for _ in ()).throw(AssertionError("unsafe commit"))
+    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *args: {(7, 2)})
+    monkeypatch.setattr(MODULE, "segment_known_free", lambda *args: False)
+    assert not explorer.activate_prepared_observation(True)
+    assert explorer.active_commitment_scope == ("lineage", 0)
+
+
+def test_completion_precedes_pending_local_request_and_old_route_repair():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1000))
+    explorer.last_task_clock_ns = 900
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2., 0.)
+    explorer.scan_waiting_for_target = False
+    explorer.healthy_task_elapsed = 0.
+    explorer.auto_start = True
+    explorer.position = (1., 0.)
+    explorer.map_update_count = 10
+    explorer.pending_path_publish_ns = 500
+    explorer.evaluate_active_observation = lambda: object()
+    explorer.observation_complete = lambda task: True
+    reasons = []
+    explorer.handoff_satisfied_observation = lambda reason: reasons.append(reason)
+    explorer.validate_and_repair_active_path = lambda: (_ for _ in ()).throw(AssertionError("obsolete route repair"))
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+    assert reasons == ["OBSERVATION_HANDOFF_COMPLETE"]
 
 
 def test_region_prediction_signature_tracks_material_inputs():

@@ -17,6 +17,8 @@ class ObservationTaskBridge:
         if old is not None and old is not value and getattr(self, "task_mode", False):
             self.cancel_observation_task(old)
         self._active_observation = value
+        if old is not value:
+            self.blocked_execution_context = None
 
     def cancel_observation_task(self, task):
         if not getattr(self, "task_mode", False) or not task.task_id:
@@ -47,8 +49,11 @@ class ObservationTaskBridge:
         message.goal = Point(x=float(task.goal[0]), y=float(task.goal[1]), z=0.0)
         message.coarse_route = [pose.pose.position for pose in path.poses]
         message.corridor_radius, message.observation_radius = self.task_corridor_radius, self.observation_radius
+        remaining = {cell for cell in task.target_cells
+                     if not self.grid.in_bounds(cell) or
+                     self.grid.sensor_observed[cell[1], cell[0]] <= task.initial_sensor_revision}
         message.target_cells = [Point(x=float(x), y=float(y), z=0.0) for x, y in
-            (self.grid.cell_to_world(cell) for cell in representative_cells(task.target_cells, self.task_representative_limit))]
+            (self.grid.cell_to_world(cell) for cell in representative_cells(remaining or task.target_cells, self.task_representative_limit))]
         message.target_cell_count, message.resolution = len(task.target_cells), self.grid.resolution
         message.representative_selection_version = 1
         message.terminal_cells = [Point(x=float(x), y=float(y), z=0.0) for x, y in
@@ -68,6 +73,7 @@ class ObservationTaskBridge:
         self.observation_task_pub.publish(message)
         self.task_requests_published += 1
         self.pending_observation_station = None
+        self.blocked_execution_context = None
 
     def observation_feedback_callback(self, message):
         if not self.task_mode:
@@ -90,12 +96,25 @@ class ObservationTaskBridge:
             self.pending_path_request_generation = None
             self.pending_path_deferred = False
             self.scan_waiting_for_target = True
+            completed = self.evaluate_active_observation()
+            if self.observation_complete(completed):
+                self.pending_observation_station = None
+                self.handoff_satisfied_observation("OBSERVATION_TASK_COMPLETE_AT_STATION")
+                return
             self.pending_observation_station = (self.map_update_count, self.get_clock().now().nanoseconds, message)
+        elif message.state == ObservationFeedback.EXECUTION_BLOCKED:
+            self.pending_observation_station = None
+            self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
+            self.pending_path_deferred = False
+            self.blocked_execution_context = self.local_execution_context()
+            self.publish_status("LOCAL_EXECUTION_BLOCKED")
         elif message.state in (ObservationFeedback.VIEWPOINT_REJECTED, ObservationFeedback.TASK_EXHAUSTED):
             self.task_local_rejections += 1
             self.pending_observation_station = None
-            self.apply_global_viewpoint_constraint(message.request_id, (message.station.x, message.station.y),
-                                                  self.blacklist_radius, message.reason)
+            if message.state == ObservationFeedback.VIEWPOINT_REJECTED:
+                self.apply_global_viewpoint_constraint(message.request_id, (message.station.x, message.station.y),
+                                                      self.blacklist_radius, message.reason)
             # Existing arbitration first tries siblings in the committed scope.
             status = String()
             status.data = (f"VIEWPOINT_LOCAL_REJECTED request_id={message.request_id} "
@@ -118,4 +137,26 @@ class ObservationTaskBridge:
         self.pending_observation_station = None
         if not self.reroute_active_goal():
             self.publish_reference_path(self.active_raw_path)
+        return True
+
+    def local_execution_context(self):
+        """Only real departure-state changes authorize retry, not map revision."""
+        x, y = self.grid.world_to_cell(*self.position)
+        radius = max(1, int(math.ceil(1.0/self.grid.resolution)))
+        cells = tuple(self.grid.value((i,j)) if self.grid.in_bounds((i,j)) else -1
+                      for j in range(y-radius,y+radius+1)
+                      for i in range(x-radius,x+radius+1))
+        return (x, y, round(getattr(self, "body_yaw", 0.0)/0.2), cells)
+
+    def continue_blocked_execution(self):
+        context = getattr(self, "blocked_execution_context", None)
+        if context is None:
+            return False
+        if self.local_execution_context() != context:
+            self.blocked_execution_context = None
+            self.healthy_task_elapsed = 0.0
+            self.publish_reference_path(self.active_raw_path)
+            self.publish_status("LOCAL_EXECUTION_RETRY_CHANGED_STATE")
+        # Holding is a durable explicit state, not an exploration timeout and
+        # not permission to blacklist successive distant viewpoints.
         return True

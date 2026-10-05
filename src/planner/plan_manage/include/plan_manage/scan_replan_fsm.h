@@ -129,6 +129,7 @@ namespace scan_planner
     bool preset_started_{false};
     bool rviz_height_ready_;
     std::atomic<bool> go2_execution_frozen_{false};
+    std::atomic<bool> go2_heading_aligning_{false};
     std::atomic<bool> go2_heading_stalled_{false};
     std::atomic<double> go2_heading_error_{0.0};
     bool enable_fail_safe_, need_hover_stop_;
@@ -148,6 +149,7 @@ namespace scan_planner
     std::vector<Eigen::Vector3d> active_waypoints_;
     std::vector<Eigen::Vector3d> reference_path_;
     bool task_mode_{false};
+    bool task_departure_blocked_{false};
     scan_planner_msgs::msg::ObservationTask::ConstSharedPtr observation_task_;
     scan_planner_msgs::msg::ObservationTask::ConstSharedPtr deferred_task_;
     rclcpp::Subscription<scan_planner_msgs::msg::ObservationTask>::SharedPtr task_sub_;
@@ -164,9 +166,13 @@ namespace scan_planner
     bool task_station_target_{false}, task_goal_available_{false};
     Eigen::Vector3d task_station_{Eigen::Vector3d::Zero()};
     std::vector<Eigen::Vector2d> task_rejected_stations_;
+    std::vector<Eigen::Vector2d> task_visited_stations_;
     std::vector<Eigen::Vector3d> task_approach_;
     LocalTaskDomain observationTaskDomain() const;
     uint32_t task_station_adjustments_{0};
+    std::atomic<uint32_t> task_execution_stalls_{0};
+    std::atomic<int64_t> last_stalled_trajectory_{-1};
+    std::atomic<bool> task_execution_exhausted_{false};
     void observationTaskCallback(const scan_planner_msgs::msg::ObservationTask::ConstSharedPtr &msg);
     bool processObservationTaskTransitions();
     void retireObservationTask(TaskVersion version);

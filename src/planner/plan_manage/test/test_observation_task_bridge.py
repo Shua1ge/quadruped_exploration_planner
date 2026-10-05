@@ -32,6 +32,8 @@ def bridge():
     now=SimpleNamespace(nanoseconds=1_000_000_000,to_msg=lambda:Time(sec=1))
     value.get_clock=lambda:SimpleNamespace(now=lambda:now)
     value.active_observation=ObservationTask(7,(3.,2.),{(x,5) for x in range(8)})
+    value.evaluate_active_observation=lambda:value.active_observation
+    value.observation_complete=lambda task:False
     return value
 
 
@@ -66,6 +68,19 @@ def test_new_objective_cancels_old_before_publication():
     assert [message.lifecycle for message in value.messages]==[
         TaskMessage.ACTIVE,TaskMessage.CANCELLED,TaskMessage.ACTIVE]
     assert value.messages[1].task_id==100 and value.messages[2].task_id==101
+
+
+def test_station_retry_sends_only_unresolved_boundaries_without_changing_denominator():
+    value=bridge()
+    value.publish_observation_task(path(),100)
+    for x in range(7):
+        value.grid.sensor_observed[5,x]=value.active_observation.initial_sensor_revision+1
+    value.publish_observation_task(path(),101)
+    retry=value.messages[-1]
+    assert retry.task_id==100 and retry.task_version==1
+    assert retry.target_cell_count==8
+    assert len(retry.target_cells)==1
+    assert retry.target_cells[0].x==value.grid.cell_to_world((7,5))[0]
 
 
 def test_stale_feedback_cannot_end_new_task_and_arrival_is_not_completion():
@@ -132,6 +147,64 @@ def test_sensor_completion_closes_task_without_another_station():
     assert value.continue_observation_station()
     assert finished==["OBSERVATION_TASK_COMPLETE_AT_STATION"]
     assert value.pending_observation_station is None
+
+
+def test_completed_arrival_hands_off_in_feedback_without_waiting_timer():
+    value=bridge()
+    value.publish_observation_task(path(),100)
+    value.active_path_request_generation=100
+    value.observation_complete=lambda task:True
+    reasons=[]
+    value.handoff_satisfied_observation=lambda reason:reasons.append(reason)
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,task_version=1,
+        request_id=100,candidate_id=12,state=ObservationFeedback.STATION_REACHED,
+        station=Point(x=2.,y=2.,z=.4),station_adjustments=1))
+    assert reasons==["OBSERVATION_TASK_COMPLETE_AT_STATION"]
+    assert value.pending_observation_station is None
+
+
+def test_execution_block_is_not_spatial_failure_or_map_revision_retry():
+    value=bridge()
+    value.position=(2.,2.)
+    value.body_yaw=0.
+    value.grid.data.fill(0)
+    value.publish_observation_task(path(),100)
+    value.active_path_request_generation=100
+    value.pending_path_request_generation=100
+    value.active_raw_path=[(2,2)]
+    statuses=[]; retries=[]
+    value.publish_status=statuses.append
+    value.publish_reference_path=lambda route:retries.append(route)
+    value.apply_global_viewpoint_constraint=lambda *args: (_ for _ in ()).throw(
+        AssertionError("execution failure must not constrain a viewpoint"))
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,task_version=1,
+        request_id=100,state=ObservationFeedback.EXECUTION_BLOCKED,
+        station=Point(x=2.,y=2.,z=.4),reason="DEPARTURE_UNSAFE"))
+    task=value.active_observation
+    assert value.pending_path_request_generation is None
+    value.map_update_count+=10000
+    value.grid.data[10,10]=100
+    assert value.continue_blocked_execution() and not retries
+    value.body_yaw=.6
+    value.healthy_task_elapsed=999.
+    assert value.continue_blocked_execution()
+    assert retries==[[(2,2)]]
+    assert value.healthy_task_elapsed==0.
+    assert value.active_observation is task
+
+
+def test_local_occupancy_change_authorizes_execution_retry():
+    value=bridge()
+    value.position=(2.,2.)
+    value.grid.data.fill(0)
+    value.blocked_execution_context=value.local_execution_context()
+    value.active_raw_path=[(2,2)]
+    retries=[]
+    value.publish_reference_path=lambda route:retries.append(route)
+    value.publish_status=lambda status:None
+    x,y=value.grid.world_to_cell(*value.position)
+    value.grid.data[y,x]=100
+    assert value.continue_blocked_execution() and retries==[[(2,2)]]
 
 
 def test_legacy_mode_ignores_task_feedback():

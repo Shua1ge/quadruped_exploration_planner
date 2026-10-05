@@ -35,6 +35,8 @@ public:
     heading_error_threshold_ = declare_parameter<double>("heading_error_threshold", 0.8);
     heading_stall_timeout_ = declare_parameter<double>("heading_stall_timeout", 3.0);
     heading_progress_epsilon_ = declare_parameter<double>("heading_progress_epsilon", 0.05);
+    motion_stall_timeout_ = declare_parameter<double>("motion_stall_timeout", 3.0);
+    motion_progress_epsilon_ = declare_parameter<double>("motion_progress_epsilon", 0.05);
     kp_pos_ = declare_parameter<double>("kp_pos", 0.8);
     kp_yaw_ = declare_parameter<double>("kp_yaw", 1.5);
     max_vx_ = declare_parameter<double>("max_vx", 0.75);
@@ -58,7 +60,9 @@ public:
         handoff_reaction_time_ < 0.0 || handoff_max_deceleration_ <= 0.0 ||
         max_handoff_yaw_error_ <= 0.0 ||
         heading_stall_timeout_ <= 0.0 ||
-        heading_progress_epsilon_ <= 0.0)
+        heading_progress_epsilon_ <= 0.0 ||
+        !std::isfinite(motion_stall_timeout_) || motion_stall_timeout_ <= 0.0 ||
+        !std::isfinite(motion_progress_epsilon_) || motion_progress_epsilon_ <= 0.0)
       throw std::runtime_error(
           "handoff parameters must have a non-negative search time and positive sample interval/error limit");
 
@@ -146,6 +150,7 @@ private:
 
   void publishStop(double yaw_rate = 0.0)
   {
+    physical_progress_.reset();
     geometry_msgs::msg::Twist cmd;
     cmd.angular.z = std::clamp(
         yaw_rate, -active_max_vyaw_, active_max_vyaw_);
@@ -388,6 +393,14 @@ private:
         matched_yaw_error = std::abs(
             normalizeAngle(candidate_body_yaw - odom_yaw_));
       }
+      else if (msg->min_forward_command > 0.0)
+      {
+        const double lookahead = forwardGaitLookaheadTime(matched_time, candidate_duration,
+            [&](double t) { return candidate[0].evaluateDeBoorT(t); });
+        const Eigen::Vector2d delta=(candidate[0].evaluateDeBoorT(lookahead)-odom_pos_).head<2>();
+        if(delta.norm()>1e-6)
+          matched_yaw_error=std::abs(normalizeAngle(std::atan2(delta.y(),delta.x())-odom_yaw_));
+      }
       else if (receive_traj_ && !soft_hold_)
       {
         const double before_time = std::max(
@@ -436,6 +449,8 @@ private:
     last_update_time_ = now();
     receive_traj_ = true;
     terminal_event_reported_ = false;
+    motion_stalled_ = false;
+    physical_progress_.reset();
     spatial_terminal_reached_ = false;
     terminal_best_error_ = std::numeric_limits<double>::infinity();
     terminal_last_progress_time_ = now();
@@ -635,6 +650,7 @@ private:
 
     if (soft_hold_)
     {
+      physical_progress_.reset();
       resetHeadingFreezeState();
       publishExecutionState(
           scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
@@ -648,6 +664,15 @@ private:
       resetHeadingFreezeState();
       publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_IDLE);
       publishStop();
+      return;
+    }
+    if (motion_stalled_)
+    {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                            "EXECUTION_NO_PROGRESS",
+                            (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm());
+      publishStop();
+      last_update_time_ = current_time;
       return;
     }
     double dt = (current_time - last_update_time_).seconds();
@@ -747,6 +772,7 @@ private:
       publishExecutionState(
           scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN,
           heading_stall_reported_ ? "HEADING_STALLED" : "HEADING_ALIGNMENT");
+      physical_progress_.reset();
       publishStop(yaw_command);
       last_update_time_ = current_time;
       return;
@@ -785,6 +811,24 @@ private:
       command.linear.y = 0.0;
     }
     const double terminal_error = pos_error.norm();
+    const double endpoint_error =
+        (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm();
+    if (physical_progress_.stalled(current_time.seconds(), odom_pos_.head<2>(),
+            std::hypot(command.linear.x,command.linear.y) > 0.05 &&
+                endpoint_error > finish_dist_,
+            motion_stall_timeout_,motion_progress_epsilon_))
+    {
+      motion_stalled_ = true;
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                            "EXECUTION_NO_PROGRESS",endpoint_error,true);
+      publishExecutionEvent("LOCAL_TRAJECTORY_STALLED",endpoint_error);
+      RCLCPP_ERROR(get_logger(),
+          "[EXECUTION_NO_PROGRESS] request_id=%llu trajectory=%lld window=%.2fs displacement<%.3fm execution_time=%.2f/%.2fs; holding for local repair",
+          static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),
+          motion_stall_timeout_,motion_progress_epsilon_,exec_time_,traj_duration_);
+      publishStop();
+      return;
+    }
     if (exec_time_ >= traj_duration_ && terminal_error < finish_dist_)
     {
       command = geometry_msgs::msg::Twist();
@@ -898,6 +942,9 @@ private:
   bool heading_frozen_{false};
   bool heading_stall_reported_{false};
   bool terminal_event_reported_{false};
+  bool motion_stalled_{false};
+  PhysicalProgressWindow physical_progress_;
+  double motion_stall_timeout_, motion_progress_epsilon_;
   bool spatial_terminal_reached_{false};
   double terminal_best_error_{std::numeric_limits<double>::infinity()};
   rclcpp::Time terminal_last_progress_time_{0, 0, RCL_ROS_TIME};
