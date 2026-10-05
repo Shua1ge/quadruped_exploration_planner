@@ -1810,6 +1810,131 @@ def test_replan_gate_bounds_attempts_until_planning_context_changes():
     assert gate.allow(MODULE.ReplanContext((4, 5), 11, 3, 8))
 
 
+def test_retry_epoch_uses_deadline_not_sensor_frame_count():
+    epoch = MODULE.retry_epoch(2_000_000_000, 2.0)
+    assert MODULE.retry_epoch(2_100_000_000, 2.0) == epoch
+    assert MODULE.retry_epoch(4_000_000_000, 2.0) == epoch + 1
+
+
+def test_static_revision_tick_still_honors_goal_timeout_with_request_pending():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2.0, 0.0)
+    explorer.active_goal_cell = (2, 0)
+    explorer.active_raw_path = [(1, 0), (2, 0)]
+    explorer.scan_waiting_for_target = False
+    explorer.active_task_elapsed = 10.0
+    explorer.healthy_task_elapsed = 10.0
+    explorer.goal_timeout = 5.0
+    explorer.auto_start = True
+    explorer.position = (1.0, 0.0)
+    explorer.map_update_count = 10
+    explorer.map_content_revision = 4
+    explorer.pending_path_publish_ns = 9_000_000_000
+    explorer.pending_path_request_generation = 12
+    explorer.pending_path_deferred = True
+    explorer.task_mode = False
+    explorer.blacklist = []
+    explorer.pending_blocked_edge = None
+    explorer.prepared_candidate = object()
+    explorer.replacement_pending = True
+    explorer.active_path_request_generation = 12
+    explorer.pending_observation_station = (1, 2, object())
+    explorer.blocked_execution_context = (1, 2)
+    explorer.goal_timeout_count = 0
+    explorer.last_active_goal_clear_reason = "none"
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+    explorer.evaluate_active_observation = lambda: object()
+    explorer.observation_complete = lambda task: False
+
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+
+    assert explorer.goal_timeout_count == 1
+    assert explorer.blacklist == [(2.0, 0.0)]
+    assert explorer.active_goal is None
+    assert explorer.pending_path_publish_ns == 0
+    assert explorer.pending_path_request_generation is None
+
+
+def test_completion_is_checked_before_static_decision_gate():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2.0, 0.0)
+    explorer.active_observation = object()
+    explorer.scan_waiting_for_target = True
+    explorer.active_task_elapsed = 0.0
+    explorer.healthy_task_elapsed = 0.0
+    explorer.goal_timeout = 100.0
+    explorer.auto_start = True
+    explorer.position = (1.0, 0.0)
+    explorer.map_update_count = 10
+    explorer.map_content_revision = 4
+    explorer.evaluate_active_observation = lambda: object()
+    explorer.observation_complete = lambda task: True
+    calls = []
+    explorer.handoff_satisfied_observation = calls.append
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+
+    assert calls == ["OBSERVATION_HANDOFF_COMPLETE"]
+
+
+def test_static_occupancy_still_accumulates_sensor_revision_before_gate():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.grid.sensor_revision = 1
+    explorer.grid.sensor_observed[2, 2] = 1
+    explorer.position = explorer.grid.cell_to_world((1, 1))
+    explorer.active_goal = (3.0, 3.0)
+    explorer.active_goal_cell = (3, 3)
+    explorer.active_observation = MODULE.ObservationTask(
+        region_id=7, goal=(3.0, 3.0), target_cells={(2, 2)},
+        require_sensor_evidence=True, initial_sensor_revision=0)
+    explorer.task_mode = False
+    explorer.scan_waiting_for_target = False
+    explorer.active_task_elapsed = 0.0
+    explorer.healthy_task_elapsed = 0.0
+    explorer.goal_timeout = 100.0
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.locomotion_ready = lambda: True
+    explorer.auto_start = True
+    explorer.map_update_count = 10
+    explorer.map_content_revision = 4
+    explorer.route_constraint_revision = 2
+    explorer.active_path_request_generation = 3
+    explorer.replacement_pending = False
+    explorer.last_decision_context = (
+        4, 2, explorer.grid.world_to_cell(*explorer.position), 0, 1, 3, False)
+    explorer.last_decision_retry_epoch = MODULE.retry_epoch(10_000_000_000, 2.0)
+    explorer.skipped_decision_ticks = 0
+    explorer.observation_done_ratio = 1.0
+    explorer.observation_done_updates = 2
+    explorer.observation_closure_updates = 4
+    explorer.viewpoint_standoff = 1.0
+    explorer.observations_satisfied = 0
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+    explorer.handle_local_execution_finish = lambda: False
+
+    explorer.pending_path_publish_ns = 0
+    explorer.pending_observation_station = None
+    explorer.replan_retry_period = 2.0
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+
+    assert explorer.active_observation.sensor_observed_cells == 1
+    assert explorer.active_observation.last_evaluated_update == 10
+    assert explorer.skipped_decision_ticks == 1
+
+
 def test_region_sequence_prediction_never_runs_dense_pair_searches():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.grid = MODULE.ExplorationGrid(12.0, 8.0, 1.0, 0.0, 0.0)

@@ -6,6 +6,12 @@ from typing import Optional
 from .grid import Cell
 
 
+def retry_epoch(now_ns: int, period_seconds: float) -> int:
+    """Return a time deadline bucket independent of sensor frame count."""
+    period_ns = max(1, int(max(0.1, float(period_seconds)) * 1e9))
+    return max(0, int(now_ns)) // period_ns
+
+
 @dataclass(frozen=True)
 class ReplanContext:
     robot_cell: Cell

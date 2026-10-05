@@ -371,21 +371,23 @@ class ExplorationGrid:
             return
         ray_count = len(ranges)
         if ray_count == 0:
-            return
+            return self._integrate_ranges_reference(
+                position, ranges, max_range, min_range, no_return_range)
         ranges_arr = np.asarray(ranges, dtype=np.float64)
         is_nan = np.isnan(ranges_arr)
         # NaN is an observed but deliberately ignored 3-D return: neither an
         # obstacle hit in the 2-D projection nor free-space evidence.  A
         # genuine no-return ray is an infinity (or any finite range at/over
         # max_range) and frees up to miss_range.
-        hit = ~is_nan & (ranges_arr < max_range)
+        hit = np.isfinite(ranges_arr) & (ranges_arr < max_range)
         miss = ~is_nan & ~hit
         miss_range = (max_range if no_return_range is None
                       else min(max_range, no_return_range))
         ray_range = np.where(hit, np.minimum(ranges_arr, max_range), miss_range)
         valid = (hit | miss) & (ray_range >= min_range)
         if not valid.any():
-            return
+            return self._integrate_ranges_reference(
+                position, ranges, max_range, min_range, no_return_range)
         idx = np.nonzero(valid)[0]
         is_hit = hit[idx]
         angles = -math.pi + (idx + 0.5) * (2.0 * math.pi / ray_count)

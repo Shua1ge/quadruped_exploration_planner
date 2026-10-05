@@ -68,7 +68,7 @@ from explorer_core.planning_coordinator import (
     PlanningSnapshotCoordinator, with_planning_grid_snapshot,
 )
 from explorer_core.portal_connectivity import SafeRegionConnectivity
-from explorer_core.replan_control import ReplanContext, ReplanGate
+from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import ResidualCommitmentGate
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
@@ -392,8 +392,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self.declare_parameter("min_expected_observation_cells", 8).value)
         self.max_replans_per_context = int(
             self.declare_parameter("max_replans_per_context", 2).value)
-        self.replan_retry_updates = max(1, int(
-            self.declare_parameter("replan_retry_updates", 10).value))
+        self.replan_retry_period = max(0.1, float(
+            self.declare_parameter("replan_retry_period", 2.0).value))
         self.region_max_path_ratio = float(
             self.declare_parameter("region_max_path_ratio", 1.5).value)
         self.region_max_detour_ratio = float(
@@ -450,7 +450,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             "stall_detection_seconds", 30.0).value)
         self.map_update_count = 0
         self.map_content_revision = 0
-        self.last_decision_revision = -1
+        self.last_decision_context = None
+        self.last_decision_retry_epoch = -1
         self.skipped_decision_ticks = 0
         self.last_planning_map_ns = None
         self.map_published = False
@@ -651,6 +652,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             raise ValueError("locomotion_state_max_age must be positive")
         self.last_task_clock_ns = self.get_clock().now().nanoseconds
         self.healthy_task_elapsed = 0.0
+        self.active_task_elapsed = 0.0
         self.unreachable_context = None
         self.last_candidate_rejections = dict.fromkeys((
             "no_safe_viewpoint", "insufficient_gain", "too_close",
@@ -2337,19 +2339,38 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if not self.locomotion_ready():
             self.publish_status("PAUSED_ROBOT_UNHEALTHY")
             return
-        if (self.active_goal is not None and not self.scan_waiting_for_target):
-            self.healthy_task_elapsed += dt
+        if self.active_goal is not None:
+            self.active_task_elapsed += dt
+            if not self.scan_waiting_for_target:
+                self.healthy_task_elapsed += dt
         if not self.auto_start or self.position is None or self.map_update_count < 2:
             return
-        # Decision work is keyed to map revisions: a tick whose revision has
-        # not advanced (fusion still pending or unchanged scene) is a no-op
-        # instead of recomputing candidates on an unchanged snapshot.  Placed
-        # after the healthy-elapsed bookkeeping so stall timers keep running.
-        if (self.map_content_revision == self.last_decision_revision
-                and not self.pending_path_publish_ns):
-            self.skipped_decision_ticks += 1
+        if self.active_goal is not None:
+            task = self.evaluate_active_observation()
+            if self.observation_complete(task):
+                self.handoff_satisfied_observation("OBSERVATION_HANDOFF_COMPLETE")
+                return
+        if (self.active_goal is not None
+                and self.active_task_elapsed > self.goal_timeout):
+            self.goal_timeout_count += 1
+            self.get_logger().warning("Frontier goal timed out; blacklisting it")
+            self.blacklist.append(self.active_goal)
+            self.active_goal = None
+            self.active_goal_cell = None
+            self.active_observation = None
+            self.active_raw_path = []
+            self.pending_blocked_edge = None
+            self.prepared_candidate = None
+            self.replacement_pending = False
+            self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
+            self.pending_path_deferred = False
+            self.active_path_request_generation = None
+            self.pending_observation_station = None
+            self.blocked_execution_context = None
+            self.last_active_goal_clear_reason = "GOAL_TIMEOUT"
+            self.active_task_elapsed = 0.0
             return
-        self.last_decision_revision = self.map_content_revision
         if self.pending_path_publish_ns:
             if self.pending_path_deferred:
                 self.get_logger().info(
@@ -2386,23 +2407,23 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             return
         if self.handle_local_execution_finish():
             return
+        retry_deadline = retry_epoch(now_ns, self.replan_retry_period)
+        decision_context = (
+            self.map_content_revision, self.route_constraint_revision,
+            self.grid.world_to_cell(*self.position),
+            getattr(self.active_observation, "task_id", 0),
+            getattr(self.active_observation, "task_version", 0),
+            self.active_path_request_generation, self.replacement_pending)
+        if (decision_context == self.last_decision_context
+                and retry_deadline == self.last_decision_retry_epoch):
+            self.skipped_decision_ticks += 1
+            return
+        self.last_decision_context = decision_context
+        self.last_decision_retry_epoch = retry_deadline
         if self.active_goal is not None:
             if not self.validate_and_repair_active_path():
                 return
-            elapsed = self.healthy_task_elapsed
-            if elapsed > self.goal_timeout:
-                self.goal_timeout_count += 1
-                self.get_logger().warning("Frontier goal timed out; blacklisting it")
-                self.blacklist.append(self.active_goal)
-                self.active_goal = None
-                self.active_goal_cell = None
-                self.active_observation = None
-                self.active_raw_path = []
-                self.pending_blocked_edge = None
-                self.prepared_candidate = None
-                self.replacement_pending = False
-                self.last_active_goal_clear_reason = "GOAL_TIMEOUT"
-            elif self.replacement_pending:
+            if self.replacement_pending:
                 self.replace_unsatisfied_observation()
                 return
             else:
@@ -2433,18 +2454,19 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if self.position is None:
             return False
 
+        now_ns = self.get_clock().now().nanoseconds
         context = ReplanContext(
             self.grid.world_to_cell(*self.position),
             self.map_content_revision,
             self.route_constraint_revision,
-            self.map_update_count // self.replan_retry_updates)
+            retry_epoch(now_ns, self.replan_retry_period))
         frontier_signature = (self.latest_frontier_count, self.map_content_revision)
         unreachable_key = (
             context.robot_cell, context.map_content_revision,
             context.route_constraint_revision, self.locomotion_epoch,
             frontier_signature)
-        # Diagnostic memo only.  Retry cadence stays owned by ReplanGate, whose
-        # context carries a retry bucket that advances with map_update_count.  A
+        # Diagnostic memo only. Retry cadence stays owned by ReplanGate, whose
+        # context carries a deadline bucket independent of sensor-frame count. A
         # robot that is healthy but stationary cannot change map_content_revision,
         # so suppressing on this latch alone would block every retry and idle
         # forever instead of reporting a stall.

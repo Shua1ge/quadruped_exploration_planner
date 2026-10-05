@@ -84,6 +84,19 @@ def test_vectorized_fusion_out_of_bounds_origin_is_noop():
     assert np.array_equal(before, grid.data)
 
 
+@pytest.mark.parametrize("ranges", [[], [float("nan")] * 8,
+    [0.1] * 8, [float("-inf")] * 8])
+def test_degenerate_scan_preserves_reference_seed_and_sensor_epoch(ranges):
+    grid = ExplorationGrid(10.0, 10.0, 0.2)
+    reference = _clone(grid)
+    grid.integrate_ranges((0., 0.), ranges, 5.)
+    reference._integrate_ranges_reference((0., 0.), ranges, 5.)
+    assert np.array_equal(reference.data, grid.data)
+    assert np.array_equal(reference.evidence, grid.evidence)
+    assert np.array_equal(reference.sensor_observed, grid.sensor_observed)
+    assert reference.sensor_revision == grid.sensor_revision
+
+
 def test_vectorized_frontier_cells_match_reference():
     rng = np.random.default_rng(7)
     grid = _random_scene(rng)

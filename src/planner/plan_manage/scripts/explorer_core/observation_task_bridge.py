@@ -17,6 +17,8 @@ class ObservationTaskBridge:
         if old is not None and old is not value and getattr(self, "task_mode", False):
             self.cancel_observation_task(old)
         self._active_observation = value
+        if old is not value:
+            self.active_task_elapsed = 0.0
 
     def cancel_observation_task(self, task):
         if not getattr(self, "task_mode", False) or not task.task_id:
