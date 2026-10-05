@@ -557,6 +557,8 @@ def test_incremental_map_update_uses_changed_cell_bounds():
     node.changed_cells = {(2, 1), (3, 3)}
     node.map_published = True
     node.frame_id = "world"
+    node.last_planning_map_ns = None
+    node.planning_map_publish_period = 2.0
     published = []
     node.map_updates_pub = SimpleNamespace(publish=published.append)
     node.map_pub = SimpleNamespace(publish=lambda _: None)
@@ -2037,6 +2039,82 @@ def test_legacy_path_evidence_is_ignored_in_task_mode():
     explorer.grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
     explorer.blocked_segment_callback(MODULE.Path())
     assert explorer.temporary_blocked_edges == {}
+
+
+def test_completion_is_checked_before_static_decision_gate():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2.0, 0.0)
+    explorer.active_observation = object()
+    explorer.scan_waiting_for_target = True
+    explorer.active_task_elapsed = 0.0
+    explorer.healthy_task_elapsed = 0.0
+    explorer.goal_timeout = 100.0
+    explorer.auto_start = True
+    explorer.position = (1.0, 0.0)
+    explorer.map_update_count = 10
+    explorer.map_content_revision = 4
+    explorer.evaluate_active_observation = lambda: object()
+    explorer.observation_complete = lambda task: True
+    calls = []
+    explorer.handoff_satisfied_observation = calls.append
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+
+    assert calls == ["OBSERVATION_HANDOFF_COMPLETE"]
+
+
+def test_static_occupancy_still_accumulates_sensor_revision_before_gate():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.grid.sensor_revision = 1
+    explorer.grid.sensor_observed[2, 2] = 1
+    explorer.position = explorer.grid.cell_to_world((1, 1))
+    explorer.active_goal = (3.0, 3.0)
+    explorer.active_goal_cell = (3, 3)
+    explorer.active_observation = MODULE.ObservationTask(
+        region_id=7, goal=(3.0, 3.0), target_cells={(2, 2)},
+        require_sensor_evidence=True, initial_sensor_revision=0)
+    explorer.task_mode = False
+    explorer.scan_waiting_for_target = False
+    explorer.active_task_elapsed = 0.0
+    explorer.healthy_task_elapsed = 0.0
+    explorer.goal_timeout = 100.0
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.locomotion_ready = lambda: True
+    explorer.auto_start = True
+    explorer.map_update_count = 10
+    explorer.map_content_revision = 4
+    explorer.route_constraint_revision = 2
+    explorer.active_path_request_generation = 3
+    explorer.replacement_pending = False
+    explorer.last_decision_context = (
+        4, 2, explorer.grid.world_to_cell(*explorer.position), 0, 1, 3, False)
+    explorer.last_decision_retry_epoch = MODULE.retry_epoch(10_000_000_000, 2.0)
+    explorer.skipped_decision_ticks = 0
+    explorer.observation_done_ratio = 1.0
+    explorer.observation_done_updates = 2
+    explorer.observation_closure_updates = 4
+    explorer.viewpoint_standoff = 1.0
+    explorer.observations_satisfied = 0
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+    explorer.handle_local_execution_finish = lambda: False
+
+    explorer.pending_path_publish_ns = 0
+    explorer.pending_observation_station = None
+    explorer.replan_retry_period = 2.0
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+
+    assert explorer.active_observation.sensor_observed_cells == 1
+    assert explorer.active_observation.last_evaluated_update == 10
+    assert explorer.skipped_decision_ticks == 1
 
 
 def test_region_sequence_prediction_never_runs_dense_pair_searches():

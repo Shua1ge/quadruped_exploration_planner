@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stage-one frontier explorer using only local world-frame LiDAR observations."""
 
+import array
 import csv
 import json
 import math
@@ -309,6 +310,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if self.global_reroute_failure_updates < 1:
             raise ValueError("global_reroute_failure_updates must be at least one")
         self.map_update_period = float(self.declare_parameter("map_update_period", 0.5).value)
+        self.planning_map_publish_period = float(
+            self.declare_parameter("planning_map_publish_period", 2.0).value)
         self.goal_timeout = float(self.declare_parameter("goal_timeout", 120.0).value)
         self.path_request_timeout = float(self.declare_parameter(
             "path_request_timeout", 5.0).value)
@@ -448,6 +451,10 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             "stall_detection_seconds", 30.0).value)
         self.map_update_count = 0
         self.map_content_revision = 0
+        self.last_decision_context = None
+        self.last_decision_retry_epoch = -1
+        self.skipped_decision_ticks = 0
+        self.last_planning_map_ns = None
         self.map_published = False
         self.changed_cells: Set[Cell] = set()
         self.route_constraint_revision = 0
@@ -2532,6 +2539,19 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             return
         if self.handle_local_execution_finish():
             return
+        retry_deadline = retry_epoch(now_ns, self.replan_retry_period)
+        decision_context = (
+            self.map_content_revision, self.route_constraint_revision,
+            self.grid.world_to_cell(*self.position),
+            getattr(self.active_observation, "task_id", 0),
+            getattr(self.active_observation, "task_version", 0),
+            self.active_path_request_generation, self.replacement_pending)
+        if (decision_context == self.last_decision_context
+                and retry_deadline == self.last_decision_retry_epoch):
+            self.skipped_decision_ticks += 1
+            return
+        self.last_decision_context = decision_context
+        self.last_decision_retry_epoch = retry_deadline
         if self.active_goal is not None:
             if not self.validate_and_repair_active_path():
                 return
@@ -4012,9 +4032,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         msg.info.origin.orientation.w = 1.0
         data = self.grid.data.copy()
         if planning:
-            for x, y in self.grid.inflated_obstacles(self.inflation_radius):
-                data[y, x] = OCCUPIED
-        msg.data = data.reshape(-1).astype(int).tolist()
+            data[self.grid.inflated_mask(self.inflation_radius)] = OCCUPIED
+        msg.data = array.array('b', data.reshape(-1).tobytes())
         return msg
 
     def publish_maps(self):
@@ -4034,10 +4053,18 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             update.y = min_y
             update.width = max_x - min_x + 1
             update.height = max_y - min_y + 1
-            update.data = self.grid.data[
-                min_y:max_y + 1, min_x:max_x + 1].reshape(-1).astype(int).tolist()
+            update.data = array.array(
+                'b', self.grid.data[
+                    min_y:max_y + 1, min_x:max_x + 1].reshape(-1).tobytes())
             self.map_updates_pub.publish(update)
-        self.planning_map_pub.publish(self.occupancy_message(True))
+        # The planning map has no in-repo consumer (RViz shows explorer/map);
+        # publish it on a slow cadence instead of once per fused scan.
+        now_s = time.monotonic()
+        if (self.last_planning_map_ns is None
+                or (now_s - self.last_planning_map_ns)
+                >= self.planning_map_publish_period):
+            self.last_planning_map_ns = now_s
+            self.planning_map_pub.publish(self.occupancy_message(True))
         self.changed_cells.clear()
         self.map_published = True
 
