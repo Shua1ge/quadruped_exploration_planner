@@ -197,7 +197,22 @@ class GlobalRepresentationNode(Node):
                 "[FAILURE_EVIDENCE_REJECTED] non-finite or unscoped evidence")
             return
 
-        if int(evidence.failure_scope) == FailureEvidence.SCOPE_VIEWPOINT:
+        failure_scope = int(evidence.failure_scope)
+        if failure_scope == FailureEvidence.SCOPE_PATH:
+            segment_start = getattr(evidence, "path_start", None)
+            segment_end = getattr(evidence, "path_end", None)
+            if (int(evidence.task_id) <= 0 or int(evidence.task_version) <= 0
+                    or int(evidence.trajectory_id) <= 0
+                    or not getattr(evidence, "has_path_segment", False)
+                    or segment_start is None or segment_end is None
+                    or not all(math.isfinite(value) for value in (
+                        segment_start.x, segment_start.y, segment_start.z,
+                        segment_end.x, segment_end.y, segment_end.z))):
+                self.get_logger().warning(
+                    "[FAILURE_EVIDENCE_REJECTED] path evidence lacks task lineage or segment")
+                return
+
+        if failure_scope == FailureEvidence.SCOPE_VIEWPOINT:
             request_id = int(evidence.request_id)
             constraint = {
                 "request_id": request_id,

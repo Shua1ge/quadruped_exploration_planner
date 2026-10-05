@@ -9,6 +9,24 @@ from explorer_core.observation_lifecycle import (
 from explorer_core.observation_contract import representative_cells, bind_task_identity
 
 
+def test_fsm_callsite_does_not_gate_geometry_on_walking_status():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    source = (root / "src" / "scan_replan_fsm.cpp").read_text()
+    begin = source.index("const TrackingDeviationAction tracking_action =")
+    call = source[begin:source.index("if (tracking_action ==", begin)]
+    assert "= classifyTrackingDeviation(" in call
+    assert "execution_progress_eligible ? execution_age : 0.0" in call
+    assert ": TrackingDeviationAction::KEEP_EXECUTING" not in call
+
+
+def test_path_exhaustion_is_wired_to_path_feedback_not_execution_blocked():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    source = (root / "src" / "observation_task_adapter.cpp").read_text()
+    handler = source[source.index("void SCANReplanFSM::observationTaskRejected"):]
+    assert 'reason == "LOCAL_PATH_FAMILY_EXHAUSTED"' in handler
+    assert "path_failed ? scan_planner_msgs::msg::ObservationFeedback::PATH_REJECTED" in handler
+
+
 def test_disappearing_boundary_without_sensor_evidence_does_not_complete():
     grid = ExplorationGrid(8, 8, 1, 0, 0)
     grid.data.fill(FREE)  # Initialization is not a lidar observation.

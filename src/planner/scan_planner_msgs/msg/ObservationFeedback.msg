@@ -4,6 +4,8 @@ uint8 TASK_EXHAUSTED=3
 uint8 CANCEL_ACK=4
 # Current execution/path failure; not spatial evidence against a viewpoint.
 uint8 EXECUTION_BLOCKED=5
+# Local path candidates exhausted; retry the route before rejecting the station.
+uint8 PATH_REJECTED=6
 std_msgs/Header header
 uint64 task_id
 uint64 task_version

@@ -1835,6 +1835,210 @@ def test_replan_gate_bounds_attempts_until_planning_context_changes():
     assert gate.allow(MODULE.ReplanContext((4, 5), 11, 3, 8))
 
 
+def test_replan_retry_epoch_uses_time_deadlines_not_sensor_revision_count():
+    epoch = MODULE.retry_epoch(2_000_000_000, 2.0)
+    assert MODULE.retry_epoch(2_100_000_000, 2.0) == epoch
+    assert MODULE.retry_epoch(4_000_000_000, 2.0) == epoch + 1
+
+
+def test_pending_path_does_not_block_healthy_task_timeout():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2.0, 0.0)
+    explorer.scan_waiting_for_target = False
+    explorer.active_task_elapsed = 10.0
+    explorer.healthy_task_elapsed = 10.0
+    explorer.goal_timeout = 5.0
+    explorer.auto_start = True
+    explorer.position = (1.0, 0.0)
+    explorer.map_update_count = 10
+    explorer.pending_path_publish_ns = 9_000_000_000
+    explorer.pending_path_request_generation = 12
+    explorer.pending_path_deferred = True
+    explorer.evaluate_active_observation = lambda: object()
+    explorer.observation_complete = lambda task: False
+    explorer.goal_timeout_count = 0
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+    calls = []
+    explorer.terminate_active_observation = lambda *a, **k: calls.append((a, k))
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+    assert explorer.goal_timeout_count == 1
+    assert calls == [(('GOAL_TIMEOUT',), {'blacklist_goal': True})]
+
+
+def test_unhealthy_pause_does_not_terminate_active_task_by_timeout():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: False
+    explorer.active_goal = (2.0, 0.0)
+    explorer.active_task_elapsed = 10.0
+    explorer.healthy_task_elapsed = 10.0
+    explorer.goal_timeout = 5.0
+    explorer.publish_status = lambda value: None
+    calls = []
+    explorer.terminate_active_observation = lambda *a, **k: calls.append((a, k))
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+    assert calls == []
+    assert explorer.active_task_elapsed == 10.0
+
+
+def test_failed_task_termination_clears_execution_without_marking_complete():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    task = SimpleNamespace(task_id=31, task_version=1)
+    explorer._active_observation = task
+    explorer.task_mode = False
+    explorer.active_goal = (3.0, 4.0)
+    explorer.active_goal_cell = (3, 4)
+    explorer.active_raw_path = [(1, 1), (3, 4)]
+    explorer.active_path_progress_index = 1
+    explorer.pending_blocked_edge = ((1, 1), (2, 1))
+    explorer.prepared_candidate = object()
+    explorer.replacement_pending = True
+    explorer.active_path_request_generation = 20
+    explorer.active_path_trajectory_id = 5
+    explorer.pending_path_request_generation = 21
+    explorer.pending_path_publish_ns = 100
+    explorer.pending_path_deferred = True
+    explorer.pending_observation_station = (4, 100, object())
+    explorer.blocked_execution_context = (1, 2)
+    explorer.scan_waiting_for_target = True
+    explorer.active_task_elapsed = 9.0
+    explorer.healthy_task_elapsed = 8.0
+    explorer.last_active_goal_clear_reason = "none"
+    explorer.blacklist = []
+    explorer.completed_goals = []
+    explorer.active_region_id = 7
+    explorer.active_commitment_scope = ("region", 7)
+    explorer.task_path_constraints = {(31, 1): {((1, 1), (2, 1))}}
+    explorer.route_constraint_revision = 4
+
+    assert explorer.terminate_active_observation(
+        "GOAL_TIMEOUT", blacklist_goal=True)
+    assert explorer.active_goal is None
+    assert explorer.active_goal_cell is None
+    assert explorer.active_observation is None
+    assert explorer.active_raw_path == []
+    assert explorer.pending_path_request_generation is None
+    assert explorer.active_path_request_generation is None
+    assert explorer.pending_path_publish_ns == 0
+    assert not explorer.pending_path_deferred
+    assert explorer.pending_observation_station is None
+    assert explorer.blocked_execution_context is None
+    assert explorer.blacklist == [(3.0, 4.0)]
+    assert explorer.completed_goals == []
+    assert explorer.active_region_id == 7
+    assert explorer.route_constraint_revision == 5
+
+
+def test_task_path_evidence_is_scoped_until_task_identity_ends():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
+    task = SimpleNamespace(task_id=11, task_version=2)
+    explorer.active_observation = task
+    explorer.active_raw_path = [(1, 1), (2, 1), (3, 1)]
+    explorer.task_mode = True
+    explorer.task_path_constraints = {}
+    explorer.temporary_blocked_edges = {}
+    explorer.route_constraint_revision = 0
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=0))
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **k: None)
+    start = explorer.grid.cell_to_world((1, 1))
+    end = explorer.grid.cell_to_world((2, 1))
+    evidence = SimpleNamespace(
+        has_path_segment=True, trajectory_id=5,
+        path_start=SimpleNamespace(x=start[0], y=start[1], z=0.0),
+        path_end=SimpleNamespace(x=end[0], y=end[1], z=0.0),
+        request_id=9)
+
+    assert explorer.record_task_path_constraint(evidence)
+    assert explorer.route_constraint_revision == 1
+    assert explorer.current_blocked_edges() == {((1, 1), (2, 1))}
+    explorer._active_observation = task
+    assert explorer.current_blocked_edges() == {((1, 1), (2, 1))}
+    explorer._active_observation = SimpleNamespace(task_id=12, task_version=1)
+    assert explorer.current_blocked_edges() == set()
+    assert explorer.revoke_task_path_constraints(task)
+    assert explorer.route_constraint_revision == 2
+    assert explorer.current_blocked_edges() == set()
+
+
+def test_failure_evidence_callback_rejects_stale_lineage_and_deduplicates():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
+    task = SimpleNamespace(task_id=11, task_version=2)
+    explorer._active_observation = task
+    explorer.active_raw_path = [(1, 1), (2, 1), (3, 1)]
+    explorer.task_mode = True
+    explorer.active_path_request_generation = 9
+    explorer.active_path_trajectory_id = 10
+    explorer.task_path_constraints = {}
+    explorer.route_constraint_revision = 0
+    explorer.failure_evidence_received = 0
+    explorer.failure_evidence_matched = 0
+    explorer.get_logger = lambda: SimpleNamespace(
+        warning=lambda *a, **k: None, warn=lambda *a, **k: None)
+    start = explorer.grid.cell_to_world((1, 1))
+    end = explorer.grid.cell_to_world((2, 1))
+
+    def evidence(task_id=11, task_version=2, request_id=9, trajectory_id=11):
+        return SimpleNamespace(
+            task_id=task_id, task_version=task_version,
+            request_id=request_id, trajectory_id=trajectory_id,
+            failure_scope=MODULE.FailureEvidence.SCOPE_PATH,
+            position=SimpleNamespace(x=start[0], y=start[1], z=0.0),
+            stage="FINAL_CLEARANCE", reason="PLANNING_MARGIN",
+            required_clearance=0.1, attempted_candidates=1,
+            has_path_segment=True,
+            path_start=SimpleNamespace(x=start[0], y=start[1], z=0.0),
+            path_end=SimpleNamespace(x=end[0], y=end[1], z=0.0))
+
+    explorer.failure_evidence_callback(evidence())
+    explorer.failure_evidence_callback(evidence())
+    assert explorer.route_constraint_revision == 1
+    assert explorer.task_path_constraints[(11, 2)] == {((1, 1), (2, 1))}
+
+    explorer.failure_evidence_callback(evidence(task_version=1))
+    explorer.failure_evidence_callback(evidence(request_id=8))
+    explorer.failure_evidence_callback(evidence(trajectory_id=9))
+    assert explorer.route_constraint_revision == 1
+
+
+def test_trajectory_ack_tracks_only_current_task_request():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer._active_observation = SimpleNamespace(task_id=11, task_version=2)
+    explorer.active_path_request_generation = 9
+    explorer.active_path_trajectory_id = None
+    ack = MODULE.TrajectoryAck(
+        task_id=11, task_version=2, request_id=9, trajectory_id=10,
+        status=MODULE.TrajectoryAck.STATUS_ACCEPTED)
+    explorer.trajectory_ack_callback(ack)
+    assert explorer.active_path_trajectory_id == 10
+    ack.request_id = 8
+    ack.trajectory_id = 12
+    explorer.trajectory_ack_callback(ack)
+    assert explorer.active_path_trajectory_id == 10
+
+
+def test_legacy_path_evidence_is_ignored_in_task_mode():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.task_mode = True
+    explorer.temporary_blocked_edges = {}
+    explorer.active_raw_path = [(1, 1), (2, 1)]
+    explorer.blocked_edge_ttl = 10.0
+    explorer.frame_id = "map"
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
+    explorer.grid = MODULE.ExplorationGrid(8.0, 8.0, 1.0, 0.0, 0.0)
+    explorer.blocked_segment_callback(MODULE.Path())
+    assert explorer.temporary_blocked_edges == {}
+
+
 def test_region_sequence_prediction_never_runs_dense_pair_searches():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.grid = MODULE.ExplorationGrid(12.0, 8.0, 1.0, 0.0, 0.0)

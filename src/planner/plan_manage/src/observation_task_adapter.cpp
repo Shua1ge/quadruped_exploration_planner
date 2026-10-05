@@ -173,8 +173,7 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
     task_rejected_stations_.clear(); // Candidate exclusions belong to one request.
     if (!same_task) {
       task_visited_stations_.clear(); task_station_adjustments_ = 0;
-      task_execution_stalls_.store(0); last_stalled_trajectory_.store(-1);
-      task_execution_exhausted_.store(false);
+      execution_no_progress_exhausted_.store(false);
     }
     task_terminal_request_ = 0;
     task_departure_blocked_ = false;
@@ -326,18 +325,24 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
 void SCANReplanFSM::observationTaskRejected(const std::string& reason) {
   if (!observation_task_ || task_terminal_request_==active_reference_request_id_.load()) return;
   task_terminal_request_=active_reference_request_id_.load();
-  const bool spatial = reason == "OBSERVATION_STATION_BUDGET_EXHAUSTED";
-  publishFailureEvidence(task_terminal_request_,planner_manager_->local_data_.traj_id_,
-      "OBSERVATION_LOCAL_PLANNING",reason,spatial ? task_station_ : odom_pos_,static_cast<uint32_t>(replan_fail_count_),
-      planning_clearance_margin_,ClearanceFailure::NONE,
-      scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
+  const bool spatial = reason == "OBSERVATION_STATION_BUDGET_EXHAUSTED" ||
+                       reason == "NO_NEW_OBSERVATION_STATION";
+  const bool path_failed = reason == "LOCAL_PATH_FAMILY_EXHAUSTED" ||
+                           reason == "TASK_REFERENCE_NOT_ACTIVATABLE";
+  if (spatial)
+    publishFailureEvidence(task_terminal_request_,planner_manager_->local_data_.traj_id_,
+        "OBSERVATION_LOCAL_PLANNING",reason,task_station_,static_cast<uint32_t>(replan_fail_count_),
+        planning_clearance_margin_,ClearanceFailure::NONE,
+        scan_planner_msgs::msg::FailureEvidence::SCOPE_VIEWPOINT);
   publishObservationFeedback(spatial
       ? scan_planner_msgs::msg::ObservationFeedback::TASK_EXHAUSTED
-      : scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED,reason);
+      : (path_failed ? scan_planner_msgs::msg::ObservationFeedback::PATH_REJECTED
+                     : scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED),reason);
   have_target_=false; have_new_target_=false; reference_path_active_=false;
   reference_path_update_pending_=false; predictive_replan_requested_.store(false);
   stopped_local_repair_pending_.store(false); terminal_local_repair_hold_.store(true);
-  requestExecutionStop(spatial ? "VIEWPOINT_LOCAL_REJECTED" : "LOCAL_EXECUTION_BLOCKED",false);
+  requestExecutionStop(spatial ? "VIEWPOINT_LOCAL_REJECTED" :
+                       (path_failed ? "LOCAL_PATH_REJECTED" : "LOCAL_EXECUTION_BLOCKED"),false);
   {std::lock_guard<std::mutex> lock(execution_snapshot_mutex_); execution_snapshot_.valid=false;}
   changeFSMExecState(WAIT_TARGET,"OBSERVATION_LOCAL_REJECTED");
 }

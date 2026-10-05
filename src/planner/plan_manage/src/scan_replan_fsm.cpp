@@ -1230,6 +1230,18 @@ namespace scan_planner
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD ||
         msg->state == scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP);
+    const uint8_t previous_state = go2_execution_state_.exchange(msg->state);
+    if (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_RUNNING &&
+        previous_state != scan_planner_msgs::msg::ExecutionState::STATE_RUNNING)
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      if (execution_snapshot_.valid && execution_snapshot_.request_id == msg->request_id &&
+          execution_snapshot_.trajectory_id == msg->trajectory_id)
+      {
+        execution_snapshot_.accepted_at = std::chrono::steady_clock::now();
+        execution_snapshot_.accepted_position = odom_pos_;
+      }
+    }
     if (std::isfinite(msg->execution_time))
     {
       std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
@@ -1242,16 +1254,8 @@ namespace scan_planner
     if (msg->state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED &&
         (msg->reason == "TERMINAL_NO_PROGRESS" || msg->reason == "EXECUTION_NO_PROGRESS"))
     {
-      if (last_stalled_trajectory_.exchange(msg->trajectory_id) != msg->trajectory_id)
-      {
-        if (task_mode_ && task_execution_stalls_.fetch_add(1) + 1 >= 3)
-          task_execution_exhausted_.store(true);
-        else
-        {
-          terminal_repair_error_.store(msg->terminal_error);
-          terminal_repair_requested_.store(true);
-        }
-      }
+      handleExecutionNoProgress(msg->request_id, msg->task_id,
+          msg->task_version, msg->trajectory_id, msg->terminal_error);
     }
 
     const bool structured_feedback_terminal =
@@ -1559,7 +1563,8 @@ namespace scan_planner
       const std::string &stage, const std::string &reason,
       const Eigen::Vector3d &position, uint32_t attempted_candidates,
       double required_clearance, ClearanceFailure clearance_failure,
-      uint8_t failure_scope)
+      uint8_t failure_scope, bool has_path_segment,
+      Eigen::Vector3d path_start, Eigen::Vector3d path_end)
   {
     scan_planner_msgs::msg::FailureEvidence evidence;
     evidence.stamp = node_->now();
@@ -1577,7 +1582,107 @@ namespace scan_planner
     evidence.required_clearance = required_clearance;
     evidence.clearance_failure = static_cast<uint8_t>(clearance_failure);
     evidence.failure_scope = failure_scope;
+    evidence.has_path_segment =
+        failure_scope == scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH &&
+        has_path_segment && path_start.allFinite() && path_end.allFinite() &&
+        (path_end - path_start).head<2>().norm() > 1e-6;
+    if (evidence.has_path_segment)
+    {
+      evidence.path_start.x = path_start.x();
+      evidence.path_start.y = path_start.y();
+      evidence.path_start.z = path_start.z();
+      evidence.path_end.x = path_end.x();
+      evidence.path_end.y = path_end.y();
+      evidence.path_end.z = path_end.z();
+    }
     failure_evidence_pub_->publish(evidence);
+  }
+
+  void SCANReplanFSM::handleExecutionNoProgress(
+      uint64_t request_id, uint64_t task_id, uint64_t task_version,
+      int64_t trajectory_id, double terminal_error)
+  {
+    bool current_execution_valid = false;
+    {
+      std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+      current_execution_valid = execution_snapshot_.valid &&
+          execution_snapshot_.request_id == request_id &&
+          execution_snapshot_.task_id == task_id &&
+          execution_snapshot_.task_version == task_version &&
+          execution_snapshot_.trajectory_id == trajectory_id;
+    }
+
+    // An unrelated/retired execution cannot replace the live task's budget.
+    if (!current_execution_valid)
+      return;
+    const uint8_t controller_state = go2_execution_state_.load();
+    const ExecutionMotionState motion_state =
+        controller_state == scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN
+            ? ExecutionMotionState::ALIGNING
+        : (controller_state == scan_planner_msgs::msg::ExecutionState::STATE_RUNNING ||
+           controller_state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED)
+            ? ExecutionMotionState::COMMANDING
+        : (controller_state == scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD ||
+           controller_state == scan_planner_msgs::msg::ExecutionState::STATE_HARD_STOP)
+            ? ExecutionMotionState::HOLDING
+            : ExecutionMotionState::UNAVAILABLE;
+    bool candidate_pending = false;
+    {
+      std::lock_guard<std::mutex> lock(pending_handoff_mutex_);
+      candidate_pending = pending_handoff_.valid;
+    }
+
+    ExecutionProgressDecision decision;
+    uint32_t replacements_used = 0;
+    {
+      std::lock_guard<std::mutex> lock(execution_progress_budget_mutex_);
+      execution_progress_budget_.ensureContext(
+          task_mode_, request_id, task_id, task_version);
+      if (execution_progress_budget_.isDuplicateStall(trajectory_id))
+        return;
+      replacements_used = execution_progress_budget_.replacements_used;
+      decision = arbitrateExecutionProgress(
+          safety_stop_active_.load(), current_execution_valid, motion_state,
+          true, candidate_pending, replacements_used,
+          kMaxExecutionNoProgressReplacements);
+      if (decision == ExecutionProgressDecision::REPLACE_CANDIDATE)
+      {
+        const auto budget_result = execution_progress_budget_.recordStall(
+            trajectory_id, kMaxExecutionNoProgressReplacements);
+        if (budget_result == ExecutionProgressBudgetResult::DUPLICATE_STALL)
+          return;
+        if (budget_result == ExecutionProgressBudgetResult::EXHAUSTED)
+          decision = ExecutionProgressDecision::REPORT_BLOCKED;
+      }
+    }
+
+    if (decision == ExecutionProgressDecision::HOLD_FOR_SAFETY ||
+        decision == ExecutionProgressDecision::WAIT_FOR_EXECUTION ||
+        decision == ExecutionProgressDecision::WAIT_FOR_CANDIDATE ||
+        decision == ExecutionProgressDecision::KEEP_CURRENT)
+      return;
+
+    if (decision == ExecutionProgressDecision::REPORT_BLOCKED)
+    {
+      execution_no_progress_exhausted_.store(true);
+      RCLCPP_ERROR(
+          node_->get_logger(),
+          "[EXECUTION_BLOCKED] request_id=%llu task_id=%llu task_version=%llu replacements=%u; no spatial evidence emitted",
+          static_cast<unsigned long long>(request_id),
+          static_cast<unsigned long long>(task_id),
+          static_cast<unsigned long long>(task_version),
+          kMaxExecutionNoProgressReplacements);
+      return;
+    }
+
+    terminal_repair_error_.store(terminal_error);
+    terminal_repair_requested_.store(true);
+    RCLCPP_WARN(
+        node_->get_logger(),
+        "[EXECUTION_REPLACEMENT_REQUESTED] request_id=%llu trajectory=%lld replacement=%u/%u; retaining the acknowledged execution version",
+        static_cast<unsigned long long>(request_id),
+        static_cast<long long>(trajectory_id), replacements_used + 1,
+        kMaxExecutionNoProgressReplacements);
   }
 
   void SCANReplanFSM::publishBlockedSegment()
@@ -1900,9 +2005,23 @@ namespace scan_planner
       }
     }
     updateLocalTrajTimeFreeze();
-    if (task_mode_ && task_execution_exhausted_.exchange(false))
+    if (execution_no_progress_exhausted_.exchange(false))
     {
-      observationTaskRejected("LOCAL_EXECUTION_NO_PROGRESS_EXHAUSTED");
+      if (task_mode_)
+        observationTaskRejected("LOCAL_EXECUTION_NO_PROGRESS_EXHAUSTED");
+      else
+      {
+        const uint64_t request_id = active_reference_request_id_.load();
+        requestExecutionStop("EXECUTION_BLOCKED", false);
+        publishReferenceStatus("EXECUTION_BLOCKED", request_id);
+        have_target_ = false;
+        have_new_target_ = false;
+        reference_path_active_ = false;
+        reference_path_update_pending_ = false;
+        { std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+          execution_snapshot_.valid = false; }
+        changeFSMExecState(WAIT_TARGET, "EXECUTION_BLOCKED");
+      }
       return;
     }
     if (!go2_heading_stalled_.load())
@@ -3168,11 +3287,11 @@ namespace scan_planner
         accepted_position = safety_odom_pos_;
     }
     std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
-    const bool preserve_progress = execution_snapshot_.valid &&
-        execution_snapshot_.request_id == request_id &&
-        execution_snapshot_.execution_mode ==
-            scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED &&
-        execution_mode == scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED;
+    const bool same_execution_context = execution_snapshot_.valid &&
+        ((task_mode_ && execution_snapshot_.task_id == task_id_.load() &&
+          execution_snapshot_.task_version == task_version_.load()) ||
+         (!task_mode_ && execution_snapshot_.request_id == request_id));
+    const bool preserve_progress = same_execution_context;
     const auto progress_started = execution_snapshot_.accepted_at;
     const auto progress_position = execution_snapshot_.accepted_position;
     execution_snapshot_.position = info.position_traj_;
@@ -3212,10 +3331,16 @@ namespace scan_planner
     execution_snapshot_.valid = info.start_time_.seconds() > 1e-5 && info.duration_ > 0.0;
     terminal_repair_requested_.store(false);
     terminal_repair_error_.store(0.0);
-    // Frozen is versioned feedback.  Never carry the previous trajectory's
-    // frozen bit across a handoff while waiting for the new state heartbeat.
-    go2_execution_frozen_.store(false);
-    go2_heading_aligning_.store(false);
+    // Keep the prior state through same-context candidate ACKs so a replacement
+    // cannot restart no-progress accounting. A new task/reference waits for its
+    // own controller heartbeat before execution progress is eligible.
+    if (!same_execution_context)
+    {
+      go2_execution_state_.store(
+          scan_planner_msgs::msg::ExecutionState::STATE_IDLE);
+      go2_execution_frozen_.store(false);
+      go2_heading_aligning_.store(false);
+    }
   }
 
   void SCANReplanFSM::setLocalRecoveryState(
@@ -3758,6 +3883,10 @@ namespace scan_planner
       const double odometry_progress =
           (odom_pos.head<2>() -
            trajectory.accepted_position.head<2>()).norm();
+      const uint8_t controller_state = go2_execution_state_.load();
+      const bool execution_progress_eligible =
+          controller_state == scan_planner_msgs::msg::ExecutionState::STATE_RUNNING ||
+          controller_state == scan_planner_msgs::msg::ExecutionState::STATE_STALLED;
       const bool clearance_limited_execution =
           trajectory.execution_mode ==
           scan_planner_msgs::msg::Bspline::MODE_CLEARANCE_LIMITED;
@@ -3773,13 +3902,16 @@ namespace scan_planner
           execution_snapshot_.accepted_position = odom_pos;
         }
       }
-      const TrackingDeviationAction tracking_action =
-          classifyTrackingDeviation(
+      // Alignment/HOLD suppress only failed-walking evidence. Geometry must
+      // still be evaluated even before a RUNNING heartbeat arrives.
+      const TrackingDeviationAction tracking_action = classifyTrackingDeviation(
               clearance_limited_execution, recovery_corridor_blocked,
               connector_length, tracking_degraded_error_,
-              tracking_recovery_max_error_, execution_age,
+              tracking_recovery_max_error_,
+              execution_progress_eligible ? execution_age : 0.0,
               clearance_limited_execution_grace_,
-              clearance_limited_no_progress_timeout_, odometry_progress,
+              clearance_limited_no_progress_timeout_,
+              execution_progress_eligible ? odometry_progress : clearance_limited_min_progress_,
               clearance_limited_min_progress_);
 
       if (tracking_action == TrackingDeviationAction::ROLLING_REPLAN)
@@ -3792,31 +3924,15 @@ namespace scan_planner
       else if (tracking_action == TrackingDeviationAction::LOCAL_REPAIR)
       {
         predictive_replan_requested_.store(false);
-        const bool clearance_limited_no_progress =
-            clearance_limited_execution && !recovery_corridor_blocked &&
+        const bool execution_no_progress =
+            execution_progress_eligible && !recovery_corridor_blocked &&
             execution_age >= clearance_limited_no_progress_timeout_ &&
             odometry_progress < clearance_limited_min_progress_;
-        if (clearance_limited_no_progress)
-        {
-          // Replanning another copy of the same hard-safe fallback would only
-          // restart the controller clock. Enter the existing bounded stopped
-          // recovery transaction; if its finite candidate family is exhausted,
-          // it returns VIEWPOINT_LOCAL_REJECTED to Explorer.
-          terminal_repair_requested_.store(false);
-          stopped_local_repair_pending_.store(true);
-          if (!safety_stop_active_.exchange(true))
-          {
-            safety_generation_.fetch_add(1);
-            requestExecutionStop("CLEARANCE_LIMITED_NO_PROGRESS", false);
-          }
-          RCLCPP_ERROR_THROTTLE(
-              node_->get_logger(), *node_->get_clock(), 500,
-              "[CLEARANCE_LIMITED_NO_PROGRESS] request=%llu trajectory=%lld age=%.2fs tracking_error=%.3fm odom_progress=%.3fm/%.3fm; entering bounded stopped recovery without publishing an equivalent fallback",
-              static_cast<unsigned long long>(trajectory.request_id),
-              static_cast<long long>(trajectory.trajectory_id), execution_age,
-              connector_length, odometry_progress,
-              clearance_limited_min_progress_);
-        }
+        if (execution_no_progress)
+          handleExecutionNoProgress(
+              trajectory.request_id, trajectory.task_id,
+              trajectory.task_version, trajectory.trajectory_id,
+              connector_length);
         else
         {
           terminal_repair_error_.store(connector_length);
@@ -3825,8 +3941,8 @@ namespace scan_planner
         setLocalRecoveryState(
             LocalRecoveryState::LOCAL_REPAIR, connector_length,
             recovery_corridor_blocked ? "recovery_corridor_blocked"
-                : (clearance_limited_no_progress
-                       ? "clearance_limited_no_progress"
+                : (execution_no_progress
+                       ? "execution_no_progress"
                        : "tracking_recovery_error_exceeded"));
       }
       else
@@ -4381,7 +4497,10 @@ namespace scan_planner
               shape.deviation,shape.regression);
           publishFailureEvidence(planning_request_id,executing_trajectory.traj_id_,
               "LOCAL_PATH_SHAPE",shape.reason,start_pt_,1,planning_clearance_margin_,
-              ClearanceFailure::NONE,scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
+              ClearanceFailure::NONE,scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH,
+              task_approach_.size() > 1,
+              task_approach_.size() > 1 ? task_approach_[0] : start_pt_,
+              task_approach_.size() > 1 ? task_approach_[1] : end_pt_);
           return reject_planned_trajectory();
         }
       }
@@ -4533,7 +4652,9 @@ namespace scan_planner
               planning_request_id, info->traj_id_, "FINAL_CLEARANCE",
               "CANDIDATE_CLEARANCE_REJECTED", blocked_point,
               static_cast<uint32_t>(replan_fail_count_ + 1),
-              planning_clearance_margin_, clearance_result.failure);
+              planning_clearance_margin_, clearance_result.failure,
+              scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH, true,
+              pos, pos_next);
           RCLCPP_ERROR(node_->get_logger(),
                        "[CANDIDATE_CLEARANCE_REJECTED] t=%.3fs center=(%.3f,%.3f,%.3f) hit=(%.3f,%.3f) hard_margin=%.2fm violations=%zu initial=%zu physical_collision=%d failure=%u",
                        t, pos.x(), pos.y(), pos.z(), blocked_point.x(),

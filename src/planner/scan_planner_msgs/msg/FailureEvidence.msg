@@ -15,6 +15,7 @@ uint64 task_id
 uint64 task_version
 # Stable topology ID for PORTAL / REGION; task-local stable ID for VIEWPOINT.
 uint64 failed_object_id
+# Candidate trajectory whose path failed validation; it may not be ACKed.
 int64 trajectory_id
 string stage
 string reason
@@ -23,3 +24,7 @@ uint32 attempted_candidates
 float64 required_clearance
 uint8 clearance_failure
 uint8 failure_scope
+# PATH evidence is task-local geometry. It is not an occupancy observation.
+bool has_path_segment
+geometry_msgs/Point path_start
+geometry_msgs/Point path_end

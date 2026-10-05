@@ -15,22 +15,43 @@ class ObservationTaskBridge:
     def active_observation(self, value):
         old = getattr(self, "_active_observation", None)
         if old is not None and old is not value and getattr(self, "task_mode", False):
-            self.cancel_observation_task(old)
+            lifecycle = (TaskMessage.SUPERSEDED if value is not None
+                         else TaskMessage.CANCELLED)
+            self.retire_observation_task(old, lifecycle)
         self._active_observation = value
         if old is not value:
+            self.active_task_elapsed = 0.0
             self.blocked_execution_context = None
+            revoke = getattr(self, "revoke_task_path_constraints", None)
+            if revoke is not None:
+                revoke(old)
+            if old is not None:
+                self.pending_observation_station = None
+                self.pending_path_publish_ns = 0
+                self.pending_path_request_generation = None
+                self.pending_path_deferred = False
+                self.active_path_request_generation = None
+                self.active_path_trajectory_id = None
 
     def cancel_observation_task(self, task):
-        if not getattr(self, "task_mode", False) or not task.task_id:
-            return
+        return self.retire_observation_task(task, TaskMessage.CANCELLED)
+
+    def retire_observation_task(self, task, lifecycle):
+        """Publish one terminal lifecycle event for an objective identity."""
+        if (not getattr(self, "task_mode", False) or not task.task_id
+                or getattr(task, "lifecycle", "ACTIVE") in
+                ("CANCELLED", "SUPERSEDED", "COMPLETED")):
+            return False
         message = TaskMessage()
         message.header.frame_id = self.frame_id
         message.header.stamp = self.get_clock().now().to_msg()
         message.task_id, message.task_version = task.task_id, task.task_version
-        message.lifecycle = TaskMessage.CANCELLED
-        task.lifecycle = "CANCELLED"
+        message.lifecycle = lifecycle
+        task.lifecycle = ("SUPERSEDED" if lifecycle == TaskMessage.SUPERSEDED
+                          else "CANCELLED")
         self.observation_task_pub.publish(message)
         self.task_cancellations += 1
+        return True
 
     def publish_observation_task(self, path, request_id):
         task = self.active_observation
@@ -109,6 +130,22 @@ class ObservationTaskBridge:
             self.pending_path_deferred = False
             self.blocked_execution_context = self.local_execution_context()
             self.publish_status("LOCAL_EXECUTION_BLOCKED")
+        elif message.state == ObservationFeedback.PATH_REJECTED:
+            self.pending_observation_station = None
+            self.pending_path_publish_ns = 0
+            self.pending_path_request_generation = None
+            self.pending_path_deferred = False
+            self.blocked_execution_context = None
+            # No second progress ledger: retain task/coverage and try a route
+            # avoiding its typed path evidence. Never repeat an identical route.
+            failed_route = tuple(self.active_raw_path)
+            if self.reroute_active_goal(excluded_route=failed_route):
+                self.publish_status("LOCAL_PATH_REPAIRED")
+                return
+            status = String()
+            status.data = (f"VIEWPOINT_LOCAL_REJECTED request_id={message.request_id} "
+                           f"task_id={message.task_id} task_version={message.task_version}")
+            self.planning_status_callback(status)
         elif message.state in (ObservationFeedback.VIEWPOINT_REJECTED, ObservationFeedback.TASK_EXHAUSTED):
             self.task_local_rejections += 1
             self.pending_observation_station = None

@@ -95,6 +95,10 @@ def test_duplicate_viewpoint_failure_is_idempotent_but_forwarded():
 def test_path_scoped_failure_is_forwarded_without_graph_constraint():
     node = make_node()
     message = evidence(scope=MODULE.FailureEvidence.SCOPE_PATH)
+    message.task_id, message.task_version = 100, 2
+    message.has_path_segment = True
+    message.path_start = SimpleNamespace(x=1.0, y=2.0, z=0.0)
+    message.path_end = SimpleNamespace(x=2.0, y=2.0, z=0.0)
 
     node.failure_evidence_callback(message)
 
@@ -102,3 +106,13 @@ def test_path_scoped_failure_is_forwarded_without_graph_constraint():
     assert node.viewpoint_constraints == {}
     assert node.safe_region_pub.messages == []
     assert node.failure_evidence_pub.messages == [message]
+
+
+def test_path_scoped_failure_without_identity_or_segment_is_rejected():
+    node = make_node()
+    message = evidence(scope=MODULE.FailureEvidence.SCOPE_PATH)
+
+    node.failure_evidence_callback(message)
+
+    assert node.failure_evidence_pub.messages == []
+    assert node.failure_evidence_forwarded == 0

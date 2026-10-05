@@ -66,7 +66,7 @@ def test_new_objective_cancels_old_before_publication():
     value.active_observation=ObservationTask(8,(4.,2.),{(5,5)})
     value.publish_observation_task(path(),101)
     assert [message.lifecycle for message in value.messages]==[
-        TaskMessage.ACTIVE,TaskMessage.CANCELLED,TaskMessage.ACTIVE]
+        TaskMessage.ACTIVE,TaskMessage.SUPERSEDED,TaskMessage.ACTIVE]
     assert value.messages[1].task_id==100 and value.messages[2].task_id==101
 
 
@@ -212,3 +212,39 @@ def test_legacy_mode_ignores_task_feedback():
     value.task_mode=False
     value.observation_feedback_callback(ObservationFeedback())
     assert value.task_stale_feedback==0
+
+
+def test_path_failure_reroutes_same_task_once_without_execution_wait():
+    value = bridge()
+    value.publish_observation_task(path(), 100)
+    value.active_path_request_generation = 100
+    value.active_raw_path = [(1, 1), (2, 1)]
+    value.blocked_execution_context = ("old",)
+    routes, statuses = [], []
+    value.reroute_active_goal = lambda **kw: routes.append(kw) or True
+    value.publish_status = statuses.append
+    message = ObservationFeedback(task_id=100, task_version=1, request_id=100,
+        candidate_id=12, state=ObservationFeedback.PATH_REJECTED,
+        station=Point(x=2., y=2.), reason="LOCAL_PATH_FAMILY_EXHAUSTED")
+    task = value.active_observation
+    value.observation_feedback_callback(message)
+    value.observation_feedback_callback(message)
+    assert routes == [{"excluded_route": ((1, 1), (2, 1))}]
+    assert statuses == ["LOCAL_PATH_REPAIRED"]
+    assert value.active_observation is task
+    assert value.blocked_execution_context is None
+
+
+def test_exhausted_path_without_alternative_enters_sibling_arbitration():
+    value = bridge()
+    value.publish_observation_task(path(), 100)
+    value.active_path_request_generation = 100
+    value.active_raw_path = [(1, 1), (2, 1)]
+    value.reroute_active_goal = lambda **kw: False
+    statuses = []
+    value.planning_status_callback = lambda msg: statuses.append(msg.data)
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,
+        task_version=1, request_id=100, candidate_id=12,
+        state=ObservationFeedback.PATH_REJECTED, station=Point(x=2., y=2.)))
+    assert statuses == ["VIEWPOINT_LOCAL_REJECTED request_id=100 task_id=100 task_version=1"]
+    assert value.blocked_execution_context is None

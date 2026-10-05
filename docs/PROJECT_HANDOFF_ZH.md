@@ -102,7 +102,7 @@ Explorer 一次只允许一个 `initial_path` 请求处于在途状态。request
 
 ### 5.7 全局重规划节流
 
-`ReplanGate`（`explorer_core/replan_control.py`）以上下文 `(robot_cell, map_content_revision, route_constraint_revision, retry_epoch)` 为键，同一上下文最多 `max_replans_per_context=2` 次，超出打印 `[GLOBAL_REPLAN_SUPPRESSED]`。retry_epoch 每 `replan_retry_updates=10` 次地图更新递增，保证长时间无进展时仍会重试。
+`ReplanGate`（`explorer_core/replan_control.py`）以上下文 `(robot_cell, map_content_revision, route_constraint_revision, retry_epoch)` 为键，同一上下文最多 `max_replans_per_context=2` 次，超出打印 `[GLOBAL_REPLAN_SUPPRESSED]`。retry_epoch 按 `replan_retry_period=2.0s` 的期限递增，与静态地图上的重复传感器帧数无关。
 
 ## 6. SCAN 当前在做什么
 

@@ -19,6 +19,67 @@ TEST(PhysicalProgress, SlidingWindowDetectsStallAfterEarlierProgress) {
   EXPECT_FALSE(window.stalled(1,{.21,0},true,3,.05));
 }
 
+TEST(ExecutionProgressArbitration, SafetyAndExecutionEligibilityWin)
+{
+  using scan_planner::ExecutionMotionState;
+  using scan_planner::ExecutionProgressDecision;
+  using scan_planner::arbitrateExecutionProgress;
+  EXPECT_EQ(arbitrateExecutionProgress(true, true,
+                ExecutionMotionState::COMMANDING, true, false, 0, 2),
+            ExecutionProgressDecision::HOLD_FOR_SAFETY);
+  EXPECT_EQ(arbitrateExecutionProgress(false, true,
+                ExecutionMotionState::ALIGNING, true, false, 0, 2),
+            ExecutionProgressDecision::KEEP_CURRENT);
+  EXPECT_EQ(arbitrateExecutionProgress(false, true,
+                ExecutionMotionState::HOLDING, true, false, 0, 2),
+            ExecutionProgressDecision::KEEP_CURRENT);
+  EXPECT_EQ(arbitrateExecutionProgress(false, false,
+                ExecutionMotionState::COMMANDING, true, false, 0, 2),
+            ExecutionProgressDecision::WAIT_FOR_EXECUTION);
+}
+
+TEST(ExecutionProgressArbitration, ReplacesOnlyWithinBudgetAndWaitsForAck)
+{
+  using scan_planner::ExecutionMotionState;
+  using scan_planner::ExecutionProgressDecision;
+  using scan_planner::arbitrateExecutionProgress;
+  EXPECT_EQ(arbitrateExecutionProgress(false, true,
+                ExecutionMotionState::COMMANDING, true, true, 0, 2),
+            ExecutionProgressDecision::WAIT_FOR_CANDIDATE);
+  EXPECT_EQ(arbitrateExecutionProgress(false, true,
+                ExecutionMotionState::COMMANDING, true, false, 0, 2),
+            ExecutionProgressDecision::REPLACE_CANDIDATE);
+  EXPECT_EQ(arbitrateExecutionProgress(false, true,
+                ExecutionMotionState::COMMANDING, true, false, 2, 2),
+            ExecutionProgressDecision::REPORT_BLOCKED);
+}
+
+TEST(ExecutionProgressBudget, EquivalentAcksDoNotResetAndStallsAreIdempotent)
+{
+  using scan_planner::ExecutionProgressBudget;
+  using scan_planner::ExecutionProgressBudgetResult;
+  ExecutionProgressBudget budget;
+  budget.ensureContext(true, 100, 7, 3);
+  EXPECT_EQ(budget.recordStall(20, 2),
+            ExecutionProgressBudgetResult::REPLACEMENT_RESERVED);
+  // A request refresh within the same task version cannot buy a fresh budget.
+  budget.ensureContext(true, 101, 7, 3);
+  EXPECT_EQ(budget.replacements_used, 1U);
+  EXPECT_EQ(budget.recordStall(20, 2),
+            ExecutionProgressBudgetResult::DUPLICATE_STALL);
+  EXPECT_EQ(budget.recordStall(21, 2),
+            ExecutionProgressBudgetResult::REPLACEMENT_RESERVED);
+  EXPECT_TRUE(budget.isDuplicateStall(21));
+  EXPECT_EQ(budget.recordStall(21, 2),
+            ExecutionProgressBudgetResult::DUPLICATE_STALL);
+  EXPECT_EQ(budget.recordStall(22, 2),
+            ExecutionProgressBudgetResult::EXHAUSTED);
+  budget.ensureContext(true, 102, 7, 4);
+  EXPECT_EQ(budget.replacements_used, 0U);
+  EXPECT_EQ(budget.recordStall(22, 2),
+            ExecutionProgressBudgetResult::REPLACEMENT_RESERVED);
+}
+
 TEST(ForwardGaitTracking, SharesSpatialLookaheadAndBoundsStationaryTail)
 {
   using scan_planner::forwardGaitLookaheadTime;
@@ -108,6 +169,17 @@ TEST(TrackingDeviation, HarderDeviationBypassesExecutionOwnership)
                 true, false, 0.31, 0.10, 0.30,
                 0.2, 1.0, 2.0, 0.0, 0.05),
             TrackingDeviationAction::LOCAL_REPAIR);
+}
+
+TEST(TrackingDeviation, AlignmentSuppressesOnlyProgressNotGeometry)
+{
+  // These are the neutral progress inputs supplied by the FSM while not walking.
+  EXPECT_EQ(classifyTrackingDeviation(true, false, .12, .10, .30,
+      0., 1., 2., .05, .05), TrackingDeviationAction::KEEP_EXECUTING);
+  EXPECT_EQ(classifyTrackingDeviation(true, true, .12, .10, .30,
+      0., 1., 2., .05, .05), TrackingDeviationAction::LOCAL_REPAIR);
+  EXPECT_EQ(classifyTrackingDeviation(true, false, .31, .10, .30,
+      0., 1., 2., .05, .05), TrackingDeviationAction::LOCAL_REPAIR);
 }
 
 TEST(PredictedCollisionInterval, ExpandsRiskWindowForDynamicHandoff)

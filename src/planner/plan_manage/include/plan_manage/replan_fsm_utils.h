@@ -41,6 +41,103 @@ struct PhysicalProgressWindow
   }
 };
 
+enum class ExecutionMotionState : uint8_t
+{
+  UNAVAILABLE = 0,
+  ALIGNING = 1,
+  HOLDING = 2,
+  COMMANDING = 3,
+};
+
+enum class ExecutionProgressDecision : uint8_t
+{
+  HOLD_FOR_SAFETY = 0,
+  WAIT_FOR_EXECUTION = 1,
+  WAIT_FOR_CANDIDATE = 2,
+  KEEP_CURRENT = 3,
+  REPLACE_CANDIDATE = 4,
+  REPORT_BLOCKED = 5,
+};
+
+inline constexpr uint32_t kMaxExecutionNoProgressReplacements = 2;
+
+inline ExecutionProgressDecision arbitrateExecutionProgress(
+    bool safety_hold_active, bool current_execution_valid,
+    ExecutionMotionState motion_state, bool no_progress,
+    bool candidate_pending, uint32_t replacements_used,
+    uint32_t replacement_limit)
+{
+  if (safety_hold_active)
+    return ExecutionProgressDecision::HOLD_FOR_SAFETY;
+  if (!current_execution_valid)
+    return ExecutionProgressDecision::WAIT_FOR_EXECUTION;
+  if (candidate_pending)
+    return ExecutionProgressDecision::WAIT_FOR_CANDIDATE;
+  if (motion_state != ExecutionMotionState::COMMANDING || !no_progress)
+    return ExecutionProgressDecision::KEEP_CURRENT;
+  return replacements_used < replacement_limit
+             ? ExecutionProgressDecision::REPLACE_CANDIDATE
+             : ExecutionProgressDecision::REPORT_BLOCKED;
+}
+
+enum class ExecutionProgressBudgetResult : uint8_t
+{
+  REPLACEMENT_RESERVED = 0,
+  DUPLICATE_STALL = 1,
+  EXHAUSTED = 2,
+};
+
+// Acknowledging a new local trajectory does not reset this budget. In task
+// mode it belongs to the task version; outside task mode it belongs to the
+// global reference request. Only a genuinely new context starts a new budget.
+struct ExecutionProgressBudget
+{
+  bool initialized{false};
+  bool task_scoped{false};
+  uint64_t request_id{0};
+  uint64_t task_id{0};
+  uint64_t task_version{0};
+  uint32_t replacements_used{0};
+  int64_t last_stalled_trajectory{0};
+
+  void ensureContext(bool task_mode, uint64_t request,
+                     uint64_t task, uint64_t version)
+  {
+    const bool use_task_scope = task_mode && task != 0 && version != 0;
+    const bool same_context = initialized && task_scoped == use_task_scope &&
+        (use_task_scope
+             ? task_id == task && task_version == version
+             : request_id == request);
+    if (same_context)
+      return;
+
+    initialized = true;
+    task_scoped = use_task_scope;
+    request_id = request;
+    task_id = use_task_scope ? task : 0;
+    task_version = use_task_scope ? version : 0;
+    replacements_used = 0;
+    last_stalled_trajectory = 0;
+  }
+
+  bool isDuplicateStall(int64_t trajectory) const
+  {
+    return trajectory == last_stalled_trajectory;
+  }
+
+  ExecutionProgressBudgetResult recordStall(
+      int64_t trajectory, uint32_t replacement_limit)
+  {
+    if (isDuplicateStall(trajectory))
+      return ExecutionProgressBudgetResult::DUPLICATE_STALL;
+    last_stalled_trajectory = trajectory;
+    if (replacements_used >= replacement_limit)
+      return ExecutionProgressBudgetResult::EXHAUSTED;
+    ++replacements_used;
+    return ExecutionProgressBudgetResult::REPLACEMENT_RESERVED;
+  }
+};
+
 // Shared by calibrated-gait execution and candidate certification. The
 // bounded horizon also handles stationary spline tails without a full scan.
 template <typename SamplePosition>

@@ -132,6 +132,8 @@ namespace scan_planner
     std::atomic<bool> go2_heading_aligning_{false};
     std::atomic<bool> go2_heading_stalled_{false};
     std::atomic<double> go2_heading_error_{0.0};
+    std::atomic<uint8_t> go2_execution_state_{
+        scan_planner_msgs::msg::ExecutionState::STATE_IDLE};
     bool enable_fail_safe_, need_hover_stop_;
     FSM_EXEC_STATE exec_state_;
     int continuously_called_times_{0};
@@ -170,9 +172,9 @@ namespace scan_planner
     std::vector<Eigen::Vector3d> task_approach_;
     LocalTaskDomain observationTaskDomain() const;
     uint32_t task_station_adjustments_{0};
-    std::atomic<uint32_t> task_execution_stalls_{0};
-    std::atomic<int64_t> last_stalled_trajectory_{-1};
-    std::atomic<bool> task_execution_exhausted_{false};
+    std::mutex execution_progress_budget_mutex_;
+    ExecutionProgressBudget execution_progress_budget_;
+    std::atomic<bool> execution_no_progress_exhausted_{false};
     void observationTaskCallback(const scan_planner_msgs::msg::ObservationTask::ConstSharedPtr &msg);
     bool processObservationTaskTransitions();
     void retireObservationTask(TaskVersion version);
@@ -398,7 +400,14 @@ namespace scan_planner
                                 double required_clearance,
                                 ClearanceFailure clearance_failure,
                                 uint8_t failure_scope =
-                                    scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
+                                    scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH,
+                                bool has_path_segment = false,
+                                Eigen::Vector3d path_start = Eigen::Vector3d::Zero(),
+                                Eigen::Vector3d path_end = Eigen::Vector3d::Zero());
+    void handleExecutionNoProgress(uint64_t request_id, uint64_t task_id,
+                                   uint64_t task_version,
+                                   int64_t trajectory_id,
+                                   double terminal_error);
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
                                            uint64_t request_id,

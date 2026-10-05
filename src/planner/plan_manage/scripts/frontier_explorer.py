@@ -25,7 +25,8 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import Marker
-from scan_planner_msgs.msg import FailureEvidence, LocomotionState, TopoGraphDelta
+from scan_planner_msgs.msg import (
+    FailureEvidence, LocomotionState, TopoGraphDelta, TrajectoryAck)
 from scan_planner_msgs.msg import ObservationTask as TaskMessage, ObservationFeedback
 from explorer_core.observation_task_bridge import ObservationTaskBridge
 
@@ -67,7 +68,7 @@ from explorer_core.planning_coordinator import (
     PlanningSnapshotCoordinator, with_planning_grid_snapshot,
 )
 from explorer_core.portal_connectivity import SafeRegionConnectivity
-from explorer_core.replan_control import ReplanContext, ReplanGate
+from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import ResidualCommitmentGate
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
@@ -389,8 +390,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self.declare_parameter("min_expected_observation_cells", 8).value)
         self.max_replans_per_context = int(
             self.declare_parameter("max_replans_per_context", 2).value)
-        self.replan_retry_updates = max(1, int(
-            self.declare_parameter("replan_retry_updates", 10).value))
+        self.replan_retry_period = max(0.1, float(
+            self.declare_parameter("replan_retry_period", 2.0).value))
         self.region_max_path_ratio = float(
             self.declare_parameter("region_max_path_ratio", 1.5).value)
         self.region_max_detour_ratio = float(
@@ -492,6 +493,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.last_path_request_generation = 0
         self.pending_path_request_generation: Optional[int] = None
         self.active_path_request_generation: Optional[int] = None
+        self.active_path_trajectory_id: Optional[int] = None
         self.last_completed_request_generation: Optional[int] = None
         self.scan_waiting_for_target = False
         self.pending_local_execution_finish = None
@@ -510,6 +512,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.region_failure_cooldowns: Dict[int, Tuple[int, int]] = {}
         self.dense_invalid_region_revisions: Dict[int, int] = {}
         self.temporary_blocked_edges: Dict[DirectedEdge, int] = {}
+        self.task_path_constraints: Dict[
+            Tuple[int, int], Set[DirectedEdge]] = {}
         self.pending_blocked_edge: Optional[DirectedEdge] = None
         self.disabled_by_collision = False
         self.region_tracker = PersistentRegionTracker(
@@ -645,6 +649,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             raise ValueError("locomotion_state_max_age must be positive")
         self.last_task_clock_ns = self.get_clock().now().nanoseconds
         self.healthy_task_elapsed = 0.0
+        self.active_task_elapsed = 0.0
         self.unreachable_context = None
         self.last_candidate_rejections = dict.fromkeys((
             "no_safe_viewpoint", "insufficient_gain", "too_close",
@@ -665,6 +670,10 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.create_subscription(
             FailureEvidence, "global_representation/failure_evidence",
             self.failure_evidence_callback, 20,
+            callback_group=self.planning_callback_group)
+        self.create_subscription(
+            TrajectoryAck, "planning/trajectory_ack",
+            self.trajectory_ack_callback, 20,
             callback_group=self.planning_callback_group)
         self.create_subscription(
             String, "planning/local_execution_event",
@@ -742,6 +751,20 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.last_locomotion_state_stamp_ns = (
             int(msg.stamp.sec) * 1000000000 + int(msg.stamp.nanosec))
 
+    def trajectory_ack_callback(self, msg: TrajectoryAck):
+        """Track only an accepted trajectory for the current task request."""
+        task = getattr(self, "active_observation", None)
+        if (msg.status != TrajectoryAck.STATUS_ACCEPTED
+                or msg.trajectory_id <= 0
+                or msg.request_id != self.active_path_request_generation
+                or task is None
+                or msg.task_id != task.task_id
+                or msg.task_version != task.task_version):
+            return
+        current = getattr(self, "active_path_trajectory_id", None)
+        if current is None or msg.trajectory_id > current:
+            self.active_path_trajectory_id = int(msg.trajectory_id)
+
     def failure_evidence_callback(self, msg: FailureEvidence):
         """Apply graph-mediated evidence without taking terminal ownership.
 
@@ -764,18 +787,74 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.last_failure_clearance = float(msg.required_clearance)
         failure_scope = int(getattr(
             msg, "failure_scope", FailureEvidence.SCOPE_PATH))
+        accepted_trajectory = getattr(
+            self, "active_path_trajectory_id", None)
+        if (failure_scope == FailureEvidence.SCOPE_PATH
+                and getattr(self, "task_mode", False)
+                and accepted_trajectory is not None
+                and int(msg.trajectory_id) < accepted_trajectory):
+            return
         if failure_scope == FailureEvidence.SCOPE_VIEWPOINT:
             self.apply_global_viewpoint_constraint(
                 int(msg.request_id),
                 (float(msg.position.x), float(msg.position.y)),
                 self.blacklist_radius,
                 str(msg.reason))
+        elif failure_scope == FailureEvidence.SCOPE_PATH and getattr(
+                self, "task_mode", False):
+            self.record_task_path_constraint(msg)
         self.get_logger().warn(
             "[LOCAL_FAILURE_EVIDENCE] "
             f"request_id={msg.request_id} trajectory={msg.trajectory_id} "
             f"stage={msg.stage} reason={msg.reason} "
             f"attempts={msg.attempted_candidates} "
             f"clearance={msg.required_clearance:.3f}m")
+
+    def record_task_path_constraint(self, msg: FailureEvidence) -> bool:
+        """Constrain one failed directed edge for this task version only."""
+        task = self.active_observation
+        if (task is None or not getattr(msg, "has_path_segment", False)
+                or int(msg.trajectory_id) <= 0
+                or len(self.active_raw_path) < 2):
+            return False
+        start, end = msg.path_start, msg.path_end
+        if not all(math.isfinite(value) for value in (
+                start.x, start.y, start.z, end.x, end.y, end.z)):
+            return False
+        edge = match_blocked_path_edge(
+            self.active_raw_path,
+            self.grid.world_to_cell(start.x, start.y),
+            self.grid.world_to_cell(end.x, end.y))
+        if edge is None:
+            return False
+        key = (int(task.task_id), int(task.task_version))
+        constraints = getattr(self, "task_path_constraints", None)
+        if constraints is None:
+            constraints = {}
+            self.task_path_constraints = constraints
+        edges = constraints.setdefault(key, set())
+        if edge in edges:
+            return False
+        edges.add(edge)
+        self.route_constraint_revision += 1
+        self.get_logger().warning(
+            f"[TASK_PATH_CONSTRAINT] revision={self.route_constraint_revision} "
+            f"task_id={task.task_id} task_version={task.task_version} "
+            f"request_id={msg.request_id} trajectory_id={msg.trajectory_id} "
+            f"edge={edge[0]}->{edge[1]}")
+        return True
+
+    def revoke_task_path_constraints(self, task) -> bool:
+        """Revoke a task's path edges when its objective identity ends."""
+        if (task is None or not hasattr(task, "task_id")
+                or not hasattr(task, "task_version")):
+            return False
+        key = (int(task.task_id), int(task.task_version))
+        constraints = getattr(self, "task_path_constraints", {})
+        if constraints.pop(key, None) is None:
+            return False
+        self.route_constraint_revision += 1
+        return True
 
     def locomotion_state_age_ns(self) -> Optional[int]:
         """Return publisher age, falling back to local receipt for old bags."""
@@ -1148,9 +1227,16 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             del self.temporary_blocked_edges[edge]
         if expired:
             self.route_constraint_revision += 1
-        return set(self.temporary_blocked_edges)
+        blocked = set(self.temporary_blocked_edges)
+        task = getattr(self, "active_observation", None)
+        if task is not None and getattr(self, "task_mode", False):
+            blocked.update(getattr(self, "task_path_constraints", {}).get(
+                (int(task.task_id), int(task.task_version)), ()))
+        return blocked
 
     def blocked_segment_callback(self, msg: Path):
+        if getattr(self, "task_mode", False):
+            return
         if len(msg.poses) < 2 or len(self.active_raw_path) < 2:
             return
         if msg.header.frame_id and msg.header.frame_id != self.frame_id:
@@ -1576,7 +1662,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 self.directional_candidate_suppressed_count += 1
         return allowed
 
-    def reroute_active_goal(self) -> bool:
+    def reroute_active_goal(self, excluded_route=None) -> bool:
         """Replan to the current observation pose without resetting its gain."""
         if (self.position is None or self.active_goal is None
                 or self.active_goal_cell is None or self.active_observation is None):
@@ -1593,6 +1679,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         raw_path = astar_known(
             self.grid, start, self.active_goal_cell, inflated, blocked_edges)
         if not raw_path:
+            return False
+        if excluded_route is not None and tuple(raw_path) == excluded_route:
             return False
         simplified = simplify_known_path(
             self.grid, raw_path, inflated, blocked_edges)
@@ -1773,22 +1861,54 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             throttle_duration_sec=2.0)
         return False
 
-    def finish_active_observation(self, status: str):
-        """Finish an information objective independently of pose arrival."""
-        self.record_observation_completion(self.active_observation)
-        if self.active_goal is not None and not self.is_blacklisted(self.active_goal):
-            self.completed_goals.append(self.active_goal)
-        self.observations_satisfied += 1
+    def terminate_active_observation(self, reason: str, status: Optional[str] = None,
+                                     blacklist_goal: bool = False,
+                                     release_region: bool = False,
+                                     completed: bool = False) -> bool:
+        """Retire one task and clear its in-flight execution identity once."""
+        task = self.active_observation
+        goal = self.active_goal
+        if task is None and goal is None:
+            return False
+        if task is not None:
+            self.retire_observation_task(task, TaskMessage.CANCELLED)
+            self.revoke_task_path_constraints(task)
+        if goal is not None:
+            if blacklist_goal:
+                self.blacklist.append(goal)
+            elif completed and not self.is_blacklisted(goal):
+                self.completed_goals.append(goal)
         self.active_goal = None
         self.active_goal_cell = None
-        self.active_observation = None
+        self._active_observation = None
         self.active_raw_path = []
+        self.active_path_progress_index = 0
         self.pending_blocked_edge = None
         self.prepared_candidate = None
         self.replacement_pending = False
         self.active_path_request_generation = None
+        self.active_path_trajectory_id = None
         self.pending_path_request_generation = None
-        self.publish_status(status)
+        self.pending_path_publish_ns = 0
+        self.pending_path_deferred = False
+        self.pending_observation_station = None
+        self.blocked_execution_context = None
+        self.scan_waiting_for_target = False
+        self.active_task_elapsed = 0.0
+        self.healthy_task_elapsed = 0.0
+        self.last_active_goal_clear_reason = reason
+        if release_region:
+            self.terminate_region_option(reason)
+        if status:
+            self.publish_status(status)
+        return True
+
+    def finish_active_observation(self, status: str):
+        """Finish an information objective independently of pose arrival."""
+        self.record_observation_completion(self.active_observation)
+        self.observations_satisfied += 1
+        self.terminate_active_observation(
+            "OBSERVATION_COMPLETE", status, completed=True)
 
     def terminate_region_option(self, reason: str) -> bool:
         """Terminate the single active semi-MDP option exactly once."""
@@ -2353,8 +2473,11 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if not self.locomotion_ready():
             self.publish_status("PAUSED_ROBOT_UNHEALTHY")
             return
-        if (self.active_goal is not None and not self.scan_waiting_for_target):
-            self.healthy_task_elapsed += dt
+        if self.active_goal is not None:
+            self.active_task_elapsed = getattr(
+                self, "active_task_elapsed", 0.0) + dt
+            if not self.scan_waiting_for_target:
+                self.healthy_task_elapsed += dt
         if not self.auto_start or self.position is None or self.map_update_count < 2:
             return
         # Information completion owns task handoff. Neither an outstanding
@@ -2364,6 +2487,13 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             if self.observation_complete(task):
                 self.handoff_satisfied_observation("OBSERVATION_HANDOFF_COMPLETE")
                 return
+        if (self.active_goal is not None
+                and self.active_task_elapsed > self.goal_timeout):
+            self.goal_timeout_count += 1
+            self.get_logger().warning("Frontier goal timed out; blacklisting it")
+            self.terminate_active_observation(
+                "GOAL_TIMEOUT", blacklist_goal=True)
+            return
         if self.pending_path_publish_ns:
             if self.pending_path_deferred:
                 self.get_logger().info(
@@ -2405,20 +2535,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if self.active_goal is not None:
             if not self.validate_and_repair_active_path():
                 return
-            elapsed = self.healthy_task_elapsed
-            if elapsed > self.goal_timeout:
-                self.goal_timeout_count += 1
-                self.get_logger().warning("Frontier goal timed out; blacklisting it")
-                self.blacklist.append(self.active_goal)
-                self.active_goal = None
-                self.active_goal_cell = None
-                self.active_observation = None
-                self.active_raw_path = []
-                self.pending_blocked_edge = None
-                self.prepared_candidate = None
-                self.replacement_pending = False
-                self.last_active_goal_clear_reason = "GOAL_TIMEOUT"
-            elif self.replacement_pending:
+            if self.replacement_pending:
                 self.replace_unsatisfied_observation()
                 return
             else:
@@ -2449,18 +2566,19 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if self.position is None:
             return False
 
+        now_ns = self.get_clock().now().nanoseconds
         context = ReplanContext(
             self.grid.world_to_cell(*self.position),
             self.map_content_revision,
             self.route_constraint_revision,
-            self.map_update_count // self.replan_retry_updates)
+            retry_epoch(now_ns, self.replan_retry_period))
         frontier_signature = (self.latest_frontier_count, self.map_content_revision)
         unreachable_key = (
             context.robot_cell, context.map_content_revision,
             context.route_constraint_revision, self.locomotion_epoch,
             frontier_signature)
-        # Diagnostic memo only.  Retry cadence stays owned by ReplanGate, whose
-        # context carries a retry bucket that advances with map_update_count.  A
+        # Diagnostic memo only. Retry cadence stays owned by ReplanGate, whose
+        # context carries a deadline bucket independent of sensor-frame count. A
         # robot that is healthy but stationary cannot change map_content_revision,
         # so suppressing on this latch alone would block every retry and idle
         # forever instead of reporting a stall.
@@ -3535,6 +3653,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.pending_path_deferred = False
         self.pending_path_request_generation = request_generation
         self.active_path_request_generation = request_generation
+        self.active_path_trajectory_id = None
         self.scan_waiting_for_target = False
         self.pending_local_execution_finish = None
 

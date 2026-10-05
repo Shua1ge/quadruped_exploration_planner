@@ -429,6 +429,13 @@ private:
       }
     }
 
+    const bool same_execution_context = receive_traj_ &&
+        ((msg->task_id != 0 && msg->task_version != 0 &&
+          active_task_id_ == msg->task_id &&
+          active_task_version_ == msg->task_version) ||
+         (msg->task_id == 0 && active_task_id_ == 0 &&
+          active_request_id_ == msg->request_id));
+    const bool resuming_hold = soft_hold_;
     traj_ = std::move(candidate);
     traj_duration_ = candidate_duration;
     traj_id_ = msg->traj_id;
@@ -449,8 +456,11 @@ private:
     last_update_time_ = now();
     receive_traj_ = true;
     terminal_event_reported_ = false;
-    motion_stalled_ = false;
-    physical_progress_.reset();
+    if (!same_execution_context || resuming_hold)
+    {
+      motion_stalled_ = false;
+      physical_progress_.reset();
+    }
     spatial_terminal_reached_ = false;
     terminal_best_error_ = std::numeric_limits<double>::infinity();
     terminal_last_progress_time_ = now();
@@ -666,15 +676,6 @@ private:
       publishStop();
       return;
     }
-    if (motion_stalled_)
-    {
-      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
-                            "EXECUTION_NO_PROGRESS",
-                            (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm());
-      publishStop();
-      last_update_time_ = current_time;
-      return;
-    }
     double dt = (current_time - last_update_time_).seconds();
     if (dt < 0.0 || dt > 0.2) dt = 0.0;
     const bool spatial_gait = active_min_forward_command_ > 0.0;
@@ -813,22 +814,25 @@ private:
     const double terminal_error = pos_error.norm();
     const double endpoint_error =
         (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm();
-    if (physical_progress_.stalled(current_time.seconds(), odom_pos_.head<2>(),
+    const bool execution_no_progress = physical_progress_.stalled(
+            current_time.seconds(), odom_pos_.head<2>(),
             std::hypot(command.linear.x,command.linear.y) > 0.05 &&
                 endpoint_error > finish_dist_,
-            motion_stall_timeout_,motion_progress_epsilon_))
+            motion_stall_timeout_,motion_progress_epsilon_);
+    if (execution_no_progress)
     {
-      motion_stalled_ = true;
-      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
-                            "EXECUTION_NO_PROGRESS",endpoint_error,true);
-      publishExecutionEvent("LOCAL_TRAJECTORY_STALLED",endpoint_error);
-      RCLCPP_ERROR(get_logger(),
-          "[EXECUTION_NO_PROGRESS] request_id=%llu trajectory=%lld window=%.2fs displacement<%.3fm execution_time=%.2f/%.2fs; holding for local repair",
-          static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),
-          motion_stall_timeout_,motion_progress_epsilon_,exec_time_,traj_duration_);
-      publishStop();
-      return;
+      if (!motion_stalled_)
+      {
+        motion_stalled_ = true;
+        publishExecutionEvent("LOCAL_TRAJECTORY_STALLED",endpoint_error);
+        RCLCPP_ERROR(get_logger(),
+            "[EXECUTION_NO_PROGRESS] request_id=%llu trajectory=%lld window=%.2fs displacement<%.3fm execution_time=%.2f/%.2fs; retaining the acknowledged spline while SCAN validates replacements",
+            static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),
+            motion_stall_timeout_,motion_progress_epsilon_,exec_time_,traj_duration_);
+      }
     }
+    else
+      motion_stalled_ = false;
     if (exec_time_ >= traj_duration_ && terminal_error < finish_dist_)
     {
       command = geometry_msgs::msg::Twist();
@@ -889,6 +893,9 @@ private:
       if (terminal_event_reported_)
         command = geometry_msgs::msg::Twist();
     }
+    else if (motion_stalled_)
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                            "EXECUTION_NO_PROGRESS",endpoint_error);
     else
       publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING);
     cmd_vel_pub_->publish(command);
