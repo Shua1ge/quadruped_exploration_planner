@@ -17,6 +17,25 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_completion_handoff_scope_is_cleared_after_success_failure_and_exception():
+    explorer=SimpleNamespace()
+    for result in (True,False,None):
+        def handoff(status):
+            assert explorer.completion_handoff_in_progress
+            assert status=="OBSERVATION_TASK_COMPLETE"
+            if result is None:
+                raise RuntimeError("selection failed")
+            return result
+        explorer._handoff_satisfied_observation=handoff
+        try:
+            returned=MODULE.FrontierExplorer.handoff_satisfied_observation(
+                explorer,"OBSERVATION_TASK_COMPLETE")
+            assert returned is result
+        except RuntimeError:
+            assert result is None
+        assert not explorer.completion_handoff_in_progress
+
+
 def candidate_test_explorer():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.grid = MODULE.ExplorationGrid(12.0, 8.0, 1.0, 0.0, 0.0)

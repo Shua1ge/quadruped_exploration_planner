@@ -4,6 +4,8 @@ uint64 request_id
 uint64 task_id
 uint64 task_version
 uint64 candidate_id
+# First cross-task candidate must connect motion, not merely position.
+bool rolling_task_handoff
 builtin_interfaces/Time start_time
 
 float64[] knots

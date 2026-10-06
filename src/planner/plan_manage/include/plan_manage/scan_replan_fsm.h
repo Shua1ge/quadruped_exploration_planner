@@ -159,6 +159,8 @@ namespace scan_planner
     std::atomic<uint64_t> task_id_{0}, task_version_{0}, task_candidate_id_{0};
     TaskVersion retired_task_{0, 0};
     TaskVersion retiring_task_{0, 0};
+    std::atomic<uint64_t> rolling_predecessor_id_{0}, rolling_predecessor_version_{0};
+    std::atomic<bool> rolling_task_handoff_{false};
     std::atomic<bool> task_retirement_pending_{false};
     std::mutex task_event_mutex_;
     TaskVersion task_retirement_confirmation_{0,0};

@@ -26,8 +26,8 @@ from sensor_msgs_py.point_cloud2 import create_cloud_xyz32
 
 
 class TestTaskRuntime(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
+        cls=self  # Each scenario gets fresh processes and odometry filters.
         cls.context=Context()
         cls.domain=150+os.getpid()%50
         rclpy.init(context=cls.context,domain_id=cls.domain)
@@ -68,8 +68,8 @@ class TestTaskRuntime(unittest.TestCase):
         cls.pose_vx=0.0
         cls.cloud_counter=0
 
-    @classmethod
-    def tearDownClass(cls):
+    def tearDown(self):
+        cls=self
         for child in cls.children:
             child.terminate()
         for child in cls.children:
@@ -315,6 +315,90 @@ class TestTaskRuntime(unittest.TestCase):
             a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=5)
         self.assertFalse(any(f.task_id==103 and f.state==ObservationFeedback.STATION_REACHED
             for f in self.feedback))
+
+
+    def test_z_rolling_task_swap_waits_for_candidate_ack_not_retirement(self):
+        self.pose_x=0.; self.pose_yaw=0.; self.pose_vx=0.
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and
+                        self.spline_pub.get_subscription_count()>0)
+        first=self.task(10000)
+        self.task_pub.publish(first)
+        self.spin_until(lambda:any("PATH_ACCEPTED" in s and
+                       f"request_id={first.request_id}" in s for s in self.statuses))
+        self.spin_until(lambda:any(a.task_id==10000 and a.request_id==first.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=8)
+        first_ack=next(a for a in self.acks if a.task_id==10000 and
+            a.request_id==first.request_id and a.status==TrajectoryAck.STATUS_ACCEPTED)
+        self.ack_pub.publish(first_ack)
+        self.spin_until(lambda:any("PATH_TRAJECTORY_READY" in s and
+            f"request_id={first.request_id}" in s for s in self.statuses))
+        old_curve=copy.deepcopy(next(s for s in self.splines if s.traj_id==first_ack.trajectory_id))
+        # At rest, rolling candidates cannot buy a pi turn or an instantaneous
+        # speed jump merely by passing the position gate.
+        for traj_id,points,reason in (
+            (9000,[.2,0.,-.2,-.4],"HANDOFF_ROLLING_HEADING_ERROR"),
+            (9001,[-.3,0.,.3,.6],"HANDOFF_ROLLING_VELOCITY_ERROR"),
+        ):
+            discontinuous=self.stationary(10000,first.request_id,traj_id)
+            discontinuous.rolling_task_handoff=True
+            discontinuous.pos_pts=[Point(x=x,y=0.,z=.4) for x in points]
+            self.spline_pub.publish(discontinuous)
+            self.spin_until(lambda:any(a.trajectory_id==traj_id and
+                a.status==TrajectoryAck.STATUS_REJECTED and a.reason==reason for a in self.acks))
+            self.assertFalse(any(s.trajectory_id==traj_id for s in self.states))
+        state_start=len(self.states)
+        successor=self.task(10001)
+        successor.predecessor_task_id=10000; successor.predecessor_task_version=1
+        self.task_pub.publish(successor)
+        self.spin_until(lambda:any(a.task_id==10001 and a.request_id==successor.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=8)
+        next_ack=next(a for a in self.acks if a.task_id==10001 and
+            a.request_id==successor.request_id and a.status==TrajectoryAck.STATUS_ACCEPTED)
+        self.assertFalse(any(a.task_id==10000 and a.status==TrajectoryAck.STATUS_TASK_RETIRED
+                             for a in self.acks))
+        self.assertFalse(any(s.reason=="TASK_RETIRED" for s in self.states[state_start:]))
+        # ACK and spline observers are independent subscriptions; receipt
+        # order in this probe is not the Controller's installation order.
+        self.spin_until(lambda:any(s.task_id==10001 and s.rolling_task_handoff for s in self.splines))
+        # Controller fences old candidates at installation, even before SCAN
+        # has received the successor ACK and sent its retirement command.
+        old_curve.traj_id=100000
+        self.spline_pub.publish(old_curve)
+        self.spin_until(lambda:any(a.trajectory_id==100000 and
+            a.status==TrajectoryAck.STATUS_REJECTED and a.reason=="TASK_RETIRED_OR_INVALID"
+            for a in self.acks))
+        self.ack_pub.publish(first_ack)  # Delayed predecessor ACK cannot commit G2.
+        self.assertFalse(any("PATH_TRAJECTORY_READY" in s and
+            f"request_id={successor.request_id}" in s for s in self.statuses))
+        self.ack_pub.publish(next_ack)
+        self.spin_until(lambda:any("PATH_TRAJECTORY_READY" in s and
+            f"request_id={successor.request_id}" in s for s in self.statuses))
+        self.spin_until(lambda:any(a.task_id==10000 and a.status==TrajectoryAck.STATUS_TASK_RETIRED
+                                  for a in self.acks))
+        self.assertFalse(any(s.task_id==10001 and s.reason=="TASK_RETIRED"
+                             for s in self.states[state_start:]))
+        # Cancellation while the next candidate ACK is withheld must stop
+        # whichever task is physically installed, and fence a late ACK.
+        cancelled=self.task(10002)
+        cancelled.predecessor_task_id=10001; cancelled.predecessor_task_version=1
+        self.task_pub.publish(cancelled)
+        self.spin_until(lambda:any(a.task_id==10002 and a.request_id==cancelled.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=8)
+        cancelled_ack=next(a for a in self.acks if a.task_id==10002 and
+            a.request_id==cancelled.request_id and a.status==TrajectoryAck.STATUS_ACCEPTED)
+        cancelled.lifecycle=ObservationTask.CANCELLED
+        self.task_pub.publish(cancelled)
+        self.spin_until(lambda:any(a.task_id==10002 and a.status==TrajectoryAck.STATUS_TASK_RETIRED
+                                  for a in self.acks))
+        self.ack_pub.publish(next(a for a in self.acks if a.task_id==10002 and
+            a.status==TrajectoryAck.STATUS_TASK_RETIRED))
+        self.ack_pub.publish(cancelled_ack)
+        until=time.monotonic()+.15
+        self.spin_until(lambda:time.monotonic()>=until)
+        self.assertFalse(any("PATH_TRAJECTORY_READY" in s and
+            f"request_id={cancelled.request_id}" in s for s in self.statuses))
+        self.assertTrue(any(s.task_id==10002 and s.state==ExecutionState.STATE_SOFT_HOLD
+            and s.reason=="TASK_RETIRED" for s in self.states))
 
 
 if __name__=="__main__": unittest.main()

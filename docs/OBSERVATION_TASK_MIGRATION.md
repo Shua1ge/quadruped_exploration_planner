@@ -187,3 +187,22 @@ It does not use Gazebo or command the user's robot.
 Gazebo locomotion, mapping efficiency and RL tracking quality are **not yet
 validated for this new mode**. Protocol tests do not prove all physical stalls
 are eliminated. Use the explicit flag above for the next simulation comparison.
+
+### Rolling sensor-completion handoff (2026-10-06)
+
+Sensor-completed G1 -> G2 carries `predecessor_task_id/version`; Explorer does
+not publish an early SUPERSEDED for this transition. Local prepares G2 while
+retaining G1's execution snapshot and measured progress for safety. The first
+G2 spline sets `rolling_task_handoff`: Controller checks position, heading
+(within its heading-release threshold) and a bounded velocity change before
+installation. A discontinuity is rejected without replacing execution; SCAN
+requests `TASK_TRANSITION_REQUIRES_STOP`, then retries a stop-first connection.
+It does not turn this discontinuity into a rejected station or obstacle edge.
+
+Controller fences G1 atomically when installing G2; SCAN retires G1 only after
+the matching G2 ACK. Explicit cancellations still stop execution, including a
+queued or in-flight successor and its predecessor. Station arrival without
+confirmed observation completion still enters the existing observation wait;
+this change does not remove safety HOLD or guarantee every task can be joined
+without stopping. Message definitions changed: rebuild both `scan_planner_msgs`
+and `scan_planner`, then restart the complete launch (do not mix old/new nodes).

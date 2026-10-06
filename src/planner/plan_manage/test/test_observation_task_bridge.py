@@ -110,6 +110,24 @@ def test_new_objective_cancels_old_before_publication():
     assert value.messages[1].task_id==100 and value.messages[2].task_id==101
 
 
+def test_sensor_completed_handoff_keeps_old_execution_until_successor_ack():
+    value=bridge()
+    value.publish_observation_task(path(),100)
+    old=value.active_observation
+    value.completion_handoff_in_progress=True
+    value.active_observation=ObservationTask(8,(4.,2.),{(5,5)})
+    value.completion_handoff_in_progress=False
+    value.publish_observation_task(path(),101)
+    assert [m.lifecycle for m in value.messages]==[TaskMessage.ACTIVE,TaskMessage.ACTIVE]
+    assert old.lifecycle=="COMPLETED"
+    assert value.messages[-1].predecessor_task_id==100
+    assert value.messages[-1].predecessor_task_version==1
+    # Cancellation retains its immediate, explicit stop-first semantics.
+    value.cancel_observation_task(value.active_observation)
+    assert value.messages[-1].lifecycle==TaskMessage.CANCELLED
+    assert value.messages[-1].task_id==101
+
+
 def test_station_retry_sends_only_unresolved_boundaries_without_changing_denominator():
     value=bridge()
     value.publish_observation_task(path(),100)

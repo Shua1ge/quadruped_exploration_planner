@@ -28,6 +28,17 @@ void SCANReplanFSM::publishObservationFeedback(uint8_t state, const std::string&
 
 void SCANReplanFSM::retireObservationTask(TaskVersion version) {
   if (version.first == 0 || version.second == 0) return;
+  // Cancelling a pending successor must also stop/fence its predecessor.
+  if (rolling_predecessor_id_.load()) {
+    scan_planner_msgs::msg::ExecutionCommand command;
+    command.command = scan_planner_msgs::msg::ExecutionCommand::COMMAND_RETIRE_TASK;
+    command.task_id = rolling_predecessor_id_.exchange(0);
+    command.task_version = rolling_predecessor_version_.exchange(0);
+    command.reason = "ROLLING_SUCCESSOR_CANCELLED";
+    execution_command_pub_->publish(command);
+    retired_task_ = std::max(retired_task_,TaskVersion{command.task_id,command.task_version});
+  }
+  rolling_task_handoff_.store(false);
   retiring_task_ = std::max(retiring_task_, version);
   task_retirement_pending_ = true;
   last_task_retirement_ns_ = 0;
@@ -72,10 +83,24 @@ void SCANReplanFSM::observationTaskCallback(
   const TaskVersion current{task_id_.load(), task_version_.load()};
   if (msg->lifecycle == scan_planner_msgs::msg::ObservationTask::CANCELLED ||
       msg->lifecycle == scan_planner_msgs::msg::ObservationTask::SUPERSEDED) {
-    if (deferred_task_ && incoming == TaskVersion{deferred_task_->task_id, deferred_task_->task_version})
+    const bool cancels_queued_task = deferred_task_ &&
+        incoming == TaskVersion{deferred_task_->task_id, deferred_task_->task_version};
+    if (cancels_queued_task)
       deferred_task_.reset();
-    if (incoming == current) retireObservationTask(incoming);
-    else retired_task_ = std::max(retired_task_, incoming);
+    if (incoming == current || cancels_queued_task) retireObservationTask(incoming);
+    else {
+      if (incoming == TaskVersion{rolling_predecessor_id_.load(),rolling_predecessor_version_.load()}) {
+        // An explicit cancellation of the still-running predecessor is not
+        // information completion. Stop it without discarding prepared G2.
+        scan_planner_msgs::msg::ExecutionCommand command;
+        command.command = scan_planner_msgs::msg::ExecutionCommand::COMMAND_RETIRE_TASK;
+        command.task_id = incoming.first; command.task_version = incoming.second;
+        command.reason = "ROLLING_PREDECESSOR_CANCELLED";
+        execution_command_pub_->publish(command);
+        rolling_task_handoff_.store(false);
+      }
+      retired_task_ = std::max(retired_task_, incoming);
+    }
     return;
   }
   const auto finite_point=[](const geometry_msgs::msg::Point& p) {
@@ -91,6 +116,10 @@ void SCANReplanFSM::observationTaskCallback(
   else if (msg->lifecycle != scan_planner_msgs::msg::ObservationTask::ACTIVE) invalid = "lifecycle";
   else if (incoming < current) invalid = "stale_task_version";
   else if (!msg->request_id) invalid = "request_id";
+  else if ((msg->predecessor_task_id == 0) != (msg->predecessor_task_version == 0)) invalid = "predecessor_identity";
+  else if (msg->predecessor_task_id && incoming != current &&
+           TaskVersion{msg->predecessor_task_id,msg->predecessor_task_version} != current)
+    invalid = "predecessor_identity";
   else if (!std::isfinite(msg->resolution) || msg->resolution <= 0) invalid = "resolution";
   else if (!std::isfinite(msg->corridor_radius) || msg->corridor_radius <= 0 || msg->corridor_radius > 10) invalid = "corridor_radius";
   else if (!std::isfinite(msg->observation_radius) || msg->observation_radius <= 0 || msg->observation_radius > 20) invalid = "observation_radius";
@@ -118,7 +147,8 @@ void SCANReplanFSM::observationTaskCallback(
   if (deferred_task_ && std::make_tuple(msg->task_id, msg->task_version, msg->request_id) <=
       std::make_tuple(deferred_task_->task_id, deferred_task_->task_version, deferred_task_->request_id)) return;
   deferred_task_ = msg;
-  if (current.first != 0 && incoming != current) retireObservationTask(current);
+  if (current.first != 0 && incoming != current && !msg->predecessor_task_id)
+    retireObservationTask(current);
 }
 
 bool SCANReplanFSM::processObservationTaskTransitions() {
@@ -160,6 +190,15 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
     const auto msg = deferred_task_; deferred_task_.reset();
     if (TaskVersion{msg->task_id, msg->task_version} <= retired_task_) return false;
     const bool same_task = task_id_.load() == msg->task_id && task_version_.load() == msg->task_version;
+    if (!same_task && msg->predecessor_task_id) {
+      // Several information tasks may finish before any successor ACK.
+      // Keep ownership of the actual oldest execution until the swap.
+      if (!rolling_predecessor_id_.load()) {
+        rolling_predecessor_id_.store(msg->predecessor_task_id);
+        rolling_predecessor_version_.store(msg->predecessor_task_version);
+      }
+      rolling_task_handoff_.store(true);
+    }
     refreshPlanningOdomFromSafety();
     if (msg->coarse_route.size() < 2 &&
         (odom_pos_.head<2>()-Eigen::Vector2d(msg->goal.x,msg->goal.y)).norm() > msg->observation_radius) {

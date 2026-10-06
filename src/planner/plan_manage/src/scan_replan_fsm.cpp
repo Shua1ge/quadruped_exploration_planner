@@ -1130,9 +1130,24 @@ namespace scan_planner
   void SCANReplanFSM::executionStateCallback(
       const scan_planner_msgs::msg::ExecutionState::ConstSharedPtr &msg)
   {
-    if (task_mode_ && (task_retirement_pending_ ||
-        TaskVersion{msg->task_id,msg->task_version} != TaskVersion{task_id_.load(),task_version_.load()}))
-      return;
+    if (task_mode_) {
+      if (task_retirement_pending_) return;
+      if (TaskVersion{msg->task_id,msg->task_version} != TaskVersion{task_id_.load(),task_version_.load()}) {
+        // During rolling preparation the predecessor is still physically
+        // executing. Keep its measured progress for safety, but do not charge
+        // its stalls to the successor's task budget.
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        if (execution_snapshot_.valid && rolling_predecessor_id_.load() &&
+            execution_snapshot_.task_id == msg->task_id &&
+            execution_snapshot_.task_version == msg->task_version &&
+            execution_snapshot_.request_id == msg->request_id &&
+            execution_snapshot_.trajectory_id == msg->trajectory_id &&
+            std::isfinite(msg->execution_time))
+          execution_snapshot_.controller_execution_time = std::clamp(
+              msg->execution_time,0.0,execution_snapshot_.duration);
+        return;
+      }
+    }
     {
       std::unique_lock<std::mutex> pending_lock(pending_handoff_mutex_);
       if (pending_handoff_.valid && pending_handoff_.timeout_hold_issued)
@@ -1335,7 +1350,17 @@ namespace scan_planner
 
     if (msg->status != scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED)
     {
-      if (task_mode_)
+      if (rolling_task_handoff_.load() &&
+          (msg->reason == "HANDOFF_ROLLING_HEADING_ERROR" ||
+           msg->reason == "HANDOFF_ROLLING_VELOCITY_ERROR")) {
+        // A discontinuous connection is not an obstacle/failed viewpoint.
+        // Explicitly stop the predecessor, then use the already-certified
+        // rest/turn path on the next bounded candidate attempt.
+        requestExecutionStop("TASK_TRANSITION_REQUIRES_STOP", false);
+        rolling_task_handoff_.store(false);
+      }
+      if (task_mode_ && msg->reason != "HANDOFF_ROLLING_HEADING_ERROR" &&
+          msg->reason != "HANDOFF_ROLLING_VELOCITY_ERROR")
       {
         std::lock_guard<std::mutex> lock(task_event_mutex_);
         task_failed_goals_.push_back({{handoff.task_id,handoff.task_version},
@@ -1411,6 +1436,19 @@ namespace scan_planner
         handoff.initial_clearance_violations,
         handoff.fixed_body_yaw, handoff.body_yaw,
         handoff.execution_mode);
+    const uint64_t predecessor_id = rolling_predecessor_id_.exchange(0);
+    const uint64_t predecessor_version = rolling_predecessor_version_.exchange(0);
+    rolling_task_handoff_.store(false);
+    if (predecessor_id) {
+      // Controller has already installed the successor. Fencing the old
+      // identity now cannot HOLD the newly installed execution.
+      scan_planner_msgs::msg::ExecutionCommand command;
+      command.command = scan_planner_msgs::msg::ExecutionCommand::COMMAND_RETIRE_TASK;
+      command.task_id = predecessor_id; command.task_version = predecessor_version;
+      command.reason = "ROLLING_SUCCESSOR_ACKNOWLEDGED";
+      retired_task_ = std::max(retired_task_,TaskVersion{predecessor_id,predecessor_version});
+      execution_command_pub_->publish(command);
+    }
     if (handoff.structured_repair_segment)
     {
       structured_local_repair_active_.store(true);
@@ -1723,6 +1761,8 @@ namespace scan_planner
       std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
       if (execution_snapshot_.valid)
       {
+        msg.task_id = execution_snapshot_.task_id;
+        msg.task_version = execution_snapshot_.task_version;
         msg.request_id = execution_snapshot_.request_id;
         msg.trajectory_id = execution_snapshot_.trajectory_id;
       }
@@ -5053,6 +5093,7 @@ namespace scan_planner
       bspline.traj_id = info->traj_id_;
       bspline.request_id = planning_request_id;
       bspline.task_id = task_id_.load(); bspline.task_version = task_version_.load();
+      bspline.rolling_task_handoff = rolling_task_handoff_.load();
       bspline.candidate_id = task_candidate_id_.load();
       bspline.execution_mode = low_speed_local_repair
           ? scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE

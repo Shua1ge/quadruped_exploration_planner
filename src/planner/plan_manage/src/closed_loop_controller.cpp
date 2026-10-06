@@ -391,6 +391,21 @@ private:
       matched_yaw_error = std::abs(normalizeAngle(candidateDesiredYaw(
           candidate, candidate_duration, matched_time, candidate_fixed_yaw,
           candidate_body_yaw, msg->min_forward_command > 0.0) - odom_yaw_));
+      if (msg->rolling_task_handoff) {
+        const Eigen::Vector3d candidate_velocity = candidate[1].evaluateDeBoorT(matched_time);
+        // Same reaction/deceleration contract as the position gate. Bound
+        // velocity change before installation, including nearly-rest cases.
+        const double velocity_limit = handoff_max_deceleration_ * handoff_reaction_time_;
+        const bool heading_jump = matched_yaw_error >
+            std::min(max_handoff_yaw_error_,heading_release_threshold_);
+        if (heading_jump ||
+            (candidate_velocity.head<2>()-odom_vel_.head<2>()).norm() > velocity_limit) {
+          publishTrajectoryAck(*msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+              heading_jump ? "HANDOFF_ROLLING_HEADING_ERROR" : "HANDOFF_ROLLING_VELOCITY_ERROR",
+              matched_time,matched_error,matched_yaw_error);
+          return;
+        }
+      }
       if (matched_yaw_error > max_handoff_yaw_error_ &&
           handoff_speed > 0.05)
       {
@@ -417,6 +432,13 @@ private:
          (msg->task_id == 0 && active_task_id_ == 0 &&
           active_request_id_ == msg->request_id));
     const bool resuming_hold = soft_hold_;
+    if (msg->task_id && active_task_id_ &&
+        std::make_pair(msg->task_id,msg->task_version) >
+        std::make_pair(active_task_id_,active_task_version_))
+      // Fence the predecessor atomically with installation, not on a later
+      // ROS command: a delayed old spline must never undo a successful swap.
+      retired_task_ = std::max(retired_task_,
+          std::make_pair(active_task_id_,active_task_version_));
     traj_ = std::move(candidate);
     traj_duration_ = candidate_duration;
     traj_id_ = msg->traj_id;

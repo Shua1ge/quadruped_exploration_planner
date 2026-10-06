@@ -8,6 +8,10 @@ uint64 task_id
 uint64 task_version
 uint64 request_id
 uint8 lifecycle
+# Normal observation completion may replace this predecessor without stopping
+# its safe execution prefix. Cancellation/supersession still uses stop-first.
+uint64 predecessor_task_id
+uint64 predecessor_task_version
 bool has_region
 uint64 region_id
 geometry_msgs/Point goal

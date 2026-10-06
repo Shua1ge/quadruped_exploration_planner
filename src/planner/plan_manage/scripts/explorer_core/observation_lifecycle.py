@@ -36,6 +36,8 @@ class ObservationTask:
     sensor_observed_cells: int = 0
     initial_sensor_revision: int = 0
     station_adjustments: int = 0
+    predecessor_task_id: int = 0
+    predecessor_task_version: int = 0
 
 
 def evaluate_observation(

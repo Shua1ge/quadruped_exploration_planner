@@ -15,9 +15,17 @@ class ObservationTaskBridge:
     def active_observation(self, value):
         old = getattr(self, "_active_observation", None)
         if old is not None and old is not value and getattr(self, "task_mode", False):
-            lifecycle = (TaskMessage.SUPERSEDED if value is not None
-                         else TaskMessage.CANCELLED)
-            self.retire_observation_task(old, lifecycle)
+            if (value is not None and old.task_id and
+                    getattr(self, "completion_handoff_in_progress", False)):
+                value.predecessor_task_id = old.task_id
+                value.predecessor_task_version = old.task_version
+                # Information completion does not revoke safe motion. Local
+                # fences the predecessor only after the replacement ACK.
+                old.lifecycle = "COMPLETED"
+            else:
+                lifecycle = (TaskMessage.SUPERSEDED if value is not None
+                             else TaskMessage.CANCELLED)
+                self.retire_observation_task(old, lifecycle)
         self._active_observation = value
         if old is not value:
             self.active_task_elapsed = 0.0
@@ -70,6 +78,8 @@ class ObservationTaskBridge:
         message.header = path.header
         message.task_id, message.task_version = task.task_id, task.task_version
         message.request_id, message.lifecycle = request_id, TaskMessage.ACTIVE
+        message.predecessor_task_id = task.predecessor_task_id
+        message.predecessor_task_version = task.predecessor_task_version
         message.has_region, message.region_id = task.region_id is not None, int(task.region_id or 0)
         message.goal = Point(x=float(task.goal[0]), y=float(task.goal[1]), z=0.0)
         message.coarse_route = [pose.pose.position for pose in path.poses]

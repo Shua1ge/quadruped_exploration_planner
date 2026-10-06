@@ -1991,6 +1991,14 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         return False
 
     def handoff_satisfied_observation(self, status: str) -> bool:
+        # Scoped to sensor-completed handoff, never failure/cancellation.
+        self.completion_handoff_in_progress = True
+        try:
+            return self._handoff_satisfied_observation(status)
+        finally:
+            self.completion_handoff_in_progress = False
+
+    def _handoff_satisfied_observation(self, status: str) -> bool:
         """Switch atomically, retaining the safe current task on failure."""
         if self.active_goal is None:
             return False
