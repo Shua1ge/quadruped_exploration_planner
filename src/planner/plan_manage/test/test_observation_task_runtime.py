@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import math
+import copy
 import unittest
 
 import rclpy
@@ -64,6 +65,7 @@ class TestTaskRuntime(unittest.TestCase):
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
         cls.pose_x=0.0
         cls.pose_yaw=0.0
+        cls.pose_vx=0.0
         cls.cloud_counter=0
 
     @classmethod
@@ -89,6 +91,7 @@ class TestTaskRuntime(unittest.TestCase):
             odom.pose.pose.position.z=.4
             odom.pose.pose.orientation.w=math.cos(self.pose_yaw/2)
             odom.pose.pose.orientation.z=math.sin(self.pose_yaw/2)
+            odom.twist.twist.linear.x=self.pose_vx
             self.odom_pub.publish(odom)
             self.sensor_pose_pub.publish(odom)
             self.cloud_counter+=1
@@ -165,6 +168,26 @@ class TestTaskRuntime(unittest.TestCase):
         self.spin_until(lambda:any(s.request_id==first.request_id and
             s.trajectory_id==planned.trajectory_id and
             s.state==ExecutionState.STATE_HEADING_FROZEN for s in self.states))
+        # The same forward candidate cannot be ACKed as yaw=0 while moving
+        # backwards-facing, then demand a pi turn after installation.
+        self.pose_vx=.2
+        until=time.monotonic()+.2
+        self.spin_until(lambda:time.monotonic()>=until)
+        reversed_handoff=copy.deepcopy(next(s for s in self.splines
+            if s.traj_id==planned.trajectory_id))
+        reversed_handoff.traj_id=900
+        self.spline_pub.publish(reversed_handoff)
+        self.spin_until(lambda:any(a.trajectory_id==900 and
+            a.status==TrajectoryAck.STATUS_REJECTED and
+            a.reason=="HANDOFF_MOVING_HEADING_ERROR" and a.yaw_error>2.5
+            for a in self.acks))
+        self.assertFalse(any(s.trajectory_id==900 for s in self.states))
+        self.pose_vx=0.
+        # Once frozen, errors in the hysteresis band must not resume walking.
+        self.pose_yaw=-.7
+        until=time.monotonic()+.3
+        self.spin_until(lambda:time.monotonic()>=until)
+        self.assertEqual(self.states[-1].state,ExecutionState.STATE_HEADING_FROZEN)
         aligned_acks=len([a for a in self.acks if a.request_id==first.request_id and
             a.status==TrajectoryAck.STATUS_ACCEPTED])
         until=time.monotonic()+1.2
@@ -261,6 +284,37 @@ class TestTaskRuntime(unittest.TestCase):
                      s.reason=="EXECUTION_NO_PROGRESS")
         self.assertLess(stalled.execution_time,stalled.duration)
         self.assertAlmostEqual(stalled.duration,10.)
+
+        # Regression: the coarse goal is inside the old 0.25 m arrival band,
+        # but the selected, acknowledged local station has not been reached.
+        # A stall must generate a replacement, not loop REPLAN->GOAL_REACHED
+        # until Explorer's 120 s timeout. Only this isolated domain is used.
+        nearby=self.task(103)
+        nearby.goal=Point(x=self.pose_x+.24,y=0.,z=0.)
+        nearby.coarse_route=[Point(x=self.pose_x,y=0.,z=0.),nearby.goal]
+        self.task_pub.publish(nearby)
+        self.spin_until(lambda:any(a.task_id==102 and
+            a.status==TrajectoryAck.STATUS_TASK_RETIRED for a in self.acks))
+        self.ack_pub.publish(next(a for a in self.acks if a.task_id==102 and
+            a.status==TrajectoryAck.STATUS_TASK_RETIRED))
+        self.spin_until(lambda:any(a.task_id==103 and a.request_id==nearby.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=8)
+        near_ack=next(a for a in self.acks if a.task_id==103 and
+            a.request_id==nearby.request_id and a.status==TrajectoryAck.STATUS_ACCEPTED)
+        self.ack_pub.publish(near_ack)
+        self.spin_until(lambda:any("PATH_TRAJECTORY_READY" in s and
+            f"request_id={nearby.request_id}" in s for s in self.statuses))
+        state_pub=self.node.create_publisher(ExecutionState,"planning/execution_state",20)
+        self.spin_until(lambda:state_pub.get_subscription_count()>0)
+        state_pub.publish(ExecutionState(task_id=103,task_version=1,
+            request_id=nearby.request_id,trajectory_id=near_ack.trajectory_id,
+            state=ExecutionState.STATE_STALLED,reason="EXECUTION_NO_PROGRESS",
+            terminal_error=.5))
+        self.spin_until(lambda:any(a.task_id==103 and a.request_id==nearby.request_id and
+            a.trajectory_id>near_ack.trajectory_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=5)
+        self.assertFalse(any(f.task_id==103 and f.state==ObservationFeedback.STATION_REACHED
+            for f in self.feedback))
 
 
 if __name__=="__main__": unittest.main()

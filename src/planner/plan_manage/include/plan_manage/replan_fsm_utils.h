@@ -12,6 +12,22 @@
 namespace scan_planner
 {
 
+inline bool headingFreezeRequired(bool frozen, double error,
+    double enter_threshold, double exit_threshold)
+{
+  if (!std::isfinite(error)) return true;
+  return std::abs(error) > (frozen ? exit_threshold : enter_threshold);
+}
+
+// Observation-task arrival is checked against the acknowledged local station
+// by processObservationTaskTransitions(), never against the coarse route goal.
+inline bool shouldFinishCoarseReferenceGoal(bool observation_task_active,
+    bool waypoint_sequence, double distance, double tolerance)
+{
+  return !observation_task_active && !waypoint_sequence &&
+      std::isfinite(distance) && distance <= tolerance;
+}
+
 inline bool shouldPreserveHeadingAlignment(bool task_mode, bool aligning,
     bool stalled, bool safety_stop, bool replacement_pending)
 {
@@ -156,6 +172,16 @@ inline double forwardGaitLookaheadTime(
     previous = point;
   }
   return target;
+}
+
+template <typename SamplePosition>
+inline double trajectorySteeringYaw(double progress, double duration,
+    const Eigen::Vector3d& anchor, double fallback_yaw, SamplePosition sample)
+{
+  const double lookahead=forwardGaitLookaheadTime(progress,duration,sample);
+  const Eigen::Vector3d direction=sample(lookahead)-anchor;
+  return direction.head<2>().squaredNorm()<1e-4 ? fallback_yaw
+      : std::atan2(direction.y(),direction.x());
 }
 
 inline bool structuredRepairMayStartAnotherEscape(bool rejoin_pending, int committed)

@@ -33,6 +33,7 @@ public:
   {
     time_forward_ = declare_parameter<double>("time_forward", 0.8);
     heading_error_threshold_ = declare_parameter<double>("heading_error_threshold", 0.8);
+    heading_release_threshold_ = declare_parameter<double>("heading_release_threshold", 0.6);
     heading_stall_timeout_ = declare_parameter<double>("heading_stall_timeout", 3.0);
     heading_progress_epsilon_ = declare_parameter<double>("heading_progress_epsilon", 0.05);
     motion_stall_timeout_ = declare_parameter<double>("motion_stall_timeout", 3.0);
@@ -59,6 +60,9 @@ public:
         min_moving_handoff_error_ > max_handoff_error_ ||
         handoff_reaction_time_ < 0.0 || handoff_max_deceleration_ <= 0.0 ||
         max_handoff_yaw_error_ <= 0.0 ||
+        !std::isfinite(heading_error_threshold_) || heading_error_threshold_ <= 0.0 ||
+        !std::isfinite(heading_release_threshold_) || heading_release_threshold_ < 0.0 ||
+        heading_release_threshold_ >= heading_error_threshold_ ||
         heading_stall_timeout_ <= 0.0 ||
         heading_progress_epsilon_ <= 0.0 ||
         !std::isfinite(motion_stall_timeout_) || motion_stall_timeout_ <= 0.0 ||
@@ -136,16 +140,17 @@ private:
     trajectory_ack_pub_->publish(ack);
   }
 
-  double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des) const
+  double candidateDesiredYaw(const std::vector<UniformBspline>& curve,
+      double duration, double t_cur, bool fixed_yaw, double body_yaw,
+      bool spatial_gait) const
   {
-    if (fixed_trajectory_yaw_)
-      return trajectory_yaw_;
-    const double t_look = std::min(traj_duration_, t_cur + time_forward_);
-    Eigen::Vector3d direction = traj_[0].evaluateDeBoorT(t_look) - pos_des;
-    if (direction.head<2>().squaredNorm() < 1e-4)
-      direction = traj_[1].evaluateDeBoorT(t_cur);
-    return direction.head<2>().squaredNorm() < 1e-4
-        ? odom_yaw_ : std::atan2(direction.y(), direction.x());
+    if (fixed_yaw) return body_yaw;
+    Eigen::Vector3d anchor=curve[0].evaluateDeBoorT(t_cur);
+    if(spatial_gait) anchor=odom_pos_;
+    // At a zero-velocity endpoint, a numerical derivative is not a new
+    // steering objective. Retain heading instead of turning toward noise.
+    return trajectorySteeringYaw(t_cur,duration,anchor,odom_yaw_,
+        [&](double t) { return curve[0].evaluateDeBoorT(t); });
   }
 
   void publishStop(double yaw_rate = 0.0)
@@ -380,52 +385,28 @@ private:
         return;
       }
 
-      // A rolling candidate may legitimately leave the current pose in a new
-      // direction after local repair.  Position continuity is mandatory, but
-      // yaw continuity is not: cmdCallback already freezes translation and
-      // performs HEADING_ALIGNMENT whenever the tangent error exceeds
-      // heading_error_threshold_.  Rejecting such a candidate here leaves an
-      // expired active spline installed forever and creates a replan/reject
-      // loop.  Measure the discontinuity for diagnostics and accept the
-      // candidate so the existing in-place alignment state can resolve it.
-      if (candidate_fixed_yaw)
+      // Certification, ACK and command execution use the same forward heading.
+      // Near rest we may align in place; a moving discontinuity is rejected
+      // before installing the candidate, preserving the old execution state.
+      matched_yaw_error = std::abs(normalizeAngle(candidateDesiredYaw(
+          candidate, candidate_duration, matched_time, candidate_fixed_yaw,
+          candidate_body_yaw, msg->min_forward_command > 0.0) - odom_yaw_));
+      if (matched_yaw_error > max_handoff_yaw_error_ &&
+          handoff_speed > 0.05)
       {
-        matched_yaw_error = std::abs(
-            normalizeAngle(candidate_body_yaw - odom_yaw_));
+        publishTrajectoryAck(*msg,
+            scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+            "HANDOFF_MOVING_HEADING_ERROR", matched_time, matched_error,
+            matched_yaw_error);
+        return;
       }
-      else if (msg->min_forward_command > 0.0)
+      if (matched_yaw_error > max_handoff_yaw_error_)
       {
-        const double lookahead = forwardGaitLookaheadTime(matched_time, candidate_duration,
-            [&](double t) { return candidate[0].evaluateDeBoorT(t); });
-        const Eigen::Vector2d delta=(candidate[0].evaluateDeBoorT(lookahead)-odom_pos_).head<2>();
-        if(delta.norm()>1e-6)
-          matched_yaw_error=std::abs(normalizeAngle(std::atan2(delta.y(),delta.x())-odom_yaw_));
-      }
-      else if (receive_traj_ && !soft_hold_)
-      {
-        const double before_time = std::max(
-            0.0, matched_time - handoff_sample_dt_);
-        const double after_time = std::min(
-            candidate_duration, matched_time + handoff_sample_dt_);
-        const Eigen::Vector3d before =
-            candidate[0].evaluateDeBoorT(before_time);
-        const Eigen::Vector3d after =
-            candidate[0].evaluateDeBoorT(after_time);
-        const Eigen::Vector2d tangent = after.head<2>() - before.head<2>();
-        if (tangent.squaredNorm() > 1e-8)
-        {
-          const double candidate_yaw = std::atan2(tangent.y(), tangent.x());
-          matched_yaw_error = std::abs(
-              normalizeAngle(candidate_yaw - odom_yaw_));
-          if (matched_yaw_error > max_handoff_yaw_error_)
-          {
-            RCLCPP_WARN(
+        RCLCPP_WARN(
                 get_logger(),
                 "[TRAJECTORY_HANDOFF_HEADING_ALIGNMENT] trajectory=%lld matched_yaw_error=%.3frad threshold=%.3frad; accepting position-continuous candidate and freezing translation until aligned",
                 static_cast<long long>(msg->traj_id), matched_yaw_error,
                 max_handoff_yaw_error_);
-          }
-        }
       }
     }
 
@@ -722,16 +703,17 @@ private:
     }
     const double t_eval = std::min(spatial_gait ? spatial_target_time : exec_time_, traj_duration_);
     Eigen::Vector3d pos_des = traj_[0].evaluateDeBoorT(t_eval);
-    const double desired_yaw = spatial_gait
-        ? std::atan2(pos_des.y() - odom_pos_.y(), pos_des.x() - odom_pos_.x())
-        : estimateDesiredYaw(t_eval, pos_des);
+    const double desired_yaw = candidateDesiredYaw(traj_, traj_duration_,
+        spatial_gait ? exec_time_ : t_eval, fixed_trajectory_yaw_,
+        trajectory_yaw_, spatial_gait);
     const double yaw_error = normalizeAngle(desired_yaw - odom_yaw_);
     std_msgs::msg::Float64 heading_error_msg;
     heading_error_msg.data = yaw_error;
     heading_error_pub_->publish(heading_error_msg);
     const double yaw_command = std::clamp(
         kp_yaw_ * yaw_error, -active_max_vyaw_, active_max_vyaw_);
-    if (std::abs(yaw_error) > heading_error_threshold_)
+    if (headingFreezeRequired(heading_frozen_, yaw_error,
+                             heading_error_threshold_, heading_release_threshold_))
     {
       const double abs_error = std::abs(yaw_error);
       if (!heading_frozen_)
@@ -958,7 +940,7 @@ private:
   uint8_t last_execution_state_{std::numeric_limits<uint8_t>::max()};
   rclcpp::Time last_execution_state_publish_time_{0, 0, RCL_ROS_TIME};
   double heading_best_error_{std::numeric_limits<double>::infinity()};
-  double time_forward_, heading_error_threshold_, kp_pos_, kp_yaw_;
+  double time_forward_, heading_error_threshold_, heading_release_threshold_, kp_pos_, kp_yaw_;
   double heading_stall_timeout_, heading_progress_epsilon_;
   double max_vx_, max_vy_, max_vyaw_, finish_dist_;
   double handoff_search_time_, handoff_sample_dt_, max_handoff_error_;

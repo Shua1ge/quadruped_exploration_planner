@@ -22,6 +22,10 @@ class ObservationTaskBridge:
         if old is not value:
             self.active_task_elapsed = 0.0
             self.blocked_execution_context = None
+            self.departure_recovery_key = None
+            self.departure_recovery_attempts = 0
+            self.departure_recovery_terminal = False
+            self.departure_last_attempt_ns = None
             revoke = getattr(self, "revoke_task_path_constraints", None)
             if revoke is not None:
                 revoke(old)
@@ -101,7 +105,8 @@ class ObservationTaskBridge:
             return
         task = self.active_observation
         if (task is None or message.task_id != task.task_id or message.task_version != task.task_version
-                or message.request_id != self.active_path_request_generation):
+                or message.request_id != self.active_path_request_generation
+                or getattr(self, "departure_recovery_terminal", False)):
             self.task_stale_feedback += 1
             return
         if not all(math.isfinite(v) for v in (message.station.x, message.station.y, message.station.z)):
@@ -122,13 +127,13 @@ class ObservationTaskBridge:
                 self.pending_observation_station = None
                 self.handoff_satisfied_observation("OBSERVATION_TASK_COMPLETE_AT_STATION")
                 return
-            self.pending_observation_station = (self.map_update_count, self.get_clock().now().nanoseconds, message)
+            self.pending_observation_station = (self.grid.sensor_revision, self.get_clock().now().nanoseconds, message)
         elif message.state == ObservationFeedback.EXECUTION_BLOCKED:
             self.pending_observation_station = None
             self.pending_path_publish_ns = 0
             self.pending_path_request_generation = None
             self.pending_path_deferred = False
-            self.blocked_execution_context = self.local_execution_context()
+            self.latch_blocked_execution(message.reason)
             self.publish_status("LOCAL_EXECUTION_BLOCKED")
         elif message.state == ObservationFeedback.PATH_REJECTED:
             self.pending_observation_station = None
@@ -139,8 +144,27 @@ class ObservationTaskBridge:
             # No second progress ledger: retain task/coverage and try a route
             # avoiding its typed path evidence. Never repeat an identical route.
             failed_route = tuple(self.active_raw_path)
-            if self.reroute_active_goal(excluded_route=failed_route):
+            self.ensure_departure_recovery_budget()
+            if not self.departure_retry_ready():
+                self.latch_blocked_execution("PATH_WAITING_FOR_SETTLING")
+                self.publish_status("LOCAL_PATH_WAITING_FOR_SETTLING")
+                return
+            if (self.departure_recovery_attempts < getattr(self, "task_departure_retry_limit", 2)
+                    and self.reroute_active_goal(excluded_route=failed_route)):
+                self.departure_recovery_attempts += 1
+                self.departure_last_attempt_ns = self.get_clock().now().nanoseconds
                 self.publish_status("LOCAL_PATH_REPAIRED")
+                return
+            # Failure to synthesize a spline is not evidence against its
+            # remote viewpoint. Only a validated, task-scoped failed segment
+            # away from the departure cell can authorize sibling arbitration.
+            departure = self.grid.world_to_cell(*self.position)
+            edges = getattr(self, "task_path_constraints", {}).get(
+                (int(task.task_id), int(task.task_version)), set())
+            has_route_evidence = any(departure not in edge for edge in edges)
+            if not has_route_evidence:
+                self.latch_blocked_execution("UNRESOLVED_PATH")
+                self.publish_status("LOCAL_PATH_UNRESOLVED_NO_SPATIAL_EVIDENCE")
                 return
             status = String()
             status.data = (f"VIEWPOINT_LOCAL_REJECTED request_id={message.request_id} "
@@ -168,7 +192,7 @@ class ObservationTaskBridge:
             self.handoff_satisfied_observation("OBSERVATION_TASK_COMPLETE_AT_STATION")
             return True
         # Await accepted post-arrival scans, with a bounded wait if clouds stop.
-        if (self.map_update_count-revision < self.observation_done_updates
+        if (self.grid.sensor_revision <= revision
                 and self.get_clock().now().nanoseconds-stamp < 2_000_000_000):
             return True
         self.pending_observation_station = None
@@ -185,15 +209,94 @@ class ObservationTaskBridge:
                       for i in range(x-radius,x+radius+1))
         return (x, y, round(getattr(self, "body_yaw", 0.0)/0.2), cells)
 
+    def ensure_departure_recovery_budget(self):
+        task = self.active_observation
+        key = (task.task_id, task.task_version) if task is not None else None
+        if getattr(self, "departure_recovery_key", None) != key:
+            self.departure_recovery_key = key
+            self.departure_recovery_attempts = 0
+            self.departure_recovery_terminal = False
+            self.departure_last_attempt_ns = None
+
+    def record_departure_motion(self, linear_speed, angular_speed):
+        """Measured odometry, not map/yaw revision, authorizes rest retries."""
+        now = self.get_clock().now().nanoseconds
+        previous = getattr(self, "departure_odom_ns", None)
+        since = getattr(self, "departure_rest_since_ns", None)
+        continuous = previous is not None and 0 <= now - previous <= 500_000_000
+        resting = (math.isfinite(linear_speed) and math.isfinite(angular_speed)
+                   and linear_speed <= 0.05 and abs(angular_speed) <= 0.10)
+        self.departure_odom_ns = now
+        self.departure_rest_since_ns = (since if continuous and since is not None
+                                       else now) if resting else None
+
+    def departure_is_settled(self):
+        now = self.get_clock().now().nanoseconds
+        stamp = getattr(self, "departure_odom_ns", None)
+        since = getattr(self, "departure_rest_since_ns", None)
+        return (stamp is not None and since is not None
+                and 0 <= now - stamp <= 500_000_000
+                and now - since >= 500_000_000)
+
+    def departure_retry_ready(self):
+        now = self.get_clock().now().nanoseconds
+        last = getattr(self, "departure_last_attempt_ns", None)
+        return self.departure_is_settled() and (last is None or
+            now - last >= int(getattr(self, "task_departure_retry_period", 2.0) * 1e9))
+
+    def latch_blocked_execution(self, reason):
+        """Task-scoped retry ownership; request/ACK refreshes cannot refill it."""
+        self.ensure_departure_recovery_budget()
+        if getattr(self, "blocked_execution_context", None) is None:
+            self.departure_recovery_started_ns = self.get_clock().now().nanoseconds
+        self.blocked_execution_context = self.local_execution_context()
+        self.departure_recovery_reason = reason
+
     def continue_blocked_execution(self):
         context = getattr(self, "blocked_execution_context", None)
         if context is None:
             return False
-        if self.local_execution_context() != context:
+        if getattr(self, "departure_recovery_terminal", False):
+            return True
+        now = self.get_clock().now().nanoseconds
+        started = getattr(self, "departure_recovery_started_ns", now)
+        self.departure_recovery_started_ns = min(started, now)
+        changed = self.local_execution_context() != context
+        expired = now - self.departure_recovery_started_ns >= int(
+            getattr(self, "task_departure_retry_period", 2.0) * 1e9)
+        # A changed cell/yaw during braking must not bypass the minimum wait.
+        if not expired:
+            return True
+        if (getattr(self, "departure_recovery_reason", "") == "INVALID_TASK_CONTRACT"
+                or getattr(self, "departure_recovery_attempts", 0) >=
+                getattr(self, "task_departure_retry_limit", 2)):
+            # A terminal result, not a silent wait or a remote viewpoint ban.
+            self.departure_recovery_terminal = True
+            task = self.active_observation
+            if task is not None:
+                self.cancel_observation_task(task)
+            self.publish_status("DEPARTURE_RECOVERY_EXHAUSTED")
+            # This execution is terminal, not the global exploration loop.
+            # Cancel first so old candidates cannot restart, then arbitrate a
+            # replacement exactly once using the failed task/request identity.
+            if task is not None:
+                request = getattr(self, "active_path_request_generation", None)
+                terminal = String()
+                terminal.data = ("LOCAL_RECOVERY_EXHAUSTED"
+                    + (f" request_id={request}" if request is not None else "")
+                    + f" task_id={task.task_id} task_version={task.task_version}")
+                self.planning_status_callback(terminal)
+            return True
+        if self.departure_retry_ready():
+            self.departure_recovery_attempts = getattr(self, "departure_recovery_attempts", 0) + 1
+            self.departure_last_attempt_ns = now
             self.blocked_execution_context = None
             self.healthy_task_elapsed = 0.0
-            self.publish_reference_path(self.active_raw_path)
-            self.publish_status("LOCAL_EXECUTION_RETRY_CHANGED_STATE")
-        # Holding is a durable explicit state, not an exploration timeout and
-        # not permission to blacklist successive distant viewpoints.
+            # Ask for a different approach first; otherwise re-evaluate the
+            # same objective from settled odometry. SCAN still certifies it.
+            reroute = getattr(self, "reroute_active_goal", None)
+            if reroute is None or not reroute(excluded_route=tuple(self.active_raw_path)):
+                self.publish_reference_path(self.active_raw_path)
+            self.publish_status("LOCAL_EXECUTION_RETRY_CHANGED_STATE" if changed
+                                else "LOCAL_EXECUTION_RETRY_AFTER_SETTLING")
         return True

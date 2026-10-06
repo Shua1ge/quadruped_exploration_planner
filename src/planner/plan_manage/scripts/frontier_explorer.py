@@ -362,6 +362,11 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.task_corridor_radius = float(self.declare_parameter("task_corridor_radius", 0.8).value)
         self.task_representative_limit = int(self.declare_parameter("task_representative_limit", 64).value)
         self.task_max_station_adjustments = int(self.declare_parameter("task_max_station_adjustments", 4).value)
+        self.task_departure_retry_period = float(self.declare_parameter("task_departure_retry_period", 2.0).value)
+        self.task_departure_retry_limit = int(self.declare_parameter("task_departure_retry_limit", 2).value)
+        if (not math.isfinite(self.task_departure_retry_period) or self.task_departure_retry_period <= 0
+                or not 0 <= self.task_departure_retry_limit <= 8):
+            raise ValueError("departure recovery requires a positive period and 0..8 retries")
         if (not math.isfinite(self.task_corridor_radius) or not 0 < self.task_corridor_radius <= 10
                 or not 1 <= self.task_representative_limit <= 256
                 or not 1 <= self.task_max_station_adjustments <= 32):
@@ -819,6 +824,12 @@ class FrontierExplorer(ObservationTaskBridge, Node):
 
     def record_task_path_constraint(self, msg: FailureEvidence) -> bool:
         """Constrain one failed directed edge for this task version only."""
+        # A bad spline or an inadmissible controller motion is not a blocked
+        # road. Keep its diagnostics, but do not turn candidate failures into
+        # persistent global geometry (including messages from older binaries).
+        if getattr(msg, "stage", "") in (
+                "LOCAL_PATH_SHAPE", "FORWARD_GAIT_STEERING"):
+            return False
         task = self.active_observation
         if (task is None or not getattr(msg, "has_path_segment", False)
                 or int(msg.trajectory_id) <= 0
@@ -1135,6 +1146,9 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 SPARSE_MISS_REASONS, 0)
 
     def odom_callback(self, msg: Odometry):
+        self.record_departure_motion(
+            math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y),
+            msg.twist.twist.angular.z)
         new_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         if self.last_metric_position is not None:
             distance = math.hypot(new_position[0] - self.last_metric_position[0],
@@ -2107,7 +2121,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                     f"[TASK_CONTRACT_REJECTED] request={request_generation} "
                     f"field={fields.get('field', 'unknown')}; retaining observation and region")
                 self.publish_status("TASK_CONTRACT_REJECTED")
-                self.blocked_execution_context = self.local_execution_context()
+                self.latch_blocked_execution("INVALID_TASK_CONTRACT")
                 return
             if status in ("BLOCKED", "TRACKING_RECOVERY_FAILED", "REFERENCE_PATH_REJECTED", "INVALID_REFERENCE_PATH"):
                 if not planning_status_matches_request(status, request_generation,
@@ -2117,7 +2131,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 self.pending_path_publish_ns = 0
                 self.pending_path_request_generation = None
                 self.pending_path_deferred = False
-                self.blocked_execution_context = self.local_execution_context()
+                self.latch_blocked_execution(fields.get("reason", status))
                 self.publish_status("LOCAL_EXECUTION_BLOCKED")
                 return
         # WAIT_TARGET is a heartbeat.  Once this request has completed, later
@@ -2209,7 +2223,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                     f"{task.frontier_missing_streak if task is not None else 0}"
                     f"/{self.observation_closure_updates}; switching anyway")
                 self.replace_unsatisfied_observation()
-        elif status == "VIEWPOINT_LOCAL_REJECTED":
+        elif status in ("VIEWPOINT_LOCAL_REJECTED", "LOCAL_RECOVERY_EXHAUSTED"):
             # SCAN exhausted a finite family of geometrically distinct local
             # paths for this exact viewpoint.  This is not evidence that the
             # committed region or portal is bad.  Cool only the rejected pose
@@ -2237,9 +2251,14 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             failed_scope = (getattr(self, "active_commitment_scope", None)
                             or ("region", failed_region))
             previous_goal = self.active_goal
+            if status == "LOCAL_RECOVERY_EXHAUSTED":
+                # CANCEL has already been sent. A sibling must get a NEW
+                # task identity; reusing the frozen cancelled objective would
+                # be rejected by Controller's task-retirement fence.
+                self.terminate_active_observation("LOCAL_RECOVERY_EXHAUSTED")
             if previous_goal is not None and not constraint_preapplied:
                 self.add_goal_failure_cooldown(
-                    previous_goal, "VIEWPOINT_LOCAL_REJECTED")
+                    previous_goal, status)
             self.active_goal = None
             self.active_goal_cell = None
             # Retain the frozen information objective while trying terminals.
@@ -2248,14 +2267,14 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self.pending_blocked_edge = None
             self.prepared_candidate = None
             self.replacement_pending = False
-            self.last_active_goal_clear_reason = "VIEWPOINT_LOCAL_REJECTED"
+            self.last_active_goal_clear_reason = status
             excluded_goals = ((previous_goal,)
                               if previous_goal is not None else ())
             if self.plan_from_current_position(
                     excluded_goals=excluded_goals, required_scope=failed_scope,
                     allow_region_release=False):
                 self.publish_status(
-                    "VIEWPOINT_LOCAL_REJECTED_SIBLING_SELECTED")
+                    status + "_SIBLING_SELECTED")
                 return
 
             # The viewpoint-level alternative set is empty.  Only now may the
@@ -2269,10 +2288,10 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                         "viewpoint_alternatives_exhausted")
             if self.plan_from_current_position(excluded_goals=excluded_goals):
                 self.publish_status(
-                    "VIEWPOINT_LOCAL_REJECTED_REGION_CHANGED")
+                    status + "_REGION_CHANGED")
             else:
                 self.publish_status(
-                    "VIEWPOINT_LOCAL_REJECTED_WAITING_FOR_ROUTE")
+                    status + "_WAITING_FOR_ROUTE")
         elif status == "LOCAL_REPAIR_EXHAUSTED":
             # SCAN has already held the robot and spent its local alternative
             # budget for this exact request.  Retire only the failed child
@@ -2494,7 +2513,16 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             if self.observation_complete(task):
                 self.handoff_satisfied_observation("OBSERVATION_HANDOFF_COMPLETE")
                 return
+            # Successor preparation depends on observation evidence, not on
+            # a route-repair tick. A Local request/ACK wait must not postpone it.
+            if (getattr(self, "observation_preplanning_enabled", False)
+                    and task is not None
+                    and task.progress >= self.observation_prepare_ratio
+                    and self.prepared_candidate is None
+                    and getattr(self, "blocked_execution_context", None) is None):
+                self.prepare_next_observation()
         if (self.active_goal is not None
+                and getattr(self, "blocked_execution_context", None) is None
                 and self.active_task_elapsed > self.goal_timeout):
             self.goal_timeout_count += 1
             self.get_logger().warning("Frontier goal timed out; blacklisting it")
@@ -2569,10 +2597,6 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                     self.handoff_satisfied_observation(
                         "OBSERVATION_HANDOFF_COMPLETE")
                     return
-                if (self.observation_preplanning_enabled and task is not None
-                        and task.progress >= self.observation_prepare_ratio
-                        and self.prepared_candidate is None):
-                    self.prepare_next_observation()
                 return
 
         self.no_active_goal_replan_count += 1
@@ -3866,6 +3890,9 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             "task_requests_published": getattr(self, "task_requests_published", 0),
             "task_stations_reached": getattr(self, "task_stations_reached", 0),
             "task_local_rejections": getattr(self, "task_local_rejections", 0),
+            "departure_recovery_attempts": getattr(self, "departure_recovery_attempts", 0),
+            "departure_recovery_terminal": getattr(self, "departure_recovery_terminal", False),
+            "departure_recovery_reason": getattr(self, "departure_recovery_reason", "none"),
             "task_stale_feedback": getattr(self, "task_stale_feedback", 0),
             "last_observation_released_reason": (
                 self.last_observation_released_reason),

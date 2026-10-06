@@ -1,6 +1,39 @@
 #include <gtest/gtest.h>
 #include <plan_manage/replan_fsm_utils.h>
 
+TEST(SteeringContract, EndpointNoiseDoesNotCreateReverseHeading) {
+  const Eigen::Vector3d anchor(1,0,0);
+  EXPECT_DOUBLE_EQ(scan_planner::trajectorySteeringYaw(1,1,anchor,.4,
+      [](double) {return Eigen::Vector3d(1-1e-8,0,0);}),.4);
+  EXPECT_NEAR(scan_planner::trajectorySteeringYaw(0,1,Eigen::Vector3d::Zero(),0,
+      [](double t) {return Eigen::Vector3d(0,t,0);}),std::acos(-1.)/2,1e-9);
+}
+
+TEST(HeadingFreeze, HysteresisKeepsBoundaryNoiseFrozenUntilAligned) {
+  using scan_planner::headingFreezeRequired;
+  bool frozen = false;
+  for (double error : {.83, .79, .81, .78, .80, .61}) {
+    frozen = headingFreezeRequired(frozen, error, .8, .6);
+    EXPECT_TRUE(frozen);
+  }
+  frozen = headingFreezeRequired(frozen, .59, .8, .6);
+  EXPECT_FALSE(frozen);
+  EXPECT_FALSE(headingFreezeRequired(frozen, .79, .8, .6));
+  EXPECT_TRUE(headingFreezeRequired(frozen, -.81, .8, .6));
+  EXPECT_TRUE(headingFreezeRequired(false, std::numeric_limits<double>::quiet_NaN(), .8, .6));
+}
+
+TEST(ObservationArrival, CoarseGoalDoesNotPreemptAcknowledgedStation) {
+  using scan_planner::shouldFinishCoarseReferenceGoal;
+  for (double distance : {0.0, 0.19, 0.20, 0.21, 0.24, 0.25})
+    EXPECT_FALSE(shouldFinishCoarseReferenceGoal(true, false, distance, .25));
+  EXPECT_TRUE(shouldFinishCoarseReferenceGoal(false, false, .24, .25));
+  EXPECT_FALSE(shouldFinishCoarseReferenceGoal(false, false, .26, .25));
+  EXPECT_FALSE(shouldFinishCoarseReferenceGoal(false, true, .10, .25));
+  EXPECT_FALSE(shouldFinishCoarseReferenceGoal(false, false,
+      std::numeric_limits<double>::quiet_NaN(), .25));
+}
+
 TEST(PhysicalProgress, MidTrajectoryStallDoesNotNeedTrackingError) {
   scan_planner::PhysicalProgressWindow window;
   EXPECT_FALSE(window.stalled(0,{0,0},true,3,.05));

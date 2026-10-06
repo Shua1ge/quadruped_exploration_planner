@@ -2128,7 +2128,7 @@ namespace scan_planner
     // zero command until that candidate passes the normal handoff checks.
     if (!structured_local_repair_executing_.load() &&
         terminal_repair_requested_.load() &&
-        exec_state_ == EXEC_TRAJ && have_target_)
+        (exec_state_ == EXEC_TRAJ || exec_state_ == REPLAN_TRAJ) && have_target_)
     {
       terminal_repair_requested_.store(false);
       const double terminal_error = terminal_repair_error_.load();
@@ -2304,8 +2304,9 @@ namespace scan_planner
 
     case REPLAN_TRAJ:
     {
-      if (!isWaypointSequenceMode() &&
-          (end_pt_.head<2>() - odom_pos_.head<2>()).norm() <= goal_tolerance_)
+      if (shouldFinishCoarseReferenceGoal(task_mode_ && observation_task_,
+          isWaypointSequenceMode(),
+          (end_pt_.head<2>() - odom_pos_.head<2>()).norm(), goal_tolerance_))
       {
         finishGoalReached("GOAL_REACHED");
         return;
@@ -2367,8 +2368,9 @@ namespace scan_planner
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
-      if (!isWaypointSequenceMode() &&
-          (end_pt_.head<2>() - odom_pos_.head<2>()).norm() <= goal_tolerance_)
+      if (shouldFinishCoarseReferenceGoal(task_mode_ && observation_task_,
+          isWaypointSequenceMode(),
+          (end_pt_.head<2>() - odom_pos_.head<2>()).norm(), goal_tolerance_))
       {
         finishGoalReached("GOAL_REACHED");
         return;
@@ -2404,7 +2406,8 @@ namespace scan_planner
         // Continue from odometry immediately instead of reporting a false
         // global REACHED and waiting for the explorer to issue another task.
         if (reference_path_active_ &&
-            (end_pt_.head<2>() - odom_pos_.head<2>()).norm() > goal_tolerance_)
+            ((task_mode_ && observation_task_) ||
+             (end_pt_.head<2>() - odom_pos_.head<2>()).norm() > goal_tolerance_))
         {
           if (planFromCurrentTraj())
           {
@@ -2524,6 +2527,8 @@ namespace scan_planner
   {
     if (task_mode_ && replan_fail_count_ >= max_replan_fail_count_)
     {
+      // observationTaskRejected classifies the shared departure pose before
+      // emitting feedback; no remote viewpoint evidence for a blocked start.
       observationTaskRejected(task_departure_blocked_ ? "DEPARTURE_UNSAFE" : "LOCAL_PATH_FAMILY_EXHAUSTED");
       replan_fail_count_ = 0;
       return;
@@ -4498,7 +4503,7 @@ namespace scan_planner
           publishFailureEvidence(planning_request_id,executing_trajectory.traj_id_,
               "LOCAL_PATH_SHAPE",shape.reason,start_pt_,1,planning_clearance_margin_,
               ClearanceFailure::NONE,scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH,
-              task_approach_.size() > 1,
+              false,  // Candidate shape is not evidence that this road is blocked.
               task_approach_.size() > 1 ? task_approach_[0] : start_pt_,
               task_approach_.size() > 1 ? task_approach_[1] : end_pt_);
           return reject_planned_trajectory();
@@ -4648,6 +4653,7 @@ namespace scan_planner
             clearance_violations);
         if (!clearance_result.accepted())
         {
+          if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
           publishFailureEvidence(
               planning_request_id, info->traj_id_, "FINAL_CLEARANCE",
               "CANDIDATE_CLEARANCE_REJECTED", blocked_point,
@@ -4728,7 +4734,16 @@ namespace scan_planner
                     t > clearance_escape_deadline,
                     map->getInflateOccupancy(origin, body_yaw) != 0,
                     violations, initial_clearance_violations))
+            {
+              if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
+              publishFailureEvidence(planning_request_id, info->traj_id_,
+                  "FORWARD_GAIT_TURN", "TURN_FOOTPRINT_REJECTED", origin,
+                  static_cast<uint32_t>(replan_fail_count_ + 1), planning_clearance_margin_,
+                  map->getInflateOccupancy(origin, body_yaw) != 0
+                      ? ClearanceFailure::PHYSICAL_COLLISION : ClearanceFailure::PLANNING_MARGIN,
+                  scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
               return reject_planned_trajectory();
+            }
           }
           // Certify the controller's steering direction and bounded turning
           // braking paths, not only the theoretical spline tangent.
@@ -4761,6 +4776,12 @@ namespace scan_planner
                 RCLCPP_WARN(node_->get_logger(),
                     "[FORWARD_GAIT_STEERING_REJECTED] t=%.2f yaw_rate=%.2f", t, rate);
                 if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
+                publishFailureEvidence(planning_request_id, info->traj_id_,
+                    "FORWARD_GAIT_STEERING", "STEERING_SWEEP_REJECTED", point,
+                    static_cast<uint32_t>(replan_fail_count_ + 1), planning_clearance_margin_,
+                    map->getInflateOccupancy(point, sweep.yaw) != 0
+                        ? ClearanceFailure::PHYSICAL_COLLISION : ClearanceFailure::PLANNING_MARGIN,
+                    scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
                 return reject_planned_trajectory();
               }
               sweep_exited = sweep_exited || !blocked;
@@ -4788,6 +4809,13 @@ namespace scan_planner
               RCLCPP_WARN(node_->get_logger(),
                           "[FORWARD_GAIT_SWEEP_REJECTED] command=%.3f effective=%.3f t=%.2f; trying another local candidate",
                           min_forward_command_, min_forward_effective_speed_, t);
+              if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
+              publishFailureEvidence(planning_request_id, info->traj_id_,
+                  "FORWARD_GAIT_SWEEP", "FORWARD_SWEEP_REJECTED", point,
+                  static_cast<uint32_t>(replan_fail_count_ + 1), planning_clearance_margin_,
+                  map->getInflateOccupancy(point, yaw) != 0
+                      ? ClearanceFailure::PHYSICAL_COLLISION : ClearanceFailure::PLANNING_MARGIN,
+                  scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH);
               return reject_planned_trajectory();
             }
             exited = exited || !blocked;
@@ -4865,18 +4893,15 @@ namespace scan_planner
                    live_orient.x() * live_orient.y()),
             1.0 - 2.0 * (live_orient.y() * live_orient.y() +
                          live_orient.z() * live_orient.z()));
-        const double tangent_before_time = std::max(
-            0.0, matched_time - handoff_sample_dt);
-        const double tangent_after_time = std::min(
-            info->duration_, matched_time + handoff_sample_dt);
-        const Eigen::Vector3d tangent_before =
-            info->position_traj_.evaluateDeBoorT(tangent_before_time);
-        const Eigen::Vector3d tangent_after =
-            info->position_traj_.evaluateDeBoorT(tangent_after_time);
+        const Eigen::Vector3d steering_anchor =
+            candidate_requires_clearance_limited_profile || low_speed_local_repair
+                ? live_odom : matched_position;
         const double trajectory_yaw =
             low_speed_local_repair && fixed_body_yaw_repair
                 ? local_repair_body_yaw
-                : estimateYawFromSegment(tangent_before, tangent_after);
+                : trajectorySteeringYaw(matched_time,info->duration_,
+                    steering_anchor,actual_yaw,
+                    [&](double t) { return info->position_traj_.evaluateDeBoorT(t); });
         size_t previous_handoff_violations = 0;
         const bool actual_clearance_blocked = footprintOccupiedWithMargin(
             map, live_odom, actual_yaw, planning_clearance_margin_, nullptr,

@@ -31,6 +31,9 @@ def bridge():
     value.observation_task_pub=SimpleNamespace(publish=value.messages.append)
     now=SimpleNamespace(nanoseconds=1_000_000_000,to_msg=lambda:Time(sec=1))
     value.get_clock=lambda:SimpleNamespace(now=lambda:now)
+    value.departure_is_settled=lambda:True
+    value.recovery_handoffs=[]
+    value.planning_status_callback=lambda msg:value.recovery_handoffs.append(msg.data)
     value.active_observation=ObservationTask(7,(3.,2.),{(x,5) for x in range(8)})
     value.evaluate_active_observation=lambda:value.active_observation
     value.observation_complete=lambda task:False
@@ -58,6 +61,43 @@ def test_reroute_keeps_task_and_denominator_and_station_budget():
     assert second.target_cell_count==8 and len(second.target_cells)==4
     assert value.active_observation.station_adjustments==2
     assert value.tasks_created==1
+
+
+def test_rest_requires_fresh_continuous_odometry_and_no_rotation():
+    value=bridge()
+    del value.departure_is_settled
+    now=value.get_clock().now()
+    assert not value.departure_is_settled()
+    for _ in range(6):
+        value.record_departure_motion(0.02,0.03)
+        now.nanoseconds += 100_000_000
+    assert value.departure_is_settled()
+    value.record_departure_motion(0.02,0.3)
+    assert not value.departure_is_settled()
+    value.record_departure_motion(0.09,0.01)
+    assert not value.departure_is_settled()
+    value.record_departure_motion(float("nan"),0)
+    assert not value.departure_is_settled()
+    now.nanoseconds += 1_000_000_000
+    value.record_departure_motion(0,0)
+    assert not value.departure_is_settled()
+
+
+def test_transient_motion_and_context_changes_do_not_spend_recovery_budget():
+    value=bridge()
+    value.position=(2.,2.)
+    value.active_raw_path=[(2,2),(3,2)]
+    value.publish_observation_task(path(),100)
+    value.publish_status=lambda status:None
+    value.departure_is_settled=lambda:False
+    value.reroute_active_goal=lambda **kw: (_ for _ in ()).throw(AssertionError("moving retry"))
+    value.latch_blocked_execution("DEPARTURE_UNSAFE")
+    for i in range(40):
+        value.get_clock().now().nanoseconds += 100_000_000
+        value.body_yaw=i*.2
+        assert value.continue_blocked_execution()
+    assert value.departure_recovery_attempts==0
+    assert not value.departure_recovery_terminal
 
 
 def test_new_objective_cancels_old_before_publication():
@@ -130,7 +170,11 @@ def test_arrival_waits_for_observation_then_requests_same_task_station():
         request_id=100,candidate_id=12,state=ObservationFeedback.STATION_REACHED,
         station=Point(x=2.,y=2.,z=.4),station_adjustments=1))
     assert value.continue_observation_station() and not reroutes
+    # One accepted post-arrival scan permits continued station selection;
+    # task completion still has its independent multi-update streak.
     value.map_update_count+=3
+    assert value.continue_observation_station() and not reroutes
+    value.grid.sensor_revision+=1
     assert value.continue_observation_station() and reroutes==[True]
     assert value.active_observation.task_id==100
     assert value.active_observation.station_adjustments==1
@@ -188,6 +232,9 @@ def test_execution_block_is_not_spatial_failure_or_map_revision_retry():
     value.body_yaw=.6
     value.healthy_task_elapsed=999.
     assert value.continue_blocked_execution()
+    assert not retries  # A yaw revision cannot bypass the settling wait.
+    value.get_clock().now().nanoseconds += 2_000_000_000
+    assert value.continue_blocked_execution()
     assert retries==[[(2,2)]]
     assert value.healthy_task_elapsed==0.
     assert value.active_observation is task
@@ -198,12 +245,15 @@ def test_local_occupancy_change_authorizes_execution_retry():
     value.position=(2.,2.)
     value.grid.data.fill(0)
     value.blocked_execution_context=value.local_execution_context()
+    value.departure_recovery_started_ns=value.get_clock().now().nanoseconds
     value.active_raw_path=[(2,2)]
     retries=[]
     value.publish_reference_path=lambda route:retries.append(route)
     value.publish_status=lambda status:None
     x,y=value.grid.world_to_cell(*value.position)
     value.grid.data[y,x]=100
+    assert value.continue_blocked_execution() and not retries
+    value.get_clock().now().nanoseconds += 2_000_000_000
     assert value.continue_blocked_execution() and retries==[[(2,2)]]
 
 
@@ -240,6 +290,8 @@ def test_exhausted_path_without_alternative_enters_sibling_arbitration():
     value.publish_observation_task(path(), 100)
     value.active_path_request_generation = 100
     value.active_raw_path = [(1, 1), (2, 1)]
+    value.position = (1., 1.)
+    value.task_path_constraints = {(100, 1): {((3, 1), (4, 1))}}
     value.reroute_active_goal = lambda **kw: False
     statuses = []
     value.planning_status_callback = lambda msg: statuses.append(msg.data)
@@ -248,3 +300,109 @@ def test_exhausted_path_without_alternative_enters_sibling_arbitration():
         state=ObservationFeedback.PATH_REJECTED, station=Point(x=2., y=2.)))
     assert statuses == ["VIEWPOINT_LOCAL_REJECTED request_id=100 task_id=100 task_version=1"]
     assert value.blocked_execution_context is None
+
+
+def test_path_failure_without_spatial_evidence_keeps_viewpoint_and_task():
+    value = bridge()
+    value.publish_observation_task(path(), 100)
+    value.active_path_request_generation = 100
+    value.active_raw_path = [(1, 1), (2, 1)]
+    value.position = (1., 1.)
+    value.reroute_active_goal = lambda **kw: False
+    value.planning_status_callback = lambda msg: (_ for _ in ()).throw(
+        AssertionError("unlocated failure must not reject a viewpoint"))
+    statuses = []
+    value.publish_status = statuses.append
+    value.task_path_constraints = {(100, 1): {((1, 1), (2, 1))}}
+    task = value.active_observation
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,
+        task_version=1, request_id=100, state=ObservationFeedback.PATH_REJECTED,
+        station=Point(x=1., y=1.)))
+    assert value.active_observation is task
+    assert value.blocked_execution_context == value.local_execution_context()
+    assert statuses == ["LOCAL_PATH_UNRESOLVED_NO_SPATIAL_EVIDENCE"]
+
+
+def test_unchanged_departure_retries_are_bounded_across_request_refreshes():
+    value = bridge()
+    value.position = (2., 2.)
+    value.grid.data.fill(0)
+    value.active_raw_path = [(2, 2), (3, 2)]
+    value.publish_observation_task(path(), 100)
+    now = value.get_clock().now()
+    statuses, retries, reroutes = [], [], []
+    value.publish_status = statuses.append
+    value.reroute_active_goal = lambda **kw: reroutes.append(kw) or False
+    value.publish_reference_path = lambda route: retries.append(route)
+    task = value.active_observation
+    def block(request):
+        value.active_path_request_generation = request
+        value.observation_feedback_callback(ObservationFeedback(task_id=100,
+            task_version=1, request_id=request, state=ObservationFeedback.EXECUTION_BLOCKED,
+            station=Point(x=2., y=2.), reason="DEPARTURE_UNSAFE"))
+    block(100)
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,
+        task_version=1, request_id=100, state=ObservationFeedback.EXECUTION_BLOCKED,
+        station=Point(x=2., y=2.), reason="DEPARTURE_UNSAFE"))
+    assert value.continue_blocked_execution() and not retries
+    for request in (101, 102):
+        now.nanoseconds += 2_000_000_000
+        assert value.continue_blocked_execution()
+        value.publish_observation_task(path(), request)  # New request/ACK does not refill budget.
+        block(request)
+    assert len(retries) == len(reroutes) == value.departure_recovery_attempts == 2
+    now.nanoseconds += 2_000_000_000
+    assert value.continue_blocked_execution()
+    assert value.departure_recovery_terminal
+    assert value.messages[-1].lifecycle == TaskMessage.CANCELLED
+    assert statuses[-1] == "DEPARTURE_RECOVERY_EXHAUSTED"
+    assert value.recovery_handoffs == [
+        "LOCAL_RECOVERY_EXHAUSTED request_id=102 task_id=100 task_version=1"]
+    for _ in range(100):
+        now.nanoseconds += 10_000_000_000
+        value.body_yaw = now.nanoseconds
+        assert value.continue_blocked_execution()
+    assert len(retries) == 2 and value.task_cancellations == 1
+    assert len(value.recovery_handoffs) == 1
+    assert value.active_observation is task
+    value.active_observation = ObservationTask(8, (4., 2.), {(5, 5)})
+    assert value.departure_recovery_attempts == 0 and not value.departure_recovery_terminal
+
+
+def test_invalid_contract_has_terminal_result_without_republishing():
+    value = bridge()
+    value.position = (2., 2.)
+    value.publish_observation_task(path(), 100)
+    statuses = []
+    value.publish_status = statuses.append
+    value.publish_reference_path = lambda route: (_ for _ in ()).throw(AssertionError("invalid contract retry"))
+    value.latch_blocked_execution("INVALID_TASK_CONTRACT")
+    value.get_clock().now().nanoseconds += 2_000_000_000
+    assert value.continue_blocked_execution()
+    assert value.departure_recovery_terminal and statuses == ["DEPARTURE_RECOVERY_EXHAUSTED"]
+
+
+def test_alternating_path_rejections_cannot_bypass_task_retry_budget():
+    value = bridge()
+    value.position = (1., 1.)
+    value.active_raw_path = [(1, 1), (2, 1)]
+    value.publish_observation_task(path(), 100)
+    reroutes = []
+    value.reroute_active_goal = lambda **kw: reroutes.append(kw) or True
+    value.publish_status = lambda status: None
+    value.task_path_constraints = {}
+    for request in (100, 101, 102):
+        value.get_clock().now().nanoseconds += 2_000_000_000
+        value.active_path_request_generation = request
+        value.observation_feedback_callback(ObservationFeedback(task_id=100,
+            task_version=1, request_id=request, state=ObservationFeedback.PATH_REJECTED,
+            station=Point(x=1., y=1.)))
+    assert len(reroutes) == value.departure_recovery_attempts == 2
+    assert value.blocked_execution_context is not None
+    value.get_clock().now().nanoseconds += 2_000_000_000
+    value.continue_blocked_execution()
+    assert value.departure_recovery_terminal
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,
+        task_version=1, request_id=102, candidate_id=999,
+        state=ObservationFeedback.STATION_REACHED, station=Point(x=1., y=1.)))
+    assert value.pending_observation_station is None and value.task_stations_reached == 0

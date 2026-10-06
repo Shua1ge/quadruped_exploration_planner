@@ -125,6 +125,22 @@ inline TaskShapeResult taskShapeResult(const std::vector<Eigen::Vector2d>& path,
   result.length=actual.first; result.turn=actual.second;
   result.guide_length=expected.first; result.guide_turn=expected.second;
   if(!std::isfinite(actual.first) || !std::isfinite(expected.first)) return result;
+  // A short reversed prefix can be invisible to both the 2 cm turn sampling
+  // and the clamped route-progress projection. It still makes the controller
+  // turn around. Compare to the LOCAL approach, not the full route endpoints.
+  Eigen::Vector2d departure=Eigen::Vector2d::Zero();
+  for(size_t i=1;i<guide.size();++i) {
+    departure=guide[i]-guide.front();
+    if(departure.norm()>=0.02) break;
+  }
+  if(departure.norm()>=0.02) {
+    for(size_t i=1;i<path.size();++i) {
+      const Eigen::Vector2d delta=path[i]-path.front();
+      if(delta.norm()<0.02) continue;
+      if(delta.dot(departure)<0) {result.reason="departure_reversal";return result;}
+      break;
+    }
+  }
   if(actual.first>1.5*expected.first+0.2) {result.reason="length"; return result;}
   if(actual.second>expected.second+0.8) {result.reason="turn"; return result;}
   double maximum_progress=taskRouteProgress(guide,path.front());

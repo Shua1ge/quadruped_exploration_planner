@@ -4,6 +4,22 @@
 
 using namespace scan_planner;
 
+TEST(LocalTaskPlanner, ShortReversePrefixCannotTurnControllerAround) {
+  auto shape=taskShapeResult({{0,0},{-.03,0},{0,0},{.5,0},{1,0}},{{0,0},{1,0}});
+  EXPECT_FALSE(shape.valid);
+  EXPECT_STREQ(shape.reason,"departure_reversal");
+  EXPECT_TRUE(taskShapeResult({{0,0},{-.5,0},{-.5,1}},
+                             {{0,0},{-.5,0},{-.5,1}}).valid);
+}
+
+TEST(LocalTaskPlanner, BentCorridorProgressIsNotEndpointDirection) {
+  const std::vector<Eigen::Vector2d> route{{0,0},{3,0},{1,2},{4,2}};
+  const Eigen::Vector2d visited{3,0}, next{2,1}, backwards{2,0};
+  EXPECT_GT(taskRouteProgress(route,next), taskRouteProgress(route,visited));
+  EXPECT_LT(taskRouteProgress(route,backwards), taskRouteProgress(route,visited)-.1);
+  EXPECT_LT((next-visited).dot((route.back()-route.front()).normalized()),-.1);
+}
+
 TEST(LocalTaskPlanner, ExhaustedSuffixMustRegenerateFromMeasuredMotion) {
   EXPECT_FALSE(taskSuffixHasUsefulHorizon(.02));
   EXPECT_FALSE(taskSuffixHasUsefulHorizon(0));

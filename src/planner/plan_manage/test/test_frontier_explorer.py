@@ -1366,6 +1366,7 @@ def test_reference_status_generation_rejects_late_previous_request():
 
 def test_invalid_task_contract_ends_request_without_viewpoint_constraint():
     explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
     task = SimpleNamespace(task_id=100, task_version=1)
     explorer.task_mode = True
     explorer.active_observation = task
@@ -1871,6 +1872,59 @@ def test_pending_path_does_not_block_healthy_task_timeout():
     assert calls == [(('GOAL_TIMEOUT',), {'blacklist_goal': True})]
 
 
+def test_successor_preparation_precedes_local_request_wait():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2., 0.)
+    explorer.active_task_elapsed = explorer.healthy_task_elapsed = 0.
+    explorer.scan_waiting_for_target = False
+    explorer.goal_timeout = 120.
+    explorer.auto_start = True
+    explorer.position = (1., 0.)
+    explorer.map_update_count = 10
+    explorer.evaluate_active_observation = lambda: SimpleNamespace(progress=.7)
+    explorer.observation_complete = lambda task: False
+    explorer.observation_preplanning_enabled = True
+    explorer.observation_prepare_ratio = .6
+    explorer.prepared_candidate = None
+    prepared = []
+    explorer.prepare_next_observation = lambda: prepared.append(True)
+    explorer.pending_path_publish_ns = 9_500_000_000
+    explorer.pending_path_request_generation = 12
+    explorer.pending_path_deferred = False
+    explorer.path_request_timeout = 5.
+    explorer.get_logger = lambda: SimpleNamespace(info=lambda *a, **kw: None)
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+    assert prepared == [True]
+
+
+def test_departure_block_does_not_timeout_blacklist_remote_viewpoint():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    explorer.last_task_clock_ns = 9_000_000_000
+    explorer.locomotion_ready = lambda: True
+    explorer.active_goal = (2., 0.)
+    explorer.active_task_elapsed = explorer.healthy_task_elapsed = 200.
+    explorer.scan_waiting_for_target = True
+    explorer.goal_timeout = 120.
+    explorer.auto_start = True
+    explorer.position = (1., 0.)
+    explorer.map_update_count = 10
+    explorer.evaluate_active_observation = lambda: object()
+    explorer.observation_complete = lambda task: False
+    explorer.blocked_execution_context = ("departure",)
+    explorer.pending_path_publish_ns = 0
+    explorer.task_mode = True
+    explorer.continue_blocked_execution = lambda: True
+    explorer.terminate_active_observation = lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("departure failure cannot blacklist a remote viewpoint"))
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+
+
 def test_unhealthy_pause_does_not_terminate_active_task_by_timeout():
     explorer = object.__new__(MODULE.FrontierExplorer)
     explorer.get_clock = lambda: SimpleNamespace(
@@ -1935,6 +1989,72 @@ def test_failed_task_termination_clears_execution_without_marking_complete():
     assert explorer.completed_goals == []
     assert explorer.active_region_id == 7
     assert explorer.route_constraint_revision == 5
+
+
+def test_exhausted_recovery_retires_identity_and_returns_to_region_arbitration():
+    for sibling_available in (True, False):
+        explorer = object.__new__(MODULE.FrontierExplorer)
+        task = MODULE.ObservationTask(12, (32.1,.7), {(5,5)},
+            task_id=100, task_version=1, lifecycle="CANCELLED")
+        explorer._active_observation=task
+        explorer.task_mode=True
+        explorer.pending_path_request_generation=None
+        explorer.active_path_request_generation=42
+        explorer.task_stale_feedback=0
+        explorer.active_path_trajectory_id=7
+        explorer.local_repair_exhausted_count=0
+        explorer.global_reroute_failure_streak=0
+        explorer.route_constraint_revision=7
+        explorer.active_region_id=12
+        explorer.active_commitment_scope=("safe_region",77)
+        explorer.active_goal=(32.1,.7)
+        explorer.active_raw_path=[(1,1),(2,1)]
+        explorer.blocked_execution_context=("blocked",)
+        explorer.departure_recovery_terminal=True
+        explorer.task_path_constraints={}
+        explorer.get_logger=lambda:SimpleNamespace(warning=lambda *a,**kw:None)
+        cooldowns, region_cooldowns, statuses, calls = [], [], [], []
+        explorer.add_goal_failure_cooldown=lambda *a:cooldowns.append(a)
+        explorer.add_region_failure_cooldown=lambda *a:region_cooldowns.append(a)
+        explorer.terminate_region_option=lambda reason:None
+        explorer.publish_status=statuses.append
+        def plan(**options):
+            assert explorer.active_observation is None
+            assert explorer.blocked_execution_context is None
+            assert explorer.active_path_request_generation is None
+            calls.append(options)
+            return sibling_available
+        explorer.plan_from_current_position=plan
+        terminal=SimpleNamespace(data="LOCAL_RECOVERY_EXHAUSTED request_id=42 task_id=100 task_version=1")
+        explorer.planning_status_callback(terminal)
+        assert calls[0] == {"excluded_goals":((32.1,.7),),
+            "required_scope":("safe_region",77),"allow_region_release":False}
+        assert cooldowns == [((32.1,.7),"LOCAL_RECOVERY_EXHAUSTED")]
+        assert not explorer.continue_blocked_execution()
+        if sibling_available:
+            assert not region_cooldowns and explorer.active_region_id==12
+            assert len(calls)==1
+        else:
+            assert len(calls)==2
+            assert statuses[-1]=="LOCAL_RECOVERY_EXHAUSTED_WAITING_FOR_ROUTE"
+        explorer.planning_status_callback(terminal)
+        assert explorer.local_repair_exhausted_count==1
+
+
+def test_candidate_shape_and_steering_failures_do_not_block_global_edges():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer._active_observation=SimpleNamespace(task_id=11,task_version=2)
+    explorer.active_raw_path=[(1,1),(2,1)]
+    explorer.grid=MODULE.ExplorationGrid(8,8,1,0,0)
+    explorer.route_constraint_revision=0
+    explorer.task_path_constraints={}
+    for stage in ("LOCAL_PATH_SHAPE","FORWARD_GAIT_STEERING"):
+        evidence=SimpleNamespace(stage=stage,has_path_segment=True,trajectory_id=5,
+            path_start=SimpleNamespace(x=1.5,y=1.5,z=0),
+            path_end=SimpleNamespace(x=2.5,y=1.5,z=0))
+        assert not explorer.record_task_path_constraint(evidence)
+    assert explorer.route_constraint_revision==0
+    assert not explorer.task_path_constraints
 
 
 def test_task_path_evidence_is_scoped_until_task_identity_ends():

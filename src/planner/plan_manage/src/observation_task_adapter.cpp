@@ -278,8 +278,8 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
   const auto goal_allowed=[&](const Eigen::Vector2d& p) {
     if ((p-start_pt_.head<2>()).norm()<0.4) return false;
     if (!task_visited_stations_.empty() && domain.route.size()>1) {
-      const Eigen::Vector2d direction=domain.route.back()-domain.route.front();
-      if(direction.norm()>1e-6 && (p-task_visited_stations_.back()).dot(direction.normalized()) < -0.1)
+      if (taskRouteProgress(domain.route,p) <
+          taskRouteProgress(domain.route,task_visited_stations_.back()) - 0.1)
         return false;
     }
     for(const auto& rejected:task_rejected_stations_) if((p-rejected).norm()<0.35) return false;
@@ -299,8 +299,12 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
       edge_safe,visible,0.2,std::min(4.0,std::max(1.0,reference_path_lookahead_)),1024,8,goal_allowed,
       getOdomYaw(),cost);
   if(candidates.empty()) {
-    if (!task_visited_stations_.empty())
-      observationTaskRejected("NO_NEW_OBSERVATION_STATION");
+    if (footprintOccupiedWithMargin(map,start_pt_,getOdomYaw(),planning_clearance_margin_))
+      observationTaskRejected("DEPARTURE_UNSAFE");
+    else
+      // An empty motion/visibility search does not prove the remote viewpoint
+      // is exhausted. Only the explicit station budget may terminate it.
+      observationTaskRejected("LOCAL_PATH_FAMILY_EXHAUSTED");
     return false;
   }
   const auto& selected=candidates.front();
@@ -327,8 +331,12 @@ void SCANReplanFSM::observationTaskRejected(const std::string& reason) {
   task_terminal_request_=active_reference_request_id_.load();
   const bool spatial = reason == "OBSERVATION_STATION_BUDGET_EXHAUSTED" ||
                        reason == "NO_NEW_OBSERVATION_STATION";
-  const bool path_failed = reason == "LOCAL_PATH_FAMILY_EXHAUSTED" ||
-                           reason == "TASK_REFERENCE_NOT_ACTIVATABLE";
+  const bool path_failure = reason == "LOCAL_PATH_FAMILY_EXHAUSTED" ||
+                            reason == "TASK_REFERENCE_NOT_ACTIVATABLE";
+  const bool departure_failure = path_failure && (task_departure_blocked_ ||
+      footprintOccupiedWithMargin(planner_manager_->grid_map_,odom_pos_,
+                                  getOdomYaw(),planning_clearance_margin_));
+  const bool path_failed = path_failure && !departure_failure;
   if (spatial)
     publishFailureEvidence(task_terminal_request_,planner_manager_->local_data_.traj_id_,
         "OBSERVATION_LOCAL_PLANNING",reason,task_station_,static_cast<uint32_t>(replan_fail_count_),
@@ -337,7 +345,8 @@ void SCANReplanFSM::observationTaskRejected(const std::string& reason) {
   publishObservationFeedback(spatial
       ? scan_planner_msgs::msg::ObservationFeedback::TASK_EXHAUSTED
       : (path_failed ? scan_planner_msgs::msg::ObservationFeedback::PATH_REJECTED
-                     : scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED),reason);
+                     : scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED),
+                     departure_failure ? "DEPARTURE_UNSAFE" : reason);
   have_target_=false; have_new_target_=false; reference_path_active_=false;
   reference_path_update_pending_=false; predictive_replan_requested_.store(false);
   stopped_local_repair_pending_.store(false); terminal_local_repair_hold_.store(true);
