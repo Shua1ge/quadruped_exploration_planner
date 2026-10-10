@@ -293,10 +293,66 @@ def double_cylinder_path_free(
         grid: ExplorationGrid, path: Sequence[Cell], terminal: Cell,
         frontier: Cell, inflated: Set[Cell], radius: float,
         offset: float) -> bool:
-    """Validate a path with the footprint oriented along its local tangent."""
+    """Boolean compatibility entry; diagnostic classification never changes safety."""
+    return diagnose_double_cylinder_path(
+        grid, path, terminal, frontier, inflated, radius, offset).accepted
+
+
+def footprint_aware_path(grid, start, terminal, frontier, inflated, radius,
+                         offset, blocked_edges, max_expansions=400):
+    """Bounded alternative to point-only routing; Local still certifies motion.
+
+    Check both endpoints with the edge tangent, matching the final path
+    predicate. This is not a rotation sweep or a locomotion certificate.
+    """
+    def edge_allowed(first, second):
+        yaw = math.atan2(second[1]-first[1], second[0]-first[0])
+        return all(double_cylinder_footprint_free(
+            grid, cell, yaw, inflated, radius, offset)
+                   for cell in (first, second))
+
+    path = astar_known(grid, start, terminal, inflated, blocked_edges,
+                       edge_allowed=edge_allowed, max_expansions=max_expansions)
+    if path and double_cylinder_path_free(
+            grid, path, terminal, frontier, inflated, radius, offset):
+        return path
+    return None
+
+
+@dataclass(frozen=True)
+class PathValidationResult:
+    accepted: bool
+    location: str = "NONE"
+    reason: str = "NONE"
+    sample_index: int = -1
+    sample_cell: Optional[Cell] = None
+    hit_cell: Optional[Cell] = None
+    sampled_distance: float = 0.0
+    sample_yaw: Optional[float] = None
+    current_margin_blocked: Optional[bool] = None
+
+
+def diagnose_double_cylinder_path(
+        grid: ExplorationGrid, path: Sequence[Cell], terminal: Cell,
+        frontier: Cell, inflated: Set[Cell], radius: float, offset: float,
+        measured_yaw: Optional[float] = None,
+        measured_cell: Optional[Cell] = None) -> PathValidationResult:
+    """Report the first rejected sample without changing the original predicate.
+
+    Departure means the first 0.5 m of sampled path (diagnostic only). A path
+    tangent is not a measured body yaw: current-footprint status stays unknown
+    unless the caller supplies a measured cell and finite measured yaw.
+    """
     if not path:
-        return False
+        return PathValidationResult(False, "UNASSESSED", "EMPTY_PATH")
+    current_blocked = None
+    if measured_cell is not None and measured_yaw is not None and math.isfinite(measured_yaw):
+        current_blocked = not double_cylinder_footprint_free(
+            grid, measured_cell, measured_yaw, inflated, radius, offset)
+    distance = 0.0
     for index, cell in enumerate(path):
+        if index:
+            distance += math.dist(path[index-1], cell) * grid.resolution
         if index + 1 < len(path):
             target = path[index + 1]
         elif index > 0:
@@ -311,8 +367,32 @@ def double_cylinder_path_free(
         check_cell = path[index]
         if not double_cylinder_footprint_free(
                 grid, check_cell, yaw, inflated, radius, offset):
-            return False
-    return True
+            if current_blocked and distance <= 0.5:
+                location = "CURRENT_FOOTPRINT_INVALID"
+            elif index == len(path)-1:
+                location = "TERMINAL_INVALID"
+            elif distance <= 0.5:
+                location = "DEPARTURE_CONNECTION_INVALID"
+            else:
+                location = "PATH_INVALID"
+            # Reconstruct the exact failed disc cell, not a nearest obstacle.
+            hit = check_cell
+            if radius > 0.0:
+                for direction in (-1.0, 1.0):
+                    probe = (int(round(check_cell[0] + direction * max(0.0, offset) /
+                                       grid.resolution * math.cos(yaw))),
+                             int(round(check_cell[1] + direction * max(0.0, offset) /
+                                       grid.resolution * math.sin(yaw))))
+                    if not grid.planning_free(probe, inflated):
+                        hit = probe
+                        break
+            reason = ("OUTSIDE_MAP" if not grid.in_bounds(hit) else
+                      "OCCUPIED_CELL" if grid.value(hit) == OCCUPIED else
+                      "UNKNOWN_CELL" if grid.value(hit) == UNKNOWN else
+                      "INFLATION_OR_MARGIN")
+            return PathValidationResult(False, location, reason, index,
+                                        check_cell, hit, distance, yaw, current_blocked)
+    return PathValidationResult(True, current_margin_blocked=current_blocked)
 
 
 @dataclass

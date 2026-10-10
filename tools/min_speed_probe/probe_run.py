@@ -21,7 +21,9 @@ import time
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
 
@@ -40,7 +42,8 @@ class MinSpeedProbe(Node):
     DONE = "done"
 
     def __init__(self, args):
-        super().__init__("min_speed_probe")
+        super().__init__("min_speed_probe", parameter_overrides=[
+            Parameter("use_sim_time", value=args.use_sim_time)])
         self.levels = args.levels
         self.drive_sec = args.drive
         self.settle_sec = args.settle
@@ -48,6 +51,17 @@ class MinSpeedProbe(Node):
         self.out_path = args.out
         self.rate_hz = args.rate
         self.stand_z_min = args.stand_z_min
+        self.use_sim_time = args.use_sim_time
+        self.require_ready = args.require_actuation_ready
+        self.wait_timeout = args.wait_timeout
+        self.started_wall = time.monotonic()
+        self.ready_wall = 0.0
+        self.actuation_ready = False
+        self.abort_reason = None
+        if self.require_ready:
+            from scan_planner_msgs.msg import LocomotionState
+            self.create_subscription(
+                LocomotionState, "/robot/locomotion_state", self.ready_callback, 10)
 
         self.cmd_pub = self.create_publisher(Twist, args.cmd_topic, 10)
         self.pose = None
@@ -60,9 +74,12 @@ class MinSpeedProbe(Node):
         self.rows = []
         self.level_idx = -1
         self.phase = "wait_odom"
-        self.phase_start = time.monotonic()
+        self.phase_start = self.sample_time()
         self.fallen = False
-        self.create_timer(1.0 / self.rate_hz, self.tick)
+        # Keep readiness/timeout checks alive even if Gazebo pauses /clock.
+        # Phase durations and recorded timestamps still use sample_time().
+        self.create_timer(1.0 / self.rate_hz, self.tick,
+                          clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def pose_callback(self, msg):
         p = msg.pose.pose.position
@@ -73,6 +90,21 @@ class MinSpeedProbe(Node):
         self.imu_w = (msg.angular_velocity.x, msg.angular_velocity.y,
                       msg.angular_velocity.z)
 
+    def sample_time(self):
+        if self.use_sim_time:
+            return self.get_clock().now().nanoseconds * 1e-9
+        return time.monotonic()
+
+    def ready_callback(self, msg):
+        self.actuation_ready = bool(msg.actuation_ready)
+        self.ready_wall = time.monotonic()
+
+    def abort(self, reason):
+        self.abort_reason = reason
+        self.get_logger().error(reason)
+        self.send_cmd(0.0)
+        self.begin_phase(self.DONE)
+
     def send_cmd(self, vx):
         msg = Twist()
         msg.linear.x = vx
@@ -80,10 +112,24 @@ class MinSpeedProbe(Node):
 
     def begin_phase(self, name):
         self.phase = name
-        self.phase_start = time.monotonic()
+        self.phase_start = self.sample_time()
 
     def tick(self):
-        now = time.monotonic()
+        now = self.sample_time()
+        if self.phase == self.DONE:
+            self.send_cmd(0.0)
+            return
+        if self.require_ready and (not self.actuation_ready
+                                   or time.monotonic() - self.ready_wall > 1.0):
+            self.send_cmd(0.0)
+            if self.phase not in ("wait_odom", "stand_check"):
+                self.abort("controller lost actuation readiness; aborting probe")
+            elif time.monotonic() - self.started_wall > self.wait_timeout:
+                self.abort("controller did not become actuation-ready before timeout")
+            else:
+                self.get_logger().info("waiting for controller actuation_ready ...",
+                                       throttle_duration_sec=2.0)
+            return
         if self.pose is None:
             self.get_logger().info("waiting for pose on body topic ...",
                                    throttle_duration_sec=2.0)
@@ -168,6 +214,12 @@ def main():
     parser.add_argument("--rate", type=float, default=50.0,
                         help="command publish / log rate [Hz]")
     parser.add_argument("--stand-z-min", type=float, default=0.20)
+    parser.add_argument("--use-sim-time", action="store_true",
+                        help="measure speed per simulation second, not Gazebo wall-clock speed")
+    parser.add_argument("--require-actuation-ready", action="store_true",
+                        help="wait for fresh supervisor readiness; abort if it is lost")
+    parser.add_argument("--wait-timeout", type=float, default=60.0,
+                        help="wall seconds allowed for controller readiness")
     parser.add_argument("--cmd-topic", default="/planning/cmd_vel_raw",
                         help="supervisor 前门命令话题(经站立/健康门控)")
     parser.add_argument("--pose-topic", default="/quad_0/body_pose")
@@ -191,7 +243,8 @@ def main():
         node.save()
         node.destroy_node()
         rclpy.shutdown()
+    return 2 if node.fallen or node.abort_reason else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

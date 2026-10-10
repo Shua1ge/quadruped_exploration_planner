@@ -19,7 +19,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
-from scan_planner_msgs.msg import Bspline, ObservationTask, ObservationFeedback, TrajectoryAck, ExecutionState, LocomotionState
+from scan_planner_msgs.msg import Bspline, ObservationTask, ObservationFeedback, TrajectoryAck, ExecutionState, LocomotionState, RoutePortal
 from std_msgs.msg import String
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py.point_cloud2 import create_cloud_xyz32
@@ -139,6 +139,29 @@ class TestTaskRuntime(unittest.TestCase):
         message.pos_pts=[Point(x=0.,y=0.,z=.4) for _ in range(4)]
         message.knots=[-3.,-2.,-1.,0.,1.,2.,3.,4.]
         return message
+
+    def test_autonomous_candidate_ack_and_frozen_topology_contract(self):
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0)
+        task=self.task(2001); task.local_geometry_autonomy=True; task.route_graph_revision=10
+        portal=RoutePortal(connection_id=11,source_node_id=1,target_node_id=2,
+                           center=Point(x=.8,y=0.,z=0.),radius=.8)
+        portal.direction.x=1.;task.route_portals=[portal]
+        self.task_pub.publish(task)
+        self.spin_until(lambda:any(a.task_id==2001 and a.request_id==task.request_id and
+            a.status==TrajectoryAck.STATUS_ACCEPTED for a in self.acks),timeout=8)
+        ack=next(a for a in self.acks if a.task_id==2001 and a.request_id==task.request_id and
+                 a.status==TrajectoryAck.STATUS_ACCEPTED)
+        self.assertFalse(any(f.task_id==2001 and f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+        self.ack_pub.publish(ack)
+        self.spin_until(lambda:any(f.task_id==2001 and f.request_id==task.request_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+        changed=copy.deepcopy(task);changed.request_id=self.node.get_clock().now().nanoseconds
+        changed.route_graph_revision=11
+        self.task_pub.publish(changed)
+        self.spin_until(lambda:any("field=route_contract_changed_without_version" in s and
+            f"request_id={changed.request_id}" in s for s in self.statuses))
+        self.assertFalse(any(f.request_id==changed.request_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
 
     def test_retirement_fences_delayed_ack_and_candidate(self):
         self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and
@@ -370,9 +393,15 @@ class TestTaskRuntime(unittest.TestCase):
         self.ack_pub.publish(first_ack)  # Delayed predecessor ACK cannot commit G2.
         self.assertFalse(any("PATH_TRAJECTORY_READY" in s and
             f"request_id={successor.request_id}" in s for s in self.statuses))
+        self.assertFalse(any(f.task_id==10001 and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
         self.ack_pub.publish(next_ack)
         self.spin_until(lambda:any("PATH_TRAJECTORY_READY" in s and
             f"request_id={successor.request_id}" in s for s in self.statuses))
+        self.spin_until(lambda:any(f.task_id==10001 and f.task_version==1 and
+            f.request_id==successor.request_id and f.trajectory_id==next_ack.trajectory_id and
+            f.candidate_id==next_ack.candidate_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
         self.spin_until(lambda:any(a.task_id==10000 and a.status==TrajectoryAck.STATUS_TASK_RETIRED
                                   for a in self.acks))
         self.assertFalse(any(s.task_id==10001 and s.reason=="TASK_RETIRED"
@@ -392,13 +421,31 @@ class TestTaskRuntime(unittest.TestCase):
                                   for a in self.acks))
         self.ack_pub.publish(next(a for a in self.acks if a.task_id==10002 and
             a.status==TrajectoryAck.STATUS_TASK_RETIRED))
+        self.spin_until(lambda:any(f.task_id==10002 and f.task_version==1 and
+            f.state==ObservationFeedback.CANCEL_ACK for f in self.feedback))
         self.ack_pub.publish(cancelled_ack)
         until=time.monotonic()+.15
         self.spin_until(lambda:time.monotonic()>=until)
         self.assertFalse(any("PATH_TRAJECTORY_READY" in s and
             f"request_id={cancelled.request_id}" in s for s in self.statuses))
+        self.assertFalse(any(f.task_id==10002 and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
         self.assertTrue(any(s.task_id==10002 and s.state==ExecutionState.STATE_SOFT_HOLD
             and s.reason=="TASK_RETIRED" for s in self.states))
+        # A contract rejected before activation must still finish cancellation.
+        invalid=self.task(10003)
+        invalid.target_cells=[]
+        self.task_pub.publish(invalid)
+        self.spin_until(lambda:any("REFERENCE_PATH_REJECTED" in s and
+            f"task_id={invalid.task_id}" in s for s in self.statuses))
+        invalid.lifecycle=ObservationTask.CANCELLED
+        self.task_pub.publish(invalid)
+        self.spin_until(lambda:any(a.task_id==10003 and
+            a.status==TrajectoryAck.STATUS_TASK_RETIRED for a in self.acks))
+        self.ack_pub.publish(next(a for a in self.acks if a.task_id==10003 and
+            a.status==TrajectoryAck.STATUS_TASK_RETIRED))
+        self.spin_until(lambda:any(f.task_id==10003 and
+            f.state==ObservationFeedback.CANCEL_ACK for f in self.feedback))
 
 
 if __name__=="__main__": unittest.main()

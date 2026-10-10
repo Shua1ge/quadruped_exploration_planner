@@ -38,7 +38,8 @@ namespace scan_planner
                        double end_acc_x = 0.0,
                        double end_acc_y = 0.0,
                        double end_acc_z = 0.0,
-                       double seed_sample_interval = 0.0);
+                       double seed_sample_interval = 0.0,
+                       double preferred_clearance_margin = 0.0);
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);

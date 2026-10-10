@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -34,12 +35,85 @@ struct LocalTaskCandidate {
   bool observation_station = false;
 };
 
+// A departure is rotate-then-drive, never a fixed-yaw lateral displacement.
+// The callback supplies the same footprint/margin semantics as final validation.
+inline bool taskDepartureCertified(const Eigen::Vector2d& start, double measured_yaw,
+    double departure_yaw, double stopping_distance,
+    const std::function<bool(const Eigen::Vector2d&, double)>& footprint_safe) {
+  if (!start.allFinite() || !std::isfinite(measured_yaw) ||
+      !std::isfinite(departure_yaw) || !std::isfinite(stopping_distance) ||
+      stopping_distance < 0 || stopping_distance > 4.0 || !footprint_safe) return false;
+  const double period=2*std::acos(-1.0);
+  measured_yaw=std::remainder(measured_yaw,period);
+  departure_yaw=std::remainder(departure_yaw,period);
+  const double delta=std::remainder(departure_yaw-measured_yaw,period);
+  const int turns=std::max(1,static_cast<int>(std::ceil(std::abs(delta)/0.05)));
+  for(int i=0;i<=turns;++i)
+    if(!footprint_safe(start,measured_yaw+delta*i/turns)) return false;
+  const int steps=std::max(1,static_cast<int>(std::ceil(stopping_distance/0.02)));
+  const Eigen::Vector2d direction(std::cos(departure_yaw),std::sin(departure_yaw));
+  for(int i=0;i<=steps;++i)
+    if(!footprint_safe(start+direction*(stopping_distance*i/steps),departure_yaw)) return false;
+  return true;
+}
+
+inline bool taskDeparturePreviouslyRejected(double yaw, const std::vector<double>& rejected) {
+  if(!std::isfinite(yaw)) return true;
+  for(double previous:rejected)
+    if(std::isfinite(previous) &&
+       std::abs(std::remainder(yaw-previous,2*std::acos(-1.0))) < std::acos(-1.0)/8)
+      return true;
+  return false;
+}
+
+struct DirectedRoutePortal {
+  Eigen::Vector2d center, direction;
+  double radius{0};
+};
+
+inline bool crossesRoutePortal(const DirectedRoutePortal& portal,
+                              const Eigen::Vector2d& before,
+                              const Eigen::Vector2d& after) {
+  if(!before.allFinite() || !after.allFinite() || !portal.center.allFinite() ||
+     !portal.direction.allFinite() || portal.direction.norm()<1e-6 ||
+     !std::isfinite(portal.radius) || portal.radius<=0) return false;
+  const auto normal=portal.direction.normalized();
+  const double a=(before-portal.center).dot(normal),b=(after-portal.center).dot(normal);
+  if(a>=0 || b<0 || b-a<1e-6) return false;
+  const Eigen::Vector2d crossing=before+(after-before)*(-a/(b-a));
+  return (crossing-portal.center).norm()<=portal.radius;
+}
+
+// Only measured, continuous odometry can advance the NEXT checkpoint.
+// This cursor is execution/topology state, never observed-information progress.
+inline size_t advanceRoutePortal(const std::vector<DirectedRoutePortal>& portals,
+                                 size_t cursor,const Eigen::Vector2d& before,
+                                 const Eigen::Vector2d& after) {
+  if(cursor>=portals.size() || (after-before).norm()>0.5) return cursor;
+  double last_crossing=-1;
+  while(cursor<portals.size() && crossesRoutePortal(portals[cursor],before,after)) {
+    const auto normal=portals[cursor].direction.normalized();
+    const double fraction=-(before-portals[cursor].center).dot(normal)/(after-before).dot(normal);
+    if(fraction<=last_crossing+1e-6) break;
+    last_crossing=fraction; ++cursor;
+  }
+  return cursor;
+}
+
 inline bool taskNeedsDwell(const LocalTaskDomain& domain,
                            const Eigen::Vector2d& point, bool visible) {
   // Seeing one boundary point while passing through the large observation
   // disk does not mean that this is the final observation station.
   return visible && (point-domain.observation_center).norm() <=
       std::min(0.8, domain.observation_radius);
+}
+
+inline bool taskStationCaptureReady(bool autonomous, bool heading_aligning,
+                                    double measured_station_error) {
+  // ObservationTask carries a position, not a demanded final yaw. In
+  // autonomy mode arrival ends translation/turning and starts sensor capture.
+  return std::isfinite(measured_station_error) && measured_station_error>=0 &&
+      measured_station_error<=0.20 && (autonomous || !heading_aligning);
 }
 
 inline bool taskRollingDirectionAllowed(const Eigen::Vector2d& displacement,
@@ -74,13 +148,20 @@ inline double taskRouteProgress(const std::vector<Eigen::Vector2d>& route,
 
 inline std::vector<Eigen::Vector2d> simplifyTaskApproach(
     const std::vector<Eigen::Vector2d>& path,
-    const std::function<bool(const Eigen::Vector2d&,const Eigen::Vector2d&)>& safe) {
+    const std::function<bool(const Eigen::Vector2d&,const Eigen::Vector2d&)>& safe,
+    const std::function<double(const Eigen::Vector2d&,const Eigen::Vector2d&)>& cost = {}) {
   if(path.size()<3) return path;
   std::vector<Eigen::Vector2d> result{path.front()};
   for(size_t i=0;i+1<path.size();) {
     size_t next=i+1;
-    for(size_t j=path.size()-1;j>i+1;--j)
-      if(safe(path[i],path[j])) {next=j;break;}
+    for(size_t j=path.size()-1;j>i+1;--j) {
+      double original=0;
+      if(cost) for(size_t k=i;k<j;++k) original+=cost(path[k],path[k+1]);
+      // A hard-safe shortcut must not erase the clearance detour selected by
+      // the search. Both costs are integrals over the complete segments.
+      if(safe(path[i],path[j]) && (!cost || cost(path[i],path[j])<=original+1e-6))
+        {next=j;break;}
+    }
     result.push_back(path[next]); i=next;
   }
   return result;
@@ -196,12 +277,14 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     size_t max_candidates = 8,
     const std::function<bool(const Eigen::Vector2d&)>& goal_allowed = {},
     double initial_yaw = std::numeric_limits<double>::quiet_NaN(),
-    const std::function<double(const Eigen::Vector2d&,const Eigen::Vector2d&)>& edge_cost = {}) {
+    const std::function<double(const Eigen::Vector2d&,const Eigen::Vector2d&)>& edge_cost = {},
+    const Eigen::Vector2d* fixed_goal = nullptr) {
   std::vector<LocalTaskCandidate> result;
   if (!start.allFinite() || !preferred.allFinite() || !edge_safe || !visible ||
       !std::isfinite(step) || step <= 0.0 || !std::isfinite(window) ||
       window <= 0.0 || max_expansions == 0 || max_candidates == 0 ||
-      !taskDomainContains(domain, start)) return result;
+      !taskDomainContains(domain, start) || (fixed_goal &&
+      (!fixed_goal->allFinite() || !taskDomainContains(domain,*fixed_goal)))) return result;
   struct Node { int x, y, heading; size_t parent; double distance, cost; };
   std::vector<Node> nodes{{0, 0, 8, 0, 0.0, 0.0}};
   using Entry=std::pair<double,size_t>;
@@ -209,8 +292,12 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
   open.push({(start-preferred).norm(),0});
   std::map<std::tuple<int,int,int>,double> best{{{0,0,8},0.0}};
   const int moves[8][2]={{1,0},{0,1},{-1,0},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+  // Anchor the departure lattice to measured heading. A world-axis lattice
+  // forced even straight departures onto a 45-degree grid near narrow walls.
+  const double basis_yaw=std::isfinite(initial_yaw) ? initial_yaw : 0.0;
+  const Eigen::Rotation2Dd basis(basis_yaw);
   const auto point = [&](const Node& n) {
-    return Eigen::Vector2d(start.x()+step*n.x, start.y()+step*n.y);
+    return Eigen::Vector2d(start+basis*Eigen::Vector2d(step*n.x,step*n.y));
   };
   size_t expanded = 0;
   while (!open.empty() && expanded++ < max_expansions) {
@@ -218,17 +305,22 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const Node current = nodes[index];
     if(current.cost>best[{current.x,current.y,current.heading}]+1e-9) continue;
     const Eigen::Vector2d p = point(current);
-    if (index > 0 && (!goal_allowed || goal_allowed(p))) {
-      const bool station = taskNeedsDwell(domain, p, visible(p));
+    const Eigen::Vector2d goal = fixed_goal ? *fixed_goal : p;
+    const bool connects = !fixed_goal || ((p-goal).norm() <= 1.5*step && edge_safe(p,goal));
+    const double extra = fixed_goal && connects && edge_cost ? edge_cost(p,goal) : 0.0;
+    if (index > 0 && connects && std::isfinite(extra) && extra>=0 &&
+        (!goal_allowed || goal_allowed(goal))) {
+      const bool station = taskNeedsDwell(domain, goal, visible(goal));
       LocalTaskCandidate candidate;
-      candidate.goal = p;
+      candidate.goal = goal;
       candidate.observation_station = station;
-      candidate.cost = (p-preferred).norm() + 0.20*current.cost;
+      candidate.cost = (goal-preferred).norm() + 0.20*(current.cost+(goal-p).norm()+extra);
       for (size_t j=index;;j=nodes[j].parent) {
         candidate.approach.push_back(point(nodes[j]));
         if (j==0) break;
       }
       std::reverse(candidate.approach.begin(), candidate.approach.end());
+      if (fixed_goal && (p-goal).norm()>1e-9) candidate.approach.push_back(goal);
       result.push_back(std::move(candidate));
       std::sort(result.begin(), result.end(), [](const LocalTaskCandidate& a,
                                                 const LocalTaskCandidate& b) {
@@ -239,12 +331,12 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     for (int heading=0;heading<8;++heading) {
       const auto& move=moves[heading];
       const int x=current.x+move[0], y=current.y+move[1];
-      const Eigen::Vector2d next(start.x()+step*x, start.y()+step*y);
+      const Eigen::Vector2d next=start+basis*Eigen::Vector2d(step*x,step*y);
       if ((next-start).norm() > window || !taskDomainContains(domain,next) ||
           !edge_safe(p,next)) continue;
-      const double yaw=std::atan2(move[1],move[0]);
+      const double yaw=basis_yaw+std::atan2(move[1],move[0]);
       const double previous_yaw=current.heading<8 ?
-          std::atan2(moves[current.heading][1],moves[current.heading][0]) : initial_yaw;
+          basis_yaw+std::atan2(moves[current.heading][1],moves[current.heading][0]) : initial_yaw;
       const double turn=std::isfinite(previous_yaw) ?
           std::abs(std::remainder(yaw-previous_yaw,2*std::acos(-1.0))) : 0.0;
       const double extra=edge_cost ? edge_cost(p,next) : 0.0;

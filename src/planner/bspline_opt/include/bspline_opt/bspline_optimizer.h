@@ -68,6 +68,10 @@ namespace scan_planner
 
     // optional inputs
     void setGuidePath(const vector<Eigen::Vector3d> &guide_pt) { guide_pts_ = guide_pt; }
+    void setPreferredClearance(std::shared_ptr<const PlanarClearanceField> field,
+                               double margin, double body_offset) {
+      clearance_field_=std::move(field); preferred_margin_=margin; body_offset_=body_offset;
+    }
     void setWaypoints(const vector<Eigen::Vector3d> &waypts,
                       const vector<int> &waypt_idx); // N-2 constraints at most
 
@@ -85,6 +89,7 @@ namespace scan_planner
     inline int getOrder(void) { return order_; }
 
   private:
+    void addPreferredClearanceCost(Eigen::MatrixXd& gradient,double& cost);
     GridMap::Ptr grid_map_;
 
     enum FORCE_STOP_OPTIMIZE_TYPE
@@ -101,6 +106,8 @@ namespace scan_planner
     // int             dim_;                // dimension of the B-spline
     //
     vector<Eigen::Vector3d> guide_pts_; // geometric guiding path points, N-6
+    std::shared_ptr<const PlanarClearanceField> clearance_field_;
+    double preferred_margin_{0}, body_offset_{0};
     vector<Eigen::Vector3d> waypoints_; // waypts constraints
     vector<int> waypt_idx_;             // waypts constraints index
                                         //

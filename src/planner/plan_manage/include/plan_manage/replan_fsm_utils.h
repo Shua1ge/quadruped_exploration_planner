@@ -377,6 +377,22 @@ struct ReferencePathLookahead
   double remaining_after_target{0.0};
 };
 
+// Diagnostic location only: never used to authorize motion or consume budgets.
+// The departure window is 0.5 m of sampled arc length, not a safety margin.
+inline const char *clearanceFailureLocation(
+    bool current_footprint_blocked, double sampled_distance,
+    bool terminal_sample, double departure_window = 0.5)
+{
+  if (!std::isfinite(sampled_distance) || sampled_distance < 0.0)
+    return "UNASSESSED";
+  if (sampled_distance <= departure_window && current_footprint_blocked)
+    return "CURRENT_FOOTPRINT_INVALID";
+  if (terminal_sample) return "TERMINAL_INVALID";
+  if (sampled_distance <= departure_window)
+    return "DEPARTURE_CONNECTION_INVALID";
+  return "PATH_INVALID";
+}
+
 enum class ClearanceFailure : uint8_t
 {
   NONE = 0,

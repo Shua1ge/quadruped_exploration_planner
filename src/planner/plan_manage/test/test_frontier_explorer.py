@@ -17,6 +17,253 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_autonomy_does_not_repair_coarse_hint_or_apply_world_half_plane():
+    # None of the legacy geometry/rejoin state is initialized: the autonomy
+    # entry must return before touching it, not just rename its output.
+    explorer=object.__new__(MODULE.FrontierExplorer)
+    explorer.task_mode=True; explorer.task_geometry_autonomy=True
+    assert explorer.validate_and_repair_active_path()
+    assert explorer.directional_candidate_allowed(None,("region",7))
+
+
+def pending_handoff_explorer():
+    from scan_planner_msgs.msg import ObservationTask as TaskMessage
+    explorer=candidate_test_explorer()
+    explorer.task_mode=True
+    explorer._active_observation=MODULE.ObservationTask(3,(6.5,2.5),{(9,2)},
+        task_id=100,information_satisfied=True,lifecycle="SATISFIED")
+    explorer.active_goal=(6.5,2.5)
+    explorer.active_goal_cell=(6,2)
+    explorer.active_raw_path=[(1,2),(6,2)]
+    explorer.active_path_request_generation=100
+    explorer.active_path_trajectory_id=10
+    explorer.active_region_id=3
+    explorer.active_commitment_scope=("region",3)
+    explorer.last_selected_commitment_scope=("region",3)
+    explorer.last_selected_region_id=3
+    explorer.region_switches=explorer.intra_scope_region_switches=0
+    explorer.last_selection_reason="completed_task_handoff"
+    explorer.directional_recovery_pending=False
+    explorer.commitment_direction_origin=(1.5,2.5)
+    explorer.commitment_direction_vector=(1.,0.)
+    explorer.commitment_direction_progress=0.
+    explorer.region_direction_lookahead=1.
+    explorer.region_backtrack_tolerance=explorer.region_recovery_backtrack_tolerance=.5
+    explorer.region_commitment_gate=SimpleNamespace(reset=lambda *args:None)
+    explorer.commitment_target_cells={(9,2)}
+    explorer.map_update_count=9
+    explorer.inflation_radius=0.
+    explorer.paths_published=explorer.short_paths_published=0
+    explorer.preferred_goal_path_length=0.
+    explorer.selection_strategy="hierarchical"
+    explorer.approach_clearance=lambda *a:2.
+    explorer.last_path_request_generation=explorer.last_observation_task_id=100
+    explorer.tasks_created=explorer.task_requests_published=explorer.task_cancellations=0
+    explorer.task_stale_feedback=0
+    explorer.observations_satisfied=0
+    explorer.completed_goals=[]
+    explorer.is_blacklisted=lambda goal:False
+    explorer.frame_id="world"
+    explorer.task_corridor_radius=.8
+    explorer.observation_radius=3.
+    explorer.task_representative_limit=4
+    explorer.task_max_station_adjustments=3
+    explorer.path_request_timeout=5.
+    explorer.pending_path_publish_ns=0
+    explorer.scan_waiting_for_target=False
+    explorer.messages=[]
+    explorer.visual_paths=[]
+    explorer.statuses=[]
+    explorer.observation_task_pub=SimpleNamespace(publish=explorer.messages.append)
+    explorer.path_vis_pub=SimpleNamespace(publish=explorer.visual_paths.append)
+    explorer.publish_goal=lambda goal:None
+    explorer.publish_status=explorer.statuses.append
+    now=SimpleNamespace(nanoseconds=1_000_000_000)
+    now.to_msg=lambda:Time(sec=now.nanoseconds//1_000_000_000)
+    explorer.get_clock=lambda:SimpleNamespace(now=lambda:now)
+    candidate=MODULE.FrontierCandidate(4,(6,3),(8,3),(6.5,3.5),[(1,2),(6,3)],
+        5.,1,1,0.,{(10,2)},terminal_cells=((6,3),),commitment_scope=("region",4))
+    explorer.completion_handoff_in_progress=True
+    explorer.activate_candidate(candidate.path,candidate)
+    explorer.completion_handoff_in_progress=False
+    assert explorer.messages[-1].lifecycle==TaskMessage.ACTIVE
+    return explorer
+
+
+def test_pending_task_is_not_active_or_committed_until_typed_execution_ready():
+    from scan_planner_msgs.msg import ObservationFeedback
+    explorer=pending_handoff_explorer()
+    old=explorer.active_observation
+    pending=explorer.pending_observation_handoff
+    assert explorer.active_goal==old.goal
+    assert explorer.active_path_request_generation==100
+    assert explorer.active_region_id==3 and explorer.active_commitment_scope==("region",3)
+    assert explorer.observations_satisfied==0 and not explorer.completed_goals
+    assert old.lifecycle=="SATISFIED"
+    assert pending.task.predecessor_task_id==old.task_id
+    explorer.planning_status_callback(MODULE.String(data=
+        f"PATH_TRAJECTORY_READY request_id={pending.request_id} task_id={pending.task.task_id} task_version=1"))
+    assert explorer.active_observation is old
+    feedback=ObservationFeedback(task_id=pending.task.task_id,task_version=1,
+        request_id=pending.request_id-1,trajectory_id=11,candidate_id=12,
+        state=ObservationFeedback.EXECUTION_READY)
+    explorer.observation_feedback_callback(feedback)
+    assert explorer.active_observation is old
+    feedback.request_id=pending.request_id
+    explorer.observation_feedback_callback(feedback)
+    assert explorer.pending_observation_handoff is None
+    assert explorer.active_observation is pending.task
+    assert explorer.active_region_id==4 and explorer.active_commitment_scope==("region",4)
+    assert explorer.active_path_request_generation==pending.request_id
+    assert explorer.active_path_trajectory_id==11
+    assert explorer.observations_satisfied==1 and explorer.completed_goals==[old.goal]
+    assert len(explorer.messages)==1  # Commit does not publish another request.
+    explorer.observation_feedback_callback(feedback)
+    assert explorer.observations_satisfied==1
+
+
+def test_pending_timeout_runs_without_map_change_and_late_ready_cannot_commit():
+    from scan_planner_msgs.msg import ObservationFeedback, ObservationTask as TaskMessage
+    explorer=pending_handoff_explorer()
+    old=explorer.active_observation
+    pending=explorer.pending_observation_handoff
+    explorer.get_clock().now().nanoseconds+=6_000_000_000
+    explorer.continue_pending_observation_handoff()
+    assert pending.state=="CANCELLING" and explorer.messages[-1].lifecycle==TaskMessage.CANCELLED
+    assert explorer.active_observation is old and explorer.active_region_id==3
+    explorer.observation_feedback_callback(ObservationFeedback(task_id=pending.task.task_id,
+        task_version=1,request_id=pending.request_id,trajectory_id=11,candidate_id=12,
+        state=ObservationFeedback.EXECUTION_READY))
+    assert explorer.active_observation is old and explorer.observations_satisfied==0
+    explorer.get_clock().now().nanoseconds+=6_000_000_000
+    explorer.continue_pending_observation_handoff()
+    assert len(explorer.messages)==3 and explorer.task_cancellations==1
+    explorer.observation_feedback_callback(ObservationFeedback(task_id=pending.task.task_id,
+        task_version=1,state=ObservationFeedback.CANCEL_ACK))
+    assert explorer.pending_observation_handoff is None
+    assert explorer.handoff_execution_retired
+    assert explorer.active_observation is old and old.information_satisfied
+    assert explorer.active_path_request_generation is None
+    assert explorer.active_region_id==3 and explorer.active_commitment_scope==("region",3)
+
+
+def test_satisfied_predecessor_feedback_does_not_reopen_its_route():
+    from scan_planner_msgs.msg import ObservationFeedback
+    explorer=pending_handoff_explorer()
+    explorer.reroute_active_goal=lambda **kw: (_ for _ in ()).throw(AssertionError("G1 reopened"))
+    explorer.observation_feedback_callback(ObservationFeedback(task_id=100,task_version=1,
+        request_id=100,state=ObservationFeedback.PATH_REJECTED))
+    assert explorer.pending_observation_handoff.state=="PREPARING"
+    assert explorer.active_observation.task_id==100
+
+
+def test_pending_timeout_precedes_health_and_map_gates():
+    explorer=pending_handoff_explorer()
+    explorer.last_task_clock_ns=explorer.get_clock().now().nanoseconds
+    explorer.locomotion_ready=lambda: (_ for _ in ()).throw(AssertionError("health gate ran first"))
+    explorer.get_clock().now().nanoseconds+=6_000_000_000
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+    assert explorer.pending_observation_handoff.state=="CANCELLING"
+
+
+def test_cancelled_successor_replacement_does_not_claim_retired_predecessor():
+    from scan_planner_msgs.msg import ObservationFeedback
+    explorer=pending_handoff_explorer()
+    pending=explorer.pending_observation_handoff
+    explorer.cancel_pending_observation_handoff("CANDIDATE_REJECTED")
+    explorer.observation_feedback_callback(ObservationFeedback(task_id=pending.task.task_id,
+        task_version=1,state=ObservationFeedback.CANCEL_ACK))
+    explorer.stage_observation_handoff(pending.path,pending.candidate)
+    replacement=explorer.pending_observation_handoff
+    assert replacement.task.task_id>pending.task.task_id
+    assert replacement.task.predecessor_task_id==0
+    assert explorer.active_observation is pending.predecessor
+    assert explorer.active_region_id==3
+
+
+def test_partial_station_handoff_needs_ack_and_does_not_count_information_complete():
+    from scan_planner_msgs.msg import ObservationFeedback
+    explorer=pending_handoff_explorer()
+    pending=explorer.pending_observation_handoff
+    old=pending.predecessor
+    old.information_satisfied=False
+    old.motion_released=True
+    old.progress=.7
+    old.lifecycle="ACTIVE"
+    explorer.observation_feedback_callback(ObservationFeedback(
+        task_id=pending.task.task_id,task_version=1,request_id=pending.request_id,
+        trajectory_id=11,candidate_id=12,state=ObservationFeedback.EXECUTION_READY))
+    assert explorer.active_observation is pending.task
+    assert old.lifecycle=="SUPERSEDED" and not old.information_satisfied
+    assert explorer.observations_satisfied==0 and explorer.completed_goals==[]
+    assert old.progress==.7 and old.target_cells=={(9,2)}
+
+
+def test_released_station_prepares_successor_without_marking_information_satisfied():
+    explorer=pending_handoff_explorer()
+    previous=explorer.pending_observation_handoff
+    explorer.pending_observation_handoff=None
+    old=explorer.active_observation
+    old.information_satisfied=False;old.motion_released=True;old.lifecycle="ACTIVE"
+    explorer.last_handoff_attempt_update=-1
+    explorer.observation_complete=lambda task:False
+    def prepare(**kwargs):
+        explorer.activate_candidate(previous.path,previous.candidate)
+        return True
+    explorer.activate_or_prepare_next_observation=prepare
+    assert explorer.handoff_satisfied_observation("OBSERVATION_STATION_MOTION_RELEASED")
+    assert not old.information_satisfied and old.lifecycle=="ACTIVE"
+    assert explorer.active_observation is old and explorer.observations_satisfied==0
+    assert explorer.pending_observation_handoff.predecessor is old
+
+
+def test_released_motion_handoff_precedes_inflight_request_even_on_static_map():
+    explorer=object.__new__(MODULE.FrontierExplorer)
+    explorer.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=1_000_000_000))
+    explorer.last_task_clock_ns=900_000_000
+    explorer.locomotion_ready=lambda:True
+    explorer.active_goal=(2.,0.);explorer.scan_waiting_for_target=True
+    explorer.active_task_elapsed=0.;explorer.auto_start=True
+    explorer.position=(1.,0.);explorer.map_update_count=10
+    explorer.pending_path_publish_ns=100
+    task=MODULE.ObservationTask(1,(2.,0.),{(2,2)},motion_released=True)
+    explorer.evaluate_active_observation=lambda:task
+    reasons=[];explorer.handoff_satisfied_observation=reasons.append
+    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
+    assert reasons==["OBSERVATION_STATION_MOTION_RELEASED"]
+
+
+def test_failed_successor_stays_cooled_after_cancel_ack_and_heading_change():
+    from scan_planner_msgs.msg import ObservationFeedback
+    explorer=pending_handoff_explorer();explorer.task_geometry_autonomy=True
+    explorer.is_goal_on_failure_cooldown=MODULE.FrontierExplorer.is_goal_on_failure_cooldown.__get__(explorer)
+    pending=explorer.pending_observation_handoff
+    explorer.cancel_pending_observation_handoff("HANDOFF_MOVING_HEADING_ERROR")
+    assert explorer.is_goal_on_failure_cooldown(pending.task.goal)
+    explorer.observation_feedback_callback(ObservationFeedback(task_id=pending.task.task_id,
+        task_version=1,state=ObservationFeedback.CANCEL_ACK))
+    explorer.body_yaw=2.5;explorer.map_content_revision+=100
+    assert explorer.is_goal_on_failure_cooldown(pending.task.goal)
+    # Even a late execution-ready cannot commit a cancelled successor.
+    explorer.observation_feedback_callback(ObservationFeedback(task_id=pending.task.task_id,
+        task_version=1,request_id=pending.request_id,trajectory_id=11,candidate_id=12,
+        state=ObservationFeedback.EXECUTION_READY))
+    assert explorer.active_observation is pending.predecessor
+
+
+def test_departure_preference_uses_route_tangent_not_remote_goal_direction():
+    explorer=candidate_test_explorer()
+    explorer.task_mode=explorer.task_geometry_autonomy=True
+    explorer.position=(1.5,2.5);explorer.body_yaw=0.
+    forward=MODULE.FrontierCandidate(1,(0,2),(0,3),(.5,2.5),[(1,2),(2,2),(0,2)],
+        3.,10,1,0.,{(0,3)})
+    reverse=MODULE.FrontierCandidate(1,(4,2),(4,3),(4.5,2.5),[(1,2),(0,2),(4,2)],
+        3.,10,1,0.,{(4,3)})
+    assert explorer.candidate_departure_penalty(forward)==0.
+    assert explorer.candidate_departure_penalty(reverse)==1.
+    assert explorer.choose_greedy_candidate([reverse,forward]) is forward
+
+
 def test_completion_handoff_scope_is_cleared_after_success_failure_and_exception():
     explorer=SimpleNamespace()
     for result in (True,False,None):
@@ -700,6 +947,108 @@ def test_position_only_path_keeps_incoming_terminal_tangent():
     assert MODULE.double_cylinder_path_free(
         grid, path, terminal, frontier, inflated,
         radius=0.35, offset=0.18)
+
+
+def test_path_validation_diagnostics_classify_first_failure_without_changing_safety():
+    grid = MODULE.ExplorationGrid(20.0, 20.0, 0.2, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    path = [(50+i, 50) for i in range(8)]
+    for index, location in ((0, "DEPARTURE_CONNECTION_INVALID"),
+                            (2, "DEPARTURE_CONNECTION_INVALID"),
+                            (4, "PATH_INVALID"), (7, "TERMINAL_INVALID")):
+        inflated = {path[index]}
+        result = MODULE.diagnose_double_cylinder_path(
+            grid, path, path[-1], (60, 50), inflated, 0, 0)
+        assert not result.accepted
+        assert result.location == location
+        assert result.reason == "INFLATION_OR_MARGIN"
+        assert result.sample_index == index and result.hit_cell == path[index]
+        assert result.current_margin_blocked is None
+        assert not MODULE.double_cylinder_path_free(
+            grid, path, path[-1], (60, 50), inflated, 0, 0)
+    result = MODULE.diagnose_double_cylinder_path(
+        grid, path, path[-1], (60, 50), {path[0]}, 0, 0,
+        measured_yaw=0, measured_cell=path[0])
+    assert result.location == "CURRENT_FOOTPRINT_INVALID"
+    assert result.current_margin_blocked is True
+    # A repaired/snap-to-free path start is not the actual robot position.
+    result = MODULE.diagnose_double_cylinder_path(
+        grid, path, path[-1], (60, 50), {path[0]}, 0, 0,
+        measured_yaw=0, measured_cell=(40, 40))
+    assert result.location == "DEPARTURE_CONNECTION_INVALID"
+    assert result.current_margin_blocked is False
+
+
+def test_path_validation_diagnostics_report_map_reason_and_unknown_pose():
+    grid = MODULE.ExplorationGrid(20.0, 20.0, 0.2, 0.0, 0.0)
+    grid.data[:, :] = MODULE.FREE
+    path = [(50, 50), (51, 50)]
+    for value, reason in ((MODULE.OCCUPIED, "OCCUPIED_CELL"),
+                          (MODULE.UNKNOWN, "UNKNOWN_CELL")):
+        grid.data[50, 50] = value
+        result = MODULE.diagnose_double_cylinder_path(
+            grid, path, path[-1], path[-1], set(), 0, 0,
+            measured_yaw=float("nan"), measured_cell=path[0])
+        assert result.reason == reason
+        assert result.current_margin_blocked is None
+    result = MODULE.diagnose_double_cylinder_path(
+        grid, [(-1, 50), (0, 50)], (0, 50), (0, 50), set(), 0, 0)
+    assert result.reason == "OUTSIDE_MAP"
+    result = MODULE.diagnose_double_cylinder_path(grid, [], (0, 0), (0, 0), set(), 0, 0)
+    assert result.location == "UNASSESSED" and result.reason == "EMPTY_PATH"
+
+
+def test_path_validation_diagnostics_preserve_boolean_predicate_randomized():
+    grid = MODULE.ExplorationGrid(20.0, 20.0, 0.2, 0.0, 0.0)
+    rng = np.random.default_rng(20261006)
+    path = [(50+i, 50+(i % 3)) for i in range(10)]
+    for _ in range(100):
+        grid.data[:, :] = MODULE.FREE
+        inflated = set()
+        for _ in range(10):
+            cell = (int(rng.integers(48, 62)), int(rng.integers(48, 54)))
+            grid.data[cell[1], cell[0]] = rng.choice([MODULE.FREE, MODULE.UNKNOWN, MODULE.OCCUPIED])
+            if rng.random() < .3:
+                inflated.add(cell)
+        radius = float(rng.choice([0, .35]))
+        offset = float(rng.choice([0, .18, .4]))
+        expected = True
+        for index, center in enumerate(path):
+            first, second = ((center, path[index+1]) if index+1 < len(path)
+                             else (path[index-1], center))
+            yaw = math.atan2(second[1]-first[1], second[0]-first[0])
+            expected &= MODULE.double_cylinder_footprint_free(
+                grid, center, yaw, inflated, radius, offset)
+        result = MODULE.diagnose_double_cylinder_path(
+            grid, path, path[-1], (70, 70), inflated, radius, offset,
+            measured_yaw=0, measured_cell=(48, 48))
+        assert result.accepted == expected
+        assert MODULE.double_cylinder_path_free(
+            grid, path, path[-1], (70, 70), inflated, radius, offset) == expected
+
+
+def test_global_validation_records_ids_revision_and_counts_without_changing_policy():
+    explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.grid = MODULE.ExplorationGrid(20, 20, .2, 0, 0)
+    explorer.grid.data[:, :] = MODULE.FREE
+    explorer.position = explorer.grid.cell_to_world((50, 50))
+    explorer.body_yaw = 1.5  # Live yaw may differ from a planning-bound position.
+    explorer.validation_measured_pose = (999, *explorer.position, 0.)
+    explorer.map_content_revision = 123
+    explorer.active_observation = MODULE.ObservationTask(3, (1, 1), set(), task_id=456)
+    messages = []
+    explorer.get_logger = lambda: SimpleNamespace(warning=lambda text, **kw: messages.append(text))
+    explorer.handoff_excluded_goals = [(1, 1)]
+    path = [(50, 50), (51, 50), (52, 50)]
+    explorer.record_path_validation_failure(path, path[-1], path[-1], {path[0]})
+    record = explorer.last_path_validation_failure
+    assert record['task_id'] == 456 and record['map_content_revision'] == 123
+    assert record['location'] == 'CURRENT_FOOTPRINT_INVALID'
+    assert record['sample_world'] == explorer.position
+    assert record['measured_yaw'] == 0. and record['measured_stamp_ns'] == 999
+    assert explorer.path_validation_failure_counts['CURRENT_FOOTPRINT_INVALID'] == 1
+    assert explorer.handoff_excluded_goals == [(1, 1)]
+    assert '[GLOBAL_PATH_VALIDATION_FAILURE]' in messages[0]
 
 
 def test_rotation_sweep_can_collide_when_both_endpoint_yaws_are_free():
@@ -1524,6 +1873,21 @@ def test_running_scan_does_not_release_region_commitment():
 
     assert not explorer.release_commitment_for_idle_handoff()
     assert explorer.active_region_id == 8
+
+
+def test_departure_cooldown_does_not_ban_sibling_viewpoint():
+    from explorer_core.observation_task_bridge import LocalMotionAttempt
+    explorer=object.__new__(MODULE.FrontierExplorer)
+    explorer.blacklist_radius=1.0
+    explorer.goal_failure_cooldowns={}
+    explorer.local_motion_goal_cooldowns={
+        (2.,3.):LocalMotionAttempt((1.,3.),"DEPARTURE_UNSAFE",frozenset())}
+    explorer.local_motion_retry_allowed=lambda attempt:False
+    assert explorer.is_goal_on_failure_cooldown((2.,3.))
+    assert not explorer.is_goal_on_failure_cooldown((2.2,3.))
+    explorer.local_motion_goal_cooldowns={
+        (2.,3.):LocalMotionAttempt((1.,3.),"STATION_CAPTURE_INCOMPLETE",frozenset())}
+    assert explorer.is_goal_on_failure_cooldown((2.2,3.))
 
 
 def test_failure_cooldown_requires_time_and_new_reachability_evidence():
@@ -2405,7 +2769,8 @@ def test_sparse_candidate_is_rejected_when_dense_map_disconnects_goal():
     assert materialized is None
     assert explorer.dense_final_validation_searches == 1
     assert explorer.sparse_final_validation_failures == 1
-    assert explorer.is_goal_on_failure_cooldown(candidate.goal)
+    assert not explorer.is_goal_on_failure_cooldown(candidate.goal)
+    assert explorer.goal_failure_cooldowns == {}  # Path failure is not viewpoint evidence.
 
 
 def test_dense_failures_release_only_an_exhausted_active_region():

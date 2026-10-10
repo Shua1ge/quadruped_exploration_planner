@@ -95,7 +95,8 @@ namespace scan_planner
                                         const std::vector<Eigen::Vector3d> *seed_path,
                                         double end_acc_x, double end_acc_y,
                                         double end_acc_z,
-                                        double seed_sample_interval)
+                                        double seed_sample_interval,
+                                        double preferred_clearance_margin)
   {
 
     grid_map_->usePlanningClearanceMarginForCurrentThread(
@@ -363,6 +364,10 @@ namespace scan_planner
     // A seed is a verified geometric guide, not merely an initialization.
     // Clear it explicitly for legacy unseeded rolling plans.
     bspline_optimizer_rebound_->setGuidePath(seed_path ? *seed_path : std::vector<Eigen::Vector3d>{});
+    const auto snapshot=grid_map_->captureInflatedOccupancySnapshot();
+    bspline_optimizer_rebound_->setPreferredClearance(
+        preferred_clearance_margin>0 ? grid_map_->capturePlanarClearance(start_pt.z()) : nullptr,
+        preferred_clearance_margin,snapshot ? snapshot->body_offset : 0.0);
     bool flag_step_1_success = bspline_optimizer_rebound_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
     cout << "first_optimize_step_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)

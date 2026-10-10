@@ -38,6 +38,17 @@ class ObservationTask:
     station_adjustments: int = 0
     predecessor_task_id: int = 0
     predecessor_task_version: int = 0
+    information_satisfied: bool = False
+    # Arrival ends this motion attempt, not its information objective. Unseen
+    # cells remain in the map and may be selected by a later observation task.
+    motion_released: bool = False
+    satisfied_map_revision: int = 0
+    satisfied_sensor_revision: int = 0
+    # Motion contract metadata; never a second observation progress ledger.
+    route_estimate: object = None
+    route_portals: tuple = ()
+    route_graph_revision: int = 0
+    route_contract_frozen: bool = False
 
 
 def evaluate_observation(
@@ -46,7 +57,7 @@ def evaluate_observation(
         done_ratio: float, done_updates: int, closure_updates: int,
         viewpoint_standoff: float) -> Optional[ObservationTask]:
     """Apply one accepted map revision to an active information objective."""
-    if task is None or task.last_evaluated_update == map_update_count:
+    if task is None or task.information_satisfied or task.last_evaluated_update == map_update_count:
         return task
     observed, _, ratio = observation_progress(
         grid, task.target_cells, active_goal_cell)

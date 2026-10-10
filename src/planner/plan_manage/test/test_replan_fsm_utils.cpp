@@ -1,6 +1,19 @@
 #include <gtest/gtest.h>
 #include <plan_manage/replan_fsm_utils.h>
 
+TEST(ClearanceDiagnostics, LocationUsesMeasuredFootprintAndSampledArcLength) {
+  using scan_planner::clearanceFailureLocation;
+  EXPECT_STREQ(clearanceFailureLocation(true, .3, false), "CURRENT_FOOTPRINT_INVALID");
+  EXPECT_STREQ(clearanceFailureLocation(false, 0, false), "DEPARTURE_CONNECTION_INVALID");
+  EXPECT_STREQ(clearanceFailureLocation(false, .5, false), "DEPARTURE_CONNECTION_INVALID");
+  EXPECT_STREQ(clearanceFailureLocation(false, .51, false), "PATH_INVALID");
+  EXPECT_STREQ(clearanceFailureLocation(false, .1, true), "TERMINAL_INVALID");
+  EXPECT_STREQ(clearanceFailureLocation(true, 1.0, false), "PATH_INVALID");
+  EXPECT_STREQ(clearanceFailureLocation(false, -1, false), "UNASSESSED");
+  EXPECT_STREQ(clearanceFailureLocation(false,
+      std::numeric_limits<double>::quiet_NaN(), false), "UNASSESSED");
+}
+
 TEST(SteeringContract, EndpointNoiseDoesNotCreateReverseHeading) {
   const Eigen::Vector3d anchor(1,0,0);
   EXPECT_DOUBLE_EQ(scan_planner::trajectorySteeringYaw(1,1,anchor,.4,

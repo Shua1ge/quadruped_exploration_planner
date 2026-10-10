@@ -13,10 +13,13 @@ void SCANReplanFSM::publishObservationFeedback(uint8_t state, const std::string&
   feedback.candidate_id = task_candidate_id_.load();
   feedback.state = state;
   feedback.station_adjustments = task_station_adjustments_;
+  feedback.route_graph_revision=observation_task_->route_graph_revision;
+  feedback.route_connection_cursor=static_cast<uint32_t>(task_route_cursor_);
   feedback.reason = reason;
   // A reached station is measured, not the requested nominal pose.
   const auto& point = (state == scan_planner_msgs::msg::ObservationFeedback::STATION_REACHED ||
-      state == scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED)
+      state == scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED ||
+      state == scan_planner_msgs::msg::ObservationFeedback::LOCAL_MOTION_EXHAUSTED)
       ? odom_pos_ : task_station_;
   feedback.station.x = point.x(); feedback.station.y = point.y(); feedback.station.z = point.z();
   {
@@ -69,8 +72,15 @@ void SCANReplanFSM::confirmObservationTaskRetirement(TaskVersion version) {
     execution_snapshot_.valid = false;
     predicted_collision_interval_.valid = false;
   }
-  publishObservationFeedback(scan_planner_msgs::msg::ObservationFeedback::CANCEL_ACK,
-                             "CONTROLLER_TASK_RETIRED");
+  // Cancellation may name a queued successor, not observation_task_.
+  // Confirm the cancelled identity so Explorer can finish its transaction.
+  scan_planner_msgs::msg::ObservationFeedback feedback;
+  feedback.header.stamp = node_->now();
+  feedback.header.frame_id = self_inflation_frame_id_;
+  feedback.task_id = version.first; feedback.task_version = version.second;
+  feedback.state = scan_planner_msgs::msg::ObservationFeedback::CANCEL_ACK;
+  feedback.reason = "CONTROLLER_TASK_RETIRED";
+  task_feedback_pub_->publish(feedback);
   observation_task_.reset();
   task_id_.store(0); task_version_.store(0);
 }
@@ -87,7 +97,10 @@ void SCANReplanFSM::observationTaskCallback(
         incoming == TaskVersion{deferred_task_->task_id, deferred_task_->task_version};
     if (cancels_queued_task)
       deferred_task_.reset();
-    if (incoming == current || cancels_queued_task) retireObservationTask(incoming);
+    // A rejected/unprocessed successor still needs a Controller fence and
+    // CANCEL_ACK. Otherwise Explorer waits forever for its cancellation.
+    if (incoming == current || cancels_queued_task || incoming > current)
+      retireObservationTask(incoming);
     else {
       if (incoming == TaskVersion{rolling_predecessor_id_.load(),rolling_predecessor_version_.load()}) {
         // An explicit cancellation of the still-running predecessor is not
@@ -131,6 +144,24 @@ void SCANReplanFSM::observationTaskCallback(
       std::hypot(msg->gate_direction.x,msg->gate_direction.y)<1e-6 ||
       !std::isfinite(msg->gate_min_progress))) invalid = "directional_gate";
   else if (!std::all_of(msg->terminal_cells.begin(), msg->terminal_cells.end(), finite_point)) invalid = "terminal_cells_nonfinite";
+  else if (msg->route_portals.size()>256 || (!msg->route_portals.empty() &&
+      (!msg->local_geometry_autonomy || !msg->route_graph_revision))) invalid = "route_portals";
+  if(!invalid) for(const auto& portal:msg->route_portals) {
+    if(portal.source_node_id==portal.target_node_id || !finite_point(portal.center) ||
+       !std::isfinite(portal.direction.x) || !std::isfinite(portal.direction.y) ||
+       std::hypot(portal.direction.x,portal.direction.y)<1e-6 ||
+       !std::isfinite(portal.radius) || portal.radius<=0 || portal.radius>msg->corridor_radius) {
+      invalid="route_portal_geometry";break;
+    }
+  }
+  if(!invalid && incoming==current && observation_task_ &&
+      (msg->local_geometry_autonomy!=observation_task_->local_geometry_autonomy ||
+       msg->route_graph_revision!=observation_task_->route_graph_revision ||
+       msg->route_portals!=observation_task_->route_portals)) invalid="route_contract_changed_without_version";
+  if(!invalid) for(size_t i=1;i<msg->route_portals.size();++i)
+    if(msg->route_portals[i-1].target_node_id!=msg->route_portals[i].source_node_id) {
+      invalid="disconnected_route_portals";break;
+    }
   if (invalid) {
     RCLCPP_WARN(node_->get_logger(), "[OBSERVATION_TASK_REJECTED] invalid contract task=%llu version=%llu request=%llu field=%s",
                 static_cast<unsigned long long>(msg->task_id), static_cast<unsigned long long>(msg->task_version),
@@ -166,6 +197,12 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
     if(item.first==TaskVersion{task_id_.load(),task_version_.load()})
       task_rejected_stations_.push_back(item.second);
   refreshPlanningOdomFromSafety();
+  if(observation_task_ && observation_task_->local_geometry_autonomy && !task_retirement_pending_) {
+    if(task_route_position_valid_)
+      task_route_cursor_=advanceRoutePortal(task_route_portals_,task_route_cursor_,
+          task_route_last_position_,odom_pos_.head<2>());
+    task_route_last_position_=odom_pos_.head<2>(); task_route_position_valid_=true;
+  }
   if (task_retirement_pending_) {
     const int64_t now = node_->now().nanoseconds();
     if (last_task_retirement_ns_ == 0 || now-last_task_retirement_ns_ >= 250000000LL) {
@@ -210,9 +247,15 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
     observation_task_ = msg;
     task_id_.store(msg->task_id); task_version_.store(msg->task_version);
     task_rejected_stations_.clear(); // Candidate exclusions belong to one request.
+    task_rejected_departures_.clear();
     if (!same_task) {
       task_visited_stations_.clear(); task_station_adjustments_ = 0;
       execution_no_progress_exhausted_.store(false);
+      task_route_cursor_=0; task_route_portals_.clear();
+      for(const auto& portal:msg->route_portals)
+        task_route_portals_.push_back({{portal.center.x,portal.center.y},
+            {portal.direction.x,portal.direction.y},portal.radius});
+      task_route_last_position_=odom_pos_.head<2>(); task_route_position_valid_=true;
     }
     task_terminal_request_ = 0;
     task_departure_blocked_ = false;
@@ -242,8 +285,8 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
   }
   if (observation_task_ && task_terminal_request_ == active_reference_request_id_.load()) return true;
   if (observation_task_ && task_station_target_ && have_target_ &&
-      !go2_heading_aligning_.load() &&
-      (odom_pos_-task_station_).head<2>().norm() <= 0.20) {
+      taskStationCaptureReady(observation_task_->local_geometry_autonomy,
+          go2_heading_aligning_.load(),(odom_pos_-task_station_).head<2>().norm())) {
     bool acknowledged=false;
     { std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
       acknowledged = execution_snapshot_.valid && execution_snapshot_.task_id == task_id_.load() &&
@@ -256,8 +299,9 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
 }
 
 bool SCANReplanFSM::selectObservationTaskTarget() {
-    const bool retain_goal = task_goal_available_ &&
-        (task_station_.head<2>()-start_pt_.head<2>()).norm() > 0.6;
+    const bool autonomy=observation_task_ && observation_task_->local_geometry_autonomy;
+    bool retain_goal = task_goal_available_ &&
+        (task_station_.head<2>()-start_pt_.head<2>()).norm() > (autonomy ? 0.20 : 0.6);
     const Eigen::Vector2d previous_goal = task_station_.head<2>();
     task_goal_available_ = false;
     task_approach_.clear();
@@ -270,21 +314,51 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
   if (!sample.valid && !in_observation) return false;
   reference_progress_idx_=sample.progress_segment; reference_progress_ratio_=sample.progress_ratio;
   LocalTaskDomain domain=observationTaskDomain();
+  const auto clearance=autonomy ? map->capturePlanarClearance(start_pt_.z()) : nullptr;
+  const auto snapshot=map->captureInflatedOccupancySnapshot();
   // Refit the approach while retaining a still-valid local objective. A
   // new map/odom sample alone is not a reason to choose another station.
-  const Eigen::Vector2d preferred=retain_goal ? previous_goal :
+  Eigen::Vector2d preferred=retain_goal ? previous_goal :
       (sample.valid ? Eigen::Vector2d(sample.target.head<2>()) : domain.observation_center);
+  if(autonomy && !retain_goal && task_route_cursor_<task_route_portals_.size()) {
+    const auto& portal=task_route_portals_[task_route_cursor_];
+    const Eigen::Vector2d checkpoint=portal.center+0.3*portal.direction.normalized();
+    if((checkpoint-start_pt_.head<2>()).norm()<=reference_path_lookahead_)
+      preferred=checkpoint;
+  }
+  bool certified_departure_available=false;
+  size_t departure_checks=0, departure_certificates=0;
   auto edge_safe=[&](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
+    if(autonomy) for(size_t i=task_route_cursor_+1;i<task_route_portals_.size();++i)
+      if(crossesRoutePortal(task_route_portals_[i],a,b)) return false;
     const double yaw=std::atan2(b.y()-a.y(),b.x()-a.x());
+    if ((a-start_pt_.head<2>()).norm()<0.01) {
+      ++departure_checks;
+      if (taskDeparturePreviouslyRejected(yaw,task_rejected_departures_)) return false;
+      // Keep command speed as a conservative bound, not as calibrated actual
+      // speed. Do not weaken the existing stopping contract in recovery.
+      const double stop_distance=min_forward_command_*
+          (command_stop_latency_+predictive_replan_reaction_time_)+
+          min_forward_command_*min_forward_command_/(2*guaranteed_braking_deceleration_);
+      if (!taskDepartureCertified(start_pt_.head<2>(),getOdomYaw(),yaw,stop_distance,
+          [&](const Eigen::Vector2d& p,double heading) {
+            return taskDomainContains(domain,p) && !footprintOccupiedWithMargin(
+                map,{p.x(),p.y(),start_pt_.z()},heading,planning_clearance_margin_);
+          })) return false;
+      certified_departure_available=true;
+      ++departure_certificates;
+    }
     if ((a-start_pt_.head<2>()).norm()<0.05 &&
         !taskRollingDirectionAllowed(b-a,getOdomYaw(),start_vel_.head<2>().norm())) return false;
     const int samples=std::max(1,static_cast<int>(std::ceil((b-a).norm()/0.05)));
-    double progress=taskRouteProgress(domain.route,a);
+    double progress=autonomy ? 0.0 : taskRouteProgress(domain.route,a);
     for(int i=0;i<=samples;++i) {
       const Eigen::Vector2d p=a+(b-a)*(static_cast<double>(i)/samples);
-      const double next_progress=taskRouteProgress(domain.route,p);
-      if(next_progress<progress-0.10) return false;
-      progress=std::max(progress,next_progress);
+      if(!autonomy) {
+        const double next_progress=taskRouteProgress(domain.route,p);
+        if(next_progress<progress-0.10) return false;
+        progress=std::max(progress,next_progress);
+      }
       if (!taskDomainContains(domain,p)) return false;
       if (footprintOccupiedWithMargin(map,{p.x(),p.y(),start_pt_.z()},yaw,planning_clearance_margin_)) return false;
     }
@@ -304,7 +378,7 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
   };
   auto visible=[&](const Eigen::Vector2d& p) {
     for(const auto& rejected:task_rejected_stations_) if ((p-rejected).norm()<0.35) return false;
-    for(const auto& visited:task_visited_stations_) if ((p-visited).norm()<0.35) return false;
+    if(!autonomy) for(const auto& visited:task_visited_stations_) if ((p-visited).norm()<0.35) return false;
     for(const auto& target:observation_task_->target_cells) {
       const Eigen::Vector2d endpoint(target.x,target.y);
       if (!sees(p,endpoint)) continue;
@@ -315,18 +389,28 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
     return false;
   };
   const auto goal_allowed=[&](const Eigen::Vector2d& p) {
-    if ((p-start_pt_.head<2>()).norm()<0.4) return false;
-    if (!task_visited_stations_.empty() && domain.route.size()>1) {
+    if ((p-start_pt_.head<2>()).norm()<(autonomy && retain_goal ? 0.20 : 0.4)) return false;
+    if (!autonomy && !task_visited_stations_.empty() && domain.route.size()>1) {
       if (taskRouteProgress(domain.route,p) <
           taskRouteProgress(domain.route,task_visited_stations_.back()) - 0.1)
         return false;
     }
     for(const auto& rejected:task_rejected_stations_) if((p-rejected).norm()<0.35) return false;
-    for(const auto& visited:task_visited_stations_) if((p-visited).norm()<0.35) return false;
+    if(!autonomy) for(const auto& visited:task_visited_stations_) if((p-visited).norm()<0.35) return false;
     return (p-domain.observation_center).norm()>domain.observation_radius || visible(p);
   };
   const auto cost=[&](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
     const double yaw=std::atan2(b.y()-a.y(),b.x()-a.x());
+    if(autonomy && clearance && snapshot) {
+      const int count=std::max(1,static_cast<int>(std::ceil((b-a).norm()/0.05)));
+      double sum=0;
+      for(int i=0;i<=count;++i) {
+        const auto p=a+(b-a)*(static_cast<double>(i)/count);
+        const double d=clearance->footprintDistance(p,yaw,snapshot->body_offset);
+        sum+=scan_planner::PlanarClearanceField::preferenceCost(d,preferred_clearance_margin_);
+      }
+      return (b-a).norm()*sum/(count+1)*50.0;
+    }
     double route_distance=std::numeric_limits<double>::infinity();
     for(size_t i=1;i<domain.route.size();++i)
       route_distance=std::min(route_distance,taskSegmentDistance(b,domain.route[i-1],domain.route[i]));
@@ -334,11 +418,24 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
     const bool narrow=footprintOccupiedWithMargin(map,{b.x(),b.y(),start_pt_.z()},yaw,preferred_clearance_margin_);
     return (b-a).norm()*(0.5*route_distance+(narrow ? 2.0 : 0.0));
   };
-  const auto candidates=selectLocalTaskCandidates(domain,start_pt_.head<2>(),preferred,
+  auto candidates=selectLocalTaskCandidates(domain,start_pt_.head<2>(),preferred,
       edge_safe,visible,0.2,std::min(4.0,std::max(1.0,reference_path_lookahead_)),1024,8,goal_allowed,
-      getOdomYaw(),cost);
+      getOdomYaw(),cost,autonomy && retain_goal ? &previous_goal : nullptr);
+  if (candidates.empty() && autonomy && retain_goal) {
+    // A target changes only if its current approach is genuinely infeasible,
+    // never just because the moving search lattice ranks a neighbour higher.
+    retain_goal=false;
+    candidates=selectLocalTaskCandidates(domain,start_pt_.head<2>(),preferred,
+        edge_safe,visible,0.2,std::min(4.0,std::max(1.0,reference_path_lookahead_)),1024,8,
+        goal_allowed,getOdomYaw(),cost);
+  }
+  RCLCPP_INFO(node_->get_logger(),
+      "[TASK_DEPARTURE_SEARCH] request=%llu heading=%.3f checked=%zu certified=%zu excluded=%zu candidates=%zu retained_goal=%d",
+      static_cast<unsigned long long>(active_reference_request_id_.load()),getOdomYaw(),
+      departure_checks,departure_certificates,task_rejected_departures_.size(),candidates.size(),retain_goal);
   if(candidates.empty()) {
-    if (footprintOccupiedWithMargin(map,start_pt_,getOdomYaw(),planning_clearance_margin_))
+    if (!certified_departure_available ||
+        footprintOccupiedWithMargin(map,start_pt_,getOdomYaw(),planning_clearance_margin_))
       observationTaskRejected("DEPARTURE_UNSAFE");
     else
       // An empty motion/visibility search does not prove the remote viewpoint
@@ -347,7 +444,8 @@ bool SCANReplanFSM::selectObservationTaskTarget() {
     return false;
   }
   const auto& selected=candidates.front();
-  const auto simple_approach=simplifyTaskApproach(selected.approach,edge_safe);
+  const auto simple_approach=simplifyTaskApproach(selected.approach,edge_safe,autonomy ? cost :
+      std::function<double(const Eigen::Vector2d&,const Eigen::Vector2d&)>{});
   for(const auto& point:simple_approach) task_approach_.push_back({point.x(),point.y(),start_pt_.z()});
   local_target_pt_={selected.goal.x(),selected.goal.y(),start_pt_.z()};
   task_station_=local_target_pt_;
@@ -372,16 +470,19 @@ void SCANReplanFSM::observationTaskRejected(const std::string& reason) {
                        reason == "NO_NEW_OBSERVATION_STATION";
   const bool path_failure = reason == "LOCAL_PATH_FAMILY_EXHAUSTED" ||
                             reason == "TASK_REFERENCE_NOT_ACTIVATABLE";
-  const bool departure_failure = path_failure && (task_departure_blocked_ ||
+  const bool departure_failure = reason == "DEPARTURE_UNSAFE" || (path_failure && (task_departure_blocked_ ||
       footprintOccupiedWithMargin(planner_manager_->grid_map_,odom_pos_,
-                                  getOdomYaw(),planning_clearance_margin_));
+                                  getOdomYaw(),planning_clearance_margin_)));
   const bool path_failed = path_failure && !departure_failure;
-  if (spatial)
+  const bool autonomy=observation_task_->local_geometry_autonomy;
+  if (spatial && !autonomy)
     publishFailureEvidence(task_terminal_request_,planner_manager_->local_data_.traj_id_,
         "OBSERVATION_LOCAL_PLANNING",reason,task_station_,static_cast<uint32_t>(replan_fail_count_),
         planning_clearance_margin_,ClearanceFailure::NONE,
         scan_planner_msgs::msg::FailureEvidence::SCOPE_VIEWPOINT);
-  publishObservationFeedback(spatial
+  publishObservationFeedback(autonomy
+      ? scan_planner_msgs::msg::ObservationFeedback::LOCAL_MOTION_EXHAUSTED
+      : spatial
       ? scan_planner_msgs::msg::ObservationFeedback::TASK_EXHAUSTED
       : (path_failed ? scan_planner_msgs::msg::ObservationFeedback::PATH_REJECTED
                      : scan_planner_msgs::msg::ObservationFeedback::EXECUTION_BLOCKED),
@@ -402,7 +503,8 @@ LocalTaskDomain SCANReplanFSM::observationTaskDomain() const {
   domain.observation_center={observation_task_->goal.x,observation_task_->goal.y};
   domain.corridor_radius=observation_task_->corridor_radius;
   domain.observation_radius=observation_task_->observation_radius;
-  domain.has_directional_gate=observation_task_->has_directional_gate;
+  domain.has_directional_gate=observation_task_->has_directional_gate &&
+      !observation_task_->local_geometry_autonomy;
   domain.gate_origin={observation_task_->gate_origin.x,observation_task_->gate_origin.y};
   domain.gate_direction={observation_task_->gate_direction.x,observation_task_->gate_direction.y};
   domain.gate_min_progress=observation_task_->gate_min_progress;

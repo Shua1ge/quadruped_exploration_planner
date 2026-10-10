@@ -152,6 +152,7 @@ namespace scan_planner
     std::vector<Eigen::Vector3d> reference_path_;
     bool task_mode_{false};
     bool task_departure_blocked_{false};
+    std::vector<double> task_rejected_departures_;
     scan_planner_msgs::msg::ObservationTask::ConstSharedPtr observation_task_;
     scan_planner_msgs::msg::ObservationTask::ConstSharedPtr deferred_task_;
     rclcpp::Subscription<scan_planner_msgs::msg::ObservationTask>::SharedPtr task_sub_;
@@ -172,6 +173,10 @@ namespace scan_planner
     std::vector<Eigen::Vector2d> task_rejected_stations_;
     std::vector<Eigen::Vector2d> task_visited_stations_;
     std::vector<Eigen::Vector3d> task_approach_;
+    std::vector<DirectedRoutePortal> task_route_portals_;
+    size_t task_route_cursor_{0};
+    Eigen::Vector2d task_route_last_position_{Eigen::Vector2d::Zero()};
+    bool task_route_position_valid_{false};
     LocalTaskDomain observationTaskDomain() const;
     uint32_t task_station_adjustments_{0};
     std::mutex execution_progress_budget_mutex_;

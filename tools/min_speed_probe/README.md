@@ -3,6 +3,83 @@
 在开阔平地(Gazebo Fortress)给一系列恒定前进指令,测每档是否产生持续位移、
 姿态是否稳定,确定 `parkour_moe_full_model.onnx` 的最低有效速度。
 
+## 新的 stateful Parkour MoE 策略（独立仿真测试入口）
+
+新策略不能直接交给旧四输入加载器。本目录新增 `probe_supervisor.py` 和
+`stateful_policy.py`，复用现有 supervisor 的站立校验、限矩和摔倒门控，仅替换
+推理接口。普通探索入口和旧模型默认值不变；这组脚本不需要重新 colcon build。
+
+此次暂时沿用现有 45 维观测/关节顺序、默认姿态、动作缩放 0.25、kp=40、kd=1。
+训练侧配置尚未提供，因此结果表示“新策略在现有合同假设下”的仿真表现。
+只跑盲走：一帧零深度、vision_flag=0。循环状态跨推理保存，零速/档间休息不清零。
+启动新 policy episode 才重置；不能为了站起来而放宽现有健康门限。
+
+默认 Actor 50 Hz，估计器每 5 个已处理的 Actor 拍刷新（约 10 Hz）。刷新拍调用新
+`parkour_moe_full_stateful.onnx`，得到动作、MCP 和新状态；中间拍使用压缩包中原始
+`actor.onnx`、缓存 MCP 和最新观测。没有把整个策略降到 10 Hz。
+`--refresh-every 5` 是 use.txt 提示的暂定值；训练侧节拍确认前不是已认证配置。
+
+为避免混到正在运行的探索，下面每个终端都使用独立的域与 Gazebo partition：
+
+```bash
+source /home/t1an/ros2_ws/scan_planner_ws/install/setup.bash
+export ROS_DOMAIN_ID=44
+export IGN_PARTITION=parkour_moe_probe_44
+```
+
+终端 1 启动独立平地物理仿真（不启动 SCAN、Explorer 或 closed_loop_controller）：
+
+```bash
+ros2 launch go2_description go2_sim.launch.py \
+  world:=/home/t1an/ros2_ws/scan_planner_ws/src/SCAN-Planner/tools/min_speed_probe/flat_ground.sdf \
+  locomotion_mode:=rl_effort headless:=false
+```
+
+终端 2 启动新策略测试 supervisor：
+
+```bash
+python3 /home/t1an/ros2_ws/scan_planner_ws/src/SCAN-Planner/tools/min_speed_probe/probe_supervisor.py \
+  --model /home/t1an/文档/Codex/2026-10-09/new-chat/parkour_moe_onnx_20261010/parkour_moe_full_stateful.onnx \
+  --archive /home/t1an/文档/xwechat_files/wxid_kzl51q4s1y6s22_7a9f/msg/file/2026-10/policies.zip \
+  --refresh-every 5
+```
+
+终端 3 在关节、IMU 和 odometry 初始化后开启策略；服务若返回初始化未完成，稍后再调用。
+“允许起身”发生在站立验证之前，不要等 STAND_VERIFIED 后才开服务：
+
+```bash
+ros2 service call /robot/enter_navigation std_srvs/srv/Trigger '{}'
+```
+
+先跑单档冒烟，探针会等 actuation_ready，60 秒内没有通过验证则中止，不生成假的零速档：
+
+```bash
+python3 /home/t1an/ros2_ws/scan_planner_ws/src/SCAN-Planner/tools/min_speed_probe/probe_run.py \
+  --use-sim-time --require-actuation-ready --wait-timeout 60 \
+  --levels 0.30 --drive 10 --out /tmp/new_policy_smoke.csv
+```
+
+确认单档没有摔倒/持续摇摆后再扫档。这里的 0.30 仅为测试命令，不是沿用旧策略的速度下限：
+
+```bash
+python3 /home/t1an/ros2_ws/scan_planner_ws/src/SCAN-Planner/tools/min_speed_probe/probe_run.py \
+  --use-sim-time --require-actuation-ready \
+  --levels 0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.50,0.60 \
+  --drive 10 --out /tmp/new_policy_min_speed.csv
+python3 /home/t1an/ros2_ws/scan_planner_ws/src/SCAN-Planner/tools/min_speed_probe/probe_analyze.py \
+  /tmp/new_policy_min_speed.csv --metrics-out /tmp/new_policy_min_speed_metrics.csv
+```
+
+`--use-sim-time` 让档位时长和速度统计都按 Gazebo /clock 计算。旧测试默认用真实时间，
+如果仿真实时因子不足 1，会把仿真运行慢混进策略速度；旧 0.30 阈值应按同样时间口径重测。
+`--require-actuation-ready` 防止“机身高度够了、控制器还没放行”被误判为策略死区。
+回调由单调真实时钟唤醒，避免 /clock 暂停时连健康/启动超时检查也一起暂停；采样时间仍取仿真时间。
+原命令未加这两个参数时保持原行为，便于对照。
+
+测试结束分别 Ctrl+C 探针、测试 supervisor、仿真 launch，不使用批量 pkill。
+若在新策略下站立验证无法通过，先记录日志和姿态；它是接入合同/零速稳定性问题，
+不是“某个 vx 档不够大”。
+
 ## 命令通路(全部已在代码中核实)
 
 - **策略运行时是 `go2_locomotion_supervisor.py`**(内嵌 `go2_onnx_50hz` 推理

@@ -1,6 +1,7 @@
 """Spawn Go2 in Gazebo Fortress with gz_ros2_control."""
 
 import os
+import shlex
 import time
 import xml.etree.ElementTree as ET
 
@@ -8,7 +9,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
-    IncludeLaunchDescription,
+    Shutdown,
     LogInfo,
     OpaqueFunction,
     RegisterEventHandler,
@@ -17,7 +18,6 @@ from launch.actions import (
 )
 from launch.conditions import UnlessCondition
 from launch.event_handlers import OnProcessExit
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
     EnvironmentVariable,
@@ -57,7 +57,7 @@ def _resume_after_controller(event, context):
     if event.returncode != 0:
         return [LogInfo(msg=(
             "Controllers failed to activate; Gazebo remains paused."
-        ))]
+        )), Shutdown(reason="controller activation failed")]
 
     # The activation helper advances the world in bounded batches while the
     # controller switch request is pending and leaves it paused afterwards.
@@ -77,7 +77,7 @@ def _start_trajectory_after_broadcaster(event, _context, trajectory_controller):
     if event.returncode != 0:
         return [LogInfo(msg=(
             "joint_state_broadcaster failed to configure; Gazebo remains paused."
-        ))]
+        )), Shutdown(reason="joint state broadcaster configuration failed")]
     return [trajectory_controller]
 
 
@@ -90,7 +90,8 @@ def _resume_after_spawn(event, context):
     because that mode loads no gz_ros2_control plugin at all.
     """
     if event.returncode != 0:
-        return [LogInfo(msg="robot spawn failed; Gazebo remains paused")]
+        return [LogInfo(msg="robot spawn failed; Gazebo remains paused"),
+                Shutdown(reason="robot spawn failed")]
     if LaunchConfiguration("locomotion_mode").perform(context) != "planning_kinematic":
         return []
     world_file = LaunchConfiguration("world").perform(context)
@@ -107,23 +108,21 @@ def _activate_controllers_after_load(event, _context, activate_controllers):
     if event.returncode != 0:
         return [LogInfo(msg=(
             "command controller failed to configure; Gazebo remains paused."
-        ))]
+        )), Shutdown(reason="command controller configuration failed")]
 
     return [activate_controllers]
 
 
-def _await_state_publisher(_context):
-    """Wait for robot_state_publisher to be discoverable before spawning.
+def _await_state_publisher(_context, spawn):
+    """Gate creation on a real URDF service response, not node discovery.
 
-    gz_ros2_control fetches the URDF once, through the parameter service of
-    ``robot_state_publisher``.  There is no retry: if that single call is
-    issued before DDS discovery settles, the response times out
-    ("failed to send response to .../get_parameters"), controller_manager is
-    never created, and the controller spawners then fail after their full
-    timeout.  Heavy worlds such as NewMine make that race much more likely.
+    This cannot guarantee a later plugin RPC succeeds. Controller startup has
+    its own deadline and failure shuts down the launch rather than leaving a
+    paused world with a half-created robot.
     """
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
+    from rcl_interfaces.srv import GetParameters
 
     ros_context = rclpy.Context()
     # Do not let rclpy parse the parent launch arguments (for example
@@ -133,34 +132,79 @@ def _await_state_publisher(_context):
         f"go2_sim_preflight_{os.getpid()}", context=ros_context)
     executor = SingleThreadedExecutor(context=ros_context)
     executor.add_node(node)
+    client = node.create_client(GetParameters, "/robot_state_publisher/get_parameters")
     try:
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
+            if not client.wait_for_service(timeout_sec=0.2):
+                continue
+            request = GetParameters.Request()
+            request.names = ["robot_description"]
+            future = client.call_async(request)
+            attempt_deadline = min(deadline, time.monotonic() + 2.0)
+            while not future.done() and time.monotonic() < attempt_deadline:
+                executor.spin_once(timeout_sec=0.1)
+            if not future.done():
+                client.remove_pending_request(future)
+                future.cancel()
+                continue
+            response = future.result()
+            if response and response.values:
+                try:
+                    root = ET.fromstring(response.values[0].string_value)
+                    if root.tag == "robot" and root.find("link") is not None:
+                        node.get_logger().info(
+                            "[ROBOT_DESCRIPTION_READY] URDF parameter round-trip verified; spawning Go2")
+                        return [spawn]
+                except ET.ParseError:
+                    pass
             executor.spin_once(timeout_sec=0.1)
-            names = {name for name, _namespace in node.get_node_names_and_namespaces()}
-            if "robot_state_publisher" in names:
-                break
         else:
-            raise RuntimeError(
-                "robot_state_publisher was not discoverable within 20s; refusing "
-                "to spawn the robot because gz_ros2_control would fail to fetch "
-                "the URDF and no controller_manager would be created")
+            return [Shutdown(reason="robot_description service did not return a valid URDF within 20s")]
     finally:
         executor.remove_node(node)
         executor.shutdown()
         node.destroy_node()
         rclpy.shutdown(context=ros_context)
-    return []
+
+
+def _gazebo_process(context, server_args, world):
+    """Avoid ros_gz_sim's shell wrapper: launch must own the server PID."""
+    plugin_path = os.pathsep.join(filter(None, [
+        os.environ.get("IGN_GAZEBO_SYSTEM_PLUGIN_PATH", ""),
+        os.environ.get("LD_LIBRARY_PATH", ""),
+    ]))
+    return [ExecuteProcess(
+        cmd=["ign", "gazebo", *shlex.split(server_args.perform(context)),
+             world.perform(context), "--force-version", "6"],
+        shell=False, output="screen",
+        additional_env={"IGN_GAZEBO_SYSTEM_PLUGIN_PATH": plugin_path},
+        on_exit=Shutdown(reason="Gazebo server exited"),
+    )]
 
 
 def generate_launch_description():
+    startup = {"ready": False}
+
+    def resume_controller(event, context):
+        startup["ready"] = event.returncode == 0
+        return _resume_after_controller(event, context)
+
+    def resume_spawn(event, context):
+        if event.returncode == 0 and LaunchConfiguration("locomotion_mode").perform(context) == "planning_kinematic":
+            startup["ready"] = True
+        return _resume_after_spawn(event, context)
+
+    def startup_deadline(_context):
+        return [] if startup["ready"] else [Shutdown(
+            reason="Go2 startup exceeded 90s (spawn / controller initialization); shutting down all launch processes")]
+
     # xacro package:// URIs are converted by Gazebo to
     # model://go2_description/..., so Gazebo must search the parent of this
     # package's share directory.  Without this, the robot is spawned but its
     # DAE visual meshes cannot be rendered.
     default_resource_root = os.path.dirname(get_package_share_directory("go2_description"))
     description_share = FindPackageShare("go2_description")
-    ros_gz_share = FindPackageShare("ros_gz_sim")
     model = PathJoinSubstitution([description_share, "xacro", "robot.xacro"])
     world = LaunchConfiguration("world")
     # Start the server and GUI as separate Gazebo processes.  The combined
@@ -195,25 +239,11 @@ def generate_launch_description():
         "use_sim_time": True,
     }
 
-    gazebo_server = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([ros_gz_share, "launch", "gz_sim.launch.py"])
-        ),
-        launch_arguments={
-            "gz_args": [server_args, world],
-            "on_exit_shutdown": "true",
-        }.items(),
-    )
-    gazebo_gui = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([ros_gz_share, "launch", "gz_sim.launch.py"])
-        ),
+    gazebo_server = OpaqueFunction(function=_gazebo_process, args=[server_args, world])
+    gazebo_gui = ExecuteProcess(
+        cmd=["ign", "gazebo", "-g", "-v", "3", "--force-version", "6"],
+        shell=False, output="screen",
         condition=UnlessCondition(LaunchConfiguration("headless")),
-        launch_arguments={
-            "gz_args": "-g -v 3",
-            # Closing the GUI must not kill the physics server and planner.
-            "on_exit_shutdown": "false",
-        }.items(),
     )
     state_publisher = Node(
         package="robot_state_publisher",
@@ -288,13 +318,13 @@ def generate_launch_description():
     start_controllers = RegisterEventHandler(
         OnProcessExit(
             target_action=spawn,
-            on_exit=[joint_state_broadcaster],
+            on_exit=lambda event, context: [joint_state_broadcaster] if event.returncode == 0 else [],
         )
     )
     resume_after_spawn = RegisterEventHandler(
         OnProcessExit(
             target_action=spawn,
-            on_exit=_resume_after_spawn,
+            on_exit=resume_spawn,
         )
     )
     start_command_controller = RegisterEventHandler(
@@ -314,7 +344,7 @@ def generate_launch_description():
     resume_physics = RegisterEventHandler(
         OnProcessExit(
             target_action=activate_controllers,
-            on_exit=_resume_after_controller,
+            on_exit=resume_controller,
         )
     )
     bridge = Node(
@@ -357,13 +387,13 @@ def generate_launch_description():
             # would run before that process exists and could never succeed.
             TimerAction(
                 period=2.0,
-                actions=[OpaqueFunction(function=_await_state_publisher)],
+                actions=[OpaqueFunction(function=_await_state_publisher, args=[spawn])],
             ),
-            spawn,
             start_controllers,
             resume_after_spawn,
             start_command_controller,
             activate_after_load,
             resume_physics,
+            TimerAction(period=90.0, actions=[OpaqueFunction(function=startup_deadline)]),
         ]
     )

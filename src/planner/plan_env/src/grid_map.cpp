@@ -132,11 +132,8 @@ thread_local const GridMap* GridMap::tls_clearance_owner_ = nullptr;
 thread_local double GridMap::tls_planning_clearance_margin_ = 0.0;
 thread_local std::vector<Eigen::Vector2d> GridMap::tls_clearance_offsets_;
 
-int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
-    const Eigen::Vector3d& pos, double yaw,
-    const std::vector<Eigen::Vector2d>& clearance_offsets) const
+int GridMap::InflatedOccupancySnapshot::getCylinderOccupancy(const Eigen::Vector3d& point) const
 {
-  auto query = [this](const Eigen::Vector3d& point) {
     Eigen::Vector3i id;
     for (int dim = 0; dim < 3; ++dim)
       id(dim) = static_cast<int>(std::floor(point(dim) * resolution_inv));
@@ -154,19 +151,51 @@ int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
     const int address = local(0) * voxel_num(1) * voxel_num(2) +
                         local(1) * voxel_num(2) + local(2);
     return static_cast<int>(buffer[address]);
-  };
+}
 
-  const auto query_with_margin = [&query, &clearance_offsets](
-      const Eigen::Vector3d& center) {
-    if (clearance_offsets.empty())
-      return query(center);
-    for (const Eigen::Vector2d &offset : clearance_offsets)
-    {
-      Eigen::Vector3d sample = center;
-      sample.head<2>() += offset;
-      const int occupancy = query(sample);
-      if (occupancy != 0)
-        return occupancy;
+std::shared_ptr<const scan_planner::PlanarClearanceField>
+GridMap::InflatedOccupancySnapshot::planarClearance(double z) const
+{
+  if (!std::isfinite(z) || resolution_inv<=0 ||
+      (bound_max.array()<bound_min.array()).any()) return {};
+  const int slice=static_cast<int>(std::floor(z*resolution_inv));
+  if(slice<bound_min.z() || slice>bound_max.z()) return {};
+  std::lock_guard<std::mutex> lock(clearance_mutex);
+  const auto found=clearance_slices.find(slice);
+  if(found!=clearance_slices.end()) return found->second;
+  const double resolution=1.0/resolution_inv;
+  const Eigen::Vector2d origin=(bound_min.head<2>().cast<double>()-Eigen::Vector2d::Ones())*resolution;
+  auto field=std::make_shared<scan_planner::PlanarClearanceField>(
+      bound_max.x()-bound_min.x()+3,bound_max.y()-bound_min.y()+3,resolution,origin,
+      [&](int x,int y) {
+        const Eigen::Vector2d p=origin+resolution*Eigen::Vector2d(x+0.5,y+0.5);
+        return getCylinderOccupancy({p.x(),p.y(),(slice+0.5)*resolution})==0;
+      });
+  // Bound memory when the body moves across many vertical slices.
+  if(clearance_slices.size()>=3) clearance_slices.erase(clearance_slices.begin());
+  clearance_slices.emplace(slice,field);
+  return field;
+}
+
+std::shared_ptr<const scan_planner::PlanarClearanceField>
+GridMap::capturePlanarClearance(double z) const
+{
+  const auto snapshot=(tls_snapshot_owner_==this && tls_snapshot_)
+      ? tls_snapshot_ : captureInflatedOccupancySnapshot();
+  return snapshot ? snapshot->planarClearance(z) : nullptr;
+}
+
+int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
+    const Eigen::Vector3d& pos, double yaw,
+    const std::vector<Eigen::Vector2d>& clearance_offsets) const
+{
+  auto query=[this](const Eigen::Vector3d& point) {return getCylinderOccupancy(point);};
+  const auto query_with_margin = [&query, &clearance_offsets](const Eigen::Vector3d& center) {
+    if(clearance_offsets.empty()) return query(center);
+    for(const auto& offset:clearance_offsets) {
+      Eigen::Vector3d sample=center; sample.head<2>()+=offset;
+      const int occupancy=query(sample);
+      if(occupancy!=0) return occupancy;
     }
     return 0;
   };

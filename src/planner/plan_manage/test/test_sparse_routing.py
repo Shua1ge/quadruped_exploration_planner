@@ -74,6 +74,10 @@ def test_graph_route_preserves_each_edge_polyline_and_connectors():
     assert result.polyline == (
         (-0.1, 0.0), (0.0, 0.0), (0.0, 1.0),
         (0.0, 2.0), (1.0, 2.0), (2.0, 2.0), (2.1, 2.0))
+    assert result.graph_revision==1
+    assert result.connections==((11,1,2),(12,2,3))
+    reverse=graph.batch_estimates((2.1,2.0),[(-.1,0.0)],.25)[0]
+    assert reverse.connections==((12,3,2),(11,2,1))
 
 
 def test_batch_query_returns_connected_targets_and_rejects_disconnected_one():

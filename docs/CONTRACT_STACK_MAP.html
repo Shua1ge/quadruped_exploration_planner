@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SCAN-Planner 契约栈 · Explorer/Global/Local 链路 v3.3</title>
+<style>
+:root{--bg:#f6f6f4;--card:#fff;--line:#e3e3e0;--ink:#1c1c1c;--muted:#6b6b6b;--accent:#0f62fe;
+--ok:#198038;--draft:#ef6c00;--todo:#8a8a8a;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box} html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--ink);font:14px/1.55 system-ui,-apple-system,"Segoe UI","Noto Sans SC",sans-serif;display:flex;flex-direction:column;height:100vh}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+header h1{font-size:15px;margin:0;font-weight:600}
+.chip{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:2px 7px;background:var(--bg)}
+.chip b{color:var(--ink)}
+.tabs{display:flex;gap:4px;margin-left:auto}
+.tabs button{border:1px solid var(--line);background:var(--bg);padding:5px 14px;border-radius:6px;cursor:pointer;font-size:13px;color:var(--muted)}
+.tabs button[aria-selected="true"]{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+main{flex:1;display:flex;min-height:0}
+#view{flex:1;overflow:auto;padding:14px 18px}
+#drawer{width:0;transition:width .18s ease;overflow:hidden;background:var(--card);border-left:1px solid var(--line);flex-shrink:0}
+#drawer.open{width:440px}
+#drawer .inner{width:440px;padding:16px;overflow-y:auto;height:100%}
+#drawer h2{font-size:15px;margin:2px 0 10px}
+#drawer .close{float:right;border:none;background:none;font-size:16px;cursor:pointer;color:var(--muted)}
+.kv{font-size:12px;color:var(--muted);margin:2px 0}
+.kv b{color:var(--ink)}
+.sec{font-size:11px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;margin:14px 0 4px}
+ul.tight{margin:4px 0;padding-left:18px} ul.tight li{margin:3px 0;font-size:13px}
+.badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;margin-right:4px;color:#fff}
+.st-已实现{background:var(--ok)} .st-草案{background:var(--draft)} .st-待填{background:var(--todo)}
+.tag{font-family:var(--mono);font-size:11px;color:var(--accent)}
+.corner{cursor:pointer}
+.corner rect{fill:var(--card);stroke:var(--line);stroke-width:1.4;rx:10}
+.corner.sel rect{stroke:var(--accent);stroke-width:2.2}
+.corner:hover rect{stroke:#9a9a9a}
+.corner text{font-size:14px;fill:var(--ink);font-weight:700;pointer-events:none}
+.corner .sub{font-size:11px;fill:var(--muted);font-weight:400}
+.corner .hint{font-size:10px;fill:var(--accent);font-weight:400}
+.pedge{fill:none;stroke:#c9c9c4;stroke-width:1.4}
+.pedge.sel{stroke:var(--accent);stroke-width:2}
+.plabel{font-size:10.5px;fill:#5a5a5a;paint-order:stroke;stroke:var(--bg);stroke-width:3px;cursor:pointer}
+.plabel.sel{fill:var(--accent);font-weight:700}
+.crumb{display:flex;gap:6px;align-items:center;font-size:12.5px;color:var(--muted);margin-bottom:10px;flex-wrap:wrap}
+.crumb a{color:var(--accent);cursor:pointer;text-decoration:none}
+.specsec{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:10px 13px;margin:8px 0;cursor:pointer}
+.specsec:hover{border-color:#9a9a9a}
+.specsec.todo{border-style:dashed;background:var(--bg)}
+.specsec .st{font-weight:600;font-size:13.5px}
+.specsec .sb{font-size:12.5px;color:var(--ink);margin-top:3px;white-space:pre-line}
+.specsec .sr{font-size:11px;color:var(--muted);margin-top:3px}
+.ladder{width:100%;border-collapse:collapse;font-size:13px;background:var(--card)}
+.ladder th,.ladder td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+.ladder th{background:#ececf8;font-weight:600}
+.principle{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:10px 13px;margin:8px 0}
+.principle .pn{font-weight:600;font-size:13.5px}
+.principle .pb{font-size:12.5px;color:var(--ink);margin-top:3px}
+.note{font-size:12px;color:var(--muted);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 11px;margin:10px 0}
+.empty{color:var(--muted);text-align:center;padding:30px 0}
+@media(max-width:900px){#drawer.open{width:100%;position:absolute;right:0;top:0;bottom:0;z-index:5;box-shadow:-4px 0 16px rgba(0,0,0,.12)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>SCAN-Planner 契约栈 · v3.3 链路</h1>
+  <span class="chip">配套规格 <b>CONTRACT_STACK_SPEC_ZH.txt</b></span>
+  <span class="chip">@2026-10-07 · 设计稿 v3.3 · 协议收束中</span>
+  <nav class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-v="triangle">契约三角</button>
+    <button role="tab" aria-selected="false" data-v="ladder">权威阶梯</button>
+    <button role="tab" aria-selected="false" data-v="specs">规格与待填</button>
+    <button role="tab" aria-selected="false" data-v="decisions">设计原则与决策</button>
+  </nav>
+</header>
+<main>
+  <div id="view" tabindex="-1"></div>
+  <aside id="drawer" aria-label="详情"><div class="inner" id="drawer-body"></div></aside>
+</main>
+<script>
+const DATA = {
+ "meta": {"branch": "codex/observation-task-local-planner-20261003 @ 649d868", "date": "2026-10-07", "version": "v3.4",
+          "spec": "docs/CONTRACT_STACK_SPEC_ZH.txt", "note": "本页与规格 txt 逐节对应;待填槽位=需要实验数字或外部输入的设计点"},
+ "corners": {
+  "explorer": {"name": "Explorer — 度量与决策", "color": "#0f62fe",
+   "tagline": "记忆与意志:度量层 + 结构副本 + 进度解释",
+   "definition": "系统的记忆与意志层——拥有度量层(积累的判断:哪里能走、哪里没看、任务完成没有)与结构副本(命名地址),独占任务进度解释权;把意志(承诺)与经验(失败)附着到结构 ID 上。",
+   "owns": ["度量层:0.2m 证据栅格 + chunk(D1 后)","结构副本+承诺视图(子树展开)","进度解释器(事实流唯一消费)","任务/失败/冷却记忆","决策拍流水线(0.25s·revision 门控)"],
+   "not_owns": ["身份颁发(Global Registry)","渔网权威(Global)","执行方式与安全反射(Local)","长程几何记忆的 LIO 本体"],
+   "specs": ["M1","M2","M3","M4","M5","M6"],
+   "todos": ["region churn 基线数字(开阔场景)","走廊域参数 R","兄弟摘要刷新策略"],
+   "spec_sec": "2.1 + 3.1 + 5", "spec_note": "同图两读(规划+完成度)合法;对账只发生在两结构答同一问"},
+  "global": {"name": "Global — 结构与身份", "color": "#007d79",
+   "tagline": "命名与连接:渔网权威 + 身份注册",
+   "definition": "系统的命名与连接层——拥有渔网权威(增量波前网格:风险/舱室/分支)与身份注册(BranchRegistry 四事件),独占结构身份;不做规划、不做意志。",
+   "owns": ["渔网权威(增量波前网格,TRG 同向)","BranchRegistry(extend/split/merge/vanish)","锚点(起点原点+量化参数)","delta/snapshot 分发","失败证据的图级固化"],
+   "not_owns": ["任务意志(Explorer)","度量证据(Explorer)","执行方式与安全反射(Local)"],
+   "specs": ["G1","G2","G3","G4","G5"],
+   "todos": ["merge 事件规则细节(环路闭合 lineage 统一)","网格分层管理(大尺度稀疏化,TRG 同向)","掐点处网格密度策略","多机器人身份上收(方案 B 触发=第二消费者)"],
+   "spec_sec": "2.2 + 3.2", "spec_note": "区域=掐点舱室;门户=窄喉;身份锚在稳定几何特征+迟滞"},
+  "local": {"name": "Local — 执行与反射", "color": "#ba4e00",
+   "tagline": "行动与反射:执行窗口 + 优化器 + 安全反射",
+   "definition": "系统的行动与反射层——拥有执行窗口(0.05m 三维滑窗)、优化器、安全反射(制动扫掠/硬停),独占执行方式与安全停车;发布纯事实流(无语义)。",
+   "owns": ["执行窗口(0.05m 三维滑窗,即用即丢)","B 样条优化器(A* 重连+软走廊)","安全反射(制动扫掠/硬停,不经全局)","STOPPING 状态[草案]","事实流发布(10Hz 纯事实)"],
+   "not_owns": ["任务进度解释(Explorer)","结构身份(Global)","长程记忆(度量层/渔网)"],
+   "specs": ["L1","L2","L3","L4","L5"],
+   "todos": ["stop-probe 标定(真实制动延迟/减速度/瞬态)","前瞻小图规格(轨迹级风险候选,可选)","轨迹级 vs 路线级风险候选的分工验证"],
+   "spec_sec": "2.3 + 3.3 + 6", "spec_note": "停止三缺陷已诊断并核验: 缺陷1 死区穿越成立(修法收窄)、缺陷2 已有防护(soft_hold :321)、缺陷3 收窄——详见规格第 6 节"}
+ },
+ "protocols": [
+  {"id": "P1", "label": "任务下发", "from": "explorer", "to": "local",
+   "fromName": "Explorer", "toName": "Local",
+   "carrier": "/observation_task(task_mode) | /initial_path(兼容)",
+   "fields": ["task_id / task_version", "region/branch 引用", "coarse_route(粗路线提示)", "corridor_radius / observation_radius", "剩余 target_cells(过滤后)", "建议站位(非必须目标)"],
+   "discipline": "单号挂起(一单在飞);5s 超时自救;超时自救不触碰承诺(A7 修复后语义)。",
+   "note": "task_mode 主模式化后为唯一探索通道;initial_path 保留兼容模式。"},
+  {"id": "P2", "label": "执行事实流", "from": "local", "to": "explorer",
+   "fromName": "Local", "toName": "Explorer",
+   "carrier": "ExecutionState 扩展(0.1s 节流,已含四 ID)——【不新增话题】",
+   "fields": ["现有: request_id/task_id/task_version/trajectory_id/state/execution_time/duration/terminal_error/reason",
+              "扩展: blocked_segments[]", "扩展: braking{eta_s, dist_m} [待填 stop-probe]",
+              "扩展: STATE_STOPPING / STATE_STOPPED 枚举"],
+   "discipline": "汇总原则(v3.3-a): 执行协调组件=对外状态唯一汇总出口,Controller/Local 各自拥有自己的结果,汇总不重新裁决;唯一来源优先于'不新增话题'。三级裁决: Controller 宣布候选装载结果(ACCEPTED/REJECTED,ACK 事务,不证明运动完成)与已装载轨迹的执行结果;Local 宣布运动尝试 EXHAUSTED;Explorer 宣布观测任务 SATISFIED。运动状态(STOPPING/STOPPED)与对象终局是正交维度,不塞单一枚举。终局保留到消费确认或同一对象替代/失效,缓冲满载→活动对象常驻+缺口事件+快照重对齐(v3.3-b)。",
+   "note": "禁令: Explorer 不得用 exec_time/duration/endpoint_error 复刻到站判断;Local 不得用运动结果代替观测完成(D-10)。"},
+  {"id": "P3", "label": "结构喂入", "from": "local", "to": "global",
+   "fromName": "Local", "toName": "Global",
+   "carrier": "/grid_map/local_map_patch 0.5s",
+   "fields": ["0.2m 占据切片", "map_revision"],
+   "discipline": "渔网唯一原料;patch 不携带任何身份/语义。",
+   "note": "Local 的 GridMap 同时是渔网的上游——走过=看到的主通道。"},
+  {"id": "P4", "label": "结构分发", "from": "global", "to": "explorer",
+   "fromName": "Global", "toName": "Explorer",
+   "carrier": "topology_delta / topology_snapshot",
+   "fields": ["节点/边增删改", "branch_id / region 属性", "谱系事件(草案)"],
+   "discipline": "Explorer 副本纯消费,不推断身份;snapshot 携带注册表用于重启恢复。",
+   "note": "身份权威在 Global(生产侧);方案 B 触发=出现第二个身份消费者。"},
+ ],
+ "ladder": [
+  {"q": "观测任务(到没到/完成没/换不换)", "who": "Explorer 独占", "struct": "观测生命周期(observation_lifecycle)+ 完成度判定(度量层读数)", "loc": "frontier_explorer.py:1958+;observation_lifecycle.py", "violation": "Local 用运动结果代替观测完成;Explorer 用 exec_time 复刻到站判断(v3 已撤销)"},
+  {"q": "运动尝试(候选穷尽/合同不适用)", "who": "Local 独占", "struct": "统一验证+安全仲裁→EXHAUSTED", "loc": "scan_replan_fsm.cpp:2735+;closed_loop_controller.cpp:845", "violation": "Local 用运动结果代替观测完成(禁令)"},
+  {"q": "执行轨迹(装载/成功/拒绝)", "who": "Controller 独占", "struct": "版本化 ACK 事务→SUCCEEDED/REJECTED", "loc": "closed_loop_controller.cpp:210-473", "violation": "无(现状健康)"},
+  {"q": "区域可达性(受阻/不可观测)", "who": "Explorer 经证据分类", "struct": "拒绝分类(反证/过期/姿态/预算/合同)→同一转换入口", "loc": "规格 §5 v3.1-e", "violation": "分歧即 blocked 自动升级(已禁止)"},
+  {"q": "分支身份(这叫什么/谁连谁/split-merge)", "who": "Global Registry 独占", "struct": "BranchRegistry 四事件(独立于网格引擎先行)", "loc": "explorer_core/branch_registry.py [待写]", "violation": "IoU 匹配造身份(lineage 断链)"},
+ ],
+ "ladderOrder": "安全反射(Local,不经全局立即执行)> 任务进度解释(Explorer 独占)> 执行方式(Local 独占)> 结构身份(Global Registry 独占)。违例判定:任何状态转换必须能指出它的权威是谁;找不到权威的转换 = 设计缺陷(A7 实证)。",
+ "principles": [
+  {"n": "每图一问", "b": "每种维护中的表示回答一个不可归约的问题;能回答已有问题的是视图不是结构。实证:骨架/safe_region/渔网曾三答连通问题,收敛为一张网。"},
+  {"n": "每问一权威", "b": "冲突时按权威阶梯裁决;违例即设计缺陷。实证:A7(goal_timeout 不释放)就是超时没有归属权威。"},
+  {"n": "层间只走消息", "b": "三张图之间不存在直接读写;跨层数据走协议并先过权威归属检查。"},
+  {"n": "故意不同步的冗余", "b": "同一巷道三层三个投影(0.05m 瞬时/0.2s 持久/~1s 结构),时差是特性:执行要新鲜、决策要保守、身份要稳定。分歧 fail-closed,不做统一地图。"},
+  {"n": "事实流=ExecutionState 扩展", "b": "不新增话题;现有 0.1s 状态流已带四个 ID,缺的是字段与语义收敛(v3.1-a)。终局保留到消费确认或被更高权威覆盖,且保留有界(v3.2-d)——状态流只保证当前态,不保证终局可重放。"},
+  {"n": "承诺=区域工作集展开", "b": "承诺是结构操作(展开/收起子树),不是过滤器状态;'漏释放不可能'是验收条件不是设计承诺:终止原因全覆盖+测试后才可声明(v3.1-h)。"},
+  {"n": "失败证据有作用域", "b": "约束必须带来源、适用运动条件、撤销条件;一次起步失败不授权 Global 宣布整条分支不可通行(v3.2-c)。"},
+  {"n": "行为是主裁判", "b": "六项行为验收(B1a/B1b 后继提交延迟分段/B2 旧前缀存续(仍须安全)/B3 失败不传染/B4 等待有出口/B5 取消不复活(观察授权/命令/停车)/B6 副作用恰好一次)+ 三条端到端演练;过程展开见 docs/PROCESS_WALKTHROUGH_ZH.txt(v3.3 协议收敛载体)。"},
+  {"n": "唯一来源与汇总出口", "b": "每个字段/对象结果有唯一来源;'不新增话题'不是正确性标准。执行协调组件=唯一汇总出口,只归并不重新裁决;任务终局是 Explorer 持有的独立对象,不随图操作隐式改变(v3.3-a/e)。"},
+  {"n": "ID 不复用,对象可退役", "b": "身份锚在世界坐标,窗口滑动不丢;节点/分支可失活退役,保留谱系——'不朽'收窄为'ID 不复用'(v3.1-f)。"},
+  {"n": "证据锚世界坐标", "b": "失败证据本体=失败段+方向+工况+撤销条件;边 ID 是索引不是存在依据——结构重建按空间范围重挂接,不复制不扩大不丢失(v3.4-b)。"},
+  {"n": "keep-or-revert", "b": "每层假设=一次 A/B=一个 keep/revert 决定;baseline tag 是裁判。"},
+ ],
+ "decisions": [
+  {"id": "D-1", "title": "不做语义层", "body": "Hydra 的 Rooms/Objects 需要检测/分割,是另一问题域;本系统的层是纯结构层(区域/分支/站点/格),几何自动生成。"},
+  {"id": "D-2", "title": "不做统一地图", "body": "三张图的时差是特性(执行新鲜/决策保守/身份稳定);统一地图=重新引入层间对账。"},
+  {"id": "D-3", "title": "铁丝降为视图", "body": "脊线按需生成,不驻留;身份锚改在网格特征(掐点/岔口)。"},
+  {"id": "D-4", "title": "TRG 网格归结构层", "body": "渔网是累积结构,滚动窗搭不起来(实测判断);Local 只保留可选的前瞻小图。"},
+  {"id": "D-5", "title": "全局居中代价取消", "body": "Option B 下几何权威归局部。状态校准(v3.2-a): preferred-clearance 代价已存在(bspline_optimizer.cpp:1228);剩余工作=margin/权重标定+全局侧残留退役,不是新建代价。"},
+  {"id": "D-6", "title": "task_mode 主模式化", "body": "reference 模式降级 benchmark——消除 Local 双重身份。"},
+  {"id": "D-7", "title": "身份权威=Global 生产侧", "body": "拓扑权威架构下 branch 是系统级地址;方案 B 触发条件=出现第二个身份消费者。"},
+  {"id": "D-8", "title": "keep-or-revert 纪律", "body": "每层假设=一次 A/B=一个 keep/revert 决定;baseline tag 是裁判。"},
+  {"id": "D-9", "title": "外部基线黑盒化", "body": "LRAE/DARE/ARiADNE/TARE/TRG 只跑对照不拆内部;口径:cmd_vel 过同一 supervisor,min-command 两种口径都记录。"},
+  {"id": "D-10", "title": "事实流并入 ExecutionState", "body": "不新增 TrajectoryProgress 话题;现有 0.1s 状态流已带四个 ID,缺的是字段与语义收敛(v3.1-a)。"},
+  {"id": "D-11", "title": "异常退出合法化", "body": "强制返航/取消/健康故障/通道阻断与正常完成同为合法转换;不为了简化承诺而关闭异常出口(v3.1-f)。"},
+  {"id": "D-12", "title": "Registry 先于网格引擎", "body": "身份迁移 bug 与图提取 bug 必须可区分(v3.1-f);两者耦合实施会让失败归因不可能。"},
+  {"id": "D-13", "title": "观测来源标记 u64→u32", "body": "sensor_observed 存最后一次打中的 revision 而非布尔——完成判定要区分任务创建前/任务期间(比较 initial_sensor_revision);u32 上限约 34 年@4Hz,收窄零语义损失。逐格记录保留(Mid360 非重复扫描+遮挡)。现实现仍 u64,待改。"},
+  {"id": "D-14", "title": "执行失败结论不得代替几何证据", "body": "重规划不得直接改写 Global 空间连接结论;失败只产生有作用域的证据(锚世界坐标,边 ID 是索引)。验证失败携带的占据反证须经核验才进结构流程。网格细化=诊断后的表示修复(局部细查确认+预算+无改善记录),不是失败恢复通用解;细化不自动触发 split。"},
+ ],
+ "specs": [
+  {"id": "M1", "corner": "explorer", "cornerName": "Explorer", "title": "度量层(证据栅格)", "status": "已实现", "sec": "2.1",
+   "body": "0.2m 三态+证据栅格:融合(0.25s·revision 门控·向量化)+ frontier + 承诺目标格 + 完成度判定(同图两读)。",
+   "refs": "explorer_core/grid.py;perf 分支 599→1.4ms", "todos": ["chunk 化(D1)", "F1 z 摘要通道", "sensor_observed u64→u32(D-13)"]},
+  {"id": "M2", "corner": "explorer", "cornerName": "Explorer", "title": "决策拍流水线", "status": "已实现", "sec": "3.1a",
+   "body": "locomotion 门→在飞检查→观测完成仲裁(最高优先)→目标维护→choose_frontier→发布。", "refs": "frontier_explorer.py:2327-2507", "todos": []},
+  {"id": "M3", "corner": "explorer", "cornerName": "Explorer", "title": "承诺=区域工作集选择", "status": "草案", "sec": "5",
+   "body": "承诺选择区域工作集(拓扑是 DAG 非树,子树是派生视图);五类合法转换(完成/强制返航/取消/健康故障/通道阻断)全部经同一转换入口。收益降级为验收条件: 终止原因全覆盖+测试后,才可声明漏释放不可能。", "refs": "规格 §5", "todos": []},
+  {"id": "M4", "corner": "explorer", "cornerName": "Explorer", "title": "进度解释器(ExecutionState 扩展)", "status": "草案", "sec": "T1.5",
+   "body": "不新增话题: 扩展现有 ExecutionState(blocked_segments/braking/STOPPING 枚举);Explorer 解释器消费事实,唯一决定任务级语义;Explorer 不得复刻 Controller 的到站判断(D-10)。", "refs": "frontier_explorer.py:1958;closed_loop_controller.cpp:165", "todos": ["与 P2 字段对齐"]},
+  {"id": "M5", "corner": "explorer", "cornerName": "Explorer", "title": "兄弟摘要", "status": "草案", "sec": "5",
+   "body": "每区域残值(未解析未知格)每 revision 归组刷新,供释放后重选。", "refs": "frontier_regions.py", "todos": []},
+  {"id": "M6", "corner": "explorer", "cornerName": "Explorer", "title": "任务契约 G2", "status": "已实现", "sec": "4-P1",
+   "body": "ObservationTask:三 ID 分离/剩余边界过滤/站位建议;完成拥有 tick 最高优先。", "refs": "observation_task_bridge.py;observation_task_adapter.cpp", "todos": []},
+  {"id": "G1", "corner": "global", "cornerName": "Global", "title": "渔网权威(增量波前网格)", "status": "草案", "sec": "2.2",
+   "body": "累积拓扑图(已实现)→ 增量波前网格(草案):节点锚定不朽+风险/舱室属性;C++ 化(T5 最大单项)。", "refs": "global_representation_node.py;trg.cpp(思想参照)", "todos": ["波前生长/收缩/重连算法", "Jetson C++ 移植", "细化=表示修复: 局部细查+预算+无改善记录(v3.4-c)"]},
+  {"id": "G2", "corner": "global", "cornerName": "Global", "title": "BranchRegistry 四事件", "status": "草案", "sec": "2.2",
+   "body": "extend(ID 不变)/split(主孩子继承)/merge(lineage 统一)/vanish(迁移动);迟滞 3-确认。身份只随真实拓扑语义变化——数值细化不构成 split,不引起区域换名(v3.4-a)。", "refs": "frontier_regions.py:489(规则原型)", "todos": ["四事件状态机+单测(T5 核心)"]},
+  {"id": "G3", "corner": "global", "cornerName": "Global", "title": "身份锚点", "status": "草案", "sec": "2.2",
+   "body": "起点原点位姿+量化参数显式持有;重锚变换留接口。", "refs": "sparse_routing.py:87(现状:分量每 revision 重建)", "todos": []},
+  {"id": "G4", "corner": "global", "cornerName": "Global", "title": "delta/snapshot 扩展", "status": "草案", "sec": "4-P4",
+   "body": "TopoNode/Edge 加 branch_id;snapshot 携带注册表(重启恢复)。", "refs": "scan_planner_msgs/msg/", "todos": []},
+  {"id": "G5", "corner": "global", "cornerName": "Global", "title": "失败证据固化", "status": "已实现", "sec": "4-P2",
+   "body": "SCOPE_VIEWPOINT 固化为图级约束 overlay,抵抗地图刷新;request_id 幂等。", "refs": "global_representation_node.py:183", "todos": ["failed_object_id 换 branch ID(E1 后)"]},
+  {"id": "L1", "corner": "local", "cornerName": "Local", "title": "执行窗口(GridMap)", "status": "已实现", "sec": "2.3",
+   "body": "0.05m 三维滑窗:20Hz 融合+TLS 快照+膨胀;即用即丢是特性。", "refs": "plan_env/src/grid_map.cpp", "todos": []},
+  {"id": "L2", "corner": "local", "cornerName": "Local", "title": "优化器/终验/扫掠", "status": "已实现", "sec": "3.3",
+   "body": "callReboundReplan 链:种子注入→A* 重连→软走廊 L-BFGS→0.02s 终验→重定时→交接扫掠。", "refs": "scan_replan_fsm.cpp:4100;bspline_optimizer.cpp", "todos": []},
+  {"id": "L3", "corner": "local", "cornerName": "Local", "title": "STOPPING 三分状态", "status": "草案", "sec": "6",
+   "body": "STOPPING 期间: 计算下一任务✓/准备候选✓/授权执行✗(执行侧按实测状态决定);STOPPED 由实测速度/角速度/姿态确认,不由 ETA 到期。", "refs": "规格第 6 节", "todos": []},
+  {"id": "L4", "corner": "local", "cornerName": "Local", "title": "停止语义三修复", "status": "草案", "sec": "6",
+   "body": "①归零豁免限显式停止意图(普通减速不得穿越死区);②急停样条已有防护: 静止样条已转版本化 soft_hold(closed_loop_controller.cpp:321),重构必须保留;③停止默认零偏航(heading-alignment 除外)——缺陷3 收窄: soft-HOLD 已零平移零偏航。", "refs": "规格第 6 节", "todos": ["stop-probe 标定"]},
+  {"id": "L5", "corner": "local", "cornerName": "Local", "title": "F1 机体带检查", "status": "待填", "sec": "2.3",
+   "body": "足迹从单 z 圆盘→机体带检查(朝向矩形足印采样,RB-TRG 同向);合成坡道/坑洞实验定严重性。", "refs": "grid_map.h:484-521(现状)", "todos": ["合成实验", "严重性判定"]},
+  {"id": "L6", "corner": "local", "cornerName": "Local", "title": "前瞻小图(可选)", "status": "待填", "sec": "2.3",
+   "body": "轨迹级风险候选:4.5m 前瞻区从 GridMap+F1 临时建小图(即用即丢,非持久渔网)。", "refs": "规格第 2.3 节 D-4 备注", "todos": ["必要性验证"]},
+ ]
+};
+const $ = s => document.querySelector(s);
+const view = $('#view'), drawer = $('#drawer'), dbody = $('#drawer-body');
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const stBadge = st => `<span class="badge st-${st}">${st}</span>`;
+function openDrawer(html){dbody.innerHTML = `<button class="close" aria-label="关闭" onclick="closeDrawer()">✕</button>`+html;drawer.classList.add('open')}
+function closeDrawer(){drawer.classList.remove('open')}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer()});
+
+function openSpec(id){
+  const s = DATA.specs.find(x=>x.id===id); if(!s) return;
+  openDrawer(`<h2>${stBadge(s.status)} ${esc(s.title)}</h2>
+    <div class="kv">角色 <b>${esc(s.cornerName)}</b> · 规格节 ${esc(s.sec)}</div>
+    <div class="sec">正文</div><p style="font-size:13px;margin:4px 0;white-space:pre-line">${esc(s.body)}</p>
+    ${s.todos&&s.todos.length?`<div class="sec">待填</div><ul class="tight">${s.todos.map(t=>`<li>${esc(t)}</li>`).join('')}</ul>`:''}
+    ${s.refs?`<div class="sec">参照</div><div class="kv"><span class="tag">${esc(s.refs)}</span></div>`:''}`);
+}
+function selCorner(id){
+  const c = DATA.corners[id];
+  openDrawer(`<h2>${esc(c.name)}</h2>
+    <div class="kv">${esc(c.tagline)}</div>
+    <div class="sec">定义与权威</div><p style="font-size:13px;margin:4px 0">${esc(c.definition)}</p>
+    <div class="sec">拥有</div><ul class="tight">${c.owns.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+    <div class="sec">刻意不拥有(防越权)</div><ul class="tight">${c.not_owns.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+    <div class="sec">规格条目(点开看正文;⬜=待填)</div>
+    ${c.specs.map(sid=>{const s=DATA.specs.find(x=>x.id===sid);
+      return s?`<div class="specsec ${s.status==='待填'?'todo':''}" onclick="openSpec('${s.id}')">
+        <div class="st">${stBadge(s.status)} ${esc(s.title)}</div>
+        <div class="sb">${esc(s.body).slice(0,120)}${s.body.length>120?'…':''}</div></div>`:'<div class="kv">—</div>'}).join('')}
+    <div class="sec">完整叙事</div>
+    <div class="kv">CONTRACT_STACK_SPEC_ZH.txt 第 ${esc(c.spec_sec)} 节 · ${esc(c.spec_note)}</div>`);
+}
+function selProtocol(id){
+  const p = DATA.protocols.find(x=>x.id===id);
+  openDrawer(`<h2>${esc(p.id)} · ${esc(p.label)}</h2>
+    <div class="kv">${esc(p.fromName)} → ${esc(p.toName)} · ${esc(p.carrier)}</div>
+    <div class="sec">载荷字段</div><ul class="tight">${p.fields.map(f=>`<li><span class="tag">${esc(f)}</span></li>`).join('')}</ul>
+    <div class="sec">纪律</div><p style="font-size:13px;margin:4px 0">${esc(p.discipline)}</p>
+    <div class="sec">备注</div><p style="font-size:13px;margin:4px 0">${esc(p.note)}</p>`);
+}
+function renderTriangle(){
+  const C = DATA.corners, P = DATA.protocols;
+  const pos = {explorer:[440,70], global:[150,470], local:[730,470]};
+  let edges='',labels='',corners='';
+  const pathCfg = {
+    P1:{pts:[[600,130],[880,470]],bend:-40},
+    P2:{pts:[[880,530],[600,190]],bend:-40},
+    P3:{pts:[[730,530],[450,530]],bend:26},
+    P4:{pts:[[300,470],[470,190]],bend:-30},
+  };
+  for(const p of P){
+    const [x1,y1]=pathCfg[p.id].pts[0], [x2,y2]=pathCfg[p.id].pts[1];
+    const mx=(x1+x2)/2,my=(y1+y2)/2,dx=x2-x1,dy=y2-y1,len=Math.hypot(dx,dy)||1;
+    const nx=-dy/len,ny=dx/len,off=pathCfg[p.id].bend;
+    const cx=mx+nx*off,cy=my+ny*off;
+    edges+=`<path class="pedge" id="pe-${p.id}" d="M${x1},${y1} Q${cx},${cy} ${x2},${y2}"/>`;
+    labels+=`<text class="plabel" id="pl-${p.id}" x="${cx}" y="${cy}" text-anchor="middle" onclick="selProtocol('${p.id}')">${p.id} ${esc(p.label)} ›</text>`;
+  }
+  for(const id of ['explorer','global','local']){
+    const c=C[id],[x,y]=pos[id];
+    corners+=`<g class="corner" id="corner-${id}" onclick="selCorner('${id}')" tabindex="0" role="button" aria-label="${esc(c.name)}"
+      onkeydown="if(event.key==='Enter')selCorner('${id}')">
+      <rect x="${x}" y="${y}" width="300" height="130" rx="10"/>
+      <rect x="${x}" y="${y}" width="5" height="130" rx="2" fill="${c.color}"/>
+      <text x="${x+16}" y="${y+30}">${esc(c.name)}</text>
+      <text class="sub" x="${x+16}" y="${y+52}">${esc(c.tagline)}</text>
+      <text class="hint" x="${x+16}" y="${y+78}">▸ 点击:定义/权威/规格</text>
+      <text class="sub" x="${x+16}" y="${y+102}">拥有 ${c.owns.length} 项 · 规格 ${c.specs.length} 条 · 待填 ${c.todos.length}</text></g>`;
+  }
+  view.innerHTML = `<div style="position:relative">
+    <svg viewBox="0 0 1180 660" width="100%" style="max-width:1180px" role="img" aria-label="契约三角图">
+      ${edges}${labels}${corners}</svg></div>
+    <div class="note">三顶点 = 三个角色(各拥有图 1/2/3 之一);<b>边 = 四条跨层协议</b>(点击看载荷字段与纪律)。
+    角色间的权威裁决见「权威阶梯」tab。本页与 CONTRACT_STACK_SPEC_ZH.txt 逐节对应。</div>`;
+}
+function renderLadder(){
+  view.innerHTML = `<div class="sec">五个不可归约的问题 → 五个权威(违反即产生对账协议)</div>
+    <table class="ladder"><tr><th style="width:34%">问题</th><th style="width:22%">权威</th><th>结构与位置</th><th>违例实证</th></tr>
+    ${DATA.ladder.map(r=>`<tr><td><b>${esc(r.q)}</b></td><td>${esc(r.who)}</td><td>${esc(r.struct)}<br><span class="tag">${esc(r.loc)}</span></td><td>${esc(r.violation)}</td></tr>`).join('')}
+    </table>
+    <div class="sec">裁决顺序</div>
+    <p style="font-size:13px;margin:4px 0">${esc(DATA.ladderOrder)}</p>
+    <div class="note">判定规则:任何一个状态转换,必须能指出它的权威是谁;找不到权威的转换 = 设计缺陷(实证:A7)。</div>`;
+}
+let specFilter = 'all';
+function renderSpecs(){
+  const fs = DATA.specs.filter(s=>(specFilter==='all'||s.status===specFilter));
+  view.innerHTML = `<div class="fchips" role="group" aria-label="状态过滤" style="display:flex;gap:6px;margin-bottom:10px">
+      ${['all','已实现','草案','待填'].map(s=>`<button aria-pressed="${specFilter===s}" onclick="setSpecFilter('${s}')" style="border:1px solid var(--line);background:var(--card);border-radius:14px;padding:3px 12px;font-size:12px;cursor:pointer">${s==='all'?'全部':s}</button>`).join('')}</div>
+    ${fs.length?fs.map(s=>`<div class="specsec ${s.status==='待填'?'todo':''}" onclick="openSpec('${s.id}')">
+      <div class="st">${stBadge(s.status)} [${esc(s.cornerName)}] ${esc(s.title)}</div>
+      <div class="sb">${esc(s.body)}</div></div>`).join(''):'<div class="empty">无匹配规格</div>'}
+    <div class="note">状态:✅已实现 · 🟠草案 · ⬜待填(需要实验数字或外部输入)。详细正文见 CONTRACT_STACK_SPEC_ZH.txt 对应节。</div>`;
+}
+function setSpecFilter(s){specFilter=s;renderSpecs()}
+function renderPrinciples(){
+  view.innerHTML = `<div class="sec">设计原则(纪律)</div>
+    ${DATA.principles.map(p=>`<div class="principle"><div class="pn">${esc(p.n)}</div><div class="pb">${esc(p.b)}</div></div>`).join('')}
+    <div class="sec">决策记录(为什么不做 XX)</div>
+    ${DATA.decisions.map(d=>`<div class="principle"><div class="pn">${esc(d.id)} ${esc(d.title)}</div><div class="pb">${esc(d.body)}</div></div>`).join('')}`;
+}
+let curView = 'triangle';
+function render(){
+  if(curView==='triangle')renderTriangle();
+  else if(curView==='ladder')renderLadder();
+  else if(curView==='specs')renderSpecs();
+  else renderPrinciples();
+}
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.tabs button').forEach(x=>x.setAttribute('aria-selected','false'));
+  b.setAttribute('aria-selected','true');curView=b.dataset.v;render();
+}));
+render();
+</script>
+</body>
+</html>

@@ -59,7 +59,8 @@ def open_start_escape_corridor(
 def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
                 inflated: Set[Cell],
                 blocked_edges: Optional[Set[DirectedEdge]] = None,
-                max_cost_cells: Optional[float] = None) -> Optional[List[Cell]]:
+                max_cost_cells: Optional[float] = None,
+                edge_allowed=None, max_expansions: Optional[int] = None) -> Optional[List[Cell]]:
     if not grid.planning_free(start, inflated) or not grid.planning_free(goal, inflated):
         return None
     queue = [(0.0, 0.0, start)]
@@ -80,6 +81,8 @@ def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
                 path.append(current)
             return list(reversed(path))
         closed.add(current)
+        if max_expansions is not None and len(closed) > max_expansions:
+            return None
         for dx, dy, step_cost in GRID_MOVES:
             nxt = (current[0] + dx, current[1] + dy)
             if (current, nxt) in forbidden:
@@ -89,6 +92,8 @@ def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
             if dx and dy and (
                     not grid.planning_free((current[0] + dx, current[1]), inflated)
                     or not grid.planning_free((current[0], current[1] + dy), inflated)):
+                continue
+            if edge_allowed is not None and not edge_allowed(current, nxt):
                 continue
             candidate = current_cost + step_cost
             if max_cost_cells is not None and candidate > max_cost_cells:

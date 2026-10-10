@@ -1543,6 +1543,9 @@ namespace scan_planner
     if (handoff.reference_path_update && reference_path_update_pending_ &&
         pending_reference_request_id_ == handoff.reference_request_id)
     {
+      if (task_mode_)
+        publishObservationFeedback(scan_planner_msgs::msg::ObservationFeedback::EXECUTION_READY,
+                                   "CONTROLLER_CANDIDATE_ACKNOWLEDGED");
       publishReferenceStatus(
           "PATH_TRAJECTORY_READY", handoff.reference_request_id);
       reference_path_update_pending_ = false;
@@ -1605,6 +1608,9 @@ namespace scan_planner
       Eigen::Vector3d path_start, Eigen::Vector3d path_end)
   {
     scan_planner_msgs::msg::FailureEvidence evidence;
+    if(task_mode_ && observation_task_ && observation_task_->local_geometry_autonomy &&
+       failure_scope==scan_planner_msgs::msg::FailureEvidence::SCOPE_PATH)
+      return; // A failed Local candidate is not proof that the Global corridor is blocked.
     evidence.stamp = node_->now();
     evidence.request_id = request_id;
     evidence.task_id = task_id_.load();
@@ -4322,6 +4328,8 @@ namespace scan_planner
   {
     auto map = planner_manager_->grid_map_;
     const uint64_t planning_request_id = active_reference_request_id_.load();
+    const uint64_t diagnostic_task_id = task_id_.load();
+    const uint64_t diagnostic_task_version = task_version_.load();
     const double local_repair_body_yaw =
         low_speed_local_repair ? getOdomYaw() : 0.0;
     struct TargetStateRestore
@@ -4346,13 +4354,23 @@ namespace scan_planner
     // controller is actually executing so every rejected result is atomic.
     const LocalTrajData executing_trajectory = planner_manager_->local_data_;
     const uint64_t safety_generation_before = safety_generation_.load();
+    bool departure_candidate_failed = false;
     const auto reject_planned_trajectory = [&]() {
       planner_manager_->local_data_ = executing_trajectory;
       if (task_mode_ && task_goal_available_ && !local_target_override && !seed_path)
       {
-        if (safety_generation_.load() == safety_generation_before)
-          task_rejected_stations_.push_back(local_target_pt_.head<2>());
-        task_goal_available_ = false;
+        if (safety_generation_.load() == safety_generation_before) {
+          if (departure_candidate_failed && task_approach_.size()>1) {
+            const Eigen::Vector2d direction=(task_approach_[1]-task_approach_[0]).head<2>();
+            const double yaw=std::atan2(direction.y(),direction.x());
+            if (!taskDeparturePreviouslyRejected(yaw,task_rejected_departures_))
+              task_rejected_departures_.push_back(yaw);
+            RCLCPP_WARN(node_->get_logger(),
+                "[TASK_DEPARTURE_ALTERNATIVE] request=%llu rejected_yaw=%.3f tried=%zu; retaining station, selecting another departure",
+                static_cast<unsigned long long>(planning_request_id),yaw,task_rejected_departures_.size());
+          } else task_rejected_stations_.push_back(local_target_pt_.head<2>());
+        }
+        task_goal_available_ = departure_candidate_failed;
       }
       return false;
     };
@@ -4454,7 +4472,9 @@ namespace scan_planner
               : std::numeric_limits<double>::quiet_NaN(),
           clearance_margin, seed_path ? seed_path : (task_seed.empty() ? nullptr : &task_seed),
           target_acceleration.x(), target_acceleration.y(),
-          target_acceleration.z(), task_seed.empty() ? seed_sample_interval : task_seed_interval);
+          target_acceleration.z(), task_seed.empty() ? seed_sample_interval : task_seed_interval,
+          task_mode_ && observation_task_ && observation_task_->local_geometry_autonomy &&
+              !low_speed_local_repair ? preferred_clearance_margin_ : 0.0);
     };
 
     // Generate normal candidates against the preferred belt first, so A* and
@@ -4641,12 +4661,61 @@ namespace scan_planner
       bool candidate_exited_clearance = false;
       bool candidate_requires_clearance_limited_profile = false;
       size_t initial_clearance_violations = 0;
+      // Observe the measured pose independently of the candidate's initial
+      // tangent. Both checks use this same immutable validation revision.
+      Eigen::Vector3d diagnostic_pose = Eigen::Vector3d::Zero();
+      Eigen::Quaterniond diagnostic_orientation = Eigen::Quaterniond::Identity();
+      bool diagnostic_have_pose = false;
+      {
+        std::lock_guard<std::mutex> lock(safety_odom_mutex_);
+        diagnostic_have_pose = safety_have_odom_;
+        diagnostic_pose = safety_odom_pos_;
+        diagnostic_orientation = safety_odom_orient_;
+      }
+      const double diagnostic_yaw = std::atan2(
+          2.0 * (diagnostic_orientation.w() * diagnostic_orientation.z() +
+                 diagnostic_orientation.x() * diagnostic_orientation.y()),
+          1.0 - 2.0 * (diagnostic_orientation.y() * diagnostic_orientation.y() +
+                       diagnostic_orientation.z() * diagnostic_orientation.z()));
+      const bool diagnostic_pose_valid = diagnostic_have_pose &&
+          diagnostic_pose.allFinite() && diagnostic_orientation.coeffs().allFinite() &&
+          diagnostic_orientation.squaredNorm() > 1e-12 && std::isfinite(diagnostic_yaw);
+      const int current_margin_blocked = diagnostic_pose_valid
+          ? static_cast<int>(footprintOccupiedWithMargin(map, diagnostic_pose,
+                diagnostic_yaw, planning_clearance_margin_)) : -1;
+      const int current_physical_blocked = diagnostic_pose_valid
+          ? static_cast<int>(map->getInflateOccupancy(diagnostic_pose, diagnostic_yaw) != 0) : -1;
+      const auto log_validation_failure = [&](const char *stage, double t,
+          double distance, const Eigen::Vector3d &point, double yaw,
+          bool terminal, const char *reason) {
+        if (task_mode_ && distance <= 0.50) {
+          departure_candidate_failed = true;
+          task_departure_blocked_ = true;
+        }
+        Eigen::Vector3d hit = point;
+        const bool hit_valid = footprintOccupiedWithMargin(
+            map, point, yaw, planning_clearance_margin_, &hit);
+        RCLCPP_WARN(node_->get_logger(),
+            "[LOCAL_VALIDATION_FAILURE] stage=%s location=%s reason=%s task_id=%llu task_version=%llu request_id=%llu trajectory_id=%lld planning_revision=%llu validation_revision=%llu sample_t=%.3f duration=%.3f sampled_distance=%.3f departure_window=0.50 sample=(%.3f,%.3f,%.3f) sample_yaw=%.3f hit=(%.3f,%.3f) hit_valid=%d measured_pose=(%.3f,%.3f) current_margin_blocked=%d current_physical_blocked=%d candidate_physical_blocked=%d hard_margin=%.3f",
+            stage, clearanceFailureLocation(current_margin_blocked == 1, distance, terminal),
+            reason, static_cast<unsigned long long>(diagnostic_task_id),
+            static_cast<unsigned long long>(diagnostic_task_version),
+            static_cast<unsigned long long>(planning_request_id),
+            static_cast<long long>(info->traj_id_),
+            static_cast<unsigned long long>(map_snapshot->revision),
+            static_cast<unsigned long long>(validation_snapshot->revision),
+            t, info->duration_, distance, point.x(), point.y(), point.z(), yaw,
+            hit.x(), hit.y(), hit_valid, diagnostic_pose.x(), diagnostic_pose.y(),
+            current_margin_blocked, current_physical_blocked,
+            map->getInflateOccupancy(point, yaw) != 0, planning_clearance_margin_);
+      };
+      double sampled_distance = 0.0;
+      Eigen::Vector3d previous_sample = info->position_traj_.evaluateDeBoorT(0.0);
       for (double t = 0.0; t <= info->duration_; t += validation_dt)
       {
-        if (task_mode_ && !taskDomainContains(task_domain,
-              info->position_traj_.evaluateDeBoorT(t).head<2>()))
-          return reject_planned_trajectory();
         const Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t);
+        sampled_distance += (pos - previous_sample).head<2>().norm();
+        previous_sample = pos;
         const Eigen::Vector3d pos_next = info->position_traj_.evaluateDeBoorT(
             std::min(t + validation_dt, info->duration_));
         Eigen::Vector3d blocked_point;
@@ -4658,6 +4727,12 @@ namespace scan_planner
             low_speed_local_repair && fixed_body_yaw_repair
                 ? local_repair_body_yaw
                 : estimateYawFromSegment(pos, pos_next);
+        if (task_mode_ && !taskDomainContains(task_domain, pos.head<2>()))
+        {
+          log_validation_failure("TASK_DOMAIN", t, sampled_distance, pos, candidate_yaw,
+              info->duration_ - t <= validation_dt + 1e-9, "OUTSIDE_TASK_DOMAIN");
+          return reject_planned_trajectory();
+        }
         const bool clearance_blocked = footprintOccupiedWithMargin(
                 map, pos, candidate_yaw,
                 planning_clearance_margin_, &blocked_point,
@@ -4693,7 +4768,25 @@ namespace scan_planner
             clearance_violations);
         if (!clearance_result.accepted())
         {
-          if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
+          RCLCPP_WARN(node_->get_logger(),
+              "[LOCAL_VALIDATION_FAILURE] stage=FINAL_CLEARANCE location=%s task_id=%llu task_version=%llu request_id=%llu trajectory_id=%lld planning_revision=%llu validation_revision=%llu sample_t=%.3f duration=%.3f sampled_distance=%.3f departure_window=0.50 sample=(%.3f,%.3f,%.3f) hit=(%.3f,%.3f) measured_pose=(%.3f,%.3f) measured_yaw=%.3f current_margin_blocked=%d current_physical_blocked=%d candidate_physical_blocked=%d clearance_failure=%u hard_margin=%.3f",
+              clearanceFailureLocation(current_margin_blocked == 1, sampled_distance,
+                  info->duration_ - t <= validation_dt + 1e-9),
+              static_cast<unsigned long long>(diagnostic_task_id),
+              static_cast<unsigned long long>(diagnostic_task_version),
+              static_cast<unsigned long long>(planning_request_id),
+              static_cast<long long>(info->traj_id_),
+              static_cast<unsigned long long>(map_snapshot->revision),
+              static_cast<unsigned long long>(validation_snapshot->revision),
+              t, info->duration_, sampled_distance, pos.x(), pos.y(), pos.z(),
+              blocked_point.x(), blocked_point.y(), diagnostic_pose.x(), diagnostic_pose.y(),
+              diagnostic_yaw, current_margin_blocked, current_physical_blocked,
+              physical_collision, static_cast<unsigned int>(clearance_result.failure),
+              planning_clearance_margin_);
+          if (task_mode_ && sampled_distance <= 0.50) {
+            task_departure_blocked_ = true;
+            departure_candidate_failed = true;
+          }
           publishFailureEvidence(
               planning_request_id, info->traj_id_, "FINAL_CLEARANCE",
               "CANDIDATE_CLEARANCE_REJECTED", blocked_point,
@@ -4713,6 +4806,9 @@ namespace scan_planner
       }
       if (candidate_started_inside_clearance && !candidate_exited_clearance)
       {
+        log_validation_failure("FINAL_CLEARANCE", -1.0, 0.0,
+            info->position_traj_.evaluateDeBoorT(0.0), diagnostic_yaw,
+            false, "ESCAPE_PREFIX_NEVER_EXITED");
         RCLCPP_ERROR(
             node_->get_logger(),
             "[CANDIDATE_CLEARANCE_REJECTED] candidate starts inside the hard planning belt but does not exit within %.2fs",
@@ -4746,9 +4842,13 @@ namespace scan_planner
           info->duration_ = info->position_traj_.getTimeSum();
           clearance_escape_deadline *= scale;
         }
+        double gait_distance = 0.0;
+        Eigen::Vector3d gait_previous = info->position_traj_.evaluateDeBoorT(0.0);
         for (double t = 0.0; t <= info->duration_; t += 0.10)
         {
           const Eigen::Vector3d origin = info->position_traj_.evaluateDeBoorT(t);
+          gait_distance += (origin - gait_previous).head<2>().norm();
+          gait_previous = origin;
           const Eigen::Vector3d before = info->position_traj_.evaluateDeBoorT(
               std::max(0.0, t - 0.05));
           const Eigen::Vector3d next = info->position_traj_.evaluateDeBoorT(
@@ -4775,6 +4875,8 @@ namespace scan_planner
                     map->getInflateOccupancy(origin, body_yaw) != 0,
                     violations, initial_clearance_violations))
             {
+              log_validation_failure("FORWARD_GAIT_TURN", t, gait_distance, origin,
+                  body_yaw, info->duration_ - t <= 0.10 + 1e-9, "TURN_FOOTPRINT_REJECTED");
               if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
               publishFailureEvidence(planning_request_id, info->traj_id_,
                   "FORWARD_GAIT_TURN", "TURN_FOOTPRINT_REJECTED", origin,
@@ -4813,6 +4915,8 @@ namespace scan_planner
                       low_speed_local_repair, initially_blocked, sweep_exited,
                       map->getInflateOccupancy(point, sweep.yaw) != 0, count, previous_count))
               {
+                log_validation_failure("FORWARD_GAIT_STEERING", t, gait_distance, point,
+                    sweep.yaw, info->duration_ - t <= 0.10 + 1e-9, "STEERING_SWEEP_REJECTED");
                 RCLCPP_WARN(node_->get_logger(),
                     "[FORWARD_GAIT_STEERING_REJECTED] t=%.2f yaw_rate=%.2f", t, rate);
                 if (task_mode_ && t <= 1e-9) task_departure_blocked_ = true;
@@ -4846,6 +4950,8 @@ namespace scan_planner
                     low_speed_local_repair, starts_inside, exited,
                     map->getInflateOccupancy(point, yaw) != 0, violations, previous))
             {
+              log_validation_failure("FORWARD_GAIT_SWEEP", t, gait_distance, point,
+                  yaw, info->duration_ - t <= 0.10 + 1e-9, "FORWARD_SWEEP_REJECTED");
               RCLCPP_WARN(node_->get_logger(),
                           "[FORWARD_GAIT_SWEEP_REJECTED] command=%.3f effective=%.3f t=%.2f; trying another local candidate",
                           min_forward_command_, min_forward_effective_speed_, t);
@@ -4979,6 +5085,10 @@ namespace scan_planner
               clearance_violations, previous_handoff_violations);
           if (!admissible)
           {
+            // A handoff connector/rotation has no spline timestamp; -1 means
+            // unavailable, not time zero. Its phase remains explicit.
+            log_validation_failure(phase, -1.0, 0.0, point, yaw, false,
+                "HANDOFF_FOOTPRINT_REJECTED");
             RCLCPP_ERROR(
                 node_->get_logger(),
                 "[PLAN_RESULT_DISCARDED] handoff %s is blocked point=(%.2f,%.2f) physical=%d violations=%zu previous=%zu started_inside=%d",
@@ -5215,6 +5325,12 @@ namespace scan_planner
     }
     else
     {
+      RCLCPP_WARN(node_->get_logger(),
+          "[LOCAL_VALIDATION_FAILURE] stage=OPTIMIZER location=UNASSESSED request_id=%llu task_id=%llu task_version=%llu planning_revision=%llu validation_revision=0 sample_t=-1 reason=NO_VALIDATED_CANDIDATE",
+          static_cast<unsigned long long>(planning_request_id),
+          static_cast<unsigned long long>(diagnostic_task_id),
+          static_cast<unsigned long long>(diagnostic_task_version),
+          static_cast<unsigned long long>(map_snapshot->revision));
       RCLCPP_INFO(node_->get_logger(),
                   "[PLAN_TIMING] optimization=%.1fms validation=0.0ms total=%.1fms planning_revision=%lu validation_revision=0 live_revision=%lu map_age=%.1fms result=failure",
                   optimization_ms, optimization_ms,

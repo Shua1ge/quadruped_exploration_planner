@@ -16,6 +16,9 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <map>
+#include <mutex>
+#include <plan_env/planar_clearance_field.h>
 #include <shared_mutex>
 #include <rmw/qos_profiles.h>
 #include <tuple>
@@ -239,6 +242,10 @@ public:
     double resolution_inv{1.0};
     double body_offset{0.0};
     uint64_t revision{0};
+    mutable std::mutex clearance_mutex;
+    mutable std::map<int, std::shared_ptr<const scan_planner::PlanarClearanceField>> clearance_slices;
+    int getCylinderOccupancy(const Eigen::Vector3d& point) const;
+    std::shared_ptr<const scan_planner::PlanarClearanceField> planarClearance(double z) const;
 
     int getInflateOccupancy(
         const Eigen::Vector3d& pos, double yaw,
@@ -250,6 +257,7 @@ public:
                rclcpp::CallbackGroup::SharedPtr update_callback_group = nullptr,
                rclcpp::CallbackGroup::SharedPtr visualization_callback_group = nullptr);
   InflatedOccupancySnapshotPtr captureInflatedOccupancySnapshot() const;
+  std::shared_ptr<const scan_planner::PlanarClearanceField> capturePlanarClearance(double z) const;
   void useInflatedOccupancySnapshotForCurrentThread(
       InflatedOccupancySnapshotPtr snapshot) const;
   void clearInflatedOccupancySnapshotForCurrentThread() const;

@@ -26,6 +26,8 @@ def bridge():
     value.task_representative_limit=4
     value.task_max_station_adjustments=3
     value.task_feedback_seen=deque(maxlen=256)
+    value.position=(2.,2.)
+    value.observation_motion_released_count=0
     value.map_update_count=5
     value.messages=[]
     value.observation_task_pub=SimpleNamespace(publish=value.messages.append)
@@ -46,6 +48,85 @@ def path():
     message.poses=[PoseStamped(),PoseStamped()]
     message.poses[1].pose.position.x=3.0
     return message
+
+
+def test_autonomy_arrival_collects_scans_then_hands_off_without_station_retry():
+    value=bridge(); value.task_geometry_autonomy=True
+    value.publish_observation_task(path(),100)
+    assert value.messages[-1].local_geometry_autonomy
+    assert not value.messages[-1].has_directional_gate
+    task=value.active_observation
+    value.active_path_request_generation=100
+    value.observation_feedback_callback(ObservationFeedback(task_id=100,task_version=1,
+        request_id=100,candidate_id=12,state=ObservationFeedback.STATION_REACHED,
+        station=Point(x=2.,y=2.,z=.4)))
+    value.grid.sensor_revision+=1
+    value.active_raw_path=[(0,0),(3,0)]
+    routes=[]
+    value.reroute_active_goal=lambda: (_ for _ in ()).throw(AssertionError("Explorer must not redo Local geometry"))
+    value.publish_reference_path=lambda cells: routes.append(cells)
+    handoffs=[]
+    value.handoff_satisfied_observation=handoffs.append
+    assert value.continue_observation_station() and not routes and not handoffs
+    value.grid.sensor_revision+=2
+    assert value.continue_observation_station()
+    assert routes==[] and value.active_observation is task
+    assert handoffs==["OBSERVATION_STATION_MOTION_RELEASED"]
+    assert task.motion_released and not task.information_satisfied
+    assert value.observation_motion_released_count==1
+    assert not value.continue_observation_station()
+    assert task.completion_reason=="none"
+
+
+def test_motion_exhaustion_is_nonspatial_terminal_and_deduplicated():
+    value=bridge(); value.task_geometry_autonomy=True
+    value.publish_observation_task(path(),100); value.active_path_request_generation=100
+    value.active_goal=(3.,2.); value.active_region_id=7; value.active_commitment_scope=("region",7)
+    value.local_execution_context=lambda:(1,2,3)
+    decisions=[]; terminals=[]; statuses=[]; resets=[]
+    value.replan_gate=SimpleNamespace(reset=lambda:resets.append(1))
+    value.terminate_active_observation=lambda reason: terminals.append(reason)
+    value.plan_from_current_position=lambda **kwargs:decisions.append(kwargs) or True
+    value.publish_status=statuses.append
+    value.reroute_active_goal=lambda: (_ for _ in ()).throw(AssertionError("second Local retry ledger"))
+    value.apply_global_viewpoint_constraint=lambda *args: (_ for _ in ()).throw(AssertionError("no spatial proof"))
+    message=ObservationFeedback(task_id=100,task_version=1,request_id=100,candidate_id=12,
+        state=ObservationFeedback.LOCAL_MOTION_EXHAUSTED,station=Point(x=2.,y=2.,z=.4))
+    value.observation_feedback_callback(message); value.observation_feedback_callback(message)
+    assert terminals==["LOCAL_MOTION_EXHAUSTED"] and resets==[1]
+    assert decisions==[dict(excluded_goals=((3.,2.),),required_scope=("region",7),allow_region_release=False)]
+    assert value.local_motion_goal_cooldowns[(3.,2.)].position==(2.,2.)
+    assert value.active_observation.completion_reason=="none"
+
+
+def test_route_checkpoints_use_directed_edges_and_freeze_revision():
+    from explorer_core.sparse_routing import SparseNode,SparseEdge,SparseRouteGraph,SparseRouteEstimate
+    value=bridge(); value.task_geometry_autonomy=True
+    graph=SparseRouteGraph()
+    graph.upsert_node(SparseNode(1,(0.,0.)));graph.upsert_node(SparseNode(2,(3.,0.)))
+    graph.upsert_edge(SparseEdge(11,1,2,3.,1.,((0.,0.),(3.,0.))))
+    graph.graph_revision=5; value.sparse_router=graph
+    value.active_observation.route_estimate=SparseRouteEstimate(3.,0.,1,2,
+        ((0.,0.),(3.,0.)),5,((11,1,2),))
+    value.publish_observation_task(path(),100)
+    message=value.messages[-1]
+    assert message.route_graph_revision==5 and len(message.route_portals)==1
+    assert message.route_portals[0].connection_id==11
+    assert message.route_portals[0].direction.x==1
+    graph.graph_revision=6; graph.edges.clear()
+    value.publish_observation_task(path(),101)
+    assert value.messages[-1].route_portals==message.route_portals
+    assert value.messages[-1].route_graph_revision==5
+
+
+def test_stale_sparse_route_explicitly_falls_back_without_inventing_connections():
+    from explorer_core.sparse_routing import SparseRouteEstimate
+    value=bridge(); value.task_geometry_autonomy=True
+    value.sparse_router=SimpleNamespace(graph_revision=6)
+    value.active_observation.route_estimate=SparseRouteEstimate(3.,0.,1,2,
+        ((0.,0.),(3.,0.)),5,((11,1,2),))
+    value.publish_observation_task(path(),100)
+    assert not value.messages[-1].route_portals and value.messages[-1].route_graph_revision==0
 
 
 def test_reroute_keeps_task_and_denominator_and_station_budget():
@@ -139,6 +220,88 @@ def test_station_retry_sends_only_unresolved_boundaries_without_changing_denomin
     assert retry.target_cell_count==8
     assert len(retry.target_cells)==1
     assert retry.target_cells[0].x==value.grid.cell_to_world((7,5))[0]
+
+
+def test_resolved_targets_are_not_reintroduced_while_completion_confirms():
+    value=bridge()
+    value.publish_observation_task(path(),100)
+    for x in range(8):
+        value.grid.sensor_observed[5,x]=value.active_observation.initial_sensor_revision+1
+    value.publish_observation_task(path(),101)
+    assert value.messages[-1].target_cell_count==8
+    assert not value.messages[-1].target_cells
+
+
+def test_station_capture_timeout_releases_motion_without_false_completion():
+    value=bridge();value.task_geometry_autonomy=True
+    value.publish_observation_task(path(),100)
+    value.pending_observation_station=(value.grid.sensor_revision,1_000_000_000,None)
+    calls=[];value.handoff_satisfied_observation=calls.append
+    value.get_clock().now().nanoseconds+=2_000_000_000
+    assert value.continue_observation_station()
+    assert value.active_observation.motion_released
+    assert not value.active_observation.information_satisfied
+    assert value.observation_motion_released_count==1
+    assert len(calls)==1
+
+
+def test_station_capture_scheduling_matrix_never_authorizes_another_old_route():
+    for elapsed_ns in (0,500_000_000,1_999_999_999,2_000_000_000):
+        for scans in (0,1,2,3):
+            value=bridge();value.task_geometry_autonomy=True
+            value.publish_observation_task(path(),100)
+            revision=value.grid.sensor_revision
+            value.pending_observation_station=(revision,1_000_000_000,None)
+            value.grid.sensor_revision+=scans
+            value.get_clock().now().nanoseconds+=elapsed_ns
+            calls=[];value.handoff_satisfied_observation=calls.append
+            value.publish_reference_path=lambda *args: (_ for _ in ()).throw(
+                AssertionError("station capture must not revive old motion"))
+            assert value.continue_observation_station()
+            released=scans>=3 or elapsed_ns>=2_000_000_000
+            assert value.active_observation.motion_released==released
+            assert len(calls)==int(released)
+            assert not value.active_observation.information_satisfied
+
+
+def test_motion_attempt_ignores_heading_jitter_and_unrelated_map_changes():
+    value=bridge();value.grid.data.fill(0)
+    value.remember_local_motion_attempt((3.,2.),"LOCAL_PATH_FAMILY_EXHAUSTED")
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    value.body_yaw=2.;value.map_update_count+=100
+    value.grid.data[10,10]=100
+    value.position=(2.2,2.)
+    assert not value.local_motion_retry_allowed(attempt)
+    value.position=(3.7,2.)
+    assert value.local_motion_retry_allowed(attempt)
+
+
+def test_only_departure_obstacle_failure_reopens_on_real_obstacle_removal():
+    value=bridge();value.grid.data.fill(0);value.grid.data[2,2]=100
+    value.remember_local_motion_attempt((3.,2.),"DEPARTURE_UNSAFE")
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    value.grid.data[2,2]=-1
+    assert not value.local_motion_retry_allowed(attempt)
+    value.grid.data[2,2]=0
+    assert value.local_motion_retry_allowed(attempt)
+    value.grid.data[2,2]=100
+    value.remember_local_motion_attempt((3.,2.),"HANDOFF_MOVING_HEADING_ERROR")
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    value.grid.data[2,2]=0
+    assert not value.local_motion_retry_allowed(attempt)
+
+
+def test_departure_retry_requires_real_heading_change_not_jitter():
+    value=bridge();value.grid.data.fill(0);value.body_yaw=3.10
+    value.remember_local_motion_attempt((3.,2.),"DEPARTURE_UNSAFE")
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    for yaw in (3.11,-3.10,3.10):
+        value.body_yaw=yaw
+        assert not value.local_motion_retry_allowed(attempt)
+    value.body_yaw=2.10
+    assert value.local_motion_retry_allowed(attempt)
+    value.body_yaw=float("nan")
+    assert not value.local_motion_retry_allowed(attempt)
 
 
 def test_stale_feedback_cannot_end_new_task_and_arrival_is_not_completion():

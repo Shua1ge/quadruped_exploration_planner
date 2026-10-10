@@ -49,6 +49,17 @@ def test_snapshot_copies_observation_provenance():
     assert not frozen.sensor_observed[4, 4]
 
 
+def test_satisfied_information_ledger_cannot_be_reopened_by_later_maps():
+    grid = ExplorationGrid(8, 8, 1, 0, 0)
+    task = ObservationTask(1, (2, 2), {(4, 4)}, information_satisfied=True,
+        progress=1., completion_streak=2, completion_reason="visible_information_resolved",
+        satisfied_map_revision=3, satisfied_sensor_revision=4)
+    evaluate_observation(task, grid, None, 9, .8, 2, 2, 1)
+    assert task.progress==1. and task.completion_streak==2
+    assert task.completion_reason=="visible_information_resolved"
+    assert (task.satisfied_map_revision,task.satisfied_sensor_revision)==(3,4)
+
+
 def test_representatives_are_bounded_deterministic_and_not_denominator():
     cells = {(x, y) for x in range(100) for y in range(4)}
     representatives = representative_cells(cells, 16)

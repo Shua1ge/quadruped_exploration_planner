@@ -17,6 +17,13 @@ uint64 region_id
 geometry_msgs/Point goal
 # Allowed domain: corridor around coarse_route UNION observation disk.
 geometry_msgs/Point[] coarse_route
+# False preserves the legacy geometric progress guards. True makes the route
+# a domain/approach hint, not an executable path or an observation ledger.
+bool local_geometry_autonomy
+# Empty: explicit geometric-domain fallback (NOT topological progress).
+# Nonempty: ordered directed checkpoints; frozen for this task/version.
+uint64 route_graph_revision
+RoutePortal[] route_portals
 float64 corridor_radius
 float64 observation_radius
 # Spatially distributed representatives; NOT the completion denominator.

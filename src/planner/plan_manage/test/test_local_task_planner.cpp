@@ -1,8 +1,134 @@
 #include <gtest/gtest.h>
 #include <plan_manage/local_task_planner.h>
 #include <plan_manage/task_protocol.h>
+#include <plan_env/planar_clearance_field.h>
 
 using namespace scan_planner;
+
+TEST(LocalTaskPlanner, DepartureCertifiesTurnAndStoppingPrefix) {
+  EXPECT_TRUE(taskDepartureCertified({0,0},0,0,.3,
+      [](const auto& p,double){return std::abs(p.y())<.01 && p.x()<.31;}));
+  EXPECT_FALSE(taskDepartureCertified({0,0},0,1,.3,
+      [](const auto&,double yaw){return std::abs(yaw)<.2;}));
+  EXPECT_FALSE(taskDepartureCertified({0,0},0,0,.3,
+      [](const auto& p,double){return p.x()<.15;}));
+  EXPECT_FALSE(taskDepartureCertified({0,0},0,0,-1,
+      [](const auto&,double){return true;}));
+  EXPECT_FALSE(taskDepartureCertified({0,0},0,0,1e300,
+      [](const auto&,double){return true;}));
+  EXPECT_TRUE(taskDepartureCertified({0,0},1e300,-1e300,.3,
+      [](const auto&,double yaw){return std::isfinite(yaw);}));
+}
+
+TEST(LocalTaskPlanner, DepartureRejectionDoesNotRejectOtherDirection) {
+  EXPECT_TRUE(taskDeparturePreviouslyRejected(.05,{0}));
+  EXPECT_TRUE(taskDeparturePreviouslyRejected(2*std::acos(-1.0),{0}));
+  EXPECT_FALSE(taskDeparturePreviouslyRejected(std::acos(-1.0)/2,{0}));
+}
+
+TEST(LocalTaskPlanner, NarrowDepartureLatticeFollowsMeasuredHeading) {
+  const double yaw=.31;
+  const Eigen::Vector2d forward(std::cos(yaw),std::sin(yaw));
+  const Eigen::Vector2d normal(-forward.y(),forward.x());
+  LocalTaskDomain domain; domain.route={{0,0},2*forward};
+  domain.corridor_radius=.4; domain.observation_center=2*forward;
+  domain.observation_radius=.4;
+  const auto safe=[&](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
+    return std::abs(a.dot(normal))<.03 && std::abs(b.dot(normal))<.03 &&
+           b.dot(forward)>=0;
+  };
+  const auto candidates=selectLocalTaskCandidates(domain,{0,0},forward,safe,
+      [](const auto&){return true;},.2,2,256,4,
+      [&](const auto& p){return p.dot(forward)>.4;},yaw);
+  ASSERT_FALSE(candidates.empty());
+  EXPECT_NEAR(candidates.front().approach[1].dot(normal),0,1e-9);
+}
+
+TEST(LocalTaskPlanner, AutonomousStationArrivalEndsMotionEvenDuringHeadingAlignment) {
+  EXPECT_TRUE(taskStationCaptureReady(true,true,.1));
+  EXPECT_TRUE(taskStationCaptureReady(true,false,.2));
+  EXPECT_FALSE(taskStationCaptureReady(true,true,.21));
+  EXPECT_FALSE(taskStationCaptureReady(false,true,.1));
+  EXPECT_TRUE(taskStationCaptureReady(false,false,.1));
+  EXPECT_FALSE(taskStationCaptureReady(true,false,-.1));
+  EXPECT_FALSE(taskStationCaptureReady(true,false,std::numeric_limits<double>::quiet_NaN()));
+}
+
+TEST(LocalTaskPlanner, RetainedGoalSurvivesMovingSearchLattice) {
+  LocalTaskDomain domain; domain.route={{0,0},{3,0}};
+  domain.corridor_radius=1; domain.observation_center={3,0}; domain.observation_radius=1;
+  const Eigen::Vector2d goal{1.07,.03};
+  for(double x : {.1,.3,.6,.8}) {
+    auto candidates=selectLocalTaskCandidates(domain,{x,.04},goal,
+        [](const auto&,const auto&){return true;},[](const auto&){return false;},
+        .2,2,1024,8,{},0,{},&goal);
+    ASSERT_FALSE(candidates.empty());
+    EXPECT_NEAR((candidates.front().goal-goal).norm(),0,1e-9);
+    EXPECT_NEAR((candidates.front().approach.back()-goal).norm(),0,1e-9);
+  }
+}
+
+TEST(LocalTaskPlanner, RetainedGoalNeverBypassesBlockedFinalConnection) {
+  LocalTaskDomain domain; domain.route={{0,0},{3,0}};
+  domain.corridor_radius=1;domain.observation_center={3,0};domain.observation_radius=1;
+  const Eigen::Vector2d goal{1.07,0};
+  const auto candidates=selectLocalTaskCandidates(domain,{0,0},goal,
+      [&](const auto&,const auto& b){return (b-goal).norm()>.05;},
+      [](const auto&){return false;},.2,2,1024,8,{},0,{},&goal);
+  EXPECT_TRUE(candidates.empty());
+}
+
+TEST(LocalTaskPlanner, PortalProgressRequiresOrderedMeasuredCrossing) {
+  std::vector<DirectedRoutePortal> portals{{{1,0},{1,0},.3},{{2,0},{1,0},.3}};
+  EXPECT_EQ(advanceRoutePortal(portals,0,{1.9,0},{2.1,0}),0u); // cannot skip first
+  EXPECT_EQ(advanceRoutePortal(portals,0,{.9,.4},{1.1,.4}),0u); // outside aperture
+  EXPECT_EQ(advanceRoutePortal(portals,0,{1.1,0},{.9,0}),0u); // backwards
+  EXPECT_EQ(advanceRoutePortal(portals,0,{0,0},{1.1,0}),0u); // teleport/discontinuity
+  EXPECT_EQ(advanceRoutePortal(portals,0,{.9,0},{1.1,0}),1u);
+  EXPECT_EQ(advanceRoutePortal(portals,1,{1.9,0},{2.1,0}),2u);
+  const std::vector<DirectedRoutePortal> close{{{1,0},{1,0},.3},{{1.05,0},{1,0},.3}};
+  EXPECT_EQ(advanceRoutePortal(close,0,{.9,0},{1.1,0}),2u); // both measured, in order
+  const std::vector<DirectedRoutePortal> wrong_order{{{1.05,0},{1,0},.3},{{1,0},{1,0},.3}};
+  EXPECT_EQ(advanceRoutePortal(wrong_order,0,{.9,0},{1.1,0}),1u);
+}
+
+TEST(LocalTaskPlanner, PortalProgressWorksAroundBentRoute) {
+  std::vector<DirectedRoutePortal> portals{{{2,1},{0,1},.3},{{1,2},{-1,0},.3}};
+  EXPECT_EQ(advanceRoutePortal(portals,0,{2,.9},{2,1.1}),1u);
+  EXPECT_EQ(advanceRoutePortal(portals,1,{1.1,2},{.9,2}),2u);
+}
+
+TEST(LocalTaskPlanner, ClearanceFieldMatchesBruteForceCellDistance) {
+  const std::vector<Eigen::Vector2i> obstacles{{0,0},{4,3},{7,7}};
+  PlanarClearanceField field(9,9,.1,{0,0},[&](int x,int y) {
+    return std::none_of(obstacles.begin(),obstacles.end(),[&](auto p){return p.x()==x && p.y()==y;});
+  });
+  for(int y=0;y<8;++y) for(int x=0;x<8;++x) {
+    double expected=1e9;
+    for(auto p:obstacles) expected=std::min(expected,(p.cast<double>()-Eigen::Vector2d(x,y)).norm()*.1);
+    EXPECT_NEAR(field.distance({(x+.5)*.1,(y+.5)*.1}),std::max(0.0,expected-.1/std::sqrt(2.0)),1e-9);
+  }
+  EXPECT_EQ(field.distance({-1,0}),0);
+  EXPECT_EQ(field.distance({std::numeric_limits<double>::quiet_NaN(),0}),0);
+}
+
+TEST(LocalTaskPlanner, SoftClearancePrefersCenterWithoutChangingHardSafety) {
+  PlanarClearanceField field(21,21,.1,{0,0},[](int x,int y){return x>0 && x<20 && y>0 && y<20;});
+  EXPECT_GT(field.footprintDistance({1,1},0,.18),field.footprintDistance({1,.15},0,.18));
+  EXPECT_LT(PlanarClearanceField::penalty(field.distance({1,1}),.2),
+            PlanarClearanceField::penalty(field.distance({1,.15}),.2));
+  EXPECT_LT(PlanarClearanceField::preferenceCost(.8,.2),PlanarClearanceField::preferenceCost(.3,.2));
+}
+
+TEST(LocalTaskPlanner, SimplificationCannotEraseClearanceDetour) {
+  const std::vector<Eigen::Vector2d> path{{0,0},{0,1},{1,1},{1,0}};
+  auto cost=[](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
+    return (a-b).norm()*(a.y()<.1 && b.y()<.1 ? 10 : 1);
+  };
+  auto result=simplifyTaskApproach(path,[](auto,auto){return true;},cost);
+  EXPECT_GT(result.size(),2u);
+  EXPECT_EQ(result.front(),path.front()); EXPECT_EQ(result.back(),path.back());
+}
 
 TEST(LocalTaskPlanner, ShortReversePrefixCannotTurnControllerAround) {
   auto shape=taskShapeResult({{0,0},{-.03,0},{0,0},{.5,0},{1,0}},{{0,0},{1,0}});

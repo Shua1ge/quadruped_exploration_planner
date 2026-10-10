@@ -181,7 +181,9 @@ def main():
               f"{str(m['pass']):>5}")
 
     good = [m for m in results if m["pass"]]
-    if not good:
+    if not results:
+        print("\nno complete speed levels: minimum effective speed cannot be determined")
+    elif not good:
         print("\nno level passed: policy produced no effective sustained "
               "forward motion in the tested range")
     else:
@@ -199,12 +201,14 @@ def main():
                                   "yaw_rate", "fall")
                       if not _ok(k, near, args)))
 
-    if args.metrics_out:
+    if args.metrics_out and results:
         with open(args.metrics_out, "w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(results[0].keys()))
             writer.writeheader()
             writer.writerows(results)
         print(f"per-level metrics -> {args.metrics_out}")
+    elif args.metrics_out:
+        print("no complete speed levels; metrics file not written")
     elif results:
         print("(use --metrics-out to save the per-level table)")
 

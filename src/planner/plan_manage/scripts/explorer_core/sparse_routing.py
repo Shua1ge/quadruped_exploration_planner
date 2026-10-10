@@ -34,6 +34,9 @@ class SparseRouteEstimate:
     source_node_id: int
     target_node_id: int
     polyline: Tuple[Point2, ...] = ()
+    graph_revision: int = 0
+    # Directed graph transitions, not nearest-polyline/arc-length labels.
+    connections: Tuple[Tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,7 @@ class SparseAttachments:
     nearby_count: int = 0
     rejected_count: int = 0
     node_paths: Dict[int, Tuple[Point2, ...]] = field(default_factory=dict)
+    node_connections: Dict[int, Tuple[Tuple[int,int,int], ...]] = field(default_factory=dict)
 
 
 class SparseRouteGraph:
@@ -347,6 +351,7 @@ class SparseRouteGraph:
         allowed = connector_allowed or (lambda _source, _target: True)
         options: Dict[int, float] = {}
         node_paths: Dict[int, Tuple[Point2, ...]] = {}
+        node_connections = {}
         edge_options: Dict[int, List[EdgeAttachment]] = {}
         nearby_count = 0
         rejected_count = 0
@@ -363,6 +368,7 @@ class SparseRouteGraph:
                 if distance < options.get(node_id, math.inf):
                     options[node_id] = distance
                     node_paths[node_id] = (point, position)
+                    node_connections[node_id] = ()
 
             for (edge_id, sample_index), (position, along) in self._sample_buckets.get(
                     key, {}).items():
@@ -386,10 +392,12 @@ class SparseRouteGraph:
                     node_paths[edge.source_id] = self._join_points(
                         (point, position),
                         tuple(reversed(edge.polyline[:sample_index + 1])))
+                    node_connections[edge.source_id]=((edge_id,edge.target_id,edge.source_id),) if sample_index>0 else ()
                 if target_cost < options.get(edge.target_id, math.inf):
                     options[edge.target_id] = target_cost
                     node_paths[edge.target_id] = self._join_points(
                         (point, position), edge.polyline[sample_index:])
+                    node_connections[edge.target_id]=((edge_id,edge.source_id,edge.target_id),) if sample_index<len(edge.polyline)-1 else ()
         node_options = sorted(
             options.items(), key=lambda item: (item[1], item[0]))[
                 :max(1, int(limit))]
@@ -403,7 +411,7 @@ class SparseRouteGraph:
             if node_id in node_paths}
         return SparseAttachments(
             node_options, edge_options, nearby_count, rejected_count,
-            retained_paths)
+            retained_paths,{node_id:node_connections.get(node_id,()) for node_id,_ in node_options})
 
     @staticmethod
     def _join_points(*parts: Sequence[Point2]) -> Tuple[Point2, ...]:
@@ -449,6 +457,16 @@ class SparseRouteGraph:
         if not points:
             points = (self.nodes[target_node].position,)
         return points
+
+    @staticmethod
+    def _graph_connections(target_node, parents):
+        transitions=[]
+        current=target_node
+        while current in parents:
+            previous,edge_id=parents[current]
+            transitions.append((edge_id,previous,current))
+            current=previous
+        return tuple(reversed(transitions))
 
     def _same_edge_polyline(
             self, first: EdgeAttachment, second: EdgeAttachment
@@ -572,7 +590,7 @@ class SparseRouteGraph:
                     (target_edge.position, target))
                 results.append(SparseRouteEstimate(
                     total, self._turn_cost(points), edge.source_id,
-                    edge.target_id, points))
+                    edge.target_id, points, self.graph_revision))
                 reasons.append(None)
                 continue
 
@@ -584,6 +602,10 @@ class SparseRouteGraph:
                 tuple(reversed(details.node_paths[target_node])))
             results.append(SparseRouteEstimate(
                 total, self._turn_cost(points), source_node, target_node,
-                points))
+                points,self.graph_revision,
+                start_details.node_connections.get(source_node,())+
+                self._graph_connections(target_node,parents)+
+                tuple((edge,target,source) for edge,source,target in
+                      reversed(details.node_connections.get(target_node,())))))
             reasons.append(None)
         return results, reasons

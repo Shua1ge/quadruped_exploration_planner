@@ -1221,7 +1221,35 @@ namespace scan_planner
         }
       }
     }
+    addPreferredClearanceCost(grad_3D,f_combine);
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
+  }
+
+  void BsplineOptimizer::addPreferredClearanceCost(Eigen::MatrixXd& gradient,double& total) {
+    if(clearance_field_ && preferred_margin_>0) {
+      // Same directional two-circle field as the LOCAL seed search. This
+      // smooth preference is not the hard footprint/sweep certificate.
+      const double weight=std::max(1.0,new_lambda2_);
+      const auto cost=[&](int i) {
+        const Eigen::Vector2d tangent=(cps_.points.col(i+1)-cps_.points.col(i-1)).head<2>();
+        const double yaw=std::atan2(tangent.y(),tangent.x());
+        return weight*PlanarClearanceField::preferenceCost(clearance_field_->footprintDistance(
+            cps_.points.col(i).head<2>(),yaw,body_offset_),preferred_margin_);
+      };
+      constexpr double epsilon=1e-4;
+      for(int i=order_;i<cps_.size-order_;++i) {
+        total+=cost(i);
+        // Include yaw dependence on both neighboring control points.
+        for(int j=std::max(order_,i-1);j<=std::min(cps_.size-order_-1,i+1);++j)
+          for(int axis=0;axis<2;++axis) {
+            const double original=cps_.points(axis,j);
+            cps_.points(axis,j)=original+epsilon; const double plus=cost(i);
+            cps_.points(axis,j)=original-epsilon; const double minus=cost(i);
+            cps_.points(axis,j)=original;
+            gradient(axis,j)+=(plus-minus)/(2*epsilon);
+          }
+      }
+    }
   }
 
   void BsplineOptimizer::combineCostRefine(const double *x, double *grad, double &f_combine, const int n)
@@ -1249,6 +1277,7 @@ namespace scan_planner
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness +
                               lambda3_ * g_feasibility;
     grad_3D.row(2).setZero();
+    addPreferredClearanceCost(grad_3D,f_combine);
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 

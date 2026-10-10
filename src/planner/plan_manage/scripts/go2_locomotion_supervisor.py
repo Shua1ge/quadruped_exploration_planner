@@ -30,7 +30,7 @@ from go2_locomotion_logic import (
 
 
 class Go2LocomotionSupervisor(Node):
-    def __init__(self):
+    def __init__(self, policy_session_factory=None):
         super().__init__("go2_locomotion_supervisor")
         self.mode_name = str(self.declare_parameter(
             "locomotion_mode", "planning_kinematic").value)
@@ -204,7 +204,9 @@ class Go2LocomotionSupervisor(Node):
                 "/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx").value)
             if not os.path.isfile(model_path):
                 raise FileNotFoundError(model_path)
-            self.onnx_session = ort.InferenceSession(model_path)
+            self.onnx_session = (
+                ort.InferenceSession(model_path) if policy_session_factory is None
+                else policy_session_factory(model_path))
             inputs = {item.name: item.shape for item in self.onnx_session.get_inputs()}
             expected = {
                 "proprio_history": [1, 450], "depth_camera": [1, 2, 58, 87],
