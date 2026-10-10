@@ -26,6 +26,9 @@ class FakeActor:
         return [SimpleNamespace(name=name, shape=shape)
                 for name, shape in ACTOR_INPUTS.items()]
 
+    def get_outputs(self):
+        return [SimpleNamespace(name="action")]
+
     def run(self, names, feeds):
         self.calls.append({name: value.copy() for name, value in feeds.items()})
         value = feeds["mcp_code"][0, 0] + feeds["obs"][0, 0]

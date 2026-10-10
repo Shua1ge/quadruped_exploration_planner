@@ -199,14 +199,36 @@ class Go2LocomotionSupervisor(Node):
             self.diagnostics_pub = None
         else:
             import onnxruntime as ort
+            from ament_index_python.packages import get_package_share_directory
+            from go2_stateful_policy import StatefulPolicyAdapter
+
+            self.locomotion_policy = str(self.declare_parameter(
+                "locomotion_policy", "parkour_moe_stateful").value)
+            if self.locomotion_policy not in ("legacy", "parkour_moe_stateful"):
+                raise ValueError("locomotion_policy must be 'legacy' or 'parkour_moe_stateful'")
+            policy_dir = os.path.join(get_package_share_directory("scan_planner"),
+                                      "config", "policies", "parkour_moe_stateful")
+            default_model = (
+                "/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx"
+                if self.locomotion_policy == "legacy" else
+                os.path.join(policy_dir, "parkour_moe_full_stateful.onnx"))
             model_path = str(self.declare_parameter(
-                "model_path",
-                "/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx").value)
+                "model_path", default_model).value) or default_model
+            actor_model_path = str(self.declare_parameter(
+                "actor_model_path", os.path.join(policy_dir, "actor.onnx")).value)
+            actor_model_path = actor_model_path or os.path.join(policy_dir, "actor.onnx")
+            refresh_every = self.declare_parameter("estimator_refresh_every", 5).value
             if not os.path.isfile(model_path):
                 raise FileNotFoundError(model_path)
-            self.onnx_session = (
-                ort.InferenceSession(model_path) if policy_session_factory is None
-                else policy_session_factory(model_path))
+            if policy_session_factory is not None:
+                self.onnx_session = policy_session_factory(model_path)
+            elif self.locomotion_policy == "parkour_moe_stateful":
+                if not os.path.isfile(actor_model_path):
+                    raise FileNotFoundError(actor_model_path)
+                self.onnx_session = StatefulPolicyAdapter(
+                    model_path, actor_model_path, refresh_every)
+            else:
+                self.onnx_session = ort.InferenceSession(model_path)
             inputs = {item.name: item.shape for item in self.onnx_session.get_inputs()}
             expected = {
                 "proprio_history": [1, 450], "depth_camera": [1, 2, 58, 87],
@@ -214,6 +236,15 @@ class Go2LocomotionSupervisor(Node):
             }
             if inputs != expected:
                 raise RuntimeError(f"unexpected ONNX input signature: {inputs}")
+            self.get_logger().info(
+                f"[LOCOMOTION_POLICY] backend={self.locomotion_policy} "
+                f"model={model_path} blind=true actor={1.0/self.policy_dt:.0f}Hz "
+                f"estimator_refresh_every={refresh_every if self.locomotion_policy != 'legacy' else 1}")
+            if self.locomotion_policy == "parkour_moe_stateful":
+                self.get_logger().warning(
+                    "[POLICY_CONTRACT] using the flat-ground-tested observation order, "
+                    f"action_scale={self.action_scale}, kp={self.kp}, kd={self.kd}; "
+                    "new training/deployment configuration has not been supplied")
             self.create_subscription(Imu, "/go2/imu", self.imu_callback, qos_profile_sensor_data)
             self.effort_pub = self.create_publisher(
                 Float64MultiArray, "/joint_group_effort_controller/commands", 10)
@@ -536,6 +567,11 @@ class Go2LocomotionSupervisor(Node):
         target, phase and observation history: the arm path in "policy" mode,
         and the end of the deterministic get-up.
         """
+        # Reset the recurrent state only on entry into a new policy episode,
+        # never on zero command, HOLD, a new trajectory or a new Explorer goal.
+        reset_policy = getattr(self.onnx_session, "reset", None)
+        if reset_policy is not None:
+            reset_policy()
         self.getup_phase = "POLICY"
         self.desired_target = DEFAULT_DOF_POS.copy()
         self.policy_cycle = 0

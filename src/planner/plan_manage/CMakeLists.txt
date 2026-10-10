@@ -78,6 +78,7 @@ install(PROGRAMS
   scripts/go2_policy_node.py
   scripts/go2_locomotion_supervisor.py
   scripts/go2_locomotion_logic.py
+  scripts/go2_stateful_policy.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}
@@ -108,6 +109,9 @@ if(BUILD_TESTING)
   add_test(NAME test_locomotion_supervisor
     COMMAND ${PYTHON_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test/test_locomotion_supervisor.py)
+  add_test(NAME test_go2_policy_loading
+    COMMAND ${PYTHON_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/test_go2_policy_loading.py)
   add_test(NAME test_observation_task_runtime
     COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_observation_task_runtime.py)
   set_tests_properties(test_observation_task_runtime PROPERTIES TIMEOUT 40)

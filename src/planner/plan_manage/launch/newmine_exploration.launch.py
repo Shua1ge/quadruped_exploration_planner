@@ -106,6 +106,10 @@ def generate_launch_description():
         # "policy" lets the zero-command ONNX policy perform the lying-to-stand;
         # "deterministic" keeps the time-scheduled PREPOSE/STAND interpolation.
         DeclareLaunchArgument("getup_mode", default_value="policy"),
+        DeclareLaunchArgument("locomotion_policy", default_value="parkour_moe_stateful"),
+        DeclareLaunchArgument("policy_model_path", default_value=""),
+        DeclareLaunchArgument("policy_actor_path", default_value=""),
+        DeclareLaunchArgument("estimator_refresh_every", default_value="5"),
         DeclareLaunchArgument(
             "metrics_file", default_value="/tmp/newmine_long_horizon_01.csv"),
         DeclareLaunchArgument("init_x", default_value=str(DEFAULT_INIT_X)),
@@ -122,6 +126,10 @@ def generate_launch_description():
                 "controller_mode": "closed_loop",
                 "locomotion_mode": LaunchConfiguration("locomotion_mode"),
                 "getup_mode": LaunchConfiguration("getup_mode"),
+                "locomotion_policy": LaunchConfiguration("locomotion_policy"),
+                "policy_model_path": LaunchConfiguration("policy_model_path"),
+                "policy_actor_path": LaunchConfiguration("policy_actor_path"),
+                "estimator_refresh_every": LaunchConfiguration("estimator_refresh_every"),
                 "use_gpu": LaunchConfiguration("use_gpu"),
                 "use_pcd_map": LaunchConfiguration("use_pcd_map"),
                 "use_sdf_map": LaunchConfiguration("use_sdf_map"),

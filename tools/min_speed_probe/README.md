@@ -106,6 +106,7 @@ ros2 launch go2_description go2_sim.launch.py \
 ros2 run scan_planner go2_locomotion_supervisor.py --ros-args \
   -r body_pose:=/quad_0/body_pose \
   -p locomotion_mode:=rl_effort \
+  -p locomotion_policy:=legacy \
   -p model_path:=/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx
 
 # 等 supervisor 日志报告站立稳定后,打开导航使能(rl_effort 模式默认要求):

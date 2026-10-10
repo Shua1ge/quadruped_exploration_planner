@@ -8,6 +8,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Opaq
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def _as_bool(value):
@@ -26,6 +27,7 @@ def _setup(context):
     sensor_type = LaunchConfiguration("sensor_type").perform(context)
     controller_mode = LaunchConfiguration("controller_mode").perform(context)
     locomotion_mode = LaunchConfiguration("locomotion_mode").perform(context)
+    locomotion_policy = LaunchConfiguration("locomotion_policy").perform(context)
     keypoints_file = LaunchConfiguration("keypoints_file").perform(context)
     navi_mode = int(LaunchConfiguration("navi_mode").perform(context))
     task_mode = _as_bool(LaunchConfiguration("task_mode").perform(context))
@@ -37,6 +39,8 @@ def _setup(context):
         raise RuntimeError("controller_mode must be 'open_loop' or 'closed_loop'")
     if locomotion_mode not in ("planning_kinematic", "rl_effort"):
         raise RuntimeError("locomotion_mode must be 'planning_kinematic' or 'rl_effort'")
+    if locomotion_policy not in ("legacy", "parkour_moe_stateful"):
+        raise RuntimeError("locomotion_policy must be 'legacy' or 'parkour_moe_stateful'")
     if navi_mode not in (1, 2, 3):
         raise RuntimeError("navi_mode must be 1, 2, or 3")
     if navi_mode == 2 and (not keypoints_file or not os.path.isfile(keypoints_file)):
@@ -108,6 +112,11 @@ def _setup(context):
         "grid_map.need_extrinsic": need_extrinsic,
         **lidar_extrinsic,
     }
+    if locomotion_mode == "rl_effort" and locomotion_policy == "parkour_moe_stateful":
+        # Keep the existing 0.30 command floor. The new flat-ground measurement
+        # at that command is 0.252 m/s, not the legacy policy's 0.165 m/s.
+        # Braking certification continues to use the conservative command floor.
+        planner_overrides["fsm.min_forward_effective_speed"] = 0.25
     actions = [
         Node(
             package="scan_planner",
@@ -243,7 +252,12 @@ def _setup(context):
                         {
                             "locomotion_mode": locomotion_mode,
                             "getup_mode": LaunchConfiguration("getup_mode"),
-                            "model_path": "/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx",
+                            "locomotion_policy": LaunchConfiguration("locomotion_policy"),
+                            "model_path": ParameterValue(
+                                LaunchConfiguration("policy_model_path"), value_type=str),
+                            "actor_model_path": ParameterValue(
+                                LaunchConfiguration("policy_actor_path"), value_type=str),
+                            "estimator_refresh_every": LaunchConfiguration("estimator_refresh_every"),
                         },
                     ],
                     remappings=[("body_pose", body_pose)],
@@ -358,6 +372,10 @@ def generate_launch_description():
             DeclareLaunchArgument("controller_mode", default_value="closed_loop"),
             DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
             DeclareLaunchArgument("getup_mode", default_value="policy"),
+            DeclareLaunchArgument("locomotion_policy", default_value="parkour_moe_stateful"),
+            DeclareLaunchArgument("policy_model_path", default_value=""),
+            DeclareLaunchArgument("policy_actor_path", default_value=""),
+            DeclareLaunchArgument("estimator_refresh_every", default_value="5"),
             DeclareLaunchArgument("keypoints_file", default_value=""),
             DeclareLaunchArgument("use_gpu", default_value="false"),
             DeclareLaunchArgument("use_pcd_map", default_value="false"),

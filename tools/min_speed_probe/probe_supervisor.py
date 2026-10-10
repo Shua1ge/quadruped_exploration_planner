@@ -25,21 +25,17 @@ def main():
         "--ros-args", "-r", "body_pose:=/quad_0/body_pose",
         "-p", "locomotion_mode:=rl_effort", "-p", "use_sim_time:=true",
         "-p", f"model_path:={args.model}",
+        "-p", f"estimator_refresh_every:={args.refresh_every}",
         *ros_args,
     ])
     adapter = ProbePolicyAdapter(args.model, args.archive, args.refresh_every)
-
-    class ProbeSupervisor(Go2LocomotionSupervisor):
-        def begin_policy_phase(self):
-            adapter.reset()
-            super().begin_policy_phase()
 
     def factory(model_path):
         if Path(model_path).resolve() != Path(args.model).resolve():
             raise ValueError("model_path override must match --model")
         return adapter
 
-    node = ProbeSupervisor(policy_session_factory=factory)
+    node = Go2LocomotionSupervisor(policy_session_factory=factory)
     node.get_logger().warning(
         "[PROBE_ASSUMED_CONTRACT] simulation-only test: using the existing "
         f"45-D observation/joint order, default pose, action_scale={node.action_scale}, "
