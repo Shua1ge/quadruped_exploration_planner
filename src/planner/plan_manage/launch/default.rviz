@@ -331,13 +331,13 @@ Visualization Manager:
       Color: 255; 255; 255
       Color Transformer: AxisColor
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Occupancy
+      Name: Raw Obstacle Occupancy (low returns separate)
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -348,11 +348,11 @@ Visualization Manager:
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /grid_map/occupancy
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -371,7 +371,7 @@ Visualization Manager:
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Inflated Occupancy
+      Name: Body-height Obstacles (display only)
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -382,11 +382,29 @@ Visualization Manager:
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Best Effort
-        Value: /grid_map/occupancy_inflate
+        Reliability Policy: Reliable
+        Value: /grid_map/body_obstacles
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Below-body Returns (not certified ground)
+      Enabled: true
+      Value: true
+      Alpha: 0.7
+      Color: 150; 150; 150
+      Color Transformer: FlatColor
+      Position Transformer: XYZ
+      Decay Time: 0
+      Size (m): 0.05
+      Style: Squares
+      Topic:
+        Value: /grid_map/low_surface_returns
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Filter size: 10
     - Class: rviz_default_plugins/Marker
       Enabled: true
       Name: Sliding Map Bounds
@@ -459,6 +477,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /explorer/path
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Global Spatial Graph
+      Namespaces: {spatial_nodes: true, spatial_edges: true, viewpoint_evidence: true}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /global_representation/graph_markers
+      Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
       Name: Explorer Frontiers
@@ -482,6 +512,18 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /explorer/goal
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Explorer Region Decision
+      Namespaces: {regions: true, rejected: true, accepted: true, prepared: true, active_goal: true, region_sequence: true}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /explorer/region_overlay
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true

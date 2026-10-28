@@ -99,6 +99,125 @@ def test_motion_exhaustion_is_nonspatial_terminal_and_deduplicated():
     assert value.active_observation.completion_reason=="none"
 
 
+def test_legacy_motion_failure_without_message_keeps_reason_and_arbitrates():
+    value=bridge();value.active_goal=(3.,2.);value.active_region_id=7
+    reasons=[];terminals=[];decisions=[]
+    value.remember_local_motion_attempt=lambda goal,reason,**kwargs:reasons.append(reason)
+    value.terminate_active_observation=terminals.append
+    value.replan_gate=SimpleNamespace(reset=lambda:None)
+    value.plan_from_current_position=lambda **kw:decisions.append(kw) or True
+    value.publish_status=lambda status:None
+    value.handle_local_motion_exhausted(reason="HEADING_ALIGNMENT_INEFFECTIVE")
+    assert reasons==["HEADING_ALIGNMENT_INEFFECTIVE"]
+    assert terminals==["LOCAL_MOTION_EXHAUSTED"] and len(decisions)==1
+    value.handle_local_motion_exhausted(None)
+    assert reasons[-1]=="LOCAL_MOTION_EXHAUSTED"
+
+
+def test_failed_side_step_blocks_same_departure_but_allows_certified_alternative_task():
+    value=bridge();value.task_geometry_autonomy=True;value.body_yaw=0.
+    value.active_goal=(3.,2.);value.active_region_id=7
+    decisions=[];statuses=[]
+    value.publish_status=statuses.append
+    value.terminate_active_observation=lambda reason:None
+    value.replan_gate=SimpleNamespace(reset=lambda:None)
+    value.plan_from_current_position=lambda **kwargs:decisions.append(kwargs) or True
+    value.handle_local_motion_exhausted(ObservationFeedback(reason="LATERAL_RECOVERY_REJOIN_FAILED",
+        trigger_reason="HANDOFF_ALIGNMENT_DEVIATED",recovery_reason="LATERAL_RECOVERY_OVERSHOOT",
+        planning_reason="LOCAL_PATH_FAMILY_EXHAUSTED"))
+    assert len(decisions)==1 and value.local_departure_replan_allowed()
+    east=SimpleNamespace(goal=(8.,2.),path=[])
+    north=SimpleNamespace(goal=(2.,8.),path=[])
+    assert not value.local_departure_candidate_allowed(east)
+    assert value.local_departure_candidate_allowed(north)
+    assert any("trigger=HANDOFF_ALIGNMENT_DEVIATED" in s and "recovery=LATERAL_RECOVERY_OVERSHOOT" in s for s in statuses)
+    value.position=(2.02,2.);value.body_yaw=.02
+    value.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=100_000_000_000))
+    assert not value.local_departure_candidate_allowed(east) # No clock/Goal refill.
+    value.position=(2.31,2.)
+    assert value.local_departure_candidate_allowed(east)
+
+
+def test_stationary_departure_alternatives_have_finite_direction_budget():
+    import math
+    value=bridge();value.body_yaw=0.
+    for i in range(8):
+        angle=i*math.pi/4
+        goal=(2.+5*math.cos(angle),2.+5*math.sin(angle))
+        candidate=SimpleNamespace(goal=goal,path=[])
+        assert value.local_departure_candidate_allowed(candidate)
+        value.remember_local_motion_attempt(goal,"LATERAL_RECOVERY_ALREADY_USED")
+    assert len(value.departure_action_failures)==8
+    for i in range(64):
+        angle=i*2*math.pi/64
+        assert not value.local_departure_candidate_allowed(SimpleNamespace(
+            goal=(2.+5*math.cos(angle),2.+5*math.sin(angle)),path=[]))
+    assert value.departure_action_suppressed
+
+
+def test_same_entry_different_remote_goal_is_blocked_but_different_entry_allowed():
+    value=bridge();value.body_yaw=0.
+    value.remember_local_motion_attempt((9.,2.),"LATERAL_RECOVERY_REJOIN_FAILED",cells=[(2,2),(5,2),(9,2)])
+    # Route first goes east then turns north; its distant goal must not bypass memory.
+    assert not value.local_departure_candidate_allowed(SimpleNamespace(goal=(5.,9.),path=[(2,2),(5,2),(5,9)]))
+    assert value.local_departure_candidate_allowed(SimpleNamespace(goal=(5.,9.),path=[(2,2),(2,5),(5,9)]))
+
+
+def test_departure_key_uses_remaining_route_not_old_task_start():
+    import math
+    value=bridge();value.position=(5.5,2.5)
+    yaw=value.departure_route_yaw((9.5,2.5),[(1,2),(9,2)])
+    assert abs(yaw)<1e-9
+
+
+def test_typed_current_pose_failure_is_not_reduced_to_an_action():
+    value=bridge();value.active_goal=(3.,2.);value.active_region_id=7
+    value.publish_status=lambda status:None
+    value.terminate_active_observation=lambda reason:None
+    value.plan_from_current_position=lambda **kwargs: (_ for _ in ()).throw(AssertionError("pose blocked"))
+    value.handle_local_motion_exhausted(ObservationFeedback(reason="LATERAL_RECOVERY_REJOIN_FAILED",
+        failure_scope=ObservationFeedback.FAILURE_CURRENT_POSE))
+    assert not value.local_departure_replan_allowed()
+
+
+def test_transition_phase_preserves_objective_and_duplicate_cannot_extend_deadline():
+    from explorer_core.observation_task_bridge import PendingObservationHandoff
+    value=bridge(); value.publish_status=lambda status:None
+    task=SimpleNamespace(task_id=101,task_version=1,goal=(3.,2.))
+    pending=PendingObservationHandoff(value.active_observation,task,None,None,request_id=99)
+    value.pending_observation_handoff=pending
+    now=SimpleNamespace(nanoseconds=2_000_000_000)
+    value.get_clock=lambda:SimpleNamespace(now=lambda:now)
+    message=ObservationFeedback(task_id=101,task_version=1,request_id=99,
+        state=ObservationFeedback.TRANSITION_WAIT_STOP)
+    assert value.pending_observation_feedback(message)
+    assert pending.published_ns==now.nanoseconds
+    now.nanoseconds+=1_000_000_000
+    assert value.pending_observation_feedback(message)
+    assert pending.published_ns==2_000_000_000 and pending.state=='PREPARING'
+    assert value.active_observation is pending.predecessor
+    message.state=ObservationFeedback.TRANSITION_RESTARTING
+    assert value.pending_observation_feedback(message)
+    assert pending.published_ns==now.nanoseconds
+    message.state=ObservationFeedback.TRANSITION_WAIT_STOP
+    now.nanoseconds+=1_000_000_000
+    value.pending_observation_feedback(message)
+    assert pending.published_ns==3_000_000_000
+
+
+def test_nonspatial_failed_goal_retry_and_handoff_exclusion_have_bounded_expiry():
+    value=bridge()
+    value.remember_local_motion_attempt((3.,2.),'HANDOFF_ROLLING_VELOCITY_ERROR')
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    assert not value.local_motion_retry_allowed(attempt)
+    value.handoff_excluded_goals=[(3.,2.)]
+    value.handoff_excluded_until={(3.,2.):6_000_000_000}
+    assert value.current_handoff_exclusions()==((3.,2.),)
+    value.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=6_000_000_000))
+    assert value.local_motion_retry_allowed(attempt)
+    assert value.current_handoff_exclusions()==()
+
+
 def test_route_checkpoints_use_directed_edges_and_freeze_revision():
     from explorer_core.sparse_routing import SparseNode,SparseEdge,SparseRouteGraph,SparseRouteEstimate
     value=bridge(); value.task_geometry_autonomy=True
@@ -587,3 +706,89 @@ def test_alternating_path_rejections_cannot_bypass_task_retry_budget():
         task_version=1, request_id=102, candidate_id=999,
         state=ObservationFeedback.STATION_REACHED, station=Point(x=1., y=1.)))
     assert value.pending_observation_station is None and value.task_stations_reached == 0
+
+
+def test_time_and_task_change_do_not_reopen_unchanged_departure_failure():
+    value=bridge();value.grid.data.fill(0);value.body_yaw=0.
+    value.remember_local_motion_attempt((3.,2.),'LATERAL_RECOVERY_INEFFECTIVE')
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    value.get_clock().now().nanoseconds+=60_000_000_000
+    value.active_observation=ObservationTask(8,(3.2,2.),{(5,5)})
+    assert not value.local_motion_retry_allowed(attempt)
+    value.body_yaw=1.
+    assert value.local_motion_retry_allowed(attempt)
+
+
+def test_turn_stage_successor_wait_is_finite_and_duplicate_does_not_extend_it():
+    from explorer_core.observation_task_bridge import PendingObservationHandoff
+    value=bridge();value.path_request_timeout=5.;value.publish_status=lambda _:None
+    task=SimpleNamespace(task_id=101,task_version=1,goal=(3.,2.))
+    pending=PendingObservationHandoff(value.active_observation,task,None,None,request_id=99)
+    value.pending_observation_handoff=pending
+    now=SimpleNamespace(nanoseconds=2_000_000_000)
+    value.get_clock=lambda:SimpleNamespace(now=lambda:now)
+    cancelled=[]
+    def cancel(reason):
+        cancelled.append(reason);pending.state='CANCELLING';pending.cancel_started_ns=now.nanoseconds
+    value.cancel_pending_observation_handoff=cancel
+    message=ObservationFeedback(task_id=101,task_version=1,request_id=99,
+        state=ObservationFeedback.TRANSITION_WAIT_STOP,reason='WAITING_FOR_TURN_STAGE')
+    assert value.pending_observation_feedback(message)
+    now.nanoseconds+=8_000_000_000
+    assert value.continue_pending_observation_handoff()
+    assert pending.state=='PREPARING' and cancelled==[]
+    assert value.pending_observation_feedback(message)
+    assert pending.published_ns==2_000_000_000
+    now.nanoseconds=17_000_000_000
+    assert value.continue_pending_observation_handoff()
+    assert cancelled==['EXECUTION_READY_TIMEOUT']
+
+
+def test_occupied_recovery_start_waits_for_physical_change_without_goal_churn():
+    value=bridge();value.task_geometry_autonomy=True;value.body_yaw=0.
+    value.active_goal=(3.,2.);value.active_region_id=7
+    value.publish_status=lambda status:None
+    value.terminate_active_observation=lambda reason:None
+    value.plan_from_current_position=lambda **kwargs: (_ for _ in ()).throw(AssertionError("occupied recovery cannot be repaired by changing remote Goal"))
+    value.handle_local_motion_exhausted(ObservationFeedback(reason="RECOVERY_START_FOOTPRINT_OCCUPIED"))
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    value.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=100_000_000_000))
+    assert not value.local_departure_replan_allowed()
+    assert not value.local_motion_retry_allowed(attempt)
+    value.position=(2.31,2.)
+    assert value.local_departure_replan_allowed()
+
+
+def test_prepared_successor_action_failure_survives_cancel_without_freezing_all_goals():
+    from explorer_core.observation_task_bridge import PendingObservationHandoff
+    value=bridge();value.task_geometry_autonomy=True;value.body_yaw=0.
+    value.publish_status=lambda status:None
+    task=SimpleNamespace(task_id=101,task_version=1,goal=(3.5,2.))
+    pending=PendingObservationHandoff(value.active_observation,task,[(2,2),(4,2)],None,request_id=99)
+    value.pending_observation_handoff=pending
+    message=ObservationFeedback(task_id=101,task_version=1,request_id=99,
+        state=ObservationFeedback.LOCAL_MOTION_EXHAUSTED,reason="LATERAL_RECOVERY_REJOIN_FAILED")
+    assert value.pending_observation_feedback(message) and pending.state=='CANCELLING'
+    message.state=ObservationFeedback.CANCEL_ACK
+    assert value.pending_observation_feedback(message)
+    assert value.pending_observation_handoff is None and value.local_departure_replan_allowed()
+    assert not value.local_departure_candidate_allowed(SimpleNamespace(goal=(9.,2.),path=[]))
+    assert value.local_departure_candidate_allowed(SimpleNamespace(goal=(2.,9.),path=[]))
+
+
+def test_prepared_successor_occupied_departure_survives_cancel_ack():
+    from explorer_core.observation_task_bridge import PendingObservationHandoff
+    value=bridge();value.task_geometry_autonomy=True;value.body_yaw=0.
+    value.publish_status=lambda status:None
+    task=SimpleNamespace(task_id=101,task_version=1,goal=(3.5,2.))
+    pending=PendingObservationHandoff(value.active_observation,task,[],None,request_id=99)
+    value.pending_observation_handoff=pending
+    message=ObservationFeedback(task_id=101,task_version=1,request_id=99,
+        state=ObservationFeedback.LOCAL_MOTION_EXHAUSTED,reason="RECOVERY_START_FOOTPRINT_OCCUPIED")
+    assert value.pending_observation_feedback(message)
+    assert pending.state=='CANCELLING'
+    assert not value.local_departure_replan_allowed()
+    message.state=ObservationFeedback.CANCEL_ACK
+    assert value.pending_observation_feedback(message)
+    assert value.pending_observation_handoff is None
+    assert not value.local_departure_replan_allowed()

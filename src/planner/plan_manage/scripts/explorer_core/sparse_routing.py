@@ -15,6 +15,8 @@ class SparseNode:
     node_id: int
     position: Point2
     clearance: float = 0.0
+    traversability: float = 1.0
+    terrain_state: int = 0
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,11 @@ class SparseEdge:
     length: float
     minimum_clearance: float
     polyline: Tuple[Point2, ...]
+    # Global's route-cost multiplier ([0.8, 2.0]); never a hard block.
+    traversability: float = 1.0
+    terrain_state: int = 0
+    traversals: int = 0
+    experience_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,9 @@ class SparseRouteEstimate:
     graph_revision: int = 0
     # Directed graph transitions, not nearest-polyline/arc-length labels.
     connections: Tuple[Tuple[int, int, int], ...] = ()
+    route_source: str = "graph"
+    # Extra cost above geometric length from Global's terrain/experience.
+    terrain_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,8 @@ class SparseAttachments:
     rejected_count: int = 0
     node_paths: Dict[int, Tuple[Point2, ...]] = field(default_factory=dict)
     node_connections: Dict[int, Tuple[Tuple[int,int,int], ...]] = field(default_factory=dict)
+    # Terrain surcharge that belongs to each node option's weighted connector.
+    node_penalties: Dict[int, float] = field(default_factory=dict)
 
 
 class SparseRouteGraph:
@@ -118,12 +130,18 @@ class SparseRouteGraph:
             raise ValueError(f"{label} must contain two finite coordinates")
 
     @classmethod
+    def _validate_price(cls, value: float, label: str):
+        if (not math.isfinite(value) or value < 0.5 or value > 4.0):
+            raise ValueError(f"{label} must be finite and within [0.5, 4.0]")
+
+    @classmethod
     def _validate_node(cls, node: SparseNode):
         if int(node.node_id) < 0:
             raise ValueError("sparse node id must be non-negative")
         cls._validate_point(node.position, "sparse node position")
         if not math.isfinite(node.clearance) or node.clearance < 0.0:
             raise ValueError("sparse node clearance must be finite and non-negative")
+        cls._validate_price(node.traversability, "sparse node traversability")
 
     @classmethod
     def _validate_edge(cls, edge: SparseEdge):
@@ -141,6 +159,7 @@ class SparseRouteGraph:
                 "sparse edge minimum clearance must be finite and non-negative")
         for index, point in enumerate(edge.polyline):
             cls._validate_point(point, f"sparse edge polyline point {index}")
+        cls._validate_price(edge.traversability, "sparse edge traversability")
 
     def upsert_node(self, node: SparseNode):
         self._validate_node(node)
@@ -230,6 +249,11 @@ class SparseRouteGraph:
             samples.append((bucket_key, sample_key))
         self._edge_sample_keys[edge.edge_id] = samples
         self._components_dirty = True
+
+    def edge_cost(self, edge_id: int) -> float:
+        """Weighted length: Global's traversability scales the geometric length."""
+        edge = self.edges.get(edge_id)
+        return 1.0 if edge is None else float(edge.traversability)
 
     def _refresh_components(self):
         if not self._components_dirty:
@@ -350,6 +374,7 @@ class SparseRouteGraph:
         radius = max(0.0, float(radius))
         allowed = connector_allowed or (lambda _source, _target: True)
         options: Dict[int, float] = {}
+        penalties: Dict[int, float] = {}
         node_paths: Dict[int, Tuple[Point2, ...]] = {}
         node_connections = {}
         edge_options: Dict[int, List[EdgeAttachment]] = {}
@@ -367,6 +392,7 @@ class SparseRouteGraph:
                     continue
                 if distance < options.get(node_id, math.inf):
                     options[node_id] = distance
+                    penalties[node_id] = 0.0
                     node_paths[node_id] = (point, position)
                     node_connections[node_id] = ()
 
@@ -385,16 +411,23 @@ class SparseRouteGraph:
                     continue
                 edge_options.setdefault(edge_id, []).append(EdgeAttachment(
                     edge_id, along, distance, position, sample_index))
-                source_cost = distance + along
-                target_cost = distance + max(0.0, edge.length - along)
+                multiplier = self.edge_cost(edge_id)
+                source_along = along
+                target_along = max(0.0, edge.length - along)
+                source_cost = distance + source_along * multiplier
+                target_cost = distance + target_along * multiplier
                 if source_cost < options.get(edge.source_id, math.inf):
                     options[edge.source_id] = source_cost
+                    penalties[edge.source_id] = (
+                        source_along * (multiplier - 1.0))
                     node_paths[edge.source_id] = self._join_points(
                         (point, position),
                         tuple(reversed(edge.polyline[:sample_index + 1])))
                     node_connections[edge.source_id]=((edge_id,edge.target_id,edge.source_id),) if sample_index>0 else ()
                 if target_cost < options.get(edge.target_id, math.inf):
                     options[edge.target_id] = target_cost
+                    penalties[edge.target_id] = (
+                        target_along * (multiplier - 1.0))
                     node_paths[edge.target_id] = self._join_points(
                         (point, position), edge.polyline[sample_index:])
                     node_connections[edge.target_id]=((edge_id,edge.source_id,edge.target_id),) if sample_index<len(edge.polyline)-1 else ()
@@ -411,7 +444,11 @@ class SparseRouteGraph:
             if node_id in node_paths}
         return SparseAttachments(
             node_options, edge_options, nearby_count, rejected_count,
-            retained_paths,{node_id:node_connections.get(node_id,()) for node_id,_ in node_options})
+            retained_paths,
+            {node_id: node_connections.get(node_id, ())
+             for node_id, _ in node_options},
+            {node_id: penalties.get(node_id, 0.0)
+             for node_id, _ in node_options})
 
     @staticmethod
     def _join_points(*parts: Sequence[Point2]) -> Tuple[Point2, ...]:
@@ -521,12 +558,14 @@ class SparseRouteGraph:
 
         queue = []
         costs: Dict[int, float] = {}
+        penalties: Dict[int, float] = {}
         parents: Dict[int, Tuple[int, int]] = {}
         roots: Dict[int, int] = {}
         for node_id, connector_cost in start_attachments:
             if connector_cost >= costs.get(node_id, math.inf):
                 continue
             costs[node_id] = connector_cost
+            penalties[node_id] = start_details.node_penalties.get(node_id, 0.0)
             roots[node_id] = node_id
             heapq.heappush(queue, (connector_cost, node_id))
 
@@ -543,10 +582,13 @@ class SparseRouteGraph:
                     break
             for neighbour, (length, edge_id) in self.adjacency.get(
                     current, {}).items():
-                candidate = current_cost + length
+                multiplier = self.edge_cost(edge_id)
+                candidate = current_cost + length * multiplier
                 if candidate >= costs.get(neighbour, math.inf):
                     continue
                 costs[neighbour] = candidate
+                penalties[neighbour] = (
+                    penalties[current] + length * (multiplier - 1.0))
                 parents[neighbour] = (current, edge_id)
                 roots[neighbour] = roots[current]
                 heapq.heappush(queue, (candidate, neighbour))
@@ -554,6 +596,15 @@ class SparseRouteGraph:
         results: List[Optional[SparseRouteEstimate]] = []
         reasons: List[Optional[str]] = []
         for target, details in zip(targets, target_details):
+            if (connector_allowed is not None and math.dist(start,target) <= attachment_radius
+                    and connector_allowed(start,target) and connector_allowed(target,start)):
+                # Short visible motion needs no detour through a graph anchor.
+                # Keep its provenance explicit; this is not a graph-edge hit.
+                results.append(SparseRouteEstimate(math.dist(start,target),0.,
+                    start_attachments[0][0],start_attachments[0][0],
+                    (start,target),self.graph_revision,(),"direct_connector"))
+                reasons.append(None)
+                continue
             attachments = details.node_options
             if not attachments:
                 results.append(None)
@@ -566,13 +617,15 @@ class SparseRouteGraph:
                        if node_id in costs]
             direct_choices = []
             for edge_id, start_edges in start_details.edge_options.items():
+                multiplier = self.edge_cost(edge_id)
                 for start_edge in start_edges:
                     for target_edge in details.edge_options.get(edge_id, []):
+                        along = abs(target_edge.along - start_edge.along)
                         direct_choices.append((
-                            start_edge.connector_cost
-                            + abs(target_edge.along - start_edge.along)
+                            start_edge.connector_cost + along * multiplier
                             + target_edge.connector_cost,
-                            start_edge, target_edge))
+                            start_edge, target_edge,
+                            along * (multiplier - 1.0)))
             graph_choice = min(choices) if choices else None
             direct_choice = min(
                 direct_choices, key=lambda item: item[0]) if direct_choices else None
@@ -582,7 +635,7 @@ class SparseRouteGraph:
                 continue
             if (direct_choice is not None
                     and (graph_choice is None or direct_choice[0] < graph_choice[0])):
-                total, start_edge, target_edge = direct_choice
+                total, start_edge, target_edge, terrain_surcharge = direct_choice
                 edge = self.edges[start_edge.edge_id]
                 points = self._join_points(
                     (start, start_edge.position),
@@ -590,7 +643,8 @@ class SparseRouteGraph:
                     (target_edge.position, target))
                 results.append(SparseRouteEstimate(
                     total, self._turn_cost(points), edge.source_id,
-                    edge.target_id, points, self.graph_revision))
+                    edge.target_id, points, self.graph_revision,
+                    terrain_cost=terrain_surcharge))
                 reasons.append(None)
                 continue
 
@@ -606,6 +660,8 @@ class SparseRouteGraph:
                 start_details.node_connections.get(source_node,())+
                 self._graph_connections(target_node,parents)+
                 tuple((edge,target,source) for edge,source,target in
-                      reversed(details.node_connections.get(target_node,())))))
+                      reversed(details.node_connections.get(target_node,()))),
+                terrain_cost=(penalties.get(target_node, 0.0)
+                              + details.node_penalties.get(target_node, 0.0))))
             reasons.append(None)
         return results, reasons

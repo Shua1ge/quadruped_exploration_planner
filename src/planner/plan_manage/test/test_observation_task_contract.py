@@ -2,7 +2,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
-from explorer_core.grid import ExplorationGrid, FREE
+from explorer_core.grid import ExplorationGrid, FREE, UNKNOWN
 from explorer_core.observation_lifecycle import (
     ObservationTask, evaluate_observation, observation_is_complete,
 )
@@ -38,6 +38,9 @@ def test_disappearing_boundary_without_sensor_evidence_does_not_complete():
     assert task.completion_reason == "none"
     grid._apply_evidence({(4, 4)}, set())
     evaluate_observation(task, grid, None, 5, .8, 2, 2, 1)
+    assert not observation_is_complete(task, 2, 2)
+    grid._apply_evidence({(4, 4)}, set())
+    evaluate_observation(task, grid, None, 6, .8, 2, 2, 1)
     assert observation_is_complete(task, 2, 2)
 
 
@@ -91,4 +94,47 @@ def test_historical_sensor_evidence_cannot_close_new_task():
     assert not observation_is_complete(task, 2, 2)
     grid._apply_evidence({(4, 4)}, set())
     evaluate_observation(task, grid, None, 6, .8, 2, 2, 1)
+    assert not observation_is_complete(task, 2, 2)
+    grid._apply_evidence({(4, 4)}, set())
+    evaluate_observation(task, grid, None, 7, .8, 2, 2, 1)
     assert observation_is_complete(task, 2, 2)
+
+
+def test_confirmation_uses_new_relevant_sources_not_compute_revisions():
+    grid = ExplorationGrid(8, 8, 1, 0, 0)
+    task = bind_task_identity(ObservationTask(1, (2, 2), {(4, 4)}), 100, grid)
+    grid._apply_evidence({(4, 4)}, set())
+    evaluate_observation(task, grid, None, 1, .8, 3, 3, 1)
+    for update in range(2, 20):
+        grid._apply_evidence({(1, 1)}, set())
+        evaluate_observation(task, grid, None, update, .8, 3, 3, 1)
+    assert task.completion_streak == 1
+    assert not observation_is_complete(task, 3, 3)
+    for _ in range(2):
+        grid._apply_evidence({(4, 4)}, set())
+        # New independent observations count even without a compute bump.
+        evaluate_observation(task, grid, None, 19, .8, 3, 3, 1)
+    assert observation_is_complete(task, 3, 3)
+
+
+def test_partial_boundary_loss_and_seeded_free_cannot_prove_closure():
+    grid = ExplorationGrid(8, 8, 1, 0, 0)
+    grid.data.fill(FREE)
+    task = bind_task_identity(ObservationTask(1, (2, 2),
+        {(4, 4), (5, 4), (6, 4), (7, 4)},
+        frontier_cluster_cells={(2, 2), (3, 2)}), 100, grid)
+    for update in range(5):
+        grid._apply_evidence({(4, 4), (2, 2)}, set())
+        evaluate_observation(task, grid, None, update, .8, 3, 3, 1)
+    assert task.progress == .25
+    assert task.frontier_missing_streak == 0
+    assert not observation_is_complete(task, 3, 3)
+    for update in range(3):
+        grid._apply_evidence({(2, 2), (3, 2)}, set())
+        evaluate_observation(task, grid, None, update + 5, .8, 3, 3, 1)
+    assert observation_is_complete(task, 3, 3)
+    assert task.completion_reason == "frontier_closed"
+    grid.data[2, 3] = UNKNOWN
+    evaluate_observation(task, grid, None, 8, .8, 3, 3, 1)
+    assert not observation_is_complete(task, 3, 3)
+    assert not task.boundary_closure_supported

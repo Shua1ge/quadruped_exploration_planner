@@ -1,6 +1,7 @@
 """Long-horizon exploration in the native NewMine Gazebo world."""
 
 import os
+import yaml
 import time
 
 from ament_index_python.packages import get_package_share_directory
@@ -81,10 +82,36 @@ def _reject_existing_simulation(context):
 
 def generate_launch_description():
     scan_share = get_package_share_directory("scan_planner")
+    with open(os.path.join(get_package_share_directory("go2_description"),
+                           "config", "mid360.yaml"), encoding="utf-8") as stream:
+        mid360_mount = yaml.safe_load(stream)["mount"]
+    with open(os.path.join(scan_share, "config", "planner.yaml"),
+              encoding="utf-8") as stream:
+        planner_parameters = yaml.safe_load(stream)["scan_planner_node"]["ros__parameters"]
+    # Local routes measured returns below this body-relative boundary to the
+    # low-surface channel. Explorer must use that same obstacle floor. The old
+    # +0.08 m floor almost coincides with the +0.0803 m MID-360 mount: normal
+    # body pitch/roll puts the ray origin outside the band and rejects every
+    # clearing prefix, leaving only the robot-centred seed cells free.
+    gazebo_obstacle_min_z = -float(
+        planner_parameters["grid_map.low_return_z_below_body"])
+    # Upper half of the same platform band. A 3-D lidar sees the tunnel's
+    # timber sets and arches; the old +0.85 m ceiling put every one of them in
+    # the obstacle band, so the corridor read as blocked and Explorer found no
+    # frontier cell at all. Explorer and Local must share this bound.
+    gazebo_obstacle_max_z = float(
+        planner_parameters["grid_map.high_return_z_above_body"])
+    # Unknown returns occupy their measured Z, not an entire XY column. The
+    # lowest voxel that can block the body plane is bounded by Local's upward
+    # inflation plus half a voxel (quantisation), capped by its raw-return band.
+    gazebo_body_slice_min_z = max(gazebo_obstacle_min_z, -float(
+        planner_parameters["grid_map.obstacles_inflation_z_up"]) - .5 * float(
+        planner_parameters["grid_map.resolution"]))
     return LaunchDescription([
         DeclareLaunchArgument(
             "world_file",
             default_value="/home/t1an/ros2_ws/mine_tunnel_world/worlds/NewMine.sdf"),
+        DeclareLaunchArgument("gazebo_resource_path", default_value=""),
         DeclareLaunchArgument("use_gpu", default_value="true"),
         DeclareLaunchArgument("use_gazebo_physics", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="true"),
@@ -100,18 +127,23 @@ def generate_launch_description():
         DeclareLaunchArgument("show_rviz", default_value="true"),
         DeclareLaunchArgument("auto_start", default_value="true"),
         DeclareLaunchArgument("task_mode", default_value="false"),
+        DeclareLaunchArgument("sparse_routing_enabled", default_value="true"),
         DeclareLaunchArgument("task_geometry_autonomy", default_value="true"),
         DeclareLaunchArgument("selection_strategy", default_value="hierarchical"),
         DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
         # "policy" lets the zero-command ONNX policy perform the lying-to-stand;
         # "deterministic" keeps the time-scheduled PREPOSE/STAND interpolation.
         DeclareLaunchArgument("getup_mode", default_value="policy"),
-        DeclareLaunchArgument("locomotion_policy", default_value="parkour_moe_stateful"),
+        DeclareLaunchArgument("locomotion_policy", default_value="legacy"),
         DeclareLaunchArgument("policy_model_path", default_value=""),
         DeclareLaunchArgument("policy_actor_path", default_value=""),
         DeclareLaunchArgument("estimator_refresh_every", default_value="5"),
         DeclareLaunchArgument(
             "metrics_file", default_value="/tmp/newmine_long_horizon_01.csv"),
+        # Scene extent is an Explorer information-map setting. Local retains
+        # its existing 10 x 10 x 5 m sliding 3-D map from planner.yaml.
+        DeclareLaunchArgument("map_size_x", default_value=str(MAP_SIZE)),
+        DeclareLaunchArgument("map_size_y", default_value=str(MAP_SIZE)),
         DeclareLaunchArgument("init_x", default_value=str(DEFAULT_INIT_X)),
         DeclareLaunchArgument("init_y", default_value=str(DEFAULT_INIT_Y)),
         DeclareLaunchArgument("init_z", default_value="0.45"),
@@ -137,8 +169,8 @@ def generate_launch_description():
                 "sdf_map_mode": LaunchConfiguration("sdf_map_mode"),
                 "sdf_sample_resolution": LaunchConfiguration("sdf_sample_resolution"),
                 "sdf_recenter": LaunchConfiguration("sdf_recenter"),
-                "map_size_x": str(MAP_SIZE),
-                "map_size_y": str(MAP_SIZE),
+                "map_size_x": LaunchConfiguration("map_size_x"),
+                "map_size_y": LaunchConfiguration("map_size_y"),
                 "map_size_z": "10.0",
                 "init_x": LaunchConfiguration("init_x"),
                 "init_y": LaunchConfiguration("init_y"),
@@ -146,7 +178,7 @@ def generate_launch_description():
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
                 "use_gazebo_physics": LaunchConfiguration("use_gazebo_physics"),
                 "gazebo_world": LaunchConfiguration("world_file"),
-                "gazebo_resource_path": "/home/t1an/ros2_ws/mine_tunnel_world/models",
+                "gazebo_resource_path": LaunchConfiguration("gazebo_resource_path"),
                 "headless": LaunchConfiguration("headless"),
                 "collision_check_enable": LaunchConfiguration("collision_check_enable"),
             }.items()),
@@ -160,15 +192,45 @@ def generate_launch_description():
                 "selection_strategy": LaunchConfiguration("selection_strategy"),
                 "metrics_file": LaunchConfiguration("metrics_file"),
                 "resolution": 0.20,
-                "map_size_x": MAP_SIZE,
-                "map_size_y": MAP_SIZE,
+                "map_size_x": ParameterValue(LaunchConfiguration("map_size_x"), value_type=float),
+                "map_size_y": ParameterValue(LaunchConfiguration("map_size_y"), value_type=float),
+                # Full 3-D identified rays preserve hits and measured no-returns.
+                "use_laser_scan": False,
+                "use_ray_cloud": LaunchConfiguration("use_gazebo_physics"),
                 "mapping_range": 7.5,
                 "no_return_range": 3.0,
                 "ray_count": 720,
                 "hit_dilation_bins": 3,
-                "obstacle_min_z": 0.08,
-                "obstacle_max_z": 0.85,
+                "obstacle_min_z": ParameterValue(PythonExpression([
+                    str(gazebo_obstacle_min_z), " if '",
+                    LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() == 'true' else 0.08",
+                ]), value_type=float),
+                "body_slice_min_z": ParameterValue(PythonExpression([
+                    str(gazebo_body_slice_min_z), " if '",
+                    LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() == 'true' else 0.08",
+                ]), value_type=float),
+                "obstacle_max_z": ParameterValue(PythonExpression([
+                    str(gazebo_obstacle_max_z), " if '",
+                    LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() == 'true' else 0.85",
+                ]), value_type=float),
+                # Clearing window, wider than the occupancy band on purpose:
+                # a ray that passes above the body still clears the cells under
+                # it. With the pitched MID-360 the near-horizontal rows sit a
+                # few degrees off the floor, so an occupancy-wide band would
+                # truncate every clearing prefix and freeze the free space.
+                "clearing_max_z": 0.85,
                 "obstacle_z_relative_to_body": True,
+                # Ground-relative clearance volume for height-carrying returns
+                # (identical wire contract and defaults as Local's
+                # grid_map.terrain_floor_tolerance / obstacle_min_height /
+                # obstacle_max_height). The body-relative band above stays the
+                # fallback for returns without a height estimate.
+                "terrain_floor_tolerance": 0.035,
+                "obstacle_min_height": 0.22,
+                "obstacle_max_height": 0.55,
                 "cloud_is_world": PythonExpression([
                     "'", LaunchConfiguration("use_gazebo_physics"),
                     "'.lower() != 'true'",
@@ -185,23 +247,18 @@ def generate_launch_description():
                 "max_interpolation_gap": 0.05,
                 "max_nearest_pose_age": 0.02,
                 "cloud_pose_wait_timeout": 0.10,
-                # Shared with run.launch.py / GridMap and robot.xacro.
-                "lidar_extrinsic_x": 0.10,
-                "lidar_extrinsic_y": 0.0,
-                "lidar_extrinsic_z": 0.12,
-                "lidar_extrinsic_roll": 0.0,
-                "lidar_extrinsic_pitch": 0.0,
-                "lidar_extrinsic_yaw": 0.0,
+                # Same Unitree kit mounting profile as Gazebo, TF and Local.
+                **{"lidar_extrinsic_" + key: float(value)
+                   for key, value in mid360_mount.items()},
                 # NewMine contains 2.9--3.0 m portals and short blind bends.
                 # Keep the physical margin conservative for a Go2 footprint,
                 # but allow rolling observation poses inside the portal.  The
                 # flat-world 0.65/1.0/2.0 defaults otherwise extract a valid
                 # frontier here and then reject every possible viewpoint.
-                # Must not drop below grid_map.double_cylinder_radius (0.35, see
-                # planner.yaml): an explorer that inflates less than the planner
-                # would select goals the planner then rejects as collisions.
-                "inflation_radius": 0.35,
-                "footprint_radius": 0.35,
+                # One planning envelope shared with GridMap. This is not a
+                # change to the simulated robot's physical collision shapes.
+                "inflation_radius": 0.25,
+                "footprint_radius": 0.25,
                 "footprint_offset": 0.18,
                 "viewpoint_standoff": 0.60,
                 # Extra annulus width, tried only when the nominal stand-off
@@ -222,15 +279,17 @@ def generate_launch_description():
                 "global_reroute_failure_updates": 3,
                 "max_replans_per_context": 2,
                 "replan_retry_period": 2.0,
-                "map_update_period": 0.5,
+                "map_update_period": 0.25,
+                "planning_map_publish_period": 0.25,
                 "goal_timeout": 120.0,
                 "path_request_timeout": 5.0,
                 "region_size": 8.0,
                 "region_max_path_ratio": 1.5,
                 "region_max_detour_ratio": 1.75,
                 "region_match_distance": 6.0,
-                "sparse_routing_enabled": True,
-                "sparse_attachment_radius": 1.5,
+                "sparse_routing_enabled": ParameterValue(
+                    LaunchConfiguration("sparse_routing_enabled"), value_type=bool),
+                "sparse_attachment_radius": 3.0,
                 "sparse_attachment_limit": 8,
                 "safe_region_attachment_radius": 3.0,
                 "region_release_updates": 3,
@@ -261,7 +320,10 @@ def generate_launch_description():
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
             }],
             remappings=[
-                ("cloud", "/quad_0/cloud"),
+                ("cloud", PythonExpression([
+                    "'/quad_0/lidar_rays' if '", LaunchConfiguration("use_gazebo_physics"),
+                    "'.lower() == 'true' else '/quad_0/cloud'",])),
+                ("scan", "/quad_0/scan"),
                 ("body_pose", "/quad_0/body_pose"),
                 ("initial_path", "/initial_path"),
                 ("planning/status", "/planning/status"),
@@ -275,11 +337,18 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
+                "spatial_engine": "wavefront",
+                "wavefront_tile_size": 2.0,
+                "wavefront_compact_routes": True,
+                "topology_oracle_period_revisions": 10,
                 "max_oracle_queries": 8,
+                # Deltas and RViz update per patch. Full recovery snapshots
+                # need not serialize the entire long-range graph at 4 Hz.
                 "snapshot_period_revisions": 10,
+                "safe_region_update_period_revisions": 1,
                 "blocked_confirmation_patches": 3,
                 "min_free_cells_for_destructive_update": 16,
-            }]),
+            }], remappings=[("body_pose", "/quad_0/body_pose")]),
         Node(
             package="scan_planner",
             executable="sdf_map_publisher.py",

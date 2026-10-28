@@ -7,7 +7,7 @@ from .frontier_regions import (
     advance_completion_streak, frontier_cluster_present,
     observation_progress,
 )
-from .grid import Cell, ExplorationGrid, Point2
+from .grid import Cell, ExplorationGrid, Point2, UNKNOWN
 
 
 @dataclass
@@ -46,9 +46,13 @@ class ObservationTask:
     satisfied_sensor_revision: int = 0
     # Motion contract metadata; never a second observation progress ledger.
     route_estimate: object = None
+    route_source: str = "dense"
     route_portals: tuple = ()
     route_graph_revision: int = 0
     route_contract_frozen: bool = False
+    last_evaluated_sensor_revision: int = 0
+    last_closure_sensor_revision: int = 0
+    boundary_closure_supported: bool = False
 
 
 def evaluate_observation(
@@ -56,8 +60,38 @@ def evaluate_observation(
         active_goal_cell: Optional[Cell], map_update_count: int,
         done_ratio: float, done_updates: int, closure_updates: int,
         viewpoint_standoff: float) -> Optional[ObservationTask]:
-    """Apply one accepted map revision to an active information objective."""
-    if task is None or task.information_satisfied or task.last_evaluated_update == map_update_count:
+    """Update coverage, counting confirmations only from new relevant evidence.
+
+    Occupancy computation revisions are not independent observations. Legacy
+    mode keeps its old update semantics; sensor-only tasks use per-cell source
+    revisions so unrelated scans cannot manufacture confirmation streaks.
+    """
+    if task is None or task.information_satisfied:
+        return task
+    tracked_frontier = (task.frontier_cluster_cells
+                        or ({task.frontier_cell}
+                            if task.frontier_cell is not None else set()))
+    relevant_cells = task.target_cells | tracked_frontier
+    frontier_present = bool(
+        tracked_frontier and frontier_cluster_present(
+            grid, tracked_frontier,
+            max(viewpoint_standoff, 2.0 * grid.resolution)))
+    if task.require_sensor_evidence and (frontier_present or any(
+            not grid.in_bounds(cell) or grid.value(cell) == UNKNOWN
+            for cell in tracked_frontier)):
+        # Evidence invalidation must run even on an otherwise idle compute
+        # revision. It may withdraw a closure proof, never add confirmation.
+        task.frontier_missing_streak = 0
+        task.boundary_closure_supported = False
+        task.completion_reason = "none"
+    sensor_revision = max((int(grid.sensor_observed[y, x])
+        for x, y in relevant_cells if grid.in_bounds((x, y))), default=0)
+    if task.require_sensor_evidence:
+        if sensor_revision <= max(task.initial_sensor_revision,
+                                  task.last_evaluated_sensor_revision):
+            return task
+        task.last_evaluated_sensor_revision = sensor_revision
+    elif task.last_evaluated_update == map_update_count:
         return task
     observed, _, ratio = observation_progress(
         grid, task.target_cells, active_goal_cell)
@@ -74,23 +108,32 @@ def evaluate_observation(
     task.last_evaluated_update = map_update_count
     task.completion_streak = advance_completion_streak(
         ratio, done_ratio, task.completion_streak)
-    tracked_frontier = (task.frontier_cluster_cells
-                        or ({task.frontier_cell}
-                            if task.frontier_cell is not None else set()))
-    frontier_present = bool(
-        tracked_frontier and frontier_cluster_present(
-            grid, tracked_frontier,
-            max(viewpoint_standoff, 2.0 * grid.resolution)))
-    task.frontier_missing_streak = (
-        0 if frontier_present else task.frontier_missing_streak + 1)
+    if not task.require_sensor_evidence:
+        task.frontier_missing_streak = (
+            0 if frontier_present else task.frontier_missing_streak + 1)
+        task.boundary_closure_supported = not frontier_present
+    elif frontier_present:
+        task.frontier_missing_streak = 0
+        task.boundary_closure_supported = False
+    else:
+        # Closure is a proof about the original boundary, not every unknown
+        # behind it. Each confirmation requires a new observed cover of that
+        # boundary; seeded FREE and window loss never provide this cover.
+        baseline = max(task.initial_sensor_revision, task.last_closure_sensor_revision)
+        supported = bool(tracked_frontier) and all(
+            grid.in_bounds(cell) and grid.value(cell) != UNKNOWN
+            and int(grid.sensor_observed[cell[1], cell[0]]) > baseline
+            for cell in tracked_frontier)
+        if supported:
+            task.last_closure_sensor_revision = max(
+                int(grid.sensor_observed[y, x]) for x, y in tracked_frontier)
+            task.frontier_missing_streak += 1
+            task.boundary_closure_supported = True
     if task.completion_streak >= done_updates:
         task.completion_reason = "visible_information_resolved"
     elif (task.frontier_missing_streak >= closure_updates
           and (not task.require_sensor_evidence
-               or task.sensor_observed_cells > 0)):
-        # This objective exists to resolve its frozen frontier cluster.  Once
-        # that cluster has remained absent for a confirmed run, its purpose is
-        # complete even if not every neighbouring unknown became observable.
+               or task.boundary_closure_supported)):
         task.completion_reason = "frontier_closed"
     else:
         task.completion_reason = "none"
@@ -105,7 +148,7 @@ def observation_is_complete(
         task.completion_streak >= done_updates
         or (task.frontier_missing_streak >= closure_updates
             and (not task.require_sensor_evidence
-                 or task.sensor_observed_cells > 0))))
+                 or task.boundary_closure_supported))))
 
 
 def observation_completion_record(

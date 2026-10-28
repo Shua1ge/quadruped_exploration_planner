@@ -24,6 +24,7 @@ def main():
     rclpy.init(args=[
         "--ros-args", "-r", "body_pose:=/quad_0/body_pose",
         "-p", "locomotion_mode:=rl_effort", "-p", "use_sim_time:=true",
+        "-p", "locomotion_policy:=parkour_moe_stateful",
         "-p", f"model_path:={args.model}",
         "-p", f"estimator_refresh_every:={args.refresh_every}",
         *ros_args,

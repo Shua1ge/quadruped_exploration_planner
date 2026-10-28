@@ -68,25 +68,25 @@
     <gazebo reference="lidar_link">
       <sensor name="exploration_lidar" type="gpu_lidar">
         <topic>/quad_0/lidar/points</topic>
-        <update_rate>10</update_rate>
+        <update_rate>${mid360.sensor.update_rate}</update_rate>
         <lidar>
           <scan>
             <horizontal>
-              <samples>720</samples>
+              <samples>${mid360.sensor.horizontal_samples}</samples>
               <resolution>1</resolution>
-              <min_angle>-3.14159265359</min_angle>
-              <max_angle>3.14159265359</max_angle>
+              <min_angle>${mid360.sensor.horizontal_min}</min_angle>
+              <max_angle>${mid360.sensor.horizontal_max}</max_angle>
             </horizontal>
             <vertical>
-              <samples>1</samples>
+              <samples>${mid360.sensor.vertical_samples}</samples>
               <resolution>1</resolution>
-              <min_angle>0</min_angle>
-              <max_angle>0</max_angle>
+              <min_angle>${mid360.sensor.vertical_min}</min_angle>
+              <max_angle>${mid360.sensor.vertical_max}</max_angle>
             </vertical>
           </scan>
           <range>
-            <min>0.20</min>
-            <max>7.50</max>
+            <min>${mid360.sensor.range_min}</min>
+            <max>${mid360.sensor.range_max}</max>
             <resolution>0.01</resolution>
           </range>
         </lidar>

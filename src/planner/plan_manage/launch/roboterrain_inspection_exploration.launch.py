@@ -90,7 +90,7 @@ def _setup(context):
                 "region_max_detour_ratio": 1.75,
                 "region_match_distance": 6.0,
                 "sparse_routing_enabled": True,
-                "sparse_attachment_radius": 1.5,
+                "sparse_attachment_radius": 3.0,
                 "sparse_attachment_limit": 8,
                 "region_release_updates": 3,
                 "region_unreachable_timeout": 5.0,

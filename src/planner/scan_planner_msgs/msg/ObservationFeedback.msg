@@ -11,6 +11,10 @@ uint8 EXECUTION_READY=7
 # Local bounded motion search/budget exhausted. NOT proof of an impassable
 # viewpoint, portal or region; Explorer alone decides another task.
 uint8 LOCAL_MOTION_EXHAUSTED=8
+uint8 CANCEL_UNCONFIRMED=9
+# Same successor identity. Phase events grant neither motion nor completion.
+uint8 TRANSITION_WAIT_STOP=10
+uint8 TRANSITION_RESTARTING=11
 std_msgs/Header header
 uint64 task_id
 uint64 task_version
@@ -24,3 +28,11 @@ uint32 station_adjustments
 uint64 route_graph_revision
 uint32 route_connection_cursor
 string reason
+# Failure scope never grants motion or proves a remote route impassable.
+uint8 FAILURE_ACTION=0
+uint8 FAILURE_CURRENT_POSE=1
+uint8 failure_scope
+# Preserve the causal chain when a failed escape cannot rejoin its task.
+string trigger_reason
+string recovery_reason
+string planning_reason

@@ -1,6 +1,32 @@
 #include <gtest/gtest.h>
 #include <plan_manage/replan_fsm_utils.h>
 
+TEST(HandoffCertificate, RejectsMissingMalformedAndStaleState) {
+  using namespace scan_planner;
+  const Eigen::Vector3d origin=Eigen::Vector3d::Zero();
+  EXPECT_STREQ(handoffCertificateFailure(false,0,1,origin,origin,0,0,0,0),"HANDOFF_CERTIFICATE_MISSING");
+  EXPECT_STREQ(handoffCertificateFailure(true,1.01,1,origin,origin,0,0,0,0),"HANDOFF_CERTIFICATE_INVALID");
+  EXPECT_STREQ(handoffCertificateFailure(true,0,1,origin,{.021,0,0},0,0,0,0),"HANDOFF_CERTIFICATE_STATE_CHANGED");
+  EXPECT_STREQ(handoffCertificateFailure(true,0,1,origin,origin,0,.021,0,0),"HANDOFF_CERTIFICATE_STATE_CHANGED");
+  EXPECT_STREQ(handoffCertificateFailure(true,0,1,origin,origin,0,0,0,.021),"HANDOFF_CERTIFICATE_HEADING_CHANGED");
+  EXPECT_EQ(handoffCertificateFailure(true,.4,1,origin,{.019,0,0},0,.019,M_PI,-M_PI),nullptr);
+  EXPECT_STREQ(handoffCertificateFailure(true,std::numeric_limits<double>::quiet_NaN(),1,
+      origin,origin,0,0,0,0),"HANDOFF_CERTIFICATE_INVALID");
+}
+
+TEST(TaskTransitionRest, RequiresHoldFreshDistinctSamplesAndNoResidualTurn) {
+  scan_planner::TaskTransitionRestGate gate;
+  EXPECT_FALSE(gate.observe(false,true,0,0,1));
+  EXPECT_FALSE(gate.observe(true,false,0,0,2));
+  EXPECT_FALSE(gate.observe(true,true,.10,0,3));
+  EXPECT_FALSE(gate.observe(true,true,0,.2,4));
+  EXPECT_FALSE(gate.observe(true,true,.01,.01,5));
+  for(int i=0;i<10;++i) EXPECT_FALSE(gate.observe(true,true,.01,.01,5));
+  EXPECT_FALSE(gate.observe(true,true,.01,.01,6));
+  EXPECT_TRUE(gate.observe(true,true,.01,.01,7));
+  EXPECT_FALSE(gate.observe(true,true,std::numeric_limits<double>::quiet_NaN(),0,8));
+}
+
 TEST(ClearanceDiagnostics, LocationUsesMeasuredFootprintAndSampledArcLength) {
   using scan_planner::clearanceFailureLocation;
   EXPECT_STREQ(clearanceFailureLocation(true, .3, false), "CURRENT_FOOTPRINT_INVALID");
@@ -120,10 +146,28 @@ TEST(ExecutionProgressBudget, EquivalentAcksDoNotResetAndStallsAreIdempotent)
             ExecutionProgressBudgetResult::DUPLICATE_STALL);
   EXPECT_EQ(budget.recordStall(22, 2),
             ExecutionProgressBudgetResult::EXHAUSTED);
+  EXPECT_TRUE(budget.exhausted);
+  EXPECT_EQ(budget.recordStall(22, 2),
+            ExecutionProgressBudgetResult::DUPLICATE_STALL);
+  budget.ensureContext(true, 103, 7, 3);
+  EXPECT_TRUE(budget.isDuplicateStall(23));
+  EXPECT_EQ(budget.replacements_used, 2U);
   budget.ensureContext(true, 102, 7, 4);
+  EXPECT_FALSE(budget.exhausted);
   EXPECT_EQ(budget.replacements_used, 0U);
   EXPECT_EQ(budget.recordStall(22, 2),
             ExecutionProgressBudgetResult::REPLACEMENT_RESERVED);
+}
+
+TEST(ForwardGaitTracking, RetimedPrefixStillFindsDistanceTarget) {
+  using namespace scan_planner;
+  int calls=0;
+  const auto slow=[&](double t) { ++calls;return Eigen::Vector3d(.001*t,0,0); };
+  const double t=forwardGaitLookaheadTime(.8,1000,slow);
+  EXPECT_GE(.001*(t-.8),.15);
+  EXPECT_LE(calls,257);
+  EXPECT_NEAR(trajectorySteeringYaw(.8,1000,{.002,.015,0},0,
+      [](double t) {return Eigen::Vector3d(.001*t,0,0);}),-.1,.02);
 }
 
 TEST(ForwardGaitTracking, SharesSpatialLookaheadAndBoundsStationaryTail)
@@ -135,7 +179,7 @@ TEST(ForwardGaitTracking, SharesSpatialLookaheadAndBoundsStationaryTail)
   EXPECT_LT(.165 * (target - 1.), .16);
   EXPECT_DOUBLE_EQ(forwardGaitLookaheadTime(9.9, 10., line), 10.);
   const auto stopped = [](double) { return Eigen::Vector3d::Zero().eval(); };
-  EXPECT_DOUBLE_EQ(forwardGaitLookaheadTime(1., 1000., stopped), 3.);
+  EXPECT_DOUBLE_EQ(forwardGaitLookaheadTime(1., 1000., stopped), 1000.);
 }
 
 TEST(StructuredRepair, FailedRejoinCannotPurchaseAnotherEscape)
@@ -1117,3 +1161,113 @@ TEST(OdometryValidation, NormalizesOnlyFiniteNonDegenerateQuaternions)
 }
 
 } // namespace scan_planner
+
+
+TEST(HeadingAlignment, ReplacementPreservesIncompleteTurnAndAllowsOrdinaryRolling) {
+  EXPECT_TRUE(scan_planner::handoffNeedsHeadingAlignment(true,false,true,.06,.365,.6));
+  EXPECT_TRUE(scan_planner::handoffNeedsHeadingAlignment(true,false,true,.06,.02,.6));
+  EXPECT_FALSE(scan_planner::handoffNeedsHeadingAlignment(true,false,false,.25,.365,.6));
+  EXPECT_TRUE(scan_planner::handoffNeedsHeadingAlignment(true,false,false,.02,.365,.6));
+  EXPECT_FALSE(scan_planner::handoffNeedsHeadingAlignment(true,true,true,.0,.365,.6));
+}
+
+TEST(PredictiveCollision, LinearRestCannotReleaseOngoingYawMotion) {
+  EXPECT_FALSE(scan_planner::brakingHoldMayReleaseAfterStop(.02,3,3,false,false,.21));
+  EXPECT_TRUE(scan_planner::brakingHoldMayReleaseAfterStop(.02,3,3,false,false,.02));
+  EXPECT_FALSE(scan_planner::brakingHoldMayReleaseAfterStop(.02,3,3,false,false,NAN));
+}
+
+
+TEST(StoppedLocalRepair, ResidualAngularMotionStillRequiresStopping) {
+  EXPECT_FALSE(scan_planner::shouldStartStoppedLocalRepair(true,true,.02,false,false,.21));
+  EXPECT_TRUE(scan_planner::shouldStartStoppedLocalRepair(true,true,.02,false,false,.02));
+}
+
+
+TEST(RollingSuccessor, PrepareMovingTransitBeforeEndAndKeepStationRest) {
+  EXPECT_TRUE(scan_planner::shouldPrepareRollingSuccessor(.4,1.2,.3,1.5,false));
+  EXPECT_FALSE(scan_planner::shouldPrepareRollingSuccessor(.1,1.2,.3,1.5,false));
+  EXPECT_FALSE(scan_planner::shouldPrepareRollingSuccessor(.4,1.2,.3,1.5,true));
+  EXPECT_FALSE(scan_planner::shouldPrepareRollingSuccessor(.4,0.,.3,1.5,false));
+  EXPECT_FALSE(scan_planner::shouldPrepareRollingSuccessor(.4,1.2,0.,1.5,false));
+  EXPECT_FALSE(scan_planner::shouldPrepareRollingSuccessor(.4,NAN,.3,1.5,false));
+}
+
+TEST(HeadingAlignment, ResidualBandRequiresBoundedLocalCertification) {
+  EXPECT_TRUE(scan_planner::validCertifiedAlignmentTolerance(.05));
+  EXPECT_TRUE(scan_planner::validCertifiedAlignmentTolerance(.12));
+  EXPECT_FALSE(scan_planner::validCertifiedAlignmentTolerance(.049));
+  EXPECT_FALSE(scan_planner::validCertifiedAlignmentTolerance(.121));
+  EXPECT_FALSE(scan_planner::validCertifiedAlignmentTolerance(NAN));
+}
+
+
+TEST(ForwardStage, BrakesBeforeEndpointAndRejectsOvershootCrossTrackAndHeading) {
+  using scan_planner::forwardStageState;
+  Eigen::Vector2d start(0.,0.),goal(.4,0.);
+  auto before=forwardStageState(start,goal,{.23,0.},0.,0.,.2,.55,.32);
+  EXPECT_TRUE(before.brake);EXPECT_EQ(before.failure,nullptr);
+  EXPECT_LT(.4-before.progress,.2);
+  EXPECT_STREQ(forwardStageState(start,goal,{.51,0.},0.,0.,.1,.55,.32).failure,"FORWARD_STAGE_OVERSHOOT");
+  EXPECT_STREQ(forwardStageState(start,goal,{.2,.09},0.,0.,.1,.55,.32).failure,"FORWARD_STAGE_CROSS_TRACK_DRIFT");
+  EXPECT_STREQ(forwardStageState(start,goal,{.2,0.},0.,.11,.1,.55,.32).failure,"FORWARD_STAGE_HEADING_DRIFT");
+  EXPECT_STREQ(forwardStageState(start,goal,{.2,0.},0.,0.,.1,.55,0.).failure,"FORWARD_STAGE_INVALID_STATE");
+}
+
+TEST(TurnRefresh,FreshMeasuredGrantCannotWidenOrResumeHold) {
+  using scan_planner::turnRefreshAcceptable;
+  EXPECT_TRUE(turnRefreshAcceptable(true,false,false,1000000000,990000000,980000000,.005,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,true,false,1000000000,990000000,980000000,.005,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,true,1000000000,990000000,980000000,.005,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,false,1000000000,800000000,780000000,.005,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,false,1000000000,1010000000,980000000,.005,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,false,1000000000,990000000,990000000,.005,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,false,1000000000,990000000,980000000,.03,0.,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,false,1000000000,990000000,980000000,.005,.02,.1,.1));
+  EXPECT_FALSE(turnRefreshAcceptable(true,false,false,1000000000,990000000,980000000,.005,0.,.1,.08));
+}
+TEST(TerminalSpeed,SlowEndpointDoesNotSlowTheWholeWideRoute) {
+  using scan_planner::terminalApproachSpeed;
+  EXPECT_DOUBLE_EQ(terminalApproachSpeed(.75,.3,5.,.32,.55),.75);
+  EXPECT_LT(terminalApproachSpeed(.75,.3,.3,.32,.55),.75);
+  EXPECT_DOUBLE_EQ(terminalApproachSpeed(.75,.3,0.,.32,.55),.3);
+  EXPECT_DOUBLE_EQ(terminalApproachSpeed(.75,0.,0.,.32,.55),.75);
+  EXPECT_DOUBLE_EQ(terminalApproachSpeed(.75,.3,0.,0.,.55),0.);
+}
+
+TEST(MeasuredProgress,StationaryBodyDoesNotChaseReferenceClock) {
+  const auto sample=[](double t) {return Eigen::Vector3d(.4*t,0,0);};
+  double progress=0.;
+  for(int i=0;i<100;++i)
+    progress=scan_planner::measuredTrajectoryProgress(progress,5.,Eigen::Vector3d::Zero(),sample);
+  EXPECT_DOUBLE_EQ(progress,0.);
+  progress=scan_planner::measuredTrajectoryProgress(progress,5.,Eigen::Vector3d(.4,0,0),sample);
+  EXPECT_NEAR(progress,1.,1e-9);
+  EXPECT_DOUBLE_EQ(scan_planner::measuredTrajectoryProgress(progress,5.,Eigen::Vector3d(.2,0,0),sample),progress);
+}
+
+TEST(MeasuredProgress,MatchesExactEndpointWithoutSkippingSearchHorizon) {
+  const auto sample=[](double t) {return Eigen::Vector3d(t,0,0);};
+  EXPECT_DOUBLE_EQ(scan_planner::measuredTrajectoryProgress(.8,1.013,Eigen::Vector3d(1.013,0,0),sample),1.013);
+  EXPECT_LE(scan_planner::measuredTrajectoryProgress(0.,10.,Eigen::Vector3d(8.,0,0),sample),2.);
+}
+
+TEST(PlanningTravelMatchWindow, CoversActualTravelAtDifferentSpeedsAndTiming)
+{
+  using namespace scan_planner;
+  for (double speed : {.1, .2, .5, 1.0}) {
+    const auto sample = [=](double t) { return Eigen::Vector3d(speed*t,0,.4); };
+    const Eigen::Vector2d robot(speed*2.,0);
+    const double end = planningTravelMatchEnd(.8,4.,speed*2.,sample);
+    const double match = nearestTimeInWindow(0,end,4.,sample,.02,robot);
+    EXPECT_NEAR(match,2.,.021);
+    EXPECT_LT((sample(match).head<2>()-robot).norm(),.021);
+    EXPECT_DOUBLE_EQ(planningTravelMatchEnd(.8,4.,0.,sample),.8);
+  }
+  // Optimizer retiming does not erase actual travel in metres.
+  const auto slow=[](double t) { return Eigen::Vector3d(.1*t,0,.4); };
+  const double end=planningTravelMatchEnd(.8,6.,.4,slow);
+  EXPECT_NEAR(nearestTimeInWindow(0,end,6.,slow,.02,{.4,0}),4.,.021);
+  EXPECT_NEAR(nearestTimeInWindow(0,.77,6.,slow,.05,{.077,0}),.77,1e-9);
+  EXPECT_LE(planningTravelMatchEnd(.8,1.,10.,slow),1.);
+}

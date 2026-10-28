@@ -8,7 +8,9 @@ from typing import Dict, Hashable, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from .grid import Cell, ExplorationGrid, FREE, OCCUPIED, UNKNOWN, bresenham
-from .path_planning import astar_known, path_length_cells, segment_known_free
+from .path_planning import (
+    ExpansionBudget, adjacent_grid_path_is_valid, astar_known, path_length_cells, segment_known_free,
+)
 
 
 def region_information_efficiency(unknown_gain: int, frontier_size: int,
@@ -94,6 +96,20 @@ def observation_target_cells(grid: ExplorationGrid, center: Cell,
                 continue
             result.add(cell)
     return result
+
+
+def observation_hypothesis_cells(grid: ExplorationGrid, viewpoint: Cell,
+                                 targets: Set[Cell], radius: float) -> Set[Cell]:
+    """Potential information, not observed coverage or a traversable ray.
+
+    Motion must stay in known-free space. A sensor ray may cross UNKNOWN:
+    requiring it to be known before approaching defeats exploration.
+    """
+    return {target for target in targets
+            if grid.in_bounds(target) and grid.value(target) == UNKNOWN
+            and math.dist(viewpoint, target) * grid.resolution <= radius
+            and not any(grid.value(cell) == OCCUPIED
+                        for cell in bresenham(viewpoint, target)[1:-1])}
 
 
 def observation_progress(grid: ExplorationGrid,
@@ -223,7 +239,8 @@ def safe_viewpoint_cells(grid: ExplorationGrid, frontier: Cell,
         best = float(clearance_cells + 1)
         for ox in range(-clearance_cells, clearance_cells + 1):
             for oy in range(-clearance_cells, clearance_cells + 1):
-                if (cell[0] + ox, cell[1] + oy) in inflated:
+                neighbour = (cell[0] + ox, cell[1] + oy)
+                if neighbour in inflated or (not inflated and grid.value(neighbour) == OCCUPIED):
                     best = min(best, math.hypot(ox, oy))
         return best * grid.resolution
 
@@ -299,22 +316,86 @@ def double_cylinder_path_free(
 
 
 def footprint_aware_path(grid, start, terminal, frontier, inflated, radius,
-                         offset, blocked_edges, max_expansions=400):
-    """Bounded alternative to point-only routing; Local still certifies motion.
+                         offset, blocked_edges, max_expansions=400,
+                         reference_path=None, expansion_budget=None):
+    """Repair a coarse route locally before a bounded whole-route search.
 
-    Check both endpoints with the edge tangent, matching the final path
-    predicate. This is not a rotation sweep or a locomotion certificate.
+    A distant goal must not spend the entire budget reaching a corner that is
+    already located by final validation. Keep the known-free prefix/suffix and
+    replace at most four short failed segments. All patches and the fallback
+    spend ONE max_expansions allowance, plus the shared outer pass budget.
+    Always revalidate the full result, including both joins.
+    This certifies coarse geometry; Local still certifies actual motion.
     """
+    budget = ExpansionBudget(max(0, int(max_expansions)))
+
+    class SharedBudget:
+        def consume(self):
+            if budget.remaining == 0 or (expansion_budget is not None and
+                                         expansion_budget.remaining == 0):
+                return False
+            budget.consume()
+            if expansion_budget is not None:
+                expansion_budget.consume()
+            return True
+
+    shared = SharedBudget()
+
     def edge_allowed(first, second):
         yaw = math.atan2(second[1]-first[1], second[0]-first[0])
         return all(double_cylinder_footprint_free(
             grid, cell, yaw, inflated, radius, offset)
                    for cell in (first, second))
 
+    def valid(path):
+        return (adjacent_grid_path_is_valid(grid, path, inflated, blocked_edges)
+                and double_cylinder_path_free(
+                    grid, path, terminal, frontier, inflated, radius, offset))
+
+    if (reference_path and reference_path[0] == start and reference_path[-1] == terminal
+            and adjacent_grid_path_is_valid(grid, reference_path, inflated, blocked_edges)):
+        route = list(reference_path)
+        # About one footprint length on each side of the rejected sample;
+        # bounds also apply on synthetic/coarser grids used by regression tests.
+        window = max(2, int(math.ceil(max(.8, 2*(radius+offset))/grid.resolution)))
+        padding = max(1, int(math.ceil((radius+offset)/grid.resolution))+1)
+        for _ in range(4):
+            failure = diagnose_double_cylinder_path(
+                grid, route, terminal, frontier, inflated, radius, offset)
+            if failure.accepted:
+                return route
+            left = max(0, failure.sample_index-window)
+            right = min(len(route)-1, failure.sample_index+window)
+            if left >= right:
+                break
+            segment = route[left:right+1]
+            xmin = min(cell[0] for cell in segment)-padding
+            xmax = max(cell[0] for cell in segment)+padding
+            ymin = min(cell[1] for cell in segment)-padding
+            ymax = max(cell[1] for cell in segment)+padding
+
+            def local_edge_allowed(first, second):
+                return (xmin <= second[0] <= xmax and ymin <= second[1] <= ymax
+                        and edge_allowed(first, second))
+
+            patch = astar_known(
+                grid, route[left], route[right], inflated, blocked_edges,
+                edge_allowed=local_edge_allowed, max_expansions=budget.remaining, expansion_budget=shared)
+            if not patch:
+                break
+            revised = route[:left]+patch+route[right+1:]
+            if revised == route:
+                break
+            route = revised
+        if valid(route):
+            return route
+
+    # Preserve the existing fallback for routes that need a larger geometric
+    # change. A budget-limited miss remains a miss, never permission to bypass
+    # known-free, directed-edge or footprint checks.
     path = astar_known(grid, start, terminal, inflated, blocked_edges,
-                       edge_allowed=edge_allowed, max_expansions=max_expansions)
-    if path and double_cylinder_path_free(
-            grid, path, terminal, frontier, inflated, radius, offset):
+                       edge_allowed=edge_allowed, max_expansions=budget.remaining, expansion_budget=shared)
+    if path and valid(path):
         return path
     return None
 
@@ -417,7 +498,9 @@ def region_commitment_scope(region: FrontierRegion) -> Tuple[str, int]:
     unchanged region appear to cross components on every rebuild.
 
     Frontier lineage is maintained explicitly across updates and inherited by
-    children when a region splits.  It is therefore the safe commitment key.
+    children with overlapping evidence when a region splits. This is a legacy
+    association hint; Explorer's branch option uses world entrance witnesses
+    and its own lifetime rather than treating lineage as the option boundary.
     Topology components remain useful for current-revision reachability, but
     must not become commitment identities until they have their own persistent
     tracker.
@@ -638,6 +721,8 @@ class PersistentRegionTracker:
                     union = observation.cells | old.cells
                     overlap = (len(observation.cells & old.cells) / len(union)
                                if union else 0.0)
+                    if overlap == 0.0:
+                        continue  # Proximity is not evidence of split ancestry.
                     lineage_candidates.append((
                         -overlap, distance, old.region_id,
                         old.lineage_id if old.lineage_id is not None

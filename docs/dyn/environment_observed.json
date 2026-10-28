@@ -1,0 +1,20 @@
+{
+  "observed_on": "2026-10-28",
+  "system": "Ubuntu 22.04.5 LTS",
+  "python": "Python 3.10.12",
+  "python_packages": {
+    "numpy": "1.23.5",
+    "scipy": "1.8.0",
+    "torch": "2.14.0",
+    "onnxruntime": "1.23.2",
+    "Pillow": "12.3.0",
+    "PyYAML": "5.4.1"
+  },
+  "ros_gazebo_packages": [
+    "libignition-gazebo6:amd64\t6.18.0-1~jammy",
+    "ros-humble-gz-ros2-control\t0.7.21-1jammy.20260908.125238",
+    "ros-humble-ros-gz\t0.244.26-1jammy.20260908.015605",
+    "ros-humble-ros2-control\t2.54.2-1jammy.20260908.123937",
+    "ros-humble-ros2-controllers\t2.54.0-1jammy.20260909.011001"
+  ]
+}

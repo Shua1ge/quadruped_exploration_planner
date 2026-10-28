@@ -1,0 +1,47 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <world name="campus_go2_fortress_audit">
+    <gravity>0 0 -9.81</gravity>
+    <physics name="go2_physics" type="ignored">
+      <max_step_size>.002</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+    <plugin filename="ignition-gazebo-physics-system" name="ignition::gazebo::systems::Physics" />
+    <plugin filename="ignition-gazebo-sensors-system" name="ignition::gazebo::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="ignition-gazebo-imu-system" name="ignition::gazebo::systems::Imu" />
+    <plugin filename="ignition-gazebo-contact-system" name="ignition::gazebo::systems::Contact" />
+    <plugin filename="ignition-gazebo-user-commands-system" name="ignition::gazebo::systems::UserCommands" />
+    <plugin filename="ignition-gazebo-scene-broadcaster-system" name="ignition::gazebo::systems::SceneBroadcaster" />
+    <scene>
+      <ambient>.7 .7 .7 1</ambient>
+      <background>.15 .2 .25 1</background>
+      <shadows>false</shadows>
+    </scene>
+    <light name="sun" type="directional">
+      <direction>-.4 -.2 -1</direction>
+      <diffuse>.8 .8 .8 1</diffuse>
+    </light>
+    <model name="campus">
+      <static>true</static>
+      <pose>0 0 0.000157343 0 0 0</pose>
+      <link name="map">
+        <collision name="campus_collision">
+          <geometry>
+            <mesh>
+              <uri>model://campus_runtime/campus_collision.stl</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="campus_visual">
+          <geometry>
+            <mesh>
+              <uri>model://campus_runtime/visual/campus_zup.obj</uri>
+            </mesh>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

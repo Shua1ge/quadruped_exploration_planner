@@ -16,6 +16,11 @@ class StartupLaunchTest(unittest.TestCase):
         result = module._resume_after_controller(SimpleNamespace(returncode=1), None)
         self.assertTrue(any(isinstance(a, Shutdown) for a in result))
 
+    def test_activation_success_does_not_issue_another_world_control(self):
+        result = module._resume_after_controller(SimpleNamespace(returncode=0), None)
+        self.assertFalse(any(isinstance(a, (ExecuteProcess, TimerAction, Shutdown))
+                             for a in result))
+
     def test_broadcaster_failure_does_not_start_controller(self):
         sentinel = object()
         result = module._start_trajectory_after_broadcaster(

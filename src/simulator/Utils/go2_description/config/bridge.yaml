@@ -52,3 +52,7 @@
   ros_type_name: sensor_msgs/msg/PointCloud2
   gz_type_name: gz.msgs.PointCloudPacked
   direction: GZ_TO_ROS
+
+# Full multi-elevation Gazebo LaserScan is consumed by mid360_ray_bridge.
+# sensor_msgs/LaserScan cannot carry its vertical identities; do not bridge
+# it as a second 2-D mapping stream. /quad_0/cloud remains raw XYZ for RViz.

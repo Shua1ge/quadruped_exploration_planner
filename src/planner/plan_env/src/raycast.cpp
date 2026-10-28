@@ -1,6 +1,7 @@
 #include <Eigen/Eigen>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <plan_env/raycast.h>
 
 int signum(int x) {
@@ -287,6 +288,16 @@ bool RayCaster::step(Eigen::Vector3d& ray_pt) {
   if (x_ == endX_ && y_ == endY_ && z_ == endZ_) {
     return false;
   }
+
+  // Floating-point ties can advance a completed axis past its endpoint.
+  // The old all-three-equal termination then becomes unreachable, blocking
+  // map integration (and readers waiting for its write lock) indefinitely.
+  // Only unfinished axes may advance: every step consumes one remaining
+  // Manhattan voxel crossing, including rays starting on grid boundaries.
+  const double infinity = std::numeric_limits<double>::infinity();
+  if (x_ == endX_) tMaxX_ = infinity;
+  if (y_ == endY_) tMaxY_ = infinity;
+  if (z_ == endZ_) tMaxZ_ = infinity;
 
   // if (dist_ > maxDist_)
   // {

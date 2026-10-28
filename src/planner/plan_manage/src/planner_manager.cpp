@@ -70,6 +70,17 @@ namespace scan_planner
     grid_map_.reset(new GridMap);
     grid_map_->initMap(
         node_, map_callback_group, map_visualization_callback_group);
+    // Sensor fusion preserves height evidence. The Local motion owner states
+    // the capability used to derive terrain constraints for this execution mode.
+    plan_env::TerrainMotionPolicy terrain;
+    terrain.floor_tolerance=get_double("motion.terrain.floor_tolerance",
+        node_->get_parameter("grid_map.terrain_floor_tolerance").as_double());
+    terrain.maximum_rise=get_double("motion.terrain.maximum_rise",
+        node_->get_parameter("grid_map.obstacle_min_height").as_double());
+    terrain.maximum_drop=get_double("motion.terrain.maximum_drop",terrain.maximum_rise);
+    terrain.body_top=get_double("motion.terrain.body_top",
+        node_->get_parameter("grid_map.obstacle_max_height").as_double());
+    grid_map_->setTerrainMotionPolicy(terrain);
 
     bspline_optimizer_rebound_.reset(new BsplineOptimizer);
     bspline_optimizer_rebound_->setParam(node_);
@@ -130,7 +141,12 @@ namespace scan_planner
     cout << "start: " << start_pt.transpose() << ", " << start_vel.transpose() << "\ngoal:" << local_target_pt.transpose() << ", " << local_target_vel.transpose()
          << endl;
 
-    if ((start_pt - local_target_pt).norm() < 0.2)
+    // Bounded fixed-yaw rest-to-rest recovery may need only a 15 cm side-step.
+    // Ordinary candidates retain their existing minimum approach distance.
+    const bool short_fixed_yaw_recovery = use_collision_yaw_override &&
+        initialization_speed_limit > 0.0 && minimum_initial_duration > 0.0 &&
+        start_vel.norm() <= 0.05 && local_target_vel.norm() <= 1e-6;
+    if ((start_pt - local_target_pt).norm() < (short_fixed_yaw_recovery ? 0.05 : 0.2))
     {
       cout << "Close to goal" << endl;
       continuous_failures_count_++;

@@ -54,9 +54,11 @@ def projected_gravity_from_quaternion(x, y, z, w):
     A level robot must report ``[0, 0, -1]``: the observation convention used by
     the trained policy expects gravity pointing down the body z axis.
     """
-    norm = math.sqrt(x * x + y * y + z * z + w * w)
-    if norm < 1e-9:
-        raise ValueError("IMU quaternion has zero norm")
+    if not all(math.isfinite(v) for v in (x, y, z, w)):
+        raise ValueError("IMU quaternion must be finite")
+    norm = math.hypot(x, y, z, w)
+    if not math.isfinite(norm) or norm < 1e-9:
+        raise ValueError("IMU quaternion has invalid norm")
     x, y, z, w = x / norm, y / norm, z / norm, w / norm
     rotation = np.array([
         [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
@@ -127,6 +129,43 @@ def planar_pose_valid(x, y, z, w, body_height, max_tilt_cos,
             and float(body_height) >= float(min_body_height))
 
 
+def leg_extension_height(position, gravity_body):
+    """Median downward foot reach, NOT measured height above terrain.
+
+    Go2 FK constants mirror go2_description/xacro/const.xacro. World Z does
+    not enter the calculation: descending a slope cannot become a collapse
+    just because the map datum is zero. No contact or ground is inferred.
+    """
+    q = np.asarray(position, dtype=np.float64)
+    g = np.asarray(gravity_body, dtype=np.float64)
+    if q.shape != (12,) or g.shape != (3,) or not np.isfinite(q).all() or not np.isfinite(g).all():
+        raise ValueError('foot reach requires finite Go2 joints and gravity')
+    hip, thigh, calf = q.reshape(4, 3).T
+    side = np.array([1., -1., 1., -1.])
+    front = np.array([1., 1., -1., -1.])
+    down = -.213 * (np.cos(thigh) + np.cos(thigh + calf))
+    feet = np.column_stack((front*.1934 - .213*(np.sin(thigh)+np.sin(thigh+calf)),
+                            side*.0465 + side*.0955*np.cos(hip) - down*np.sin(hip),
+                            side*.0955*np.sin(hip) + down*np.cos(hip)))
+    return float(np.median(feet @ g))
+
+
+def fault_support_mode(reason, fresh, finite, extension, tilt, linear_speed, angular_speed, joint_speed):
+    """Navigation stays FAULT. A hold is admitted only from a settled posture.
+
+    Bad feedback must disable effort; a falling/tipped robot receives bounded
+    damping, never a blind get-up. A stationary upright body-pose fault may
+    retain support without inferring task/motion success.
+    """
+    if not fresh or not finite:
+        return 'DISABLED'
+    if (reason == 'BODY_POSE_INVALID_MAP_RESTART_REQUIRED'
+            and extension >= .18 and tilt >= math.cos(math.radians(30))
+            and linear_speed <= .10 and angular_speed <= .5 and joint_speed <= 2.):
+        return 'SUPPORT_HOLD'
+    return 'DAMPING_ONLY'
+
+
 def advance_limited_command(current, requested, limits, slew_rates, dt):
     """Clamp a velocity request and approach it with a per-axis slew limit."""
     current = np.asarray(current, dtype=np.float64)
@@ -172,3 +211,40 @@ def upright_for_hold(body_height, gravity_body, linear_velocity,
             and body_motion_stable(
                 linear_velocity, angular_velocity,
                 max_linear_speed, max_angular_speed))
+
+
+def message_stamp_ns(message):
+    """Diagnostic source time; an absent/zero header is unknown, not fresh."""
+    header = getattr(message, 'header', None)
+    stamp = getattr(header, 'stamp', None)
+    if stamp is None:
+        return None
+    value = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+    return value if value != 0 else None
+
+
+def diagnostic_age_ms(now_ns, stamp_ns):
+    """Subtract times in the SAME clock domain; retain future/rewound stamps."""
+    return None if stamp_ns is None else (now_ns - stamp_ns) * 1e-6
+
+
+def summarize_policy_timing(records):
+    """One low-rate summary of installed actions, never an actuator decision."""
+    fields = (
+        'observation_interval_ros_ms', 'queue_wall_ms', 'inference_wall_ms',
+        'result_wait_wall_ms', 'observation_to_install_wall_ms',
+        'observation_to_install_ros_ms', 'joint_sample_age_ms',
+        'imu_sample_age_ms', 'odom_sample_age_ms',
+        'estimator_observation_interval_ros_ms',
+        'estimator_execution_interval_ros_ms', 'estimator_interval_wall_ms',
+    )
+    summary = {}
+    for field in fields:
+        values = [row[field] for row in records
+                  if row.get(field) is not None and math.isfinite(row[field])]
+        if values:
+            summary[field] = {
+                'count': len(values), 'mean': sum(values) / len(values),
+                'min': min(values), 'max': max(values),
+            }
+    return summary

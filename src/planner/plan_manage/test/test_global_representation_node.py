@@ -2,6 +2,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import pytest
 from types import SimpleNamespace
 
 
@@ -37,7 +38,8 @@ def make_node():
     node.safe_region_pub = Publisher()
     node.failure_evidence_pub = Publisher()
     node.get_logger = lambda: SimpleNamespace(
-        warning=lambda *args, **kwargs: None)
+        warning=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None)
     return node
 
 
@@ -116,3 +118,273 @@ def test_path_scoped_failure_without_identity_or_segment_is_rejected():
 
     assert node.failure_evidence_pub.messages == []
     assert node.failure_evidence_forwarded == 0
+
+
+def test_graph_markers_replace_stable_slots_and_remove_stale_evidence():
+    from geometry_msgs.msg import Point
+    from std_msgs.msg import Header
+    from visualization_msgs.msg import Marker
+    node = make_node()
+    node.global_node_messages = {
+        1: SimpleNamespace(position=Point(x=1., y=2., z=.3)),
+        2: SimpleNamespace(position=Point(x=2., y=2., z=.3))}
+    node.global_edge_messages = {
+        3: SimpleNamespace(source_id=1, target_id=2,
+                           polyline=[v.position for v in node.global_node_messages.values()]),
+        4: SimpleNamespace(source_id=2, target_id=999, polyline=[])}
+    node.graph_vis_pub = Publisher()
+    node.viewpoint_constraints = {1: {"x": 2., "y": 3.}}
+    node.publish_graph_markers(Header(frame_id="world"))
+    markers = node.graph_vis_pub.messages[-1].markers
+    assert [m.id for m in markers] == [0, 1, 2]
+    assert [len(m.points) for m in markers] == [2, 2, 1]
+    assert all(m.action == Marker.ADD for m in markers)
+    node.viewpoint_constraints.clear()
+    node.publish_graph_markers(Header(frame_id="world"))
+    assert len(node.graph_vis_pub.messages[-1].markers[2].points) == 0
+
+
+def test_malformed_patch_does_not_advance_global_revision():
+    from scan_planner_msgs.msg import LocalMapPatch
+    node = make_node()
+    for bad in (float("nan"), float("inf"), 0., -1.):
+        patch = LocalMapPatch(map_revision=18, width=1, height=1,
+                              resolution=bad, occupancy=[0])
+        patch.header.frame_id = "world"
+        node.patch_callback(patch)
+        assert node.last_map_revision == 17
+
+
+def test_nonfinite_patch_origin_is_rejected_before_extraction():
+    from scan_planner_msgs.msg import LocalMapPatch
+    patch = LocalMapPatch(map_revision=18, width=1, height=1,
+                          resolution=.2, occupancy=[0])
+    patch.header.frame_id = "world"
+    patch.origin.x = float("nan")
+    node = make_node()
+    node.patch_callback(patch)
+    assert node.last_map_revision == 17
+
+
+def make_wavefront_node():
+    from explorer_core.wavefront_graph import IncrementalWavefrontGraph
+    from explorer_core.topology_persistence import ExplicitBlockageTracker
+    node = make_node()
+    from explorer_core.terrain_graph import TerrainTileStore
+    node.spatial_engine = 'wavefront'
+    node.wavefront = IncrementalWavefrontGraph(2.)
+    node.wavefront_tile_size = 2.0
+    node.patch_inflation_radius = 0.0
+    node.node_attribute_radius = 0.5
+    node.experience_half_life = 300.0
+    node.terrain = TerrainTileStore(2.0)
+    node.node_attribute_hash = {}
+    node.edge_attribute_hash = {}
+    node.terrain_reset_count = 0
+    node.graph_changes = ({}, {}, set(), {}, {}, set())
+    node.wavefront_compact_routes = False
+    node.last_map_revision = node.graph_revision = 0
+    node.max_oracle_queries = 1
+    node.topology_oracle_period_revisions = 10
+    node.last_topology_oracle = {}
+    node.safe_region_shadow_enabled = False
+    node.min_free_cells_for_destructive_update = 16
+    node.node_blockage = ExplicitBlockageTracker(3)
+    node.edge_blockage = ExplicitBlockageTracker(3)
+    node.global_nodes, node.global_edges = {}, {}
+    node.global_node_messages, node.global_edge_messages = {}, {}
+    node.snapshot_period_revisions = 10
+    for name in ('delta_pub', 'snapshot_pub', 'graph_vis_pub', 'metrics_pub'):
+        setattr(node, name, Publisher())
+    return node
+
+
+def test_wavefront_delta_replaces_explorer_copy_and_keeps_evidence_on_split_merge():
+    import numpy as np
+    from explorer_core.sparse_routing import SparseRouteGraph, SparseNode, SparseEdge
+    from scan_planner_msgs.msg import LocalMapPatch
+    node = make_wavefront_node()
+    mirror = SparseRouteGraph()
+    grid = np.zeros((10, 30), dtype=np.int8)
+    node.failure_evidence_callback(evidence())
+    constraints = dict(node.viewpoint_constraints)
+
+    def publish_patch():
+        patch = LocalMapPatch(map_revision=node.last_map_revision+1,
+                              width=30, height=10, resolution=.2,
+                              occupancy=grid.ravel().tolist())
+        patch.header.frame_id = 'world'
+        node.patch_callback(patch)
+        delta = node.delta_pub.messages[-1]
+        def nodes(messages):
+            return [SparseNode(n.id, (n.position.x, n.position.y), n.clearance)
+                    for n in messages]
+        def edges(messages):
+            return [SparseEdge(e.id, e.source_id, e.target_id, e.length,
+                               e.minimum_clearance,
+                               tuple((p.x, p.y) for p in e.polyline)) for e in messages]
+        mirror.apply_delta(delta.graph_revision, delta.source_map_revision,
+                           nodes(delta.added_nodes), nodes(delta.updated_nodes),
+                           delta.removed_node_ids, edges(delta.added_edges),
+                           edges(delta.updated_edges), delta.removed_edge_ids)
+        assert set(mirror.nodes) == set(node.wavefront.nodes)
+        assert set(mirror.edges) == set(node.wavefront.edges)
+        for key, message in node.global_edge_messages.items():
+            assert mirror.edges[key].polyline == tuple((p.x, p.y) for p in message.polyline)
+        assert node.viewpoint_constraints == constraints
+        assert node.route_constraint_revision == 1
+        return delta
+
+    publish_patch()
+    seed = next(n for n in node.wavefront.nodes.values() if 10 <= n.cell[0] < 20)
+    grid[seed.cell[1], seed.cell[0]] = 100
+    moved = publish_patch()
+    assert seed.node_id in {n.id for n in moved.updated_nodes}
+    assert moved.updated_edges
+    grid[:, 14] = 100
+    closed = publish_patch()
+    assert closed.removed_edge_ids and len(mirror.nodes) == 4
+    grid[4, 14] = 0
+    reopened = publish_patch()
+    assert reopened.removed_node_ids and len(mirror.nodes) == 3
+    unchanged = publish_patch()
+    assert not unchanged.added_nodes and not unchanged.updated_edges
+    metrics = json.loads(node.metrics_pub.messages[-1].data)
+    assert metrics['wavefront_dirty_tiles'] == 0
+    assert metrics['global_nodes'] == 3 and metrics['global_edges'] == 2
+    assert all(p.z == .1 for m in node.graph_vis_pub.messages[-1].markers for p in m.points)
+
+
+def test_compacted_public_delta_survives_closure_and_reopening_in_explorer_copy():
+    import numpy as np
+    from explorer_core.sparse_routing import SparseRouteGraph, SparseNode, SparseEdge
+    from scan_planner_msgs.msg import LocalMapPatch
+    node=make_wavefront_node(); node.wavefront_compact_routes=True
+    mirror=SparseRouteGraph()
+    grid=np.zeros((10,70),dtype=np.int8)
+    for phase in range(4):
+        if phase==1: grid[:,34]=100
+        if phase==2: grid[4,34]=0
+        patch=LocalMapPatch(map_revision=phase+1,width=70,height=10,resolution=.2,
+                            occupancy=grid.ravel().tolist())
+        patch.header.frame_id='world'
+        node.patch_callback(patch)
+        delta=node.delta_pub.messages[-1]
+        ns=lambda messages:[SparseNode(n.id,(n.position.x,n.position.y),n.clearance) for n in messages]
+        es=lambda messages:[SparseEdge(e.id,e.source_id,e.target_id,e.length,e.minimum_clearance,
+            tuple((p.x,p.y) for p in e.polyline)) for e in messages]
+        mirror.apply_delta(delta.graph_revision,delta.source_map_revision,
+            ns(delta.added_nodes),ns(delta.updated_nodes),delta.removed_node_ids,
+            es(delta.added_edges),es(delta.updated_edges),delta.removed_edge_ids)
+        assert set(mirror.nodes)==set(node.global_nodes)
+        assert set(mirror.edges)==set(node.global_edges)
+        assert all(e.source_id in mirror.nodes and e.target_id in mirror.nodes for e in mirror.edges.values())
+        route=mirror.batch_estimates((1.1,1.1),[(12.1,1.1)],.5)[0]
+        assert (route is None)==(phase==1)
+        if phase==0: assert len(node.global_nodes)<len(node.wavefront.nodes)
+        if phase==1: assert delta.removed_edge_ids
+        if phase==3: assert not delta.added_nodes and not delta.updated_edges
+
+
+def test_measured_slow_travel_updates_global_but_jitter_pose_jump_and_stale_data_do_not():
+    import numpy as np
+    from nav_msgs.msg import Odometry
+    node=make_wavefront_node()
+    node.wavefront.update(np.zeros((10,30),dtype=np.int8),.2,(0.,0.))
+    node.traversal_frame='world'
+    now=SimpleNamespace(nanoseconds=1_000_000_000)
+    node.get_clock=lambda:SimpleNamespace(now=lambda:now)
+    def sample(x, y=1.1, age=0, frame='world'):
+        message=Odometry(); message.header.frame_id=frame
+        stamp=now.nanoseconds-age
+        message.header.stamp.sec=stamp//1000000000
+        message.header.stamp.nanosec=stamp%1000000000
+        message.pose.pose.position.x=x; message.pose.pose.position.y=y
+        node.traversal_callback(message)
+    sample(.5)
+    for i in range(1,8):
+        now.nanoseconds+=100_000_000
+        sample(.5+i*.017)  # Effective velocity 0.17 m/s, not the command.
+    assert node.wavefront.experience_revision==1
+    node.wavefront.update(np.zeros((10,30),dtype=np.int8),.2,(0.,0.))
+    revision=node.wavefront.experience_revision
+    for i in range(20):
+        now.nanoseconds+=100_000_000; sample(.62+(i%2)*.002)
+    assert node.wavefront.experience_revision==revision and not node.wavefront.experience_dirty
+    now.nanoseconds+=100_000_000; sample(4.)  # Teleport is not travel.
+    assert node.wavefront.experience_revision==revision
+    now.nanoseconds+=100_000_000; sample(4.2,age=800_000_000)
+    assert node.traversal_anchor is None
+    now.nanoseconds+=100_000_000; sample(4.2,frame='odom')
+    assert node.traversal_anchor is None
+
+
+def test_odom_travel_uses_sample_time_and_translated_rotated_world_tf():
+    import math
+    import numpy as np
+    from geometry_msgs.msg import TransformStamped
+    from nav_msgs.msg import Odometry
+    node = make_wavefront_node()
+    node.wavefront.update(np.zeros((20,30),dtype=np.int8),.2,(0.,0.))
+    node.traversal_frame = 'world'
+    now = SimpleNamespace(nanoseconds=1_000_000_000)
+    node.get_clock = lambda: SimpleNamespace(now=lambda:now)
+    calls = []
+    transform = TransformStamped()
+    transform.transform.translation.x = 2.
+    transform.transform.translation.y = 1.
+    transform.transform.rotation.z = math.sin(math.pi/4)
+    transform.transform.rotation.w = math.cos(math.pi/4)
+    def lookup(target, source, stamp):
+        calls.append((target,source,stamp.nanoseconds))
+        return transform
+    node.traversal_tf_buffer = SimpleNamespace(lookup_transform=lookup)
+    for x in (0., .12):
+        message = Odometry()
+        message.header.frame_id = 'go2/odom'
+        message.header.stamp.sec = now.nanoseconds//1_000_000_000
+        message.header.stamp.nanosec = now.nanoseconds%1_000_000_000
+        message.pose.pose.position.x = x
+        node.traversal_callback(message)
+        now.nanoseconds += 100_000_000
+    assert calls == [('world','go2/odom',1_000_000_000),('world','go2/odom',1_100_000_000)]
+    assert node.wavefront.experience_revision == 1
+    assert node.traversal_anchor[1] == pytest.approx((2.,1.12))
+    assert node.traversal_transformed_samples == 2
+    def missing(*args):
+        raise MODULE.TransformException('sample-time transform unavailable')
+    node.traversal_tf_buffer.lookup_transform = missing
+    message.header.stamp.nanosec = 200_000_000
+    node.traversal_callback(message)
+    assert node.traversal_anchor is None
+    assert node.wavefront.experience_revision == 1
+    assert node.traversal_transform_failures == 1
+
+
+def test_unknown_only_patch_reports_no_oracle_cohort():
+    from scan_planner_msgs.msg import LocalMapPatch
+    node = make_wavefront_node()
+    patch = LocalMapPatch(map_revision=1,width=4,height=4,resolution=.2,
+                          occupancy=[-1]*16)
+    patch.header.frame_id = 'world'
+    node.patch_callback(patch)
+    metrics = json.loads(node.metrics_pub.messages[-1].data)
+    assert metrics['queries'] == 0
+    assert metrics['connectivity_recall'] is None
+
+
+def test_published_room_graph_and_markers_use_the_same_compacted_geometry():
+    import numpy as np
+    from scan_planner_msgs.msg import LocalMapPatch
+    node=make_wavefront_node();node.wavefront_compact_routes=True
+    patch=LocalMapPatch(map_revision=1,resolution=.2,width=20,height=20,occupancy=[0]*400)
+    patch.header.frame_id='world'
+    update=node.wavefront.update(np.zeros((20,20),dtype=np.int8),.2,(0.,0.))
+    node.commit_wavefront_update(patch,update)
+    assert len(node.wavefront.nodes)==4
+    assert len(node.global_nodes)==2 and len(node.global_edges)==1
+    node.publish_graph_markers(patch.header)
+    markers=node.graph_vis_pub.messages[-1].markers
+    assert len(markers[0].points)==len(node.global_node_messages)
+    assert len(markers[1].points)==sum(2*(len(e.polyline)-1) for e in node.global_edge_messages.values())
+    assert all(e.source_id in node.global_nodes and e.target_id in node.global_nodes for e in node.global_edges.values())

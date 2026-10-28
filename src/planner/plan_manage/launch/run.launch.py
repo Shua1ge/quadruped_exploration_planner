@@ -1,6 +1,7 @@
 """Main ROS 2 launch entry point for simulation and real-robot remapping."""
 
 import os
+import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -18,6 +19,8 @@ def _as_bool(value):
 def _setup(context):
     scan_share = get_package_share_directory("scan_planner")
     go2_share = get_package_share_directory("go2_description")
+    with open(os.path.join(go2_share, "config", "mid360.yaml"), encoding="utf-8") as stream:
+        mid360_mount = yaml.safe_load(stream)["mount"]
     planner_yaml = os.path.join(scan_share, "config", "planner.yaml")
     controllers_yaml = os.path.join(scan_share, "config", "controllers.yaml")
     is_real = _as_bool(LaunchConfiguration("is_real_world").perform(context))
@@ -39,8 +42,9 @@ def _setup(context):
         raise RuntimeError("controller_mode must be 'open_loop' or 'closed_loop'")
     if locomotion_mode not in ("planning_kinematic", "rl_effort"):
         raise RuntimeError("locomotion_mode must be 'planning_kinematic' or 'rl_effort'")
-    if locomotion_policy not in ("legacy", "parkour_moe_stateful"):
-        raise RuntimeError("locomotion_policy must be 'legacy' or 'parkour_moe_stateful'")
+    if locomotion_policy not in ("legacy", "parkour_moe_stateful", "go2_rl_lab"):
+        raise RuntimeError(
+            "locomotion_policy must be 'legacy', 'parkour_moe_stateful' or 'go2_rl_lab'")
     if navi_mode not in (1, 2, 3):
         raise RuntimeError("navi_mode must be 1, 2, or 3")
     if navi_mode == 2 and (not keypoints_file or not os.path.isfile(keypoints_file)):
@@ -77,24 +81,19 @@ def _setup(context):
     else:
         body_pose = "/quad_0/body_pose"
         if use_gazebo_physics and sensor_type == "lidar":
-            # Gazebo publishes the lidar cloud in the robot-mounted sensor
-            # frame.  The lidar is rigidly mounted close to the trunk origin,
-            # so the bridged model odometry supplies the ray origin and
-            # orientation used to project it into world coordinates.
+            # Raw rays use the Unitree kit mount, including its 13deg pitch.
+            # Gazebo ranges carry vertical identities and explicit no-returns.
             sensor_pose = body_pose
             need_extrinsic = True
             lidar_extrinsic = {
-                "grid_map.lidar_extrinsic_x": 0.10,
-                "grid_map.lidar_extrinsic_y": 0.0,
-                "grid_map.lidar_extrinsic_z": 0.12,
-                "grid_map.lidar_extrinsic_roll": 0.0,
-                "grid_map.lidar_extrinsic_pitch": 0.0,
-                "grid_map.lidar_extrinsic_yaw": 0.0,
+                "grid_map.lidar_extrinsic_" + key: float(value)
+                for key, value in mid360_mount.items()
             }
         else:
             sensor_pose = ("/quad_0/camera_pose" if sensor_type == "depth"
                            else "/quad_0/lidar_pose")
-        cloud = "/quad_0/cloud"
+        cloud = ("/quad_0/lidar_rays" if use_gazebo_physics and sensor_type == "lidar"
+                 else "/quad_0/cloud")
         depth = "/quad_0/depth"
         cloud_is_world = not use_gazebo_physics
         if not (use_gazebo_physics and sensor_type == "lidar"):
@@ -108,6 +107,14 @@ def _setup(context):
         "fsm.navi_mode": navi_mode,
         "fsm.task_mode": task_mode,
         "grid_map.sensor_type": sensor_type,
+        "grid_map.use_laser_scan": False,
+        "grid_map.use_ray_cloud": use_gazebo_physics and sensor_type == "lidar",
+        # Identified 3-D rays carry floor and overhead returns that a planar
+        # scan never produced. Both body-relative bands must be active with
+        # them, or every beam and arch becomes a blocked cell.
+        "grid_map.separate_low_returns": use_gazebo_physics and sensor_type == "lidar",
+        "grid_map.separate_high_returns": use_gazebo_physics and sensor_type == "lidar",
+        "grid_map.no_return_range": 3.0,
         "grid_map.cloud_is_world": cloud_is_world,
         "grid_map.need_extrinsic": need_extrinsic,
         **lidar_extrinsic,
@@ -128,12 +135,23 @@ def _setup(context):
                 ("body_pose", body_pose),
                 ("sensor_pose", sensor_pose),
                 ("cloud", cloud),
+                ("scan", "/quad_0/scan"),
                 ("depth", depth),
                 ("move_base_simple/goal", "/move_base_simple/goal"),
                 ("initial_path", "/initial_path"),
             ],
         )
     ]
+    if use_gazebo_physics and sensor_type == "lidar":
+        actions.append(Node(
+            package="scan_planner", executable="mid360_ray_bridge",
+            name="mid360_ray_bridge", output="screen",
+            parameters=[common, {"no_return_range": 3.0,
+                                 "classify_observed_ground": True,
+                                 **{"lidar_extrinsic_" + key: float(value)
+                                    for key, value in mid360_mount.items()}}],
+            remappings=[("body_pose", "/quad_0/body_pose")],
+        ))
     if not use_gazebo_physics:
         actions.append(Node(
             package="robot_state_publisher",
@@ -372,7 +390,7 @@ def generate_launch_description():
             DeclareLaunchArgument("controller_mode", default_value="closed_loop"),
             DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
             DeclareLaunchArgument("getup_mode", default_value="policy"),
-            DeclareLaunchArgument("locomotion_policy", default_value="parkour_moe_stateful"),
+            DeclareLaunchArgument("locomotion_policy", default_value="legacy"),
             DeclareLaunchArgument("policy_model_path", default_value=""),
             DeclareLaunchArgument("policy_actor_path", default_value=""),
             DeclareLaunchArgument("estimator_refresh_every", default_value="5"),

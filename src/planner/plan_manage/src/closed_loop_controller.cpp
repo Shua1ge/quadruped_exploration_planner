@@ -22,6 +22,8 @@
 
 #include "bspline_opt/uniform_bspline.h"
 #include "plan_manage/replan_fsm_utils.h"
+#include "plan_manage/local_task_planner.h"
+#include "plan_manage/boundary_escape.h"
 #include "plan_manage/task_protocol.h"
 
 namespace scan_planner
@@ -55,6 +57,14 @@ public:
         "handoff_max_deceleration", 0.50);
     max_handoff_yaw_error_ = declare_parameter<double>(
         "max_handoff_yaw_error", 0.80);
+    // A small residual yaw after a certified handoff may be absorbed by the
+    // tracker while translation continues, instead of forcing an in-place turn.
+    // Zero disables the exception and restores the original align-then-connect
+    // path.
+    handoff_moving_alignment_tolerance_ = declare_parameter<double>(
+        "handoff_moving_alignment_tolerance", 0.20);
+    handoff_moving_speed_limit_ = declare_parameter<double>(
+        "handoff_moving_speed_limit", 0.25);
     if (handoff_search_time_ < 0.0 || handoff_sample_dt_ <= 0.0 ||
         max_handoff_error_ <= 0.0 || min_moving_handoff_error_ < 0.0 ||
         min_moving_handoff_error_ > max_handoff_error_ ||
@@ -69,6 +79,14 @@ public:
         !std::isfinite(motion_progress_epsilon_) || motion_progress_epsilon_ <= 0.0)
       throw std::runtime_error(
           "handoff parameters must have a non-negative search time and positive sample interval/error limit");
+    if (!std::isfinite(handoff_moving_alignment_tolerance_) ||
+        handoff_moving_alignment_tolerance_ < 0.0 ||
+        handoff_moving_alignment_tolerance_ > kMaxMovingAlignmentTolerance ||
+        !std::isfinite(handoff_moving_speed_limit_) ||
+        handoff_moving_speed_limit_ < 0.0 ||
+        handoff_moving_speed_limit_ > kMaxMovingAlignmentSpeedLimit)
+      throw std::runtime_error(
+          "handoff moving-alignment tolerance must be finite in [0, 0.35] rad and the speed limit finite in [0, 1.0] m/s");
 
     active_max_vx_ = max_vx_;
     active_max_vy_ = max_vy_;
@@ -107,6 +125,12 @@ public:
 
 private:
   static constexpr double kMaxVYawLimit = 1.0;
+  // Bounds for the optional moving-alignment exception. A residual heading
+  // beyond ~20 deg is no longer a small tracking correction and must keep the
+  // certified in-place turn; 1.0 m/s is the hard sanity ceiling for measured
+  // planar speed, independent of a possibly misconfigured max_vx.
+  static constexpr double kMaxMovingAlignmentTolerance = 0.35;
+  static constexpr double kMaxMovingAlignmentSpeedLimit = 1.0;
 
   static double normalizeAngle(double angle)
   {
@@ -142,11 +166,11 @@ private:
 
   double candidateDesiredYaw(const std::vector<UniformBspline>& curve,
       double duration, double t_cur, bool fixed_yaw, double body_yaw,
-      bool spatial_gait) const
+      bool measured_progress) const
   {
     if (fixed_yaw) return body_yaw;
     Eigen::Vector3d anchor=curve[0].evaluateDeBoorT(t_cur);
-    if(spatial_gait) anchor=odom_pos_;
+    if(measured_progress) anchor=odom_pos_;
     // At a zero-velocity endpoint, a numerical derivative is not a new
     // steering objective. Retain heading instead of turning toward noise.
     return trajectorySteeringYaw(t_cur,duration,anchor,odom_yaw_,
@@ -182,6 +206,10 @@ private:
     msg.terminal_error = terminal_error;
     msg.reason = reason;
     execution_state_pub_->publish(msg);
+    if(last_execution_state_!=state)
+      RCLCPP_INFO(get_logger(),"[CONTROLLER_EXECUTION_STATE] task=%llu version=%llu request=%llu trajectory=%lld state=%u reason=%s",
+          static_cast<unsigned long long>(active_task_id_),static_cast<unsigned long long>(active_task_version_),
+          static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),static_cast<unsigned>(state),reason.c_str());
     last_execution_state_ = state;
     last_execution_state_publish_time_ = current_time;
   }
@@ -211,6 +239,7 @@ private:
                   static_cast<unsigned long long>(active_request_id_),
                   static_cast<long long>(traj_id_));
     heading_frozen_ = false;
+    alignment_yaw_bias_ = 0.0;
     heading_stall_reported_ = false;
     heading_best_error_ = std::numeric_limits<double>::infinity();
     if (publish_clear && had_freeze_state)
@@ -254,7 +283,7 @@ private:
       return;
     }
     if (msg->execution_mode >
-            scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE ||
+            scan_planner_msgs::msg::Bspline::MODE_FORWARD_TURN_STAGE ||
         !std::isfinite(msg->max_forward_speed) ||
         !std::isfinite(msg->max_lateral_speed) ||
         !std::isfinite(msg->max_yaw_rate) ||
@@ -275,6 +304,14 @@ private:
           *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
           "INVALID_EXECUTION_PROFILE");
       return;
+    }
+    if (!std::isfinite(msg->terminal_speed_limit) || msg->terminal_speed_limit<0. ||
+        (msg->terminal_speed_limit>0. &&
+         (!std::isfinite(msg->terminal_braking_deceleration) || msg->terminal_braking_deceleration<=0. ||
+          !std::isfinite(msg->terminal_command_latency) || msg->terminal_command_latency<0. ||
+          msg->terminal_speed_limit>max_vx_))) {
+      publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+                           "INVALID_TERMINAL_SPEED_PROFILE");return;
     }
     const double candidate_max_vx = msg->max_forward_speed > 0.0
         ? std::min(msg->max_forward_speed, max_vx_) : max_vx_;
@@ -314,6 +351,13 @@ private:
       return;
     }
 
+    if(msg->execution_mode==scan_planner_msgs::msg::Bspline::MODE_FORWARD_TURN_STAGE &&
+        (!candidate_fixed_yaw || !msg->handoff_certified || msg->min_forward_command<=0. ||
+         !std::isfinite(msg->forward_stage_stop_latency) || msg->forward_stage_stop_latency<=0. ||
+         !std::isfinite(msg->forward_stage_deceleration) || msg->forward_stage_deceleration<=0.)) {
+      publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+                           "FORWARD_STAGE_CERTIFICATE_INVALID");return;
+    }
     std::vector<Eigen::Vector3d> control_points;
     control_points.reserve(points.cols());
     for (Eigen::Index column = 0; column < points.cols(); ++column)
@@ -333,7 +377,8 @@ private:
       receive_traj_ = true;
       resetHeadingFreezeState();
       publishTrajectoryAck(
-          *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED,
+          *msg, msg->task_id ? scan_planner_msgs::msg::TrajectoryAck::STATUS_HOLD_INSTALLED
+                            : scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED,
           "STATIONARY_HOLD_ACCEPTED");
       publishExecutionState(
           scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD,
@@ -352,8 +397,56 @@ private:
     double start_error = 0.0;
     double matched_error = 0.0;
     double matched_yaw_error = 0.0;
+    const double turn_position_allowance=msg->handoff_turn_position_allowance==0.
+        ? kHandoffPositionAllowance : msg->handoff_turn_position_allowance;
+    const double alignment_tolerance=msg->handoff_alignment_tolerance==0.
+        ? kHandoffAlignmentTolerance : msg->handoff_alignment_tolerance;
+    if(!validCertifiedAlignmentTolerance(alignment_tolerance) ||
+        (candidate_fixed_yaw && alignment_tolerance>kHandoffAlignmentTolerance) ||
+        (!msg->handoff_certified && alignment_tolerance>kHandoffAlignmentTolerance)) {
+      publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+                           "HANDOFF_CERTIFICATE_YAW_BAND_INVALID");
+      return;
+    }
+    if(!std::isfinite(turn_position_allowance) || turn_position_allowance<kHandoffPositionAllowance ||
+        turn_position_allowance>kHandoffTurnPositionAllowance ||
+        (candidate_fixed_yaw && turn_position_allowance>kHandoffPositionAllowance)) {
+      publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+                           "HANDOFF_CERTIFICATE_TURN_ENVELOPE_INVALID");
+      return;
+    }
+    if (msg->task_id && !have_odom_) {
+      publishTrajectoryAck(*msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+                           "HANDOFF_STATE_UNAVAILABLE");
+      return;
+    }
     if (have_odom_)
     {
+      if (msg->task_id || msg->handoff_certified)
+      {
+        const Eigen::Vector3d certified_position(msg->handoff_position.x,
+            msg->handoff_position.y, msg->handoff_position.z);
+        // Validate time before evaluating the curve, including malformed input.
+        const double safe_time = std::isfinite(msg->handoff_matched_time)
+            ? std::clamp(msg->handoff_matched_time, 0.0, candidate_duration) : 0.0;
+        const double target_yaw = candidateDesiredYaw(candidate, candidate_duration,
+            safe_time, candidate_fixed_yaw, candidate_body_yaw,
+            msg->use_measured_progress);
+        const char* failure = handoffCertificateFailure(msg->handoff_certified,
+            msg->handoff_matched_time, candidate_duration, certified_position,
+            odom_pos_, msg->handoff_body_yaw, odom_yaw_,
+            msg->handoff_target_yaw, target_yaw);
+        if (failure) {
+          publishTrajectoryAck(*msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED, failure);
+          return;  // Preserve the predecessor, its command and execution clock.
+        }
+        matched_time = msg->handoff_matched_time;
+        start_error = (candidate[0].evaluateDeBoorT(0).head<2>()-odom_pos_.head<2>()).norm();
+        matched_error = (candidate[0].evaluateDeBoorT(matched_time).head<2>()-odom_pos_.head<2>()).norm();
+      }
+      else
+      {
+      // Legacy non-task messages retain independent matching.
       const double search_end = std::min(candidate_duration, handoff_search_time_);
       std::vector<Eigen::Vector3d> samples;
       std::vector<double> sample_times;
@@ -368,6 +461,7 @@ private:
       matched_time = sample_times[match];
       start_error = (samples.front().head<2>() - odom_pos_.head<2>()).norm();
       matched_error = (samples[match].head<2>() - odom_pos_.head<2>()).norm();
+      }
       const double handoff_speed = odom_vel_.head<2>().norm();
       const double dynamic_handoff_limit = speedAwareHandoffErrorLimit(
           handoff_speed, handoff_max_deceleration_, handoff_reaction_time_,
@@ -390,16 +484,26 @@ private:
       // before installing the candidate, preserving the old execution state.
       matched_yaw_error = std::abs(normalizeAngle(candidateDesiredYaw(
           candidate, candidate_duration, matched_time, candidate_fixed_yaw,
-          candidate_body_yaw, msg->min_forward_command > 0.0) - odom_yaw_));
+          candidate_body_yaw, msg->use_measured_progress) - odom_yaw_));
       if (msg->rolling_task_handoff) {
+        if(handoff_alignment_pending_) {
+          publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+              "HANDOFF_ROLLING_ALIGNMENT_PENDING",matched_time,matched_error,matched_yaw_error);
+          return; // Preserve predecessor ownership; Local may request confirmed rest.
+        }
         const Eigen::Vector3d candidate_velocity = candidate[1].evaluateDeBoorT(matched_time);
+        // The spline derivative is world-frame; the odometry twist is
+        // body-frame. Comparing them directly makes the implied velocity jump
+        // grow with yaw (~0.7 m/s at 90 deg for a 0.5 m/s handoff), so a
+        // continuous successor is rejected purely because of its heading.
+        const Eigen::Vector2d odom_world_velocity = odom_world_velocity_.head<2>();
         // Same reaction/deceleration contract as the position gate. Bound
         // velocity change before installation, including nearly-rest cases.
         const double velocity_limit = handoff_max_deceleration_ * handoff_reaction_time_;
         const bool heading_jump = matched_yaw_error >
             std::min(max_handoff_yaw_error_,heading_release_threshold_);
         if (heading_jump ||
-            (candidate_velocity.head<2>()-odom_vel_.head<2>()).norm() > velocity_limit) {
+            (candidate_velocity.head<2>()-odom_world_velocity).norm() > velocity_limit) {
           publishTrajectoryAck(*msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
               heading_jump ? "HANDOFF_ROLLING_HEADING_ERROR" : "HANDOFF_ROLLING_VELOCITY_ERROR",
               matched_time,matched_error,matched_yaw_error);
@@ -432,6 +536,15 @@ private:
          (msg->task_id == 0 && active_task_id_ == 0 &&
           active_request_id_ == msg->request_id));
     const bool resuming_hold = soft_hold_;
+    const bool unfinished_alignment=handoff_alignment_pending_ ||
+        handoff_alignment_deviated_ || uncertified_turn_latched_;
+    if(msg->handoff_certified && candidate_fixed_yaw && unfinished_alignment &&
+        (odom_vel_.head<2>().norm()>.05 || !std::isfinite(odom_yaw_rate_) ||
+         std::abs(odom_yaw_rate_)>.10)) {
+      publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+          "HANDOFF_FIXED_YAW_REQUIRES_STOP",matched_time,matched_error,matched_yaw_error);
+      return;
+    }
     if (msg->task_id && active_task_id_ &&
         std::make_pair(msg->task_id,msg->task_version) >
         std::make_pair(active_task_id_,active_task_version_))
@@ -448,8 +561,17 @@ private:
     fixed_trajectory_yaw_ = candidate_fixed_yaw;
     trajectory_yaw_ = candidate_body_yaw;
     active_execution_mode_ = msg->execution_mode;
+    terminal_speed_limit_=msg->terminal_speed_limit;
+    terminal_deceleration_=msg->terminal_braking_deceleration;
+    terminal_latency_=msg->terminal_command_latency;
+    last_turn_certificate_stamp_=0;
+    forward_stage_braking_=false;forward_stage_failure_.clear();forward_stage_rest_gate_={};
+    forward_stage_installed_at_=now();forward_stage_progress_.reset();
+    forward_stage_stop_latency_=msg->forward_stage_stop_latency;
+    forward_stage_deceleration_=msg->forward_stage_deceleration;
     active_max_vx_ = candidate_max_vx;
     active_min_forward_command_ = msg->min_forward_command;
+    active_measured_progress_ = msg->use_measured_progress;
     active_min_forward_effective_speed_ = msg->min_forward_effective_speed;
     active_max_vy_ = candidate_max_vy;
     active_max_vyaw_ = candidate_max_vyaw;
@@ -464,10 +586,45 @@ private:
       motion_stalled_ = false;
       physical_progress_.reset();
     }
-    spatial_terminal_reached_ = false;
+    terminal_capture_latched_ = false;
+    terminal_rest_gate_={};terminal_capture_started_=now();
     terminal_best_error_ = std::numeric_limits<double>::infinity();
     terminal_last_progress_time_ = now();
     resetHeadingFreezeState();
+    handoff_alignment_pending_=handoffNeedsHeadingAlignment(msg->handoff_certified,
+        candidate_fixed_yaw,unfinished_alignment,odom_vel_.head<2>().norm(),
+        matched_yaw_error,heading_release_threshold_);
+    const auto install_time=now();
+    const bool measured_rest=measured_rest_gate_.settled_samples>=3 &&
+        measured_rest_gate_.last_pose_stamp==odom_stamp_ns_ &&
+        odom_stamp_ns_>0 && install_time.nanoseconds()>=odom_stamp_ns_ &&
+        install_time.nanoseconds()-odom_stamp_ns_<=250000000LL &&
+        odom_vel_.head<2>().norm()<=.05 &&
+        std::isfinite(odom_yaw_rate_) && std::abs(odom_yaw_rate_)<=.10;
+    handoff_alignment_started_=handoff_alignment_pending_ && measured_rest;
+    // Reuse fresh, measured rest across candidate installation. Only a
+    // fixed-yaw departure with no such proof waits; normal moving splines
+    // keep rolling. Residual angular motion cannot count as rest.
+    handoff_departure_wait_rest_=msg->handoff_certified && !measured_rest &&
+        (candidate_fixed_yaw ||
+         (odom_vel_.head<2>().norm()<=.05 &&
+          (!std::isfinite(odom_yaw_rate_) || std::abs(odom_yaw_rate_)>.10)));
+    handoff_certified_body_yaw_=msg->handoff_body_yaw;
+    handoff_alignment_rest_gate_={};
+    handoff_alignment_wait_started_=now();
+    handoff_alignment_deviated_ = false;
+    uncertified_turn_latched_ = false;
+    lateral_recovery_deviated_ = false;
+    lateral_stop_reason_.clear();
+    lateral_capture_waiting_=false;
+    lateral_capture_attempts_=0;
+    lateral_capture_compensation_=0.;
+    lateral_capture_rest_gate_={};
+    handoff_turn_position_allowance_=turn_position_allowance;
+    handoff_alignment_tolerance_=alignment_tolerance;
+    handoff_alignment_position_ = Eigen::Vector3d(msg->handoff_position.x,
+        msg->handoff_position.y, msg->handoff_position.z);
+    handoff_alignment_yaw_ = msg->handoff_target_yaw;
     if (soft_hold_ && trajectorySupersedesExecutionCommand(
             msg->request_id, msg->traj_id,
             soft_hold_request_id_, soft_hold_trajectory_id_))
@@ -483,7 +640,10 @@ private:
       soft_hold_reason_.clear();
     }
     publishTrajectoryAck(
-        *msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED,
+        *msg, msg->task_id
+            ? (soft_hold_ ? scan_planner_msgs::msg::TrajectoryAck::STATUS_HOLD_INSTALLED
+                          : scan_planner_msgs::msg::TrajectoryAck::STATUS_ACTIVATED)
+            : scan_planner_msgs::msg::TrajectoryAck::STATUS_ACCEPTED,
         "HANDOFF_ACCEPTED", matched_time, matched_error, matched_yaw_error);
     publishExecutionState(
         soft_hold_ ? scan_planner_msgs::msg::ExecutionState::STATE_SOFT_HOLD
@@ -543,6 +703,28 @@ private:
           static_cast<long long>(msg->trajectory_id),
           static_cast<unsigned long long>(active_request_id_),
           static_cast<long long>(traj_id_), msg->reason.c_str());
+      return;
+    }
+    if (msg->command == scan_planner_msgs::msg::ExecutionCommand::COMMAND_REFRESH_TURN) {
+      const Eigen::Vector3d position(msg->certificate_position.x,
+          msg->certificate_position.y,msg->certificate_position.z);
+      const int64_t stamp=rclcpp::Time(msg->certificate_stamp).nanoseconds();
+      if(msg->task_id!=active_task_id_ || msg->task_version!=active_task_version_ ||
+          msg->request_id!=active_request_id_ || msg->trajectory_id!=traj_id_ ||
+          msg->certificate_map_revision==0 || !position.allFinite() ||
+          handoff_departure_wait_rest_ ||
+          !turnRefreshAcceptable(handoff_alignment_pending_,soft_hold_,handoff_alignment_deviated_,
+              now().nanoseconds(),stamp,last_turn_certificate_stamp_,
+              (position-odom_pos_).head<2>().norm(),
+              normalizeAngle(msg->certificate_target_yaw-handoff_alignment_yaw_),
+              msg->certificate_position_allowance,handoff_turn_position_allowance_)) return;
+      handoff_alignment_position_=position;
+      handoff_turn_position_allowance_=msg->certificate_position_allowance;
+      last_turn_certificate_stamp_=stamp;
+      RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),1000,
+          "[TURN_CERTIFICATE_REFRESHED] request=%llu trajectory=%lld map=%llu radius=%.3fm",
+          static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),
+          static_cast<unsigned long long>(msg->certificate_map_revision),handoff_turn_position_allowance_);
       return;
     }
     if (msg->command == scan_planner_msgs::msg::ExecutionCommand::COMMAND_HOLD)
@@ -619,6 +801,7 @@ private:
         !normalizeFiniteQuaternion(&orientation))
     {
       have_odom_ = false;
+      measured_rest_gate_={};
       publishStop();
       RCLCPP_ERROR_THROTTLE(
           get_logger(), *get_clock(), 1000,
@@ -633,13 +816,141 @@ private:
     if (!std::isfinite(yaw))
     {
       have_odom_ = false;
+      measured_rest_gate_={};
       publishStop();
       return;
     }
     odom_pos_ = position;
     odom_vel_ = velocity;
+    odom_world_velocity_ = rotateBodyVelocityToWorld(orientation, velocity);
     odom_yaw_ = yaw;
+    odom_yaw_rate_=msg->twist.twist.angular.z;
+    const int64_t next_stamp_ns=rclcpp::Time(msg->header.stamp).nanoseconds();
+    if(next_stamp_ns<=odom_stamp_ns_ ||
+        (odom_stamp_ns_>0 && next_stamp_ns-odom_stamp_ns_>250000000LL))
+      measured_rest_gate_={};
+    odom_stamp_ns_=next_stamp_ns;
+    const int64_t now_ns=now().nanoseconds();
+    const bool fresh=odom_stamp_ns_>0 && now_ns>=odom_stamp_ns_ &&
+        now_ns-odom_stamp_ns_<=250000000LL;
+    measured_rest_gate_.observe(true,fresh,odom_vel_.head<2>().norm(),
+                                odom_yaw_rate_,odom_stamp_ns_);
     have_odom_ = true;
+  }
+
+  void latchLateralRecoveryStop(const char* reason,
+      const Eigen::Vector2d& start,const Eigen::Vector2d& goal,double yaw_error)
+  {
+    const Eigen::Vector2d direction=(goal-start).normalized();
+    const double progress=(odom_pos_.head<2>()-start).dot(direction);
+    const double longitudinal=(odom_pos_.head<2>()-start).dot(
+        Eigen::Vector2d(std::cos(trajectory_yaw_),std::sin(trajectory_yaw_)));
+    lateral_recovery_deviated_=true;
+    lateral_stop_reason_=reason;
+    RCLCPP_WARN(get_logger(),
+        "[LATERAL_RECOVERY_STOP] reason=%s request=%llu trajectory=%lld phase=%s stop_checks=%d planned=%.3fm progress=%.3fm overshoot=%.3fm longitudinal=%.3fm yaw_error=%.4frad speed=%.3fm/s pose=(%.3f,%.3f) start=(%.3f,%.3f) goal=(%.3f,%.3f); keeping zero command until new certified candidate",
+        reason,static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),
+        lateral_capture_waiting_ ? "SETTLING" : "TRANSLATING",lateral_capture_attempts_,
+        (goal-start).norm(),progress,progress-(goal-start).norm(),longitudinal,yaw_error,
+        odom_vel_.head<2>().norm(),odom_pos_.x(),odom_pos_.y(),start.x(),start.y(),goal.x(),goal.y());
+    publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                          lateral_stop_reason_,(odom_pos_.head<2>()-goal).norm(),true);
+    publishStop();
+    last_update_time_=now();
+  }
+
+  // Completion relinquishes the old motion command. A certified successor
+  // can still install immediately; an exhausted spline cannot steer itself
+  // back into execution while Local computes that successor.
+  void holdTerminalCapture(const rclcpp::Time& current_time)
+  {
+    publishStop();last_update_time_=current_time;
+    const bool fresh=odom_stamp_ns_>0 && current_time.nanoseconds()>=odom_stamp_ns_ &&
+        current_time.nanoseconds()-odom_stamp_ns_<=250000000LL;
+    const double elapsed=(current_time-terminal_capture_started_).seconds();
+    const bool settled=terminal_rest_gate_.observe(elapsed>=.3,fresh,
+        odom_vel_.head<2>().norm(),odom_yaw_rate_,odom_stamp_ns_);
+    const double error=(traj_[0].evaluateDeBoorT(traj_duration_)-odom_pos_).head<2>().norm();
+    if(error>finish_dist_) {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                            "TERMINAL_CAPTURE_DRIFT",error);
+    } else if(settled) {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
+                            "TERMINAL_REACHED",error);
+      if(!terminal_event_reported_) {
+        terminal_event_reported_=true;
+        publishExecutionEvent("LOCAL_TRAJECTORY_FINISHED",error);
+        RCLCPP_INFO(get_logger(),"[LOCAL_TRAJECTORY_FINISHED] request_id=%llu trajectory=%lld terminal_error=%.3fm; measured rest confirmed",
+            static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),error);
+      }
+    } else if(elapsed>5.) {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                            "TERMINAL_STOP_UNCONFIRMED",error);
+    } else {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
+                            "TERMINAL_SETTLING",error);
+    }
+  }
+
+  void failForwardStage(const char* reason,double error,const rclcpp::Time& current_time)
+  {
+    if(forward_stage_failure_.empty()) {
+      forward_stage_failure_=reason;
+      RCLCPP_WARN(get_logger(),"[FORWARD_STAGE_STOP] request=%llu trajectory=%lld reason=%s error=%.3fm pose=(%.3f,%.3f)",
+          static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),reason,error,odom_pos_.x(),odom_pos_.y());
+    }
+    publishStop();last_update_time_=current_time;
+    publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                          forward_stage_failure_,error);
+  }
+
+  bool controlForwardStage(const rclcpp::Time& current_time)
+  {
+    const auto start=traj_[0].evaluateDeBoorT(0.).head<2>().eval();
+    const auto goal=traj_[0].evaluateDeBoorT(traj_duration_).head<2>().eval();
+    const auto state=forwardStageState(start,goal,odom_pos_.head<2>(),trajectory_yaw_,
+        odom_yaw_,odom_vel_.head<2>().norm(),forward_stage_stop_latency_,forward_stage_deceleration_);
+    const bool fresh=odom_stamp_ns_>0 && current_time.nanoseconds()>=odom_stamp_ns_ &&
+        current_time.nanoseconds()-odom_stamp_ns_<=250000000LL;
+    if(!forward_stage_failure_.empty() || state.failure || !fresh) {
+      failForwardStage(state.failure ? state.failure : "FORWARD_STAGE_ODOMETRY_STALE",state.error,current_time);
+      return true;
+    }
+    if(forward_stage_braking_) {
+      publishStop();last_update_time_=current_time;
+      const double elapsed=(current_time-forward_stage_brake_started_).seconds();
+      if(forward_stage_rest_gate_.observe(elapsed>=.3,fresh,odom_vel_.head<2>().norm(),
+                                          odom_yaw_rate_,odom_stamp_ns_)) {
+        if(state.error>kForwardStageCaptureRadius) {
+          failForwardStage("FORWARD_STAGE_STOP_SHORT",state.error,current_time);return true;
+        }
+        exec_time_=traj_duration_;
+        publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
+                              "FORWARD_STAGE_CAPTURED",state.error);
+        if(!terminal_event_reported_) {
+          terminal_event_reported_=true;publishExecutionEvent("LOCAL_TRAJECTORY_FINISHED",state.error);
+        }
+      } else if(elapsed>5.) failForwardStage("FORWARD_STAGE_STOP_UNCONFIRMED",state.error,current_time);
+      else publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
+                                 "FORWARD_STAGE_BRAKING",state.error);
+      return true;
+    }
+    if((current_time-forward_stage_installed_at_).seconds()>
+          std::max(5.,4.*(goal-start).norm()/active_min_forward_effective_speed_)+5. ||
+        forward_stage_progress_.stalled(current_time.seconds(),Eigen::Vector2d(state.progress,0.),
+            true,motion_stall_timeout_,motion_progress_epsilon_)) {
+      failForwardStage("FORWARD_STAGE_NO_PROGRESS",state.error,current_time);return true;
+    }
+    if(state.brake) {
+      forward_stage_braking_=true;forward_stage_brake_started_=current_time;forward_stage_rest_gate_={};
+      RCLCPP_INFO(get_logger(),"[FORWARD_STAGE_BRAKING] request=%llu trajectory=%lld remaining=%.3fm speed=%.3fm/s latency=%.3fs deceleration=%.3fm/s2",
+          static_cast<unsigned long long>(active_request_id_),static_cast<long long>(traj_id_),state.remaining,odom_vel_.head<2>().norm(),
+          forward_stage_stop_latency_,forward_stage_deceleration_);
+      publishStop();last_update_time_=current_time;
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,"FORWARD_STAGE_BRAKING",state.error);
+      return true;
+    }
+    return false;
   }
 
   void cmdCallback()
@@ -679,64 +990,133 @@ private:
       publishStop();
       return;
     }
-    double dt = (current_time - last_update_time_).seconds();
-    if (dt < 0.0 || dt > 0.2) dt = 0.0;
-    const bool spatial_gait = active_min_forward_command_ > 0.0;
-    if (spatial_gait && spatial_terminal_reached_)
-    {
-      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
-                            "TERMINAL_REACHED");
+    if (handoff_alignment_pending_ &&
+        (odom_pos_-handoff_alignment_position_).head<2>().norm() > handoff_turn_position_allowance_)
+      handoff_alignment_deviated_ = true;
+    if(handoff_departure_wait_rest_ &&
+        ((odom_pos_-handoff_alignment_position_).head<2>().norm()>handoff_turn_position_allowance_ ||
+         std::abs(normalizeAngle(odom_yaw_-handoff_certified_body_yaw_))>kHandoffYawAllowance))
+      handoff_alignment_deviated_=true;
+    if (handoff_alignment_deviated_ || uncertified_turn_latched_ || lateral_recovery_deviated_) {
+      publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                            handoff_alignment_deviated_ ? (handoff_departure_wait_rest_ ? "HANDOFF_REST_STATE_CHANGED" : "HANDOFF_ALIGNMENT_DEVIATED") :
+                                (lateral_recovery_deviated_ ? lateral_stop_reason_ :
+                                    "UNCERTIFIED_TURN_REQUIRED"),
+                            lateral_recovery_deviated_
+                              ? (odom_pos_-traj_[0].evaluateDeBoorT(traj_duration_)).head<2>().norm()
+                              : (odom_pos_-handoff_alignment_position_).head<2>().norm());
+      // Lateral terminal_error is endpoint distance, never start displacement.
       publishStop();
       last_update_time_ = current_time;
+      return;  // Only a newly certified candidate may release this latch.
+    }
+    if(handoff_departure_wait_rest_ || (handoff_alignment_pending_ && !handoff_alignment_started_)) {
+      const bool fresh=odom_stamp_ns_>0 && current_time.nanoseconds()>=odom_stamp_ns_ &&
+          current_time.nanoseconds()-odom_stamp_ns_<=250000000LL;
+      if(!handoff_alignment_rest_gate_.observe(true,fresh,odom_vel_.head<2>().norm(),
+                                              odom_yaw_rate_,odom_stamp_ns_)) {
+        const bool timeout=(current_time-handoff_alignment_wait_started_).seconds()>5.;
+        publishExecutionState(timeout ? scan_planner_msgs::msg::ExecutionState::STATE_STALLED :
+            scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN,
+            timeout ? "HANDOFF_REST_UNCONFIRMED" : "HEADING_ALIGNMENT_WAIT_REST");
+        publishStop();last_update_time_=current_time;return;
+      }
+      handoff_departure_wait_rest_=false;
+      handoff_alignment_started_=true;handoff_alignment_rest_gate_={};
+    }
+    double dt = (current_time - last_update_time_).seconds();
+    if (dt < 0.0 || dt > 0.2) dt = 0.0;
+    const bool calibrated_forward = active_min_forward_command_ > 0.0;
+    const bool measured_progress = active_measured_progress_;
+    if(active_execution_mode_==scan_planner_msgs::msg::Bspline::MODE_FORWARD_TURN_STAGE &&
+        controlForwardStage(current_time)) return;
+    if (terminal_capture_latched_)
+    {
+      holdTerminalCapture(current_time);
       return;
     }
     double spatial_target_time = exec_time_;
-    if (spatial_gait)
+    if (measured_progress && !handoff_alignment_pending_)
     {
       // Match actual progress, not a reference clock that advances while the
       // calibrated gait is slower than its command. Never chase a past point.
-      double best_distance = (traj_[0].evaluateDeBoorT(exec_time_) - odom_pos_).head<2>().squaredNorm();
-      const double search_end = std::min(traj_duration_, exec_time_ + 2.0);
-      for (double t = exec_time_; t <= search_end + 1e-9; t += 0.05)
-      {
-        const double distance = (traj_[0].evaluateDeBoorT(t) - odom_pos_).head<2>().squaredNorm();
-        if (distance < best_distance)
-        {
-          best_distance = distance;
-          spatial_target_time = t;
-        }
-      }
-      exec_time_ = spatial_target_time;
+      exec_time_=measuredTrajectoryProgress(exec_time_,traj_duration_,odom_pos_,
+          [&](double t) {return Eigen::Vector3d(traj_[0].evaluateDeBoorT(t));});
       spatial_target_time = forwardGaitLookaheadTime(exec_time_, traj_duration_,
           [&](double t) { return traj_[0].evaluateDeBoorT(t); });
       const double endpoint_error = (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm();
-      if (spatial_target_time >= traj_duration_ && endpoint_error < finish_dist_)
+      // Fixed-yaw forward staging must reach its safe turning position;
+      // the ordinary 15 cm arrival band may still lie in the narrow approach.
+      const double capture_distance=fixed_trajectory_yaw_ ? .03 : finish_dist_;
+      if (active_execution_mode_!=scan_planner_msgs::msg::Bspline::MODE_FORWARD_TURN_STAGE &&
+          spatial_target_time >= traj_duration_ && endpoint_error < capture_distance)
       {
         exec_time_ = traj_duration_;
-        terminal_event_reported_ = true;
-        spatial_terminal_reached_ = true;
-        publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
-                              "TERMINAL_REACHED", endpoint_error, true);
-        publishExecutionEvent("LOCAL_TRAJECTORY_FINISHED", endpoint_error);
-        publishStop();
-        last_update_time_ = current_time;
+        terminal_capture_latched_ = true;
+        terminal_capture_started_=current_time;terminal_rest_gate_={};
+        holdTerminalCapture(current_time);
         return;
       }
     }
-    const double t_eval = std::min(spatial_gait ? spatial_target_time : exec_time_, traj_duration_);
+    const double t_eval = std::min(measured_progress ? spatial_target_time : exec_time_, traj_duration_);
     Eigen::Vector3d pos_des = traj_[0].evaluateDeBoorT(t_eval);
-    const double desired_yaw = candidateDesiredYaw(traj_, traj_duration_,
-        spatial_gait ? exec_time_ : t_eval, fixed_trajectory_yaw_,
-        trajectory_yaw_, spatial_gait);
+    // During initial alignment use the certified target, not a fresh heading
+    // from pose drift or a later spline prefix. Progress remains frozen.
+    const double desired_yaw = handoff_alignment_pending_ ? handoff_alignment_yaw_ :
+        candidateDesiredYaw(traj_, traj_duration_,
+            measured_progress ? exec_time_ : t_eval, fixed_trajectory_yaw_,
+            trajectory_yaw_, measured_progress);
     const double yaw_error = normalizeAngle(desired_yaw - odom_yaw_);
     std_msgs::msg::Float64 heading_error_msg;
     heading_error_msg.data = yaw_error;
     heading_error_pub_->publish(heading_error_msg);
     const double yaw_command = std::clamp(
         kp_yaw_ * yaw_error, -active_max_vyaw_, active_max_vyaw_);
-    if (headingFreezeRequired(heading_frozen_, yaw_error,
-                             heading_error_threshold_, heading_release_threshold_))
+    // A stopped handoff must complete its certified rotation before driving.
+    // Normal tracking hysteresis is too loose for this align-then-connect contract.
+    // Exception: with a small residual error and bounded measured speed the
+    // tracker may translate while correcting heading. The flag is only
+    // evaluated while a certified handoff is still pending; fixed-yaw turns
+    // never reach here (handoffNeedsHeadingAlignment rejects them).
+    // odom_vel_ is the body-frame twist; only its planar norm is used, which
+    // equals the norm of the world-frame velocity, so no frame conversion is
+    // needed for this gate.
+    const double handoff_alignment_speed = odom_vel_.head<2>().norm();
+    const bool handoff_moving_alignment = handoff_alignment_pending_ &&
+        handoff_moving_alignment_tolerance_ > 0.0 &&
+        handoff_moving_speed_limit_ > 0.0 &&
+        std::isfinite(yaw_error) && std::isfinite(handoff_alignment_speed) &&
+        std::abs(yaw_error) <= handoff_moving_alignment_tolerance_ &&
+        handoff_alignment_speed <= handoff_moving_speed_limit_;
+    if (handoff_moving_alignment)
     {
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "[HANDOFF_MOVING_ALIGNMENT] request_id=%llu trajectory=%lld error=%.3frad tolerance=%.3frad speed=%.3fm/s limit=%.3fm/s; continuing translation while tracking corrects heading",
+          static_cast<unsigned long long>(active_request_id_),
+          static_cast<long long>(traj_id_), std::abs(yaw_error),
+          handoff_moving_alignment_tolerance_, handoff_alignment_speed,
+          handoff_moving_speed_limit_);
+    }
+    const bool freeze=handoff_alignment_pending_
+        ? (!handoff_moving_alignment &&
+           std::abs(yaw_error)>handoff_alignment_tolerance_)
+        : headingFreezeRequired(heading_frozen_,yaw_error,
+                                heading_error_threshold_,heading_release_threshold_);
+    if (freeze)
+    {
+      if(handoff_alignment_pending_) handoff_alignment_rest_gate_={};
+      // The candidate certificate authorizes its initial align-then-connect
+      // only. A new in-place turn during execution needs a fresh Local grant,
+      // even when the old spline itself remains position-continuous.
+      if (active_task_id_ && !handoff_alignment_pending_) {
+        uncertified_turn_latched_ = true;
+        publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_STALLED,
+                              "UNCERTIFIED_TURN_REQUIRED");
+        publishStop();
+        last_update_time_ = current_time;
+        return;
+      }
       const double abs_error = std::abs(yaw_error);
       if (!heading_frozen_)
       {
@@ -749,7 +1129,7 @@ private:
                     "[HEADING_FREEZE_ENTER] request_id=%llu trajectory=%lld error=%.3frad threshold=%.3frad",
                     static_cast<unsigned long long>(active_request_id_),
                     static_cast<long long>(traj_id_), abs_error,
-                    heading_error_threshold_);
+                    handoff_alignment_pending_ ? handoff_alignment_tolerance_ : heading_error_threshold_);
       }
       else if (abs_error + heading_progress_epsilon_ < heading_best_error_)
       {
@@ -778,17 +1158,50 @@ private:
           scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN,
           heading_stall_reported_ ? "HEADING_STALLED" : "HEADING_ALIGNMENT");
       physical_progress_.reset();
-      publishStop(yaw_command);
+      // A proportional command can stall below the real gait's effective yaw
+      // response. Ramp a bounded bias only in a certified initial turn with
+      // measured low angular speed. Keep the certificate, timeout and yaw cap.
+      // Do not carry a bias through target crossing or into path tracking.
+      double alignment_command = yaw_command;
+      if (handoff_alignment_pending_ && active_task_id_) {
+        if (alignment_yaw_bias_ * yaw_error < 0.0) alignment_yaw_bias_ = 0.0;
+        if (stalled_for >= .30 && std::abs(odom_yaw_rate_) < .08)
+          alignment_yaw_bias_ = std::copysign(
+              std::min(.35, std::abs(alignment_yaw_bias_) + .25 * std::clamp(dt, 0.0, .05)),
+              yaw_error);
+        alignment_command = std::clamp(yaw_command + alignment_yaw_bias_,
+                                        -active_max_vyaw_, active_max_vyaw_);
+      }
+      publishStop(alignment_command);
       last_update_time_ = current_time;
       return;
     }
 
+    alignment_yaw_bias_ = 0.0; // Captured: zero command and measured settling.
+    // The moving-alignment exception intentionally skips the measured-rest
+    // settle: translation must continue while the tracker removes the small
+    // residual yaw. Every other pending handoff keeps the rest contract.
+    if(handoff_alignment_pending_ && !handoff_moving_alignment) {
+      const bool fresh=odom_stamp_ns_>0 && current_time.nanoseconds()>=odom_stamp_ns_ &&
+          current_time.nanoseconds()-odom_stamp_ns_<=250000000LL;
+      if(!handoff_alignment_rest_gate_.observe(true,fresh,odom_vel_.head<2>().norm(),
+                                               odom_yaw_rate_,odom_stamp_ns_)) {
+        publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_HEADING_FROZEN,
+                              "HEADING_ALIGNMENT_SETTLING");
+        publishStop();last_update_time_=current_time;return;
+      }
+    }
+    handoff_alignment_pending_ = false;
+    handoff_alignment_started_=false;handoff_alignment_rest_gate_={};
     resetHeadingFreezeState();
-    if (!spatial_gait)
+    if (!measured_progress)
       exec_time_ = std::min(traj_duration_, exec_time_ + dt);
     last_update_time_ = current_time;
-    pos_des = traj_[0].evaluateDeBoorT(exec_time_);
-    const Eigen::Vector3d vel_des = traj_[1].evaluateDeBoorT(exec_time_);
+    // Ordinary measured-progress tracking needs an actual forward target too;
+    // sampling zero-speed departure at the nearest point would never start.
+    const double tracking_time=measured_progress ? t_eval : exec_time_;
+    pos_des = traj_[0].evaluateDeBoorT(tracking_time);
+    const Eigen::Vector3d vel_des = traj_[1].evaluateDeBoorT(tracking_time);
     const Eigen::Vector2d pos_error(pos_des.x() - odom_pos_.x(), pos_des.y() - odom_pos_.y());
     const Eigen::Vector2d tracking_correction = clampNorm(
         kp_pos_ * pos_error, active_max_tracking_correction_);
@@ -808,20 +1221,112 @@ private:
         -s * vel_world.x() + c * vel_world.y(),
         -active_max_vy_, active_max_vy_);
     command.angular.z = yaw_command;
-    if (spatial_gait)
+    if (active_execution_mode_ == scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE &&
+        fixed_trajectory_yaw_ && !calibrated_forward)
     {
-      // This policy has no calibrated reverse/strafe primitive. Steer toward
+      // This Local-certified primitive translates left/right at fixed body
+      // yaw. Do not turn its lateral feedforward into a forward command floor.
+      command.linear.x = 0.0;
+      // An upper bound alone left the real command near 0.06 m/s, inside
+      // the legacy lateral deadband. The certified primitive runs a bounded
+      // constant transverse command until measured capture, not spline time.
+      const Eigen::Vector2d left(-std::sin(trajectory_yaw_),std::cos(trajectory_yaw_));
+      const Eigen::Vector2d start=traj_[0].evaluateDeBoorT(0).head<2>();
+      const Eigen::Vector2d goal=traj_[0].evaluateDeBoorT(traj_duration_).head<2>();
+      command.linear.y = std::copysign(active_max_vy_,(goal-start).dot(left));
+      const Eigen::Vector2d direction=(goal-start).normalized();
+      const double overshoot=(odom_pos_.head<2>()-goal).dot(direction);
+      const double cross=(odom_pos_.head<2>()-start).dot(Eigen::Vector2d(
+          std::cos(trajectory_yaw_),std::sin(trajectory_yaw_)));
+      if (overshoot>kLateralRecoveryCaptureExtension ||
+          std::abs(cross)>kLateralRecoveryLongitudinalBound || std::abs(yaw_error)>.12) {
+        const char* reason=overshoot>kLateralRecoveryCaptureExtension ?
+            "LATERAL_RECOVERY_OVERSHOOT" :
+            std::abs(cross)>kLateralRecoveryLongitudinalBound ?
+            "LATERAL_RECOVERY_LONGITUDINAL_DRIFT" : "LATERAL_RECOVERY_HEADING_DRIFT";
+        latchLateralRecoveryStop(reason,start,goal,yaw_error);
+        return;  // Never reverse toward an uncertified recovery side.
+      }
+      const double progress=(odom_pos_.head<2>()-start).dot(direction);
+      // Boundary exits carry an explicit braking model. Capture begins before
+      // the endpoint using measured speed; waiting until geometric arrival
+      // previously added the whole physical stopping distance as overshoot.
+      const double stop_lead=terminal_deceleration_>0. && terminal_latency_>0. ?
+          lateralCaptureStopLead(odom_vel_.head<2>().dot(direction),terminal_deceleration_,terminal_latency_) : 0.;
+      if (!lateral_capture_waiting_ && progress+stop_lead>=(goal-start).norm()+lateral_capture_compensation_) {
+        lateral_capture_waiting_=true;
+        lateral_capture_stop_time_=current_time;
+        lateral_capture_peak_=progress;
+        ++lateral_capture_attempts_;
+        lateral_capture_rest_gate_={};
+      }
+      if (lateral_capture_waiting_) {
+        const double stopped_for=(current_time-lateral_capture_stop_time_).seconds();
+        const bool fresh=odom_stamp_ns_>0 && current_time.nanoseconds()>=odom_stamp_ns_ &&
+            current_time.nanoseconds()-odom_stamp_ns_<=250000000LL;
+        const bool settled=lateral_capture_rest_gate_.observe(stopped_for>=.8,
+            fresh && odom_vel_.head<2>().norm()<=.01,odom_vel_.head<2>().norm(),
+            odom_yaw_rate_,odom_stamp_ns_);
+        if (settled && lateralRecoveryReached(start,goal,odom_pos_.head<2>(),trajectory_yaw_,odom_yaw_)) {
+          exec_time_=traj_duration_;
+          terminal_capture_latched_=true;
+          publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
+                                "TERMINAL_REACHED");
+          publishStop();
+          return;
+        }
+        if (stopped_for>5. || (settled && (lateral_capture_attempts_>=3 || overshoot>0.))) {
+          latchLateralRecoveryStop(stopped_for>5. ?
+              "LATERAL_RECOVERY_STOP_UNCONFIRMED" : "LATERAL_RECOVERY_CAPTURE_EXHAUSTED",
+              start,goal,yaw_error);
+          return;
+        }
+        if (settled) {
+          // Measure this policy's settling retreat, then compensate inside the
+          // Local-certified extension. Three stop checks bound the primitive.
+          lateral_capture_compensation_=std::clamp(lateral_capture_peak_-progress+.01,
+              0.,kLateralRecoveryCaptureExtension-.02);
+          lateral_capture_waiting_=false;
+          physical_progress_.reset();
+        } else {
+          physical_progress_.reset();
+          publishExecutionState(scan_planner_msgs::msg::ExecutionState::STATE_RUNNING,
+                                "LATERAL_CAPTURE_SETTLING");
+          publishStop();
+          return;
+        }
+      }
+    }
+    else if (calibrated_forward)
+    {
+      // Ordinary forward-gait trajectories steer toward
       // the forward target; do not alternate tiny reverse and minimum forward.
       command.linear.x = active_min_forward_command_;
       command.linear.y = 0.0;
     }
+    if(terminal_speed_limit_>0.) {
+      const double remaining=(traj_[0].evaluateDeBoorT(traj_duration_)-odom_pos_).head<2>().norm();
+      const double bound=terminalApproachSpeed(active_max_vx_,terminal_speed_limit_,
+          remaining,terminal_deceleration_,terminal_latency_);
+      const double speed=std::hypot(command.linear.x,command.linear.y);
+      if(speed>bound && speed>0.) {command.linear.x*=bound/speed;command.linear.y*=bound/speed;}
+    }
     const double terminal_error = pos_error.norm();
+    const bool lateral_recovery=active_execution_mode_==scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE &&
+        fixed_trajectory_yaw_ && !calibrated_forward;
+    const Eigen::Vector2d recovery_start=traj_[0].evaluateDeBoorT(0).head<2>();
+    const Eigen::Vector2d recovery_goal=traj_[0].evaluateDeBoorT(traj_duration_).head<2>();
+    const double terminal_tolerance=lateral_recovery ?
+        lateralRecoveryTolerance((recovery_goal-recovery_start).norm()) : finish_dist_;
+    const bool terminal_reached=lateral_recovery ?
+        lateralRecoveryReached(recovery_start,recovery_goal,odom_pos_.head<2>(),trajectory_yaw_,odom_yaw_) :
+        terminal_error<terminal_tolerance;
     const double endpoint_error =
         (traj_[0].evaluateDeBoorT(traj_duration_) - odom_pos_).head<2>().norm();
     const bool execution_no_progress = physical_progress_.stalled(
             current_time.seconds(), odom_pos_.head<2>(),
             std::hypot(command.linear.x,command.linear.y) > 0.05 &&
-                endpoint_error > finish_dist_,
+                endpoint_error > terminal_tolerance,
             motion_stall_timeout_,motion_progress_epsilon_);
     if (execution_no_progress)
     {
@@ -837,23 +1342,14 @@ private:
     }
     else
       motion_stalled_ = false;
-    if (exec_time_ >= traj_duration_ && terminal_error < finish_dist_)
+    if (!lateral_recovery && terminal_reached && exec_time_ >= traj_duration_)
     {
-      command = geometry_msgs::msg::Twist();
-      publishExecutionState(
-          scan_planner_msgs::msg::ExecutionState::STATE_FINISHED,
-          "TERMINAL_REACHED", terminal_error);
-      if (!terminal_event_reported_)
-      {
-        terminal_event_reported_ = true;
-        publishExecutionEvent("LOCAL_TRAJECTORY_FINISHED", terminal_error);
-        RCLCPP_INFO(get_logger(),
-                    "[LOCAL_TRAJECTORY_FINISHED] request_id=%llu trajectory=%lld terminal_error=%.3fm",
-                    static_cast<unsigned long long>(active_request_id_),
-                    static_cast<long long>(traj_id_), terminal_error);
-      }
+      terminal_capture_latched_=true;
+      terminal_capture_started_=current_time;terminal_rest_gate_={};
+      holdTerminalCapture(current_time);
+      return;
     }
-    else if (exec_time_ >= traj_duration_)
+    else if (!lateral_recovery && exec_time_ >= traj_duration_)
     {
       if (terminal_error + 0.02 < terminal_best_error_)
       {
@@ -925,12 +1421,38 @@ private:
   std::int64_t soft_hold_trajectory_id_{0};
   std::string soft_hold_reason_;
   std::vector<UniformBspline> traj_;
+  bool handoff_alignment_pending_{false};
+  bool handoff_alignment_started_{false};
+  bool handoff_departure_wait_rest_{false};
+  double handoff_certified_body_yaw_{0.};
+  double handoff_turn_position_allowance_{kHandoffPositionAllowance};
+  double handoff_alignment_tolerance_{kHandoffAlignmentTolerance};
+  TaskTransitionRestGate handoff_alignment_rest_gate_;
+  TaskTransitionRestGate measured_rest_gate_;
+  rclcpp::Time handoff_alignment_wait_started_{0,0,RCL_ROS_TIME};
+  bool handoff_alignment_deviated_{false};
+  bool uncertified_turn_latched_{false};
+  bool lateral_recovery_deviated_{false};
+  std::string lateral_stop_reason_;
+  bool lateral_capture_waiting_{false};
+  int lateral_capture_attempts_{0};
+  double lateral_capture_compensation_{0.};
+  double lateral_capture_peak_{0.};
+  rclcpp::Time lateral_capture_stop_time_{0,0,RCL_ROS_TIME};
+  TaskTransitionRestGate lateral_capture_rest_gate_;
+  int64_t odom_stamp_ns_{0};
+  double odom_yaw_rate_{0.};
+  Eigen::Vector3d handoff_alignment_position_{Eigen::Vector3d::Zero()};
+  double handoff_alignment_yaw_{0.0};
+  int64_t last_turn_certificate_stamp_{0};
+  double terminal_speed_limit_{0.},terminal_deceleration_{0.},terminal_latency_{0.};
   bool fixed_trajectory_yaw_{false};
   double trajectory_yaw_{0.0};
   uint8_t active_execution_mode_{
       scan_planner_msgs::msg::Bspline::MODE_NORMAL};
   double active_max_vx_{0.0};
   double active_min_forward_command_{0.0};
+  bool active_measured_progress_{false};
   double active_min_forward_effective_speed_{0.0};
   double active_max_vy_{0.0};
   double active_max_vyaw_{0.0};
@@ -943,6 +1465,7 @@ private:
   std::pair<std::uint64_t, std::uint64_t> retired_task_{0, 0};
   Eigen::Vector3d odom_pos_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d odom_vel_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d odom_world_velocity_{Eigen::Vector3d::Zero()};
   double odom_yaw_{0.0};
   double exec_time_{0.0};
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
@@ -950,13 +1473,23 @@ private:
   bool locomotion_actuation_ready_{false};
   rclcpp::Time heading_freeze_started_{0, 0, RCL_ROS_TIME};
   rclcpp::Time heading_last_progress_{0, 0, RCL_ROS_TIME};
+  double alignment_yaw_bias_{0.0};
   bool heading_frozen_{false};
   bool heading_stall_reported_{false};
   bool terminal_event_reported_{false};
   bool motion_stalled_{false};
   PhysicalProgressWindow physical_progress_;
   double motion_stall_timeout_, motion_progress_epsilon_;
-  bool spatial_terminal_reached_{false};
+  bool terminal_capture_latched_{false};
+  bool forward_stage_braking_{false};
+  std::string forward_stage_failure_;
+  double forward_stage_stop_latency_{0.},forward_stage_deceleration_{0.};
+  rclcpp::Time forward_stage_installed_at_{0,0,RCL_ROS_TIME};
+  rclcpp::Time forward_stage_brake_started_{0,0,RCL_ROS_TIME};
+  TaskTransitionRestGate forward_stage_rest_gate_;
+  PhysicalProgressWindow forward_stage_progress_;
+  TaskTransitionRestGate terminal_rest_gate_;
+  rclcpp::Time terminal_capture_started_{0,0,RCL_ROS_TIME};
   double terminal_best_error_{std::numeric_limits<double>::infinity()};
   rclcpp::Time terminal_last_progress_time_{0, 0, RCL_ROS_TIME};
   uint8_t last_execution_state_{std::numeric_limits<uint8_t>::max()};
@@ -969,6 +1502,8 @@ private:
   double min_moving_handoff_error_, handoff_reaction_time_;
   double handoff_max_deceleration_;
   double max_handoff_yaw_error_;
+  double handoff_moving_alignment_tolerance_{0.0};
+  double handoff_moving_speed_limit_{0.0};
 };
 }  // namespace scan_planner
 

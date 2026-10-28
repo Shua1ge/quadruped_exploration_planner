@@ -1,196 +1,298 @@
-"""Rejected route correction: safety, finite work, observability and lifecycle."""
-
+"""Explorer coarse connections and incremental conflict-segment repair."""
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from test_frontier_explorer import MODULE, candidate_test_explorer
+from explorer_core.path_planning import (
+    CoarseRouteRepair, ExpansionBudget, KnownFreeSearch, RouteSearchStatus,
+    adjacent_grid_path_is_valid, path_length_cells,
+)
+from explorer_core.grid import ExplorationGrid
 
 
-def correction_scene():
-    explorer = candidate_test_explorer()
-    explorer.footprint_radius = .35
-    explorer.footprint_offset = 1.0
-    explorer.observation_radius = 6.0  # Synthetic map uses 1 m cells.
-    explorer.grid.data[1, 3] = MODULE.UNKNOWN
-    path = [(1, 2), (2, 2), (3, 2), (4, 2), (5, 3), (6, 3)]
-    messages = []
-    explorer.get_logger = lambda: SimpleNamespace(
-        info=lambda value, **kw: messages.append(value),
-        warning=lambda value, **kw: messages.append(value))
-    return explorer, path, messages
+def no_physical_veto(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Explorer cannot certify Local body motion')
+    for name in ('double_cylinder_path_free', 'footprint_aware_path',
+                 'diagnose_double_cylinder_path'):
+        monkeypatch.setattr(MODULE, name, forbidden)
 
 
-def test_same_station_repair_changes_geometry_and_reuses_result(monkeypatch):
-    explorer, failed, logs = correction_scene()
-    before = explorer.grid.data.copy()
-    assert not MODULE.double_cylinder_path_free(
-        explorer.grid, failed, failed[-1], (8, 3), set(), .35, 1.)
-    repaired = explorer.repair_rejected_global_path(
-        failed[0], failed, failed[-1], (8, 3), set(), set())
-    assert repaired and repaired != failed
-    assert repaired[0] == failed[0] and repaired[-1] == failed[-1]
-    assert MODULE.double_cylinder_path_free(
-        explorer.grid, repaired, repaired[-1], (8, 3), set(), .35, 1.)
-    monkeypatch.setattr(MODULE, "footprint_aware_path", lambda *a: (_ for _ in ()).throw(
-        AssertionError("unchanged context must not repeat the alternative search")))
-    assert explorer.repair_rejected_global_path(
-        failed[0], failed, failed[-1], (8, 3), set(), set()) == repaired
-    assert any("geometry_changed=True" in line for line in logs)
-    assert any("cached=true" in line for line in logs)
-    np.testing.assert_array_equal(before, explorer.grid.data)
+def candidate_scene(monkeypatch):
+    ex = candidate_test_explorer()
+    ex.footprint_radius, ex.footprint_offset = .35, 1.
+    path = [(x, 2) for x in range(1, 7)]
+    ex.grid.data[2, 0] = MODULE.OCCUPIED  # rear proxy overlaps; centreline remains FREE
+    ex.grid.data[2, 9] = MODULE.UNKNOWN
+    monkeypatch.setattr(MODULE, 'candidate_cells', lambda cluster: [(8, 2)])
+    monkeypatch.setattr(MODULE, 'safe_viewpoint_cells', lambda *a, **kw: [(6, 2)])
+    monkeypatch.setattr(MODULE, 'observation_target_cells', lambda *a: {(9, 2)})
+    region = MODULE.FrontierRegion(3, [[(8, 2)]], (8, 2), {(8, 2)})
+    return ex, path, region
 
 
-def test_search_exhaustion_is_memoized_but_relevant_revision_reopens(monkeypatch):
-    explorer, failed, logs = correction_scene()
-    calls = []
-    monkeypatch.setattr(MODULE, "footprint_aware_path", lambda *a: calls.append(a) or None)
-    for _ in range(10):
-        assert explorer.repair_rejected_global_path(
-            failed[0], failed, failed[-1], (8, 3), set(), set()) is None
-    assert len(calls) == 1
-    explorer.map_content_revision += 1
-    explorer.repair_rejected_global_path(failed[0], failed, failed[-1], (8, 3), set(), set())
-    assert len(calls) == 2
-    explorer.route_constraint_revision = 1
-    explorer.repair_rejected_global_path(failed[0], failed, failed[-1], (8, 3), set(), set())
-    assert len(calls) == 3
-    assert not hasattr(explorer, "goal_failure_cooldowns")
-
-
-def test_safe_approach_has_value_and_never_clears_unknown_or_exclusions():
-    explorer, failed, logs = correction_scene()
-    explorer.grid.data[3, 7] = MODULE.UNKNOWN
-    targets = {(7, 3)}
-    before = explorer.grid.data.copy()
-    result = explorer.safe_observation_approach(failed, (8, 3), targets, set(), ())
-    assert result is not None
-    prefix, cell = result
-    assert cell != failed[-1] and len(prefix) >= 2
-    assert MODULE.double_cylinder_path_free(
-        explorer.grid, prefix, cell, (8, 3), set(), .35, 1.)
-    assert explorer.safe_observation_approach(failed, (8, 3), set(), set(), ()) is None
-    explorer.global_approach_min_distance = 20.
-    assert explorer.safe_observation_approach(failed, (8, 3), targets, set(), ()) is None
-    explorer.global_approach_min_distance = 1.
-    excluded = [explorer.grid.cell_to_world(point) for point in failed]
-    assert explorer.safe_observation_approach(failed, (8, 3), targets, set(), excluded) is None
-    np.testing.assert_array_equal(before, explorer.grid.data)
-
-
-def test_dense_candidate_correction_preserves_frontier_and_observation_targets(monkeypatch):
-    explorer, failed, logs = correction_scene()
-    explorer.grid.data[3, 7] = MODULE.UNKNOWN
-    frontier = (8, 3)
-    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [frontier])
-    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **kw: [failed[-1]])
-    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *a: {(7, 3)})
-    monkeypatch.setattr(MODULE, "build_shortest_path_tree", lambda *a:
-                        SimpleNamespace(path_to=lambda cell: failed, expanded_cells=6))
-    region = MODULE.FrontierRegion(3, [[frontier]], frontier, {frontier})
-    records = explorer.build_frontier_candidates(failed[0], [region], set(), set())
+def test_dense_raw_connection_survives_inflation_and_body_proxy_failure(monkeypatch):
+    ex, path, region = candidate_scene(monkeypatch)
+    assert not MODULE.double_cylinder_path_free(ex.grid, path, path[-1], (8, 2), set(), .35, 1.)
+    no_physical_veto(monkeypatch)
+    records = ex.build_frontier_candidates(path[0], [region], set(path), set())
     assert len(records) == 1
-    assert records[0].frontier_cell == frontier
-    assert records[0].observation_cells == {(7, 3)}
-    assert records[0].path != failed
+    assert records[0].path == path
+    assert ex.last_candidate_rejections['final_validation_failed'] == 0
+    assert records[0].observation_cells == {(9, 2)}
 
 
-def test_all_full_routes_fail_then_approach_is_a_candidate_not_completion(monkeypatch):
-    explorer, failed, logs = correction_scene()
-    explorer.grid.data[3, 7] = MODULE.UNKNOWN
-    frontier = (8, 3)
-    monkeypatch.setattr(MODULE, "candidate_cells", lambda cluster: [frontier])
-    monkeypatch.setattr(MODULE, "safe_viewpoint_cells", lambda *a, **kw: [failed[-1]])
-    monkeypatch.setattr(MODULE, "observation_target_cells", lambda *a: {(7, 3)})
-    monkeypatch.setattr(MODULE, "build_shortest_path_tree", lambda *a:
-                        SimpleNamespace(path_to=lambda cell: failed, expanded_cells=6))
-    monkeypatch.setattr(MODULE, "footprint_aware_path", lambda *a: None)
-    region = MODULE.FrontierRegion(3, [[frontier]], frontier, {frontier})
-    records = explorer.build_frontier_candidates(failed[0], [region], set(), set())
-    assert len(records) == 1 and records[0].cell != failed[-1]
-    assert records[0].frontier_cell == frontier and records[0].observation_cells == {(7, 3)}
-    assert records[0].terminal_cells == (records[0].cell,)
-    assert any("SAFE_OBSERVATION_APPROACH" in line for line in logs)
+def test_sparse_materialization_uses_same_raw_check(monkeypatch):
+    ex, path, _ = candidate_scene(monkeypatch)
+    no_physical_veto(monkeypatch)
+    ex.dense_final_validation_searches = ex.sparse_final_validation_failures = 0
+    c = MODULE.FrontierCandidate(3, path[-1], (8, 2), ex.grid.cell_to_world(path[-1]),
+                                 [], 5., 1, 1, 0., {(9, 2)}, terminal_cells=(path[-1],))
+    out = ex.materialize_sparse_candidate(path[0], c, set(path), set())
+    assert out and out.path == path
 
 
-def test_released_motion_timeout_runs_on_static_map_without_blacklisting():
-    explorer = object.__new__(MODULE.FrontierExplorer)
-    explorer.get_clock = lambda: SimpleNamespace(now=lambda:
-                         SimpleNamespace(nanoseconds=20_000_000_000))
-    explorer.last_task_clock_ns = 19_000_000_000
-    explorer.locomotion_ready = lambda: True
-    explorer.active_goal = (3., 0.)
-    explorer.scan_waiting_for_target = True
-    explorer.active_task_elapsed = 10.
-    explorer.goal_timeout = 5.
-    explorer.auto_start = True
-    explorer.position = (1., 0.)
-    explorer.map_update_count = 10
-    task = MODULE.ObservationTask(3, (3., 0.), {(5, 1)}, task_id=99, motion_released=True)
-    explorer.evaluate_active_observation = lambda: task
-    explorer.observation_complete = lambda value: False
-    explorer.get_logger = lambda: SimpleNamespace(warning=lambda *a, **kw: None)
-    calls = []
-    explorer.terminate_active_observation = lambda *a, **kw: calls.append((a, kw))
-    explorer.handoff_satisfied_observation = lambda *a: (_ for _ in ()).throw(
-        AssertionError("timeout must precede the released-motion early return"))
-    MODULE.FrontierExplorer.exploration_timer.__wrapped__(explorer)
-    assert calls == [(("HANDOFF_WAIT_TIMEOUT", "REARBITRATING_FRONTIER"), {})]
-    assert explorer.goal_timeout_count == 1 and not task.information_satisfied
+@pytest.mark.parametrize('value', [MODULE.UNKNOWN, MODULE.OCCUPIED])
+def test_actual_cut_never_publishes_a_reference_through_it(monkeypatch, value):
+    ex, path, region = candidate_scene(monkeypatch)
+    ex.grid.data[:, 4] = value
+    no_physical_veto(monkeypatch)
+    assert ex.build_frontier_candidates(path[0], [region], set(), set()) == []
+    assert ex.validated_reference_path(path) is None
 
 
-def test_autonomous_dense_failure_does_not_release_or_mark_region_unobservable():
-    explorer, _, logs = correction_scene()
-    explorer.task_mode = explorer.task_geometry_autonomy = True
-    explorer.active_region_id = 3
-    assert not explorer.handle_dense_invalid_region(3, [])
-    assert explorer.active_region_id == 3 and explorer.dense_invalid_region_revisions == {}
+def test_terminal_centre_must_be_free_but_margin_is_not_a_veto():
+    ex = candidate_test_explorer()
+    cell = (6, 2)
+    assert ex.terminal_rejection_reason(cell, {cell}) is None
+    ex.grid.data[2, 6] = MODULE.OCCUPIED
+    assert ex.terminal_rejection_reason(cell, set()) == 'no_safe_viewpoint'
 
 
-def test_bounded_search_random_obstacles_never_returns_unsafe_path():
-    rng = np.random.default_rng(11)
+def test_reference_densification_cannot_restore_inflation_veto(monkeypatch):
+    ex = candidate_test_explorer()
+    ex.inflation_radius = 1.
+    ex.grid.data[1, 3] = MODULE.OCCUPIED
+    no_physical_veto(monkeypatch)
+    path = ex.validated_reference_path([(1, 2), (6, 2)])
+    assert path and path[0] == (1, 2) and path[-1] == (6, 2)
+
+
+def long_scene():
+    g = ExplorationGrid(730., 10., 1., 0., 0.)
+    g.data.fill(MODULE.FREE)
+    path = [(x, 3) for x in range(1, 711)]
+    g.data[3, 4] = MODULE.OCCUPIED
+    return g, path
+
+
+def test_conflict_repair_preserves_long_prefix_and_suffix():
+    g, path = long_scene()
+    before = g.data.copy()
+    budget = ExpansionBudget(400)
+    out = CoarseRouteRepair().repair(g, path, set(), budget)
+    assert out.status == RouteSearchStatus.FOUND
+    assert out.path != path and out.path[0] == path[0] and out.path[-1] == path[-1]
+    assert out.path[-650:] == path[-650:]
+    assert budget.used < 100  # conflict near start; no whole 710 m search
+    assert adjacent_grid_path_is_valid(g, out.path, set())
+    np.testing.assert_array_equal(before, g.data)
+
+
+def test_budget_miss_resumes_same_search_instead_of_becoming_no_path():
+    g, path = long_scene()
+    repair = CoarseRouteRepair()
+    statuses = []
+    for _ in range(100):
+        out = repair.repair(g, path, set(), ExpansionBudget(1))
+        statuses.append(out.status)
+        if out.status == RouteSearchStatus.FOUND:
+            break
+    assert statuses[0] == RouteSearchStatus.INCOMPLETE
+    assert statuses[-1] == RouteSearchStatus.FOUND
+    assert RouteSearchStatus.NO_ROUTE not in statuses
+    assert len(repair.searches) == 1
+    search = next(iter(repair.searches.values()))
+    count = len(search.closed)
+    cached = repair.repair(g, path, set(), ExpansionBudget(0))
+    assert cached.status == RouteSearchStatus.FOUND and cached.expanded == 0
+    assert len(search.closed) == count
+
+
+def test_other_goal_with_same_conflict_reuses_segment_search():
+    g, path = long_scene()
+    repair = CoarseRouteRepair()
+    assert repair.repair(g, path, set(), ExpansionBudget(1)).status == RouteSearchStatus.INCOMPLETE
+    shared = next(iter(repair.searches.values()))
+    other = path[:500]
+    result = repair.repair(g, other, set(), ExpansionBudget(400))
+    assert result.status == RouteSearchStatus.FOUND
+    assert next(iter(repair.searches.values())) is shared
+    assert result.path[-1] == other[-1]
+
+
+def test_unrelated_map_change_preserves_progress_but_relevant_change_restarts():
+    g, path = long_scene()
+    repair = CoarseRouteRepair()
+    repair.repair(g, path, set(), ExpansionBudget(1))
+    first = next(iter(repair.searches.values()))
+    g.data[9, 700] = MODULE.OCCUPIED
+    repair.repair(g, path, set(), ExpansionBudget(1))
+    assert next(iter(repair.searches.values())) is first
+    watched = next(c for c, value in first.cells.items() if value == MODULE.FREE and c[1] != 3)
+    g.data[watched[1], watched[0]] = MODULE.OCCUPIED
+    repair.repair(g, path, set(), ExpansionBudget(1))
+    assert next(iter(repair.searches.values())) is not first
+
+
+def test_measured_cut_is_distinct_from_unfinished_search():
+    g, path = long_scene()
+    g.data[:, 4] = MODULE.OCCUPIED
+    repair = CoarseRouteRepair()
+    out = repair.repair(g, path, set(), ExpansionBudget(1))
+    assert out.status == RouteSearchStatus.INCOMPLETE
+    for _ in range(100):
+        out = repair.repair(g, path, set(), ExpansionBudget(10))
+        if out.status != RouteSearchStatus.INCOMPLETE:
+            break
+    assert out.status == RouteSearchStatus.NO_ROUTE
+    assert out.reason == 'KNOWN_FREE_GRAPH_EXHAUSTED'
+    assert out.path is None
+
+
+def test_opening_in_measured_cut_invalidates_negative_result():
+    g, path = long_scene()
+    g.data[:, 4] = MODULE.OCCUPIED
+    repair = CoarseRouteRepair()
+    assert repair.repair(g, path, set(), ExpansionBudget(400)).status == RouteSearchStatus.NO_ROUTE
+    g.data[3, 4] = MODULE.FREE
+    assert repair.repair(g, path, set(), ExpansionBudget(400)).status == RouteSearchStatus.FOUND
+
+
+def test_repair_checks_all_conflicts_and_does_not_keep_a_blocked_suffix():
+    g, path = long_scene()
+    blocked = {(path[-5], path[-4])}
+    result = CoarseRouteRepair().repair(g, path, blocked, ExpansionBudget(400))
+    assert result.status == RouteSearchStatus.FOUND
+    assert adjacent_grid_path_is_valid(g, result.path, set(), blocked)
+    assert not blocked.intersection(zip(result.path, result.path[1:]))
+
+
+def test_search_forbids_unknown_and_diagonal_corner_cutting():
+    g = ExplorationGrid(5., 5., 1., 0., 0.)
+    g.data.fill(MODULE.UNKNOWN)
+    g.data[1, 1] = g.data[2, 2] = MODULE.FREE
+    out = KnownFreeSearch((1, 1), (2, 2)).advance(g, set(), ExpansionBudget(100))
+    assert out.status == RouteSearchStatus.NO_ROUTE
+    g.data[1, 2] = MODULE.FREE
+    out = KnownFreeSearch((1, 1), (2, 2)).advance(g, set(), ExpansionBudget(100))
+    assert out.path == [(1, 1), (2, 1), (2, 2)]
+
+
+def test_changed_constraint_restarts_only_affected_search():
+    g, path = long_scene()
+    repair = CoarseRouteRepair()
+    repair.repair(g, path, set(), ExpansionBudget(1))
+    first = next(iter(repair.searches.values()))
+    unrelated = {((600, 3), (601, 3))}
+    repair.repair(g, path, unrelated, ExpansionBudget(1))
+    assert next(iter(repair.searches.values())) is first
+    edge = next(edge for edge in first.edges if not first.edges[edge])
+    repair.repair(g, path, {edge}, ExpansionBudget(1))
+    assert next(iter(repair.searches.values())) is not first
+
+
+def test_pending_prepared_repair_does_not_clear_candidate_or_reenumerate():
+    ex = candidate_test_explorer()
+    ex.prepared_candidate = object()
+    candidate = ex.prepared_candidate
+    ex.last_coarse_route_result = SimpleNamespace(status=RouteSearchStatus.INCOMPLETE)
+    ex.activate_prepared_observation = lambda *a: False
+    ex.prepare_next_observation = lambda **kw: pytest.fail('must resume, not enumerate')
+    assert not ex.activate_or_prepare_next_observation(True)
+    assert ex.prepared_candidate is candidate
+
+
+def test_budget_result_is_typed_and_does_not_blacklist_information():
+    ex = candidate_test_explorer()
+    ex.grid.data[2, 4] = MODULE.OCCUPIED
+    path = [(x, 2) for x in range(1, 8)]
+    before = ex.grid.data.copy()
+    ex._repair_expansion_budget = ExpansionBudget(1)
+    first = ex.repair_rejected_global_path(path[0], path, path[-1], (8, 2), set(), set())
+    assert first.status == RouteSearchStatus.INCOMPLETE
+    ex._repair_expansion_budget = ExpansionBudget(400)
+    ex.map_content_revision += 1  # unrelated revision does not reset the session
+    last = ex.repair_rejected_global_path(path[0], path, path[-1], (8, 2), set(), set())
+    assert last.status == RouteSearchStatus.FOUND
+    assert not ex.dense_invalid_region_revisions
+    np.testing.assert_array_equal(before, ex.grid.data)
+
+
+def test_reference_repair_densifies_long_segment_without_crossing_wall():
+    g, path = long_scene()
+    result = CoarseRouteRepair().repair(g, [path[0], path[-1]], set(), ExpansionBudget(400))
+    assert result.status == RouteSearchStatus.FOUND
+    assert adjacent_grid_path_is_valid(g, result.path, set())
+
+
+def test_no_route_does_not_mark_an_information_region_unobservable():
+    ex = candidate_test_explorer()
+    ex.active_region_id = 3
+    assert not ex.handle_dense_invalid_region(3, [])
+    assert ex.active_region_id == 3 and ex.dense_invalid_region_revisions == {}
+
+
+def test_random_repair_results_are_raw_free_and_respect_constraints():
+    rng = np.random.default_rng(31)
     for _ in range(40):
-        explorer = candidate_test_explorer()
-        explorer.grid.data[rng.random(explorer.grid.data.shape) < .18] = MODULE.UNKNOWN
-        explorer.grid.data[2, 1] = explorer.grid.data[3, 6] = MODULE.FREE
-        path = MODULE.footprint_aware_path(
-            explorer.grid, (1, 2), (6, 3), (8, 3), set(), .35, 1., set(), 100)
-        if path:
-            assert MODULE.double_cylinder_path_free(
-                explorer.grid, path, (6, 3), (8, 3), set(), .35, 1.)
-            assert all(explorer.grid.value(cell) == MODULE.FREE for cell in path)
+        g = ExplorationGrid(12., 8., 1., 0., 0.)
+        g.data.fill(MODULE.FREE)
+        g.data[rng.random(g.data.shape) < .2] = MODULE.UNKNOWN
+        path = [(x, 3) for x in range(1, 11)]
+        g.data[3, 1] = g.data[3, 10] = MODULE.FREE
+        out = CoarseRouteRepair().repair(g, path, set(), ExpansionBudget(400))
+        if out.status == RouteSearchStatus.FOUND:
+            assert adjacent_grid_path_is_valid(g, out.path, set())
 
 
-def test_shortcut_cannot_undo_a_footprint_repair():
-    explorer, failed, logs = correction_scene()
-    repaired = explorer.repair_rejected_global_path(
-        failed[0], failed, failed[-1], (8, 3), set(), set())
-    assert repaired
-    # Explicit unsafe shortcut stands in for a point-only simplifier.
-    preserved = explorer.preserve_footprint_route(
-        repaired, failed, failed[-1], (8, 3), set())
-    assert preserved == repaired
-    assert any("SHORTCUT_REJECTED" in line for line in logs)
+def test_real_prepared_handoff_resumes_repair_and_activates_once():
+    ex = candidate_test_explorer()
+    ex.grid.data[2, 4] = MODULE.OCCUPIED
+    ex.grid.data[2, 9] = MODULE.UNKNOWN
+    ex.prepared_candidate = MODULE.FrontierCandidate(
+        3, (7, 2), (8, 2), ex.grid.cell_to_world((7, 2)),
+        [(x, 2) for x in range(1, 8)], 6., 1, 1, 0., {(9, 2)},
+        terminal_cells=((7, 2),))
+    original = ex.prepared_candidate
+    ex.global_repair_max_expansions = 1
+    ex.current_blocked_edges = lambda: set()
+    ex.directional_candidate_allowed = lambda *args: True
+    ex.inflation_radius = .25
+    ex.publish_status = lambda *a: None
+    ex.prepare_next_observation = lambda **kw: pytest.fail('deferred search must resume')
+    installed = []
+    ex.activate_candidate = lambda path, candidate: installed.append((path, candidate)) or True
+    assert not ex.activate_or_prepare_next_observation(True)
+    assert ex.prepared_candidate is original and ex.coarse_repair_pending()
+    for _ in range(100):
+        if ex.activate_or_prepare_next_observation(True):
+            break
+    assert len(installed) == 1
+    assert (4, 2) not in installed[0][1].path
+    assert installed[0][1].cell == (7, 2)
 
 
-def test_sparse_candidate_uses_same_repair_without_persistent_rejection(monkeypatch):
-    explorer, failed, logs = correction_scene()
-    explorer.dense_final_validation_searches = explorer.sparse_final_validation_failures = 0
-    monkeypatch.setattr(MODULE, "astar_known", lambda *a: failed)
-    candidate = MODULE.FrontierCandidate(
-        3, failed[-1], (8, 3), explorer.grid.cell_to_world(failed[-1]), [],
-        5., 1, 1, 0., {(7, 3)}, terminal_cells=(failed[-1],))
-    repaired = explorer.materialize_sparse_candidate(failed[0], candidate, set(), set())
-    assert repaired is not None and repaired.path != failed
-    assert repaired.frontier_cell == candidate.frontier_cell
-    assert repaired.sparse_route is None
-
-
-def test_search_budget_defers_untried_goal_instead_of_caching_failure(monkeypatch):
-    explorer, failed, logs = correction_scene()
-    explorer.global_repair_search_limit = 1
-    monkeypatch.setattr(MODULE, "footprint_aware_path", lambda *a: None)
-    explorer.repair_rejected_global_path(failed[0], failed, failed[-1], (8, 3), set(), set())
-    explorer.repair_rejected_global_path(failed[0], failed, failed[-1], (9, 3), set(), set())
-    assert (failed[-1], (9, 3)) not in explorer._global_repair_cache
-    assert any("DEFERRED_SEARCH_BUDGET" in line for line in logs)
+def test_handoff_does_not_fall_back_to_full_enumeration_on_pending_repair():
+    ex = candidate_test_explorer()
+    ex.prepared_candidate = object()
+    ex.active_goal = (7., 2.)
+    ex.active_observation = None
+    ex.last_coarse_route_result = SimpleNamespace(status=RouteSearchStatus.INCOMPLETE)
+    ex.map_update_count, ex.last_handoff_attempt_update = 2, 1
+    ex.activate_or_prepare_next_observation = lambda **kw: False
+    ex.plan_from_current_position = lambda **kw: pytest.fail('deferred handoff is not a failed goal')
+    ex.publish_status = lambda *a: None
+    assert not ex._handoff_satisfied_observation('test')

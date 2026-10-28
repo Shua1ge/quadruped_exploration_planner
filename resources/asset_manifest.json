@@ -1,0 +1,13 @@
+{
+  "branch": "dyn-20261028-211234",
+  "campus": {
+    "upstream": "https://github.com/HongbiaoZ/autonomous_exploration_development_environment",
+    "commit": "bf0cba71365271ebff09831a05afd78578150300",
+    "download_url": "https://drive.usercontent.google.com/download?id=1V4MWCD3qYLr3RFLLATbqAh_lXKcCU39C&export=download&confirm=t",
+    "archive_sha256": "ec0abfcf8e081b4367495f09d8736261e2bde70f01ea9ce147dd12d8e7eb3308",
+    "dae_sha256": "07c2235017ee43aa7e573a84bf233c45fad8c8efec13ebbada70298a74a66f17",
+    "redistribution": "external assets fetched from original provider, not included in this Git snapshot"
+  },
+  "newmine": "resources/newmine/MANIFEST.json",
+  "policy": "models/go2_rl_lab_policy.json"
+}

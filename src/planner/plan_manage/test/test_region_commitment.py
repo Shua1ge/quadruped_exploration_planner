@@ -87,3 +87,14 @@ def test_alternative_scores_are_not_part_of_option_termination_contract():
 
     assert not hasattr(gate, "evaluate_opportunity")
     assert gate.evaluate(("safe_region", 4), 100, 50).committed
+
+
+def test_continuation_blocks_exhaustion_without_fabricating_remaining_cells():
+    gate = ResidualCommitmentGate(10,2,3)
+    first = gate.evaluate(('branch_option',1),0,0,continuation_present=True)
+    assert first.committed and first.remaining_cells == 0
+    assert gate.state.remaining_cells == 0
+    assert gate.evaluate(('branch_option',1),1,0,continuation_present=True).committed
+    decision = gate.evaluate(('branch_option',1),3,0,continuation_present=True)
+    assert decision.release_reason == 'residual_stagnant'
+    assert decision.remaining_cells == 0 and decision.exhausted_streak == 0

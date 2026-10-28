@@ -8,11 +8,30 @@ closed_loop_controller:
     heading_stall_timeout: 3.0
     heading_progress_epsilon: 0.05
     kp_pos: 0.8
+    # Certified initial alignment adds up to 0.35 rad/s yaw bias at 0.25 rad/s²
+    # only after 0.30 s without progress and measured |yaw_rate| < 0.08.
+    # Candidate yaw limits, pose envelope, stall timeout and settling still apply.
     kp_yaw: 1.5
     max_vx: 0.75
     max_vy: 0.35
     max_vyaw: 1.0
+    # Bspline.use_measured_progress chooses physical rather than reference-time
+    # progress independently of these caps and of min_forward_command. Local
+    # task trajectories use it in normal mode as well as clearance-limited mode.
+    # Ordinary capture tolerance. A capture latches zero command; FINISHED
+    # requires fresh measured linear/angular rest after 0.30 s. New certified
+    # candidates may replace the active prefix directly before capture.
+    # Fixed-yaw recovery limits shortfall to
+    # min(0.03 m, 20% of planned distance), and bounds overshoot by Local's
+    # certified capture extension. Failed recovery needs fresh stopped normal
+    # rejoin certification; it is never promoted to FINISHED.
+    # MODE_FORWARD_TURN_STAGE has a separate Local-certified 0.15 m capture
+    # region, 0.08 m cross-track and 0.10 m overrun bounds. It brakes from
+    # measured speed using the latency/deceleration carried by Bspline;
+    # it never waits indefinitely to pass the old 0.03 m point tolerance.
     finish_dist: 0.15
+    # Legacy non-task search only. Task installation uses Local's certified
+    # matched time, measured pose and target yaw carried by Bspline.
     handoff_search_time: 1.0
     handoff_sample_dt: 0.02
     max_handoff_error: 0.30
@@ -21,10 +40,15 @@ closed_loop_controller:
     min_moving_handoff_error: 0.10
     handoff_reaction_time: 0.25
     handoff_max_deceleration: 0.50
-    # Diagnostic threshold for handoffs that require in-place heading
-    # alignment. Position-continuous candidates are accepted; translation is
-    # frozen by heading_error_threshold until the body has turned.
+    # Large heading jumps while moving require Local's certified conversion.
+    # A certified initial turn holds translation through Local-certified 0.05--0.12 rad heading
+    # error and three fresh linear/angular rest samples. Unfinished alignment
+    # survives candidate replacement; ordinary tracking uses its hysteresis.
+    # Installation allows 0.02 m error. Turn execution uses Local's explicit
+    # footprint-certified drift envelope (at most 0.10 m), never a wider guess.
     max_handoff_yaw_error: 0.80
+    handoff_moving_alignment_tolerance: 0.0
+    handoff_moving_speed_limit: 0.0
 
 open_loop_controller:
   ros__parameters:

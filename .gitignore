@@ -44,3 +44,10 @@ Thumbs.db
 *.so.*
 *.dylib
 *.dll
+
+# External/generated Campus runtime assets and local audit backups
+/assets/runtime_worlds/
+/assets/downloads/
+/symlink_install_manifest.txt
+/docs/CONTRACT_STACK_INTERACTIVE_ZH.legacy.html
+/docs/CONTRACT_STACK_INTERACTIVE_ZH.pre-audit.html

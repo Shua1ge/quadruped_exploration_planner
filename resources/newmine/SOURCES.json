@@ -1,0 +1,50 @@
+[
+  {
+    "name": "Edgar Mine Virtual STIX 1",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX%201",
+    "license": "Creative Commons Zero v1.0 Universal",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "version": 7
+  },
+  {
+    "name": "Edgar Mine Virtual STIX 2",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX%202",
+    "license": "Creative Commons Zero v1.0 Universal",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "version": 5
+  },
+  {
+    "name": "Edgar Mine Virtual STIX 3",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX%203",
+    "license": "Creative Commons Zero v1.0 Universal",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "version": 5
+  },
+  {
+    "name": "Edgar Mine Virtual STIX 4",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX%204",
+    "license": "Creative Commons Zero v1.0 Universal",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "version": 5
+  },
+  {
+    "name": "Edgar Mine Virtual STIX 5",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX%205",
+    "license": "Creative Commons Zero v1.0 Universal",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "version": 6
+  },
+  {
+    "name": "Edgar Mine Virtual STIX Staging",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX%20Staging",
+    "license": "Creative Commons Zero v1.0 Universal",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "version": 6
+  },
+  {
+    "name": "Edgar Mine Virtual STIX shared textures",
+    "url": "https://fuel.gazebosim.org/1.0/OpenRobotics/models/Edgar%20Mine%20Virtual%20STIX",
+    "local_cached_version": 13,
+    "note": "shared texture dependency of the six CC0 source section models"
+  }
+]

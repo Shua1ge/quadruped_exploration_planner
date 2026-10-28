@@ -1,0 +1,25 @@
+# Optical simulation of the Unitree Go2 MID-360 kit, not a Livox packet driver.
+# Mount relative to the Go2 body IMU (coincident with trunk in this model).
+# Unitree installation guide: xyz=(0.1870,0,0.0803)m and +13deg about Y.
+# The 0.226rad value in Unitree's SLAM screenshot is rounded; its zero xyz
+# belongs to that SLAM point-cloud convention, not the raw sensor mount.
+mount:
+  x: 0.1870
+  y: 0.0
+  z: 0.0803
+  roll: 0.0
+  pitch: 0.22689280275926285
+  yaw: 0.0
+# Livox MID-360: 360deg azimuth, -7..52deg elevation, 200000 points/s.
+# Gazebo GPU rays approximate coverage with a simultaneous regular raster;
+# they do not reproduce the real non-repetitive scan or per-point timing.
+sensor:
+  horizontal_samples: 625
+  vertical_samples: 32
+  horizontal_min: -3.141592653589793
+  horizontal_max: 3.141592653589793
+  vertical_min: -0.12217304763960307
+  vertical_max: 0.9075712110370514
+  range_min: 0.1
+  range_max: 40.0
+  update_rate: 10

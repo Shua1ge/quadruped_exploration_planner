@@ -1,0 +1,17 @@
+{
+  "source_project": "https://github.com/wty-yy/go2_rl_lab",
+  "public_checkpoint_repository": "https://huggingface.co/wty-yy/go2_rl_gym_data",
+  "license": "MIT (checkpoint repository declaration); upstream implementation notices retained in go2_rl_lab.LICENSE",
+  "sha256": "bde5210a8114aa08bb0c611e49def1482faa1b2441673e5681374c30b935e32e",
+  "bytes": 6399130,
+  "observation": [
+    1,
+    45
+  ],
+  "action": [
+    1,
+    12
+  ],
+  "history": "stateful TorchScript, reset between episodes",
+  "specific_export_variant": "not recorded in the original local workspace; do not substitute a latest checkpoint and claim identical weights"
+}

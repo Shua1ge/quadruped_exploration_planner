@@ -1,10 +1,14 @@
+#include <set>
 #include "plan_env/grid_map.h"
+#include "plan_env/ground_height.hpp"
+#include <rclcpp/create_timer.hpp>
 #include <cmath>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 namespace
 {
@@ -114,6 +118,33 @@ int plan_env::endpointObservation(bool self_filter_enabled, bool inside_self_fil
   return self_filter_enabled && inside_self_filter ? 0 : 1;
 }
 
+bool plan_env::lowReturnOutsideBodyBand(const Eigen::Vector3d& point,
+    const Eigen::Vector3d& body_position, bool separate_low_returns,
+    double below_body)
+{
+  return separate_low_returns && point.allFinite() && body_position.allFinite() &&
+      std::isfinite(below_body) && below_body > 0. &&
+      point.z() < body_position.z() - below_body;
+}
+
+bool plan_env::highReturnOutsideBodyBand(const Eigen::Vector3d& point,
+    const Eigen::Vector3d& body_position, bool separate_high_returns,
+    double above_body)
+{
+  return separate_high_returns && point.allFinite() && body_position.allFinite() &&
+      std::isfinite(above_body) && above_body > 0. &&
+      point.z() > body_position.z() + above_body;
+}
+
+plan_env::LaserRangeEvidence plan_env::laserRangeEvidence(double measured, double minimum,
+    double maximum, double no_return_range) {
+  if(!std::isfinite(minimum) || !std::isfinite(maximum) || minimum<0. || maximum<=minimum ||
+      !std::isfinite(no_return_range) || no_return_range<=0. || std::isnan(measured) ||
+      measured<minimum || (std::isfinite(measured) && measured>maximum)) return {};
+  if(std::isfinite(measured) && measured<maximum) return {true,true,measured};
+  return {true,false,std::min(maximum,no_return_range)}; // +inf or explicit range limit
+}
+
 bool plan_env::rayTraversalStopsAtOccupied(bool historically_occupied)
 {
   return historically_occupied;
@@ -124,6 +155,38 @@ bool plan_env::occupiedMissHasEnoughConfirmation(
 {
   return required_frames > 0 &&
          static_cast<int>(consecutive_miss_frames) >= required_frames;
+}
+
+int8_t plan_env::localPatchOccupancy(bool observed, bool inflated_occupied)
+{
+  // Inflation is positive obstacle evidence even without a hit at this height.
+  return inflated_occupied ? 100 : (observed ? 0 : -1);
+}
+
+bool plan_env::observationRayMayReach(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end, double resolution,
+    const std::function<int(const Eigen::Vector3d&)>& query)
+{
+  if (!start.allFinite() || !end.allFinite() || !std::isfinite(resolution) ||
+      resolution <= 0 || query(start) != 0 || query(end) < 0)
+    return false;
+  RayCaster ray;
+  // The endpoint is the observation object, not an admitted motion waypoint.
+  if (!ray.setInput(start / resolution, end / resolution))
+    return true;
+  Eigen::Vector3d cell;
+  while (ray.step(cell))
+    if (query((cell + Eigen::Vector3d::Constant(0.5)) * resolution) != 0)
+      return false;
+  return true;
+}
+
+bool GridMap::observationRayMayReach(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end)
+{
+  std::shared_lock<std::shared_mutex> lock(map_mutex_);
+  return plan_env::observationRayMayReach(start, end, mp_.resolution_,
+      [this](const Eigen::Vector3d& point) { return getOccupancy(point); });
 }
 
 thread_local const GridMap* GridMap::tls_snapshot_owner_ = nullptr;
@@ -207,6 +270,47 @@ int GridMap::InflatedOccupancySnapshot::getInflateOccupancy(
              : query_with_margin(pos - body_offset * heading);
 }
 
+plan_env::MotionAssessment GridMap::InflatedOccupancySnapshot::assessMotion(
+    const Eigen::Vector3d& pos, double yaw) const
+{
+  plan_env::MotionAssessment result;
+  if (!pos.allFinite() || !std::isfinite(yaw) || resolution_inv<=0) {
+    result.outside_map=true;return result;
+  }
+  const Eigen::Vector3d heading(std::cos(yaw),std::sin(yaw),0.);
+  for (double side : {-1.,1.}) {
+    const Eigen::Vector3d center=pos+side*body_offset*heading;
+    const Eigen::Vector3i query=(center*resolution_inv).array().floor().cast<int>();
+    const int occupied=getCylinderOccupancy(center);
+    if (occupied<0) {result.outside_map=true;continue;}
+    bool explained=false;
+    const int xmin=query.x()-inflation_max.x(), xmax=query.x()-inflation_min.x();
+    auto source=sources.lower_bound({xmin,std::numeric_limits<int>::min(),std::numeric_limits<int>::min()});
+    for (;source!=sources.end() && source->first[0]<=xmax;++source) {
+      const auto& key=source->first;
+      if (!inflation_offsets.count({query.x()-key[0],query.y()-key[1],query.z()-key[2]})) continue;
+      explained=true;
+      const Eigen::Vector2d source_xy((key[0]+.5)/resolution_inv,(key[1]+.5)/resolution_inv);
+      // One voxel diagonal accounts for the discrete inflation kernel. This is
+      // deliberately more conservative than a point-to-cylinder distance.
+      const double penetration=std::max(0.,body_radius+std::sqrt(2.)/resolution_inv-
+          (center.head<2>()-source_xy).norm());
+      auto found=result.contacts.find(key);
+      if(found==result.contacts.end() || penetration>found->second.penetration)
+        result.contacts[key]={key,source->second.layers,penetration,source->second};
+    }
+    if (occupied>0 && !explained) result.unexplained_inflation=true;
+  }
+  return result;
+}
+
+void GridMap::setTerrainMotionPolicy(const plan_env::TerrainMotionPolicy& policy)
+{
+  policy.validate();
+  std::unique_lock<std::shared_mutex> lock(map_mutex_);
+  terrain_motion_policy_=policy;
+}
+
 GridMap::InflatedOccupancySnapshotPtr GridMap::captureInflatedOccupancySnapshot() const
 {
   auto snapshot = std::atomic_load(&latest_inflated_snapshot_);
@@ -230,6 +334,14 @@ GridMap::buildInflatedOccupancySnapshotLocked() const
   snapshot->resolution_inv = mp_.resolution_inv_;
   snapshot->body_offset = mp_.double_cylinder_offset_;
   snapshot->revision = map_revision_.load();
+  snapshot->body_radius=mp_.double_cylinder_radius_;
+  snapshot->sources=md_.occupancy_sources_;
+  snapshot->terrain_facts=md_.terrain_facts_;
+  for(const auto& offset:md_.inflate_offsets_) {
+    snapshot->inflation_offsets.insert({offset.x(),offset.y(),offset.z()});
+    snapshot->inflation_min=snapshot->inflation_min.cwiseMin(offset);
+    snapshot->inflation_max=snapshot->inflation_max.cwiseMax(offset);
+  }
   return snapshot;
 }
 
@@ -288,6 +400,17 @@ void GridMap::initMap(
     throw std::invalid_argument(
         "grid_map self-filter requires a positive radius and non-negative offsets and z bounds");
   }
+  load_parameter(node_, "grid_map.separate_low_returns", mp_.separate_low_returns_, false);
+  load_parameter(node_, "grid_map.low_return_z_below_body", mp_.low_return_z_below_body_, 0.25);
+  if (!std::isfinite(mp_.low_return_z_below_body_) || mp_.low_return_z_below_body_ <= 0.)
+    throw std::invalid_argument("grid_map.low_return_z_below_body must be finite and positive");
+  // Upper half of the same platform band. Enabled alongside the low side by
+  // the identified-ray launch: a 3-D lidar always sees overhead structure, and
+  // treating it as occupancy blocks every cell the beam passes over.
+  load_parameter(node_, "grid_map.separate_high_returns", mp_.separate_high_returns_, false);
+  load_parameter(node_, "grid_map.high_return_z_above_body", mp_.high_return_z_above_body_, 0.25);
+  if (!std::isfinite(mp_.high_return_z_above_body_) || mp_.high_return_z_above_body_ <= 0.)
+    throw std::invalid_argument("grid_map.high_return_z_above_body must be finite and positive");
   load_parameter(node_, "grid_map.map_sliding_en", mp_.map_sliding_en_, true);
   load_parameter(node_, "grid_map.map_sliding_thresh", mp_.map_sliding_thresh_, mp_.resolution_);
 
@@ -314,29 +437,74 @@ void GridMap::initMap(
       mp_.occupied_miss_confirmation_frames_ > 255)
     throw std::invalid_argument(
         "grid_map.occupied_miss_confirmation_frames must be in [1, 255]");
+  // A terrain projection is released when its cell stops being observed as a
+  // hazard for this many scans: the robot moved or the surface became
+  // occluded, and a stale block must not outlive the evidence that made it.
+  load_parameter(node_, "grid_map.terrain_projection_timeout_frames",
+                 mp_.terrain_projection_timeout_frames_, 20);
+  if (mp_.terrain_projection_timeout_frames_ < 2 ||
+      mp_.terrain_projection_timeout_frames_ > 100000)
+    throw std::invalid_argument(
+        "grid_map.terrain_projection_timeout_frames must be in [2, 100000]");
+  // Ground-relative clearance volume for height-carrying measured returns.
+  // These are robot geometry plus capability statements, not tuning: the legs
+  // handle terrain below obstacle_min_height, and obstacle_max_height is where
+  // structure stops being able to hit the body. Returns without a height keep
+  // using the body-relative band below.
+  load_parameter(node_, "grid_map.terrain_floor_tolerance",
+                 mp_.terrain_floor_tolerance_, 0.035);
+  load_parameter(node_, "grid_map.obstacle_min_height", mp_.obstacle_min_height_, 0.22);
+  load_parameter(node_, "grid_map.obstacle_max_height", mp_.obstacle_max_height_, 0.55);
+  if (!(mp_.terrain_floor_tolerance_ > 0. &&
+        mp_.terrain_floor_tolerance_ < mp_.obstacle_min_height_ &&
+        mp_.obstacle_min_height_ < mp_.obstacle_max_height_))
+    throw std::invalid_argument(
+        "grid_map terrain heights must satisfy 0 < terrain_floor_tolerance < "
+        "obstacle_min_height < obstacle_max_height");
 
+  terrain_motion_policy_={mp_.terrain_floor_tolerance_,mp_.obstacle_min_height_,
+      mp_.obstacle_min_height_,mp_.obstacle_max_height_};
+  terrain_motion_policy_.validate();
   load_parameter(node_, "grid_map.vis_height", mp_.vis_height_, 0.3);
+  // Display separation only. Neither fusion nor collision queries use this.
+  load_parameter(node_, "grid_map.body_obstacle_z_below", mp_.body_obstacle_z_below_, 0.12);
+  if (!std::isfinite(mp_.body_obstacle_z_below_) || mp_.body_obstacle_z_below_ < 0)
+    throw std::invalid_argument("grid_map.body_obstacle_z_below must be finite and nonnegative");
   load_parameter(node_, "grid_map.show_occ_time", mp_.show_occ_time_, false);
 
   load_parameter(node_, "grid_map.frame_id", mp_.frame_id_, string("world"));
   load_parameter(node_, "grid_map.sliding_map_frame_id", mp_.sliding_map_frame_id_, string("sliding_map"));
   load_parameter(node_, "grid_map.ground_height", mp_.ground_height_, 0.0);
   load_parameter(node_, "grid_map.local_patch_enabled", local_patch_enabled_, true);
-  load_parameter(node_, "grid_map.local_patch_period", local_patch_period_, 0.5);
+  load_parameter(node_, "grid_map.local_patch_period", local_patch_period_, 0.25);
   load_parameter(node_, "grid_map.local_patch_resolution", local_patch_resolution_, 0.2);
   load_parameter(node_, "grid_map.local_patch_z", local_patch_z_, mp_.ground_height_ + 0.3);
   load_parameter(node_, "grid_map.local_patch_follow_body_z", local_patch_follow_body_z_, true);
   load_parameter(node_, "grid_map.local_patch_z_filter_tau", local_patch_z_filter_tau_, 0.75);
   load_parameter(node_, "grid_map.local_patch_z_max_rate", local_patch_z_max_rate_, 0.5);
-  if (local_patch_period_ <= 0.0 || local_patch_resolution_ < mp_.resolution_)
+  load_parameter(node_, "grid_map.local_patch_terrain_tile_size",
+                 local_patch_terrain_tile_size_, 2.0);
+  if (!std::isfinite(local_patch_period_) || local_patch_period_ <= 0.0 ||
+      !std::isfinite(local_patch_resolution_) || local_patch_resolution_ < mp_.resolution_)
     throw std::invalid_argument(
         "grid_map local patch period must be positive and resolution must not be finer than the voxel map");
+  if (!std::isfinite(local_patch_terrain_tile_size_) ||
+      local_patch_terrain_tile_size_ < local_patch_resolution_)
+    throw std::invalid_argument(
+        "grid_map local patch terrain tile size must be at least the patch resolution");
   if (local_patch_z_filter_tau_ <= 0.0 || local_patch_z_max_rate_ <= 0.0)
     throw std::invalid_argument(
         "grid_map local patch height filter parameters must be positive");
   local_patch_reference_z_ = local_patch_z_;
 
   load_parameter(node_, "grid_map.sensor_type", mp_.sensor_type_, string("lidar"));
+  load_parameter(node_, "grid_map.use_laser_scan", mp_.use_laser_scan_, false);
+  load_parameter(node_, "grid_map.use_ray_cloud", mp_.use_ray_cloud_, false);
+  if (mp_.use_ray_cloud_ && mp_.use_laser_scan_)
+    throw std::invalid_argument("choose one identified ray input, not both");
+  load_parameter(node_, "grid_map.no_return_range", mp_.no_return_range_, 3.0);
+  if(!std::isfinite(mp_.no_return_range_) || mp_.no_return_range_<=0.)
+    throw std::invalid_argument("grid_map.no_return_range must be finite and positive");
   load_parameter(node_, "grid_map.cloud_is_world", mp_.cloud_is_world_, true);
   load_parameter(node_, "grid_map.need_extrinsic", mp_.need_extrinsic_, true);
 
@@ -428,6 +596,7 @@ void GridMap::initMap(
 
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+  md_.terrain_projection_buffer_ = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_cnt_ = vector<int>(buffer_size, 0);
   md_.occupied_miss_confirmation_count_ = vector<uint8_t>(buffer_size, 0);
   rebuildInflationOffsets();
@@ -464,9 +633,14 @@ void GridMap::initMap(
     lidar_pose_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
         "sensor_pose", rclcpp::SensorDataQoS(),
         std::bind(&GridMap::sensorPoseCallback, this, std::placeholders::_1), options);
-    cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-        "cloud", rclcpp::SensorDataQoS(),
-        std::bind(&GridMap::cloudCallback, this, std::placeholders::_1), options);
+    if(mp_.use_laser_scan_)
+      scan_sub_ = node_->create_subscription<sensor_msgs::msg::LaserScan>(
+          "scan", rclcpp::SensorDataQoS(),
+          std::bind(&GridMap::scanCallback, this, std::placeholders::_1), options);
+    else
+      cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+          "cloud", rclcpp::SensorDataQoS(),
+          std::bind(&GridMap::cloudCallback, this, std::placeholders::_1), options);
   }
 
   rclcpp::SubscriptionOptions body_pose_options;
@@ -482,12 +656,25 @@ void GridMap::initMap(
   occ_timer_ = node_->create_wall_timer(std::chrono::milliseconds(50),
                                         std::bind(&GridMap::updateOccupancyCallback, this),
                                         update_callback_group);
-  vis_timer_ = node_->create_wall_timer(std::chrono::milliseconds(250),
+  // Use the same ROS clock as Explorer. A wall timer would run at a different
+  // effective rate when Gazebo is paused or its real-time factor changes.
+  const auto spatial_period = rclcpp::Duration::from_seconds(local_patch_period_);
+  local_patch_timer_ = rclcpp::create_timer(node_, node_->get_clock(), spatial_period,
+                                        std::bind(&GridMap::publishLocalMapPatch, this),
+                                        update_callback_group);
+  vis_timer_ = rclcpp::create_timer(node_, node_->get_clock(), spatial_period,
                                         std::bind(&GridMap::visCallback, this),
                                         visualization_callback_group);
 
-  map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", rclcpp::SensorDataQoS());
-  map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", rclcpp::SensorDataQoS());
+  // These are derived map frames, not raw sensor streams. Reliable latest-only
+  // delivery prevents large inflated clouds losing UDP fragments in RViz.
+  const auto map_display_qos = rclcpp::QoS(1).reliable().durability_volatile();
+  map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", map_display_qos);
+  map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", map_display_qos);
+  low_surface_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/low_surface_returns", map_display_qos);
+  high_surface_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/high_surface_returns", map_display_qos);
+  body_obstacle_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/body_obstacles", map_display_qos);
+  terrain_evidence_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/terrain_evidence", map_display_qos);
   sliding_map_bbox_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>("grid_map/sliding_map_bbox", 10);
 
   unknown_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/unknown", rclcpp::SensorDataQoS());
@@ -550,6 +737,13 @@ void GridMap::rebuildInflationOffsets()
 
 void GridMap::resetAllMapData()
 {
+  md_.low_surface_returns_.clear();
+  md_.high_surface_returns_.clear();
+  md_.terrain_projections_.clear();
+  md_.occupancy_sources_.clear();
+  md_.terrain_facts_.clear();
+  md_.terrain_scan_ = 0;
+  std::fill(md_.terrain_projection_buffer_.begin(),md_.terrain_projection_buffer_.end(),0);
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
   std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
   std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
@@ -610,15 +804,50 @@ void GridMap::updateInflation(const Eigen::Vector3i& id, int delta, const std::v
                        md_.occupancy_buffer_inflate_, ignore_mask);
 }
 
+void GridMap::setTerrainProjection(const Eigen::Vector3i& id, bool occupied)
+{
+  if (!isInMap(id)) return;
+  const int address=toAddress(id);
+  const bool raw=md_.occupancy_buffer_[address] > mp_.min_occupancy_log_;
+  const bool was=raw || md_.terrain_projection_buffer_[address];
+  md_.terrain_projection_buffer_[address]=occupied;
+  const plan_env::SourceKey key{id.x(),id.y(),id.z()};
+  if(occupied) md_.occupancy_sources_[key].layers|=plan_env::OccupancyEvidence::TERRAIN_CONSTRAINT;
+  else {
+    auto source=md_.occupancy_sources_.find(key);
+    if(source!=md_.occupancy_sources_.end()) {
+      source->second.layers&=~plan_env::OccupancyEvidence::TERRAIN_CONSTRAINT;
+      if(!source->second.layers) md_.occupancy_sources_.erase(source);
+    }
+  }
+  const bool now=raw || occupied;
+  if(was!=now) updateInflation(id,now ? 1 : -1);
+}
+
 void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds)
 {
   if (!isInMap(id))
     return;
 
   const int addr = toAddress(id);
-  const bool was_occ = md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_;
-  const bool now_occ = new_log_odds > mp_.min_occupancy_log_;
+  const bool was_occ = md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_ ||
+      md_.terrain_projection_buffer_[addr];
+  const bool now_occ = new_log_odds > mp_.min_occupancy_log_ ||
+      md_.terrain_projection_buffer_[addr];
 
+  const plan_env::SourceKey key{id.x(),id.y(),id.z()};
+  if(new_log_odds>mp_.min_occupancy_log_) {
+    auto& source=md_.occupancy_sources_[key];
+    source.layers|=plan_env::OccupancyEvidence::MEASURED;
+    // Free evidence changes confidence, not the time of the last real hit.
+    if(new_log_odds>md_.occupancy_buffer_[addr]) source.measured_scan=md_.terrain_scan_;
+  } else {
+    auto source=md_.occupancy_sources_.find(key);
+    if(source!=md_.occupancy_sources_.end()) {
+      source->second.layers&=~plan_env::OccupancyEvidence::MEASURED;
+      if(!source->second.layers) md_.occupancy_sources_.erase(source);
+    }
+  }
   md_.occupancy_buffer_[addr] = new_log_odds;
   if (was_occ != now_occ)
     updateInflation(id, now_occ ? 1 : -1);
@@ -628,8 +857,11 @@ void GridMap::resetCellByAddress(int addr)
 {
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
-  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
+  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_ || md_.terrain_projection_buffer_[addr])
     updateInflation(id_g, -1);
+
+  md_.terrain_projection_buffer_[addr]=0;
+  md_.occupancy_sources_.erase({id_g.x(),id_g.y(),id_g.z()});
 
   md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
   md_.occupied_miss_confirmation_count_[addr] = 0;
@@ -643,7 +875,7 @@ void GridMap::resetCellByAddressForSliding(int addr, const std::vector<char>& cl
 {
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
-  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
+  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_ || md_.terrain_projection_buffer_[addr])
     updateInflation(id_g, -1, &clear_mask);
 }
 
@@ -732,6 +964,9 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
   for (int addr : clear_addrs)
   {
     md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
+    md_.terrain_projection_buffer_[addr] = 0;
+    Eigen::Vector3i old_id; hashIdToGlobalIndex(addr,old_id);
+    md_.occupancy_sources_.erase({old_id.x(),old_id.y(),old_id.z()});
     md_.occupancy_buffer_inflate_cnt_[addr] = 0;
     md_.occupancy_buffer_inflate_[addr] = 0;
     md_.occupied_miss_confirmation_count_[addr] = 0;
@@ -872,7 +1107,7 @@ bool GridMap::isInsideSelfFilter(const Eigen::Vector3d& point) const
     return false;
 
   return plan_env::pointInsideDoubleCylinder(
-      point, md_.ray_pos_, md_.ray_q_, mp_.double_cylinder_radius_,
+      point, md_.ray_body_pos_, md_.ray_body_q_, mp_.double_cylinder_radius_,
       mp_.double_cylinder_offset_, mp_.self_filter_z_down_, mp_.self_filter_z_up_);
 }
 
@@ -885,6 +1120,38 @@ void GridMap::raycastProcess()
   updateSlidingMap(md_.ray_pos_);
 
   md_.raycast_num_ += 1;
+  md_.terrain_scan_ += 1;
+  // Retain physical XYZ for support, slopes, depressions and overhead returns.
+  // Sliding drops facts outside the window; lack of a return never says FREE.
+  for(auto it=md_.terrain_facts_.begin();it!=md_.terrain_facts_.end();) {
+    if(it->first[0]<mp_.map_bound_min_idx_.x() || it->first[0]>mp_.map_bound_max_idx_.x() ||
+        it->first[1]<mp_.map_bound_min_idx_.y() || it->first[1]>mp_.map_bound_max_idx_.y())
+      it=md_.terrain_facts_.erase(it);
+    else ++it;
+  }
+  md_.low_surface_returns_.clear();
+  md_.high_surface_returns_.clear();
+  size_t self_endpoints=0, low_endpoints=0, high_endpoints=0, obstacle_endpoints=0;
+  // One typed observation per XY cell per scan. Hazard wins over support in
+  // the same scan; only repeated explicit support can retract old projections.
+  std::map<std::pair<int,int>, std::pair<Eigen::Vector3i,plan_env::TerrainEvidence>> terrain_hazards;
+  std::set<std::pair<int,int>> terrain_support;
+  size_t projections_live=0, projections_active=0;
+  for(auto it=md_.terrain_projections_.begin();it!=md_.terrain_projections_.end();) {
+    if(!isInMap(it->second.id)) {it=md_.terrain_projections_.erase(it);continue;}
+    // Expire an action constraint, not a measured physical obstacle. Lack of
+    // returns does not constitute a free-space measurement. Sources keep their
+    // kind so expiry can never erase the independent measured layer.
+    if(md_.terrain_scan_-it->second.last_scan>=
+       static_cast<uint32_t>(mp_.terrain_projection_timeout_frames_)) {
+      setTerrainProjection(it->second.id,false);
+      it=md_.terrain_projections_.erase(it);
+      continue;
+    }
+    ++projections_live;
+    if(it->second.hits>=2) ++projections_active;
+    ++it;
+  }
 
   int vox_idx;
   double length;
@@ -923,16 +1190,76 @@ void GridMap::raycastProcess()
     {
       length = (pt_w - md_.ray_pos_).norm();
 
-      if (length > mp_.max_ray_length_)
+      const bool clearing_only = i < static_cast<int>(md_.proj_hit_flags_.size()) &&
+          md_.proj_hit_flags_[i] == 0;
+      if (length > mp_.max_ray_length_ || clearing_only)
       {
-        pt_w = (pt_w - md_.ray_pos_) / length * mp_.max_ray_length_ + md_.ray_pos_;
-        vox_idx = INVALID_IDX;
+        if(length > mp_.max_ray_length_)
+          pt_w = (pt_w - md_.ray_pos_) / length * mp_.max_ray_length_ + md_.ray_pos_;
+        vox_idx = INVALID_IDX; // no invented obstacle at a valid miss endpoint
       }
       else
       {
+        const uint8_t kind=i<static_cast<int>(md_.proj_hit_flags_.size()) ? md_.proj_hit_flags_[i] : 1;
         const bool inside_self_filter = isInsideSelfFilter(pt_w);
-        vox_idx = setCacheOccupancy(
-            pt_w, plan_env::endpointObservation(mp_.self_filter_enabled_, inside_self_filter));
+        if (inside_self_filter) {
+          ++self_endpoints;
+          vox_idx=setCacheOccupancy(pt_w,0);
+        } else if(kind>=plan_env::kHeightFirst) {
+          // Keep the measured terrain fact. Local's explicit motion profile
+          // produces a separate capability constraint, never a fabricated hit.
+          const double height=plan_env::decodeGroundHeight(kind);
+          const plan_env::TerrainEvidence fact{pt_w,height,md_.ray_body_pos_.z(),md_.terrain_scan_};
+          Eigen::Vector3i terrain_id;posToIndex(pt_w,terrain_id);
+          md_.terrain_facts_[{terrain_id.x(),terrain_id.y()}].observe(fact);
+          const auto verdict=terrain_motion_policy_.assess(fact);
+          if(verdict==plan_env::TerrainVerdict::SUPPORT) {
+            ++low_endpoints;
+            md_.low_surface_returns_.push_back(pt_w);
+            // Measured support revokes old floor hits at the actual endpoint.
+            vox_idx=setCacheOccupancy(pt_w,0);
+            Eigen::Vector3i support_id;posToIndex(pt_w,support_id);
+            terrain_support.insert({support_id.x(),support_id.y()});
+          } else if(verdict==plan_env::TerrainVerdict::BODY_HEIGHT_RISE ||
+                    verdict==plan_env::TerrainVerdict::DROP) {
+            ++obstacle_endpoints;
+            md_.low_surface_returns_.push_back(pt_w);
+            // XYZ remains measured; the obstruction blocks the body plane.
+            Eigen::Vector3d hazard=pt_w;hazard.z()=md_.ray_body_pos_.z();
+            Eigen::Vector3i hazard_id;posToIndex(hazard,hazard_id);
+            if(isInMap(hazard_id)) terrain_hazards[{hazard_id.x(),hazard_id.y()}]={hazard_id,fact};
+            vox_idx=INVALID_IDX;
+          } else if(verdict==plan_env::TerrainVerdict::OVERHEAD) {
+            ++high_endpoints;
+            md_.high_surface_returns_.push_back(pt_w);
+            vox_idx=setCacheOccupancy(pt_w,0);
+          } else {
+            // Leg-height terrain: measured, cleared at its own Z, and never a
+            // body-plane obstruction.
+            ++low_endpoints;
+            md_.low_surface_returns_.push_back(pt_w);
+            vox_idx=setCacheOccupancy(pt_w,0);
+          }
+        } else if (plan_env::lowReturnOutsideBodyBand(
+                       pt_w,md_.ray_body_pos_,mp_.separate_low_returns_,
+                       mp_.low_return_z_below_body_)) {
+          ++low_endpoints;
+          md_.low_surface_returns_.push_back(pt_w);
+          // Reclassification also challenges an old obstacle at this exact
+          // endpoint. Keep measured XYZ in its channel; never clear beyond it.
+          vox_idx=setCacheOccupancy(pt_w,0);
+        } else if (plan_env::highReturnOutsideBodyBand(
+                       pt_w,md_.ray_body_pos_,mp_.separate_high_returns_,
+                       mp_.high_return_z_above_body_)) {
+          ++high_endpoints;
+          md_.high_surface_returns_.push_back(pt_w);
+          // An old body-band hit may now be explicitly overhead. Repeated
+          // endpoint misses revoke that stale source and its inflation too.
+          vox_idx=setCacheOccupancy(pt_w,0);
+        } else {
+          ++obstacle_endpoints;
+          vox_idx=setCacheOccupancy(pt_w,1);
+        }
       }
     }
 
@@ -958,7 +1285,10 @@ void GridMap::raycastProcess()
       }
     }
 
-    raycaster.setInput(md_.ray_pos_ / mp_.resolution_, pt_w / mp_.resolution_);
+    // Use exactly the same transform as posToIndex and LocalMapPatch. Division
+    // and multiplication can straddle an integer boundary (0.30/0.05 < 6,
+    // but 0.30*20 == 6), putting ray free evidence in the wrong Z slice.
+    raycaster.setInput(md_.ray_pos_ * mp_.resolution_inv_, pt_w * mp_.resolution_inv_);
 
     while (raycaster.step(ray_pt))
     {
@@ -1006,6 +1336,46 @@ void GridMap::raycastProcess()
     }
   }
 
+  // Bounded symmetric evidence. A hazard frame adds one hit, a support frame
+  // subtracts one, up to the confirmation bound either way. A projection needs
+  // two net hits and is retracted when the support evidence has cancelled
+  // every hit with no hazard in between, so a cell whose label alternates
+  // -- the flicker a rough floor produces when the per-frame fit moves --
+  // tops out below the projection threshold instead of latching forever.
+  for(const auto& observation:terrain_hazards) {
+    auto inserted=md_.terrain_projections_.try_emplace(observation.first);
+    auto& record=inserted.first->second;
+    if(inserted.second) record.id=observation.second.first;
+    if(record.id!=observation.second.first) {
+      setTerrainProjection(record.id,false);
+      record.id=observation.second.first;
+    }
+    record.last_scan=md_.terrain_scan_;
+    record.evidence=observation.second.second;
+    if(record.hits<static_cast<uint8_t>(mp_.occupied_miss_confirmation_frames_))
+      ++record.hits;
+    if(record.hits>=2) {
+      setTerrainProjection(record.id,true);
+      md_.occupancy_sources_[{record.id.x(),record.id.y(),record.id.z()}].terrain=record.evidence;
+    }
+  }
+  for(const auto& cell:terrain_support) {
+    if(terrain_hazards.count(cell)) continue;
+    auto found=md_.terrain_projections_.find(cell);
+    if(found==md_.terrain_projections_.end()) continue;
+    auto& record=found->second;
+    if(record.hits>0) --record.hits;
+    if(record.hits==0) {
+      setTerrainProjection(record.id,false);
+      md_.terrain_projections_.erase(found);
+    }
+  }
+
+  RCLCPP_INFO_THROTTLE(node_->get_logger(),*node_->get_clock(),2000,
+      "[RAY_ENDPOINT_CHANNELS] self=%zu low_surface=%zu high_surface=%zu obstacle=%zu terrain_proj=%zu terrain_active=%zu body_z=%.3f band=[%.3f,%.3f]; raw low/high endpoints are separate; typed support clears and hazards occupy",
+      self_endpoints,low_endpoints,high_endpoints,obstacle_endpoints,projections_live,projections_active,md_.ray_body_pos_.z(),
+      md_.ray_body_pos_.z()-mp_.low_return_z_below_body_,
+      md_.ray_body_pos_.z()+mp_.high_return_z_above_body_);
   min_x = min(min_x, md_.ray_pos_(0));
   min_y = min(min_y, md_.ray_pos_(1));
   min_z = min(min_z, md_.ray_pos_(2));
@@ -1067,6 +1437,8 @@ void GridMap::raycastProcess()
 
     if (log_odds_update >= 0 && md_.occupancy_buffer_[idx_ctns] >= mp_.clamp_max_log_)
     {
+      auto source=md_.occupancy_sources_.find({idx.x(),idx.y(),idx.z()});
+      if(source!=md_.occupancy_sources_.end()) source->second.measured_scan=md_.terrain_scan_;
       continue;
     }
     else if (log_odds_update <= 0 && md_.occupancy_buffer_[idx_ctns] <= mp_.clamp_min_log_)
@@ -1117,35 +1489,93 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::visCallback()
 {
-  // RViz output is optional.  Never queue it ahead of sensor fusion, and
-  // never wait for the map lock when a writer is active or pending.
-  if (map_update_requested_.load())
-    return;
+  // Read the last completely fused frame without contending with 100 Hz poses
+  // or the 50 ms writer timer. Their phase used to drop every other RViz tick.
+  visualization_refresh_requested_.store(true);
+  const auto view = std::atomic_load(&latest_visualization_snapshot_);
+  if (view)
+  {
+    const auto stamp = rclcpp::Time(view->stamp_ns, node_->get_clock()->get_clock_type());
+    if (map_pub_->get_subscription_count() > 0 && !view->occupied.empty())
+      publishOccupancyCloud(view->occupied, *view->inflated,
+          view->maximum_z, stamp, map_pub_);
+    if (map_inf_pub_->get_subscription_count() > 0)
+      publishOccupancyCloud(view->inflated->buffer, *view->inflated,
+          view->maximum_z, stamp, map_inf_pub_);
+    if (body_obstacle_pub_->get_subscription_count() > 0)
+      publishOccupancyCloud(view->inflated->buffer, *view->inflated,
+          view->maximum_z, stamp, body_obstacle_pub_, view->body_minimum_z);
+    if (low_surface_pub_->get_subscription_count() > 0) {
+      if (mp_.separate_low_returns_)
+        publishLowSurfaceReturns(view->low_surface_returns,stamp);
+      else if (!view->occupied.empty())
+        publishOccupancyCloud(view->occupied, *view->inflated,
+            std::min(view->maximum_z, view->body_minimum_z - 1e-6),
+            stamp, low_surface_pub_);
+    }
+    if(terrain_evidence_pub_->get_subscription_count()>0)
+      publishTerrainFacts(view->terrain_facts,stamp);
+    if (high_surface_pub_->get_subscription_count() > 0)
+      publishHighSurfaceReturns(view->high_surface_returns,stamp);
+  }
+  // Small, optional live-frame displays still use a non-blocking read lock.
   std::shared_lock<std::shared_mutex> lock(map_mutex_, std::try_to_lock);
-  if (!lock.owns_lock() || map_update_requested_.load())
-    return;
+  if (lock.owns_lock())
+  {
+    publishSlidingMapFrame();
+    publishSlidingMapBBox();
+    publishDepthCloud();
+  }
+}
 
-  publishMap();
-  if (map_update_requested_.load())
+void GridMap::updateVisualizationSnapshotLocked(InflatedOccupancySnapshotPtr snapshot)
+{
+  const bool terrain_wanted=terrain_evidence_pub_->get_subscription_count()>0;
+  const bool raw_wanted = map_pub_->get_subscription_count() > 0 ||
+      low_surface_pub_->get_subscription_count() > 0 ||
+      high_surface_pub_->get_subscription_count() > 0;
+  const bool inflated_wanted = map_inf_pub_->get_subscription_count() > 0 ||
+      body_obstacle_pub_->get_subscription_count() > 0;
+  if ((!raw_wanted && !inflated_wanted && !terrain_wanted) ||
+      !visualization_refresh_requested_.exchange(false))
     return;
-  publishMapInflate(true);
-  if (map_update_requested_.load())
-    return;
-  publishSlidingMapFrame();
-  publishSlidingMapBBox();
-  publishDepthCloud();
+  auto view = std::make_shared<VisualizationSnapshot>();
+  view->inflated = std::move(snapshot);
+  if (raw_wanted)
+  {
+    view->occupied.resize(md_.occupancy_buffer_.size());
+    for(size_t i=0;i<view->occupied.size();++i)
+      view->occupied[i]=md_.occupancy_buffer_[i]>mp_.min_occupancy_log_;
+  }
+  if (low_surface_pub_->get_subscription_count() > 0)
+    view->low_surface_returns=md_.low_surface_returns_;
+  if (high_surface_pub_->get_subscription_count() > 0)
+    view->high_surface_returns=md_.high_surface_returns_;
+  view->maximum_z = md_.has_ray_pose_
+      ? md_.ray_pos_(2) + mp_.vis_height_
+      : std::numeric_limits<double>::infinity();
+  view->body_minimum_z = local_patch_reference_z_initialized_
+      ? local_patch_reference_z_ - mp_.body_obstacle_z_below_
+      : -std::numeric_limits<double>::infinity();
+  if(terrain_wanted) {
+    for(const auto& cell:view->inflated->terrain_facts) {
+      view->terrain_facts.push_back(cell.second.lowest);
+      if(!cell.second.lowest.measured.isApprox(cell.second.highest.measured))
+        view->terrain_facts.push_back(cell.second.highest);
+    }
+  }
+  view->stamp_ns = node_->now().nanoseconds();
+  std::atomic_store(&latest_visualization_snapshot_,
+      std::shared_ptr<const VisualizationSnapshot>(std::move(view)));
 }
 
 void GridMap::updateOccupancyCallback()
 {
   const auto callback_started = std::chrono::steady_clock::now();
-  scan_planner_msgs::msg::LocalMapPatch local_patch;
-  bool local_patch_ready = false;
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   const auto lock_acquired = std::chrono::steady_clock::now();
   if (!md_.occ_need_update_)
   {
-    map_update_requested_.store(false);
     return;
   }
 
@@ -1163,15 +1593,8 @@ void GridMap::updateOccupancyCallback()
   const auto fusion_finished = std::chrono::steady_clock::now();
   auto snapshot = buildInflatedOccupancySnapshotLocked();
   std::atomic_store(&latest_inflated_snapshot_, snapshot);
+  updateVisualizationSnapshotLocked(snapshot);
   const auto snapshot_finished = std::chrono::steady_clock::now();
-  const auto patch_started = std::chrono::steady_clock::now();
-  local_patch_ready = buildLocalMapPatchLocked(local_patch);
-  if (local_patch_ready)
-  {
-    local_patch.generation_ms = static_cast<float>(
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - patch_started).count());
-  }
   // t3 = ros::Time::now();
 
   // t4 = ros::Time::now();
@@ -1188,20 +1611,8 @@ void GridMap::updateOccupancyCallback()
 
   md_.occ_need_update_ = false;
   md_.use_cloud_update_ = false;
-  map_update_requested_.store(false);
   lock.unlock();
 
-  if (local_patch_ready)
-  {
-    local_patch_pub_->publish(local_patch);
-    last_local_patch_revision_ = local_patch.map_revision;
-    last_local_patch_time_ = std::chrono::steady_clock::now();
-    RCLCPP_INFO_THROTTLE(
-        node_->get_logger(), *node_->get_clock(), 2000,
-        "[LOCAL_MAP_PATCH] revision=%lu size=%ux%u generation=%.1fms",
-        static_cast<unsigned long>(local_patch.map_revision),
-        local_patch.width, local_patch.height, local_patch.generation_ms);
-  }
 
   const double lock_wait_ms = std::chrono::duration<double, std::milli>(
       lock_acquired - callback_started).count();
@@ -1216,6 +1627,161 @@ void GridMap::updateOccupancyCallback()
       static_cast<unsigned long>(snapshot->revision));
 }
 
+namespace {
+struct Fnv1aHash {
+  uint64_t value{1469598103934665603ULL};
+  void add(const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+      value ^= bytes[i];
+      value *= 1099511628211ULL;
+    }
+  }
+  template <typename T>
+  void add(const T& v) { add(&v, sizeof(T)); }
+};
+
+struct TerrainTileAccumulator {
+  std::vector<std::array<double, 3>> ground_points;
+  uint32_t support{0}, rise{0}, drop{0}, overhead{0}, columns{0}, last_scan{0};
+};
+}  // namespace
+
+void GridMap::fillTerrainTilesLocked(
+    double origin_x, double origin_y, uint32_t width, uint32_t height,
+    std::vector<scan_planner_msgs::msg::TerrainTileSummary>& tiles) const
+{
+  tiles.clear();
+  if (md_.terrain_facts_.empty())
+    return;
+  const double tile_size = local_patch_terrain_tile_size_;
+  const double max_x = origin_x + width * local_patch_resolution_;
+  const double max_y = origin_y + height * local_patch_resolution_;
+  std::map<std::pair<int, int>, TerrainTileAccumulator> accumulated;
+  for (const auto& entry : md_.terrain_facts_)
+  {
+    const double x = (entry.first[0] + 0.5) * mp_.resolution_;
+    const double y = (entry.first[1] + 0.5) * mp_.resolution_;
+    if (x < origin_x || x >= max_x || y < origin_y || y >= max_y)
+      continue;
+    const auto& column = entry.second;
+    if (column.scan == 0)
+      continue;
+    const double ground_z =
+        column.lowest.measured.z() - column.lowest.ground_relative_height;
+    const auto tx = static_cast<int>(std::floor(x / tile_size));
+    const auto ty = static_cast<int>(std::floor(y / tile_size));
+    auto& tile = accumulated[{tx, ty}];
+    tile.ground_points.push_back({x, y, ground_z});
+    ++tile.columns;
+    tile.last_scan = std::max(tile.last_scan, column.scan);
+    const auto low = terrain_motion_policy_.assess(column.lowest);
+    const auto high = terrain_motion_policy_.assess(column.highest);
+    if (low == plan_env::TerrainVerdict::SUPPORT &&
+        high == plan_env::TerrainVerdict::SUPPORT)
+      ++tile.support;
+    if (high == plan_env::TerrainVerdict::BODY_HEIGHT_RISE)
+      ++tile.rise;
+    if (low == plan_env::TerrainVerdict::DROP)
+      ++tile.drop;
+    if (high == plan_env::TerrainVerdict::OVERHEAD)
+      ++tile.overhead;
+  }
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  for (const auto& entry : accumulated)
+  {
+    const auto& key = entry.first;
+    const auto& accumulated_tile = entry.second;
+    scan_planner_msgs::msg::TerrainTileSummary tile;
+    tile.tile_x = key.first;
+    tile.tile_y = key.second;
+    tile.tile_size = static_cast<float>(tile_size);
+    tile.measured_columns = accumulated_tile.columns;
+    tile.support_cells = accumulated_tile.support;
+    tile.rise_cells = accumulated_tile.rise;
+    tile.drop_cells = accumulated_tile.drop;
+    tile.overhead_cells = accumulated_tile.overhead;
+    tile.last_scan = accumulated_tile.last_scan;
+    tile.ground_min = tile.ground_median = tile.ground_max = nan;
+    tile.slope = tile.roughness = nan;
+    std::vector<double> zs;
+    zs.reserve(accumulated_tile.ground_points.size());
+    double sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0;
+    for (const auto& point : accumulated_tile.ground_points)
+    {
+      zs.push_back(point[2]);
+      sx += point[0];
+      sy += point[1];
+      sz += point[2];
+      sxx += point[0] * point[0];
+      sxy += point[0] * point[1];
+      syy += point[1] * point[1];
+      sxz += point[0] * point[2];
+      syz += point[1] * point[2];
+    }
+    const auto [minimum, maximum] = std::minmax_element(zs.begin(), zs.end());
+    tile.ground_min = static_cast<float>(*minimum);
+    tile.ground_max = static_cast<float>(*maximum);
+    auto middle = zs.begin() + zs.size() / 2;
+    std::nth_element(zs.begin(), middle, zs.end());
+    tile.ground_median = static_cast<float>(*middle);
+    const double n = static_cast<double>(zs.size());
+    Eigen::Matrix3d normal;
+    normal << n, sx, sy, sx, sxx, sxy, sy, sxy, syy;
+    if (zs.size() >= 3 && std::abs(normal.determinant()) > 1e-9)
+    {
+      const Eigen::Vector3d coefficients =
+          normal.ldlt().solve(Eigen::Vector3d(sz, sxz, syz));
+      double residual = 0.0;
+      for (const auto& point : accumulated_tile.ground_points)
+      {
+        const double error =
+            point[2] - (coefficients(0) + coefficients(1) * point[0] +
+                        coefficients(2) * point[1]);
+        residual += error * error;
+      }
+      tile.slope = static_cast<float>(std::atan(
+          std::hypot(coefficients(1), coefficients(2))));
+      tile.roughness = static_cast<float>(std::sqrt(residual / n));
+    }
+    Fnv1aHash hash;
+    hash.add(tile.tile_x);
+    hash.add(tile.tile_y);
+    hash.add(std::llround(tile.ground_min * 1000.0));
+    hash.add(std::llround(tile.ground_median * 1000.0));
+    hash.add(std::llround(tile.ground_max * 1000.0));
+    hash.add(std::llround(tile.slope * 1000.0));
+    hash.add(std::llround(tile.roughness * 1000.0));
+    hash.add(tile.support_cells);
+    hash.add(tile.rise_cells);
+    hash.add(tile.drop_cells);
+    hash.add(tile.overhead_cells);
+    hash.add(tile.measured_columns);
+    tile.content_revision = hash.value;
+    tiles.push_back(tile);
+  }
+}
+
+void GridMap::publishLocalMapPatch()
+{
+  // A fixed timer publishes the newest fused revision. A throttle inside a
+  // 10 Hz sensor callback would quantize 0.25 s to 0.30 s instead.
+  const auto started = std::chrono::steady_clock::now();
+  scan_planner_msgs::msg::LocalMapPatch patch;
+  std::shared_lock<std::shared_mutex> lock(map_mutex_);
+  if (!buildLocalMapPatchLocked(patch))
+    return;
+  patch.generation_ms = static_cast<float>(std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count());
+  last_local_patch_revision_ = patch.map_revision;
+  lock.unlock();
+  local_patch_pub_->publish(patch);
+  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+      "[LOCAL_MAP_PATCH] revision=%lu size=%ux%u generation=%.1fms period=%.3fs",
+      static_cast<unsigned long>(patch.map_revision), patch.width, patch.height,
+      patch.generation_ms, local_patch_period_);
+}
+
 bool GridMap::buildLocalMapPatchLocked(
     scan_planner_msgs::msg::LocalMapPatch& patch) const
 {
@@ -1224,13 +1790,7 @@ bool GridMap::buildLocalMapPatchLocked(
     return false;
 
   const uint64_t revision = map_revision_.load();
-  const auto now = std::chrono::steady_clock::now();
-  const bool previously_published =
-      last_local_patch_time_.time_since_epoch().count() != 0;
-  if (revision == 0 || revision == last_local_patch_revision_ ||
-      (previously_published &&
-       std::chrono::duration<double>(now - last_local_patch_time_).count() <
-           local_patch_period_))
+  if (revision == 0 || revision == last_local_patch_revision_)
     return false;
 
   const double min_x = mp_.map_bound_min_idx_(0) * mp_.resolution_;
@@ -1284,9 +1844,12 @@ bool GridMap::buildLocalMapPatchLocked(
         if (x < mp_.map_bound_min_idx_(0) || x > mp_.map_bound_max_idx_(0))
           continue;
         const int addr = address(x, y);
-        int8_t state = -1;
-        if (md_.occupancy_buffer_[addr] >= mp_.clamp_min_log_ - 1e-3)
-          state = md_.occupancy_buffer_inflate_[addr] == 0 ? 0 : 100;
+        // Raw measured slice: no inflation, no hazard projection. Global owns
+        // clearance; terrain evidence travels separately in terrain_tiles.
+        const double value = md_.occupancy_buffer_[addr];
+        const bool unknown =
+            value <= mp_.clamp_min_log_ - mp_.unknown_flag_ + 1e-9;
+        const int8_t state = unknown ? -1 : (value > 0.0 ? 100 : 0);
         patch.occupancy[static_cast<size_t>(row) * patch.width + col] = state;
       }
     }
@@ -1295,6 +1858,25 @@ bool GridMap::buildLocalMapPatchLocked(
   patch.header.frame_id = mp_.frame_id_;
   patch.map_revision = revision;
   patch.pose_revision = 0;
+  patch.scan = md_.terrain_scan_;
+  fillTerrainTilesLocked(origin_x, origin_y, patch.width, patch.height,
+                         patch.terrain_tiles);
+  Fnv1aHash content_hash;
+  content_hash.add(patch.occupancy.data(), patch.occupancy.size());
+  for (const auto& tile : patch.terrain_tiles)
+  {
+    content_hash.add(tile.tile_x);
+    content_hash.add(tile.tile_y);
+    content_hash.add(tile.content_revision);
+  }
+  if (!last_local_patch_content_initialized_ ||
+      content_hash.value != last_local_patch_content_hash_)
+  {
+    ++content_revision_;
+    last_local_patch_content_hash_ = content_hash.value;
+    last_local_patch_content_initialized_ = true;
+  }
+  patch.content_revision = content_revision_;
   return true;
 }
 
@@ -1346,8 +1928,14 @@ void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &i
       pose->child_frame_id.empty() ? "sensor_extrinsic" : pose->child_frame_id + "_extrinsic";
   extrinsic_pose_pub_->publish(extrinsic_pose);
 
+  plan_env::TimedPose body_at_scan;
+  if (!bodyPoseAtScanLocked(rclcpp::Time(img->header.stamp).nanoseconds(),body_at_scan))
+    return;
   md_.ray_pos_ = ray_pos;
   md_.ray_q_ = ray_q;
+  md_.ray_body_pos_=body_at_scan.position;
+  md_.ray_body_q_=body_at_scan.orientation;
+  md_.proj_hit_flags_.clear();
   md_.use_cloud_update_ = false;
   updateSlidingMap(md_.ray_pos_);
   if (isInMap(md_.ray_pos_))
@@ -1364,7 +1952,6 @@ void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr &i
 
 void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose_msg)
 {
-  map_update_requested_.store(true);
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   if (mp_.sensor_type_ != "lidar")
   {
@@ -1419,10 +2006,14 @@ void GridMap::sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &
     return;
   }
 
-  md_.ray_pos_ = ray_pos;
-  md_.ray_q_ = ray_q;
+  // A newer pose must not overwrite the origin of an unconsumed scan.
+  // Its projected endpoints and origin form one timestamped observation.
+  if(!md_.occ_need_update_) {
+    md_.ray_pos_ = ray_pos;
+    md_.ray_q_ = ray_q;
+    updateSlidingMap(ray_pos);
+  }
   md_.has_ray_pose_ = true;
-  updateSlidingMap(md_.ray_pos_);
 }
 
 void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &pose)
@@ -1430,6 +2021,20 @@ void GridMap::slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstShared
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   const geometry_msgs::msg::Point &pos = pose->pose.pose.position;
   md_.sliding_map_frame_pos_ = Eigen::Vector3d(pos.x, pos.y, pos.z);
+  const auto& q=pose->pose.pose.orientation;
+  Eigen::Quaterniond body_q(q.w,q.x,q.y,q.z);
+  const int64_t body_stamp=rclcpp::Time(pose->header.stamp).nanoseconds();
+  if (body_stamp>0 && md_.sliding_map_frame_pos_.allFinite() &&
+      body_q.coeffs().allFinite() && body_q.norm()>1e-6) {
+    const plan_env::TimedPose sample{body_stamp,md_.sliding_map_frame_pos_,body_q.normalized()};
+    const auto insertion=std::lower_bound(body_pose_history_.begin(),body_pose_history_.end(),
+        body_stamp,[](const auto& item,int64_t stamp){return item.stamp_ns<stamp;});
+    if (insertion!=body_pose_history_.end() && insertion->stamp_ns==body_stamp) *insertion=sample;
+    else body_pose_history_.insert(insertion,sample);
+    const int64_t oldest=body_stamp-static_cast<int64_t>(mp_.pose_history_seconds_*1e9);
+    while (!body_pose_history_.empty() && body_pose_history_.front().stamp_ns<oldest)
+      body_pose_history_.pop_front();
+  }
   if (!local_patch_follow_body_z_ || !std::isfinite(pos.z) ||
       !locomotionReady())
     return;
@@ -1483,6 +2088,16 @@ void GridMap::clearPlanningClearanceMarginForCurrentThread() const
   tls_clearance_offsets_.clear();
 }
 
+bool GridMap::bodyPoseAtScanLocked(int64_t stamp_ns, plan_env::TimedPose& pose) const
+{
+  const auto result=plan_env::lookupTimedPose(body_pose_history_,stamp_ns,
+      static_cast<int64_t>(mp_.max_interpolation_gap_seconds_*1e9),
+      static_cast<int64_t>(mp_.max_nearest_pose_age_seconds_*1e9),pose);
+  return result==plan_env::PoseLookupResult::EXACT ||
+      result==plan_env::PoseLookupResult::INTERPOLATED ||
+      result==plan_env::PoseLookupResult::NEAREST;
+}
+
 void GridMap::locomotionStateCallback(
     const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr &msg)
 {
@@ -1502,12 +2117,27 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   if (!locomotionReady())
     return;
   const auto callback_started = std::chrono::steady_clock::now();
-  map_update_requested_.store(true);
   if (mp_.sensor_type_ != "lidar")
   {
     return;
   }
 
+  // Identified 3-D rays keep their original organized indices. The UINT8
+  // return type travels alongside XYZ; a clearing limit is never an obstacle.
+  size_t return_type_offset=0;
+  if (mp_.use_ray_cloud_) {
+    const auto field=std::find_if(img->fields.begin(),img->fields.end(),
+        [](const auto& value){return value.name=="return_type";});
+    if (field==img->fields.end() || field->datatype!=sensor_msgs::msg::PointField::UINT8 ||
+        field->count!=1 || field->offset>=img->point_step || img->width==0 ||
+        img->height==0 || img->row_step<static_cast<uint64_t>(img->width)*img->point_step ||
+        img->data.size()<static_cast<uint64_t>(img->row_step)*img->height) {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(),*node_->get_clock(),2000,
+          "[GridMap] dropping malformed identified 3-D ray cloud");
+      return;
+    }
+    return_type_offset=field->offset;
+  }
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
   const auto decoded = std::chrono::steady_clock::now();
@@ -1524,12 +2154,14 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     return;
   }
 
-  plan_env::TimedPose pose_at_scan;
+  plan_env::TimedPose pose_at_scan, body_at_scan;
+  bool body_pose_valid=false;
   plan_env::PoseLookupResult pose_result;
   size_t pose_history_size = 0;
   {
     std::shared_lock<std::shared_mutex> lock(map_mutex_);
     pose_history_size = lidar_pose_history_.size();
+    body_pose_valid=bodyPoseAtScanLocked(cloud_stamp_ns,body_at_scan);
     pose_result = plan_env::lookupTimedPose(
         lidar_pose_history_, cloud_stamp_ns,
         static_cast<int64_t>(mp_.max_interpolation_gap_seconds_ * 1e9),
@@ -1547,6 +2179,11 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     return;
   }
 
+  if (!body_pose_valid) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(),*node_->get_clock(),1000,
+        "[GridMap] dropping cloud without capture-time body pose for self/low filtering");
+    return;
+  }
   Eigen::Vector3d ray_pos = pose_at_scan.position;
   Eigen::Quaterniond ray_q = pose_at_scan.orientation;
   if (mp_.need_extrinsic_)
@@ -1570,9 +2207,24 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
 
   std::vector<Eigen::Vector3d> projected_points;
   projected_points.reserve(latest_cloud.points.size());
+  std::vector<uint8_t> projected_hits;
+  if (mp_.use_ray_cloud_) projected_hits.reserve(latest_cloud.points.size());
 
   for (size_t i = 0; i < latest_cloud.points.size(); ++i)
   {
+    uint8_t return_type=1;
+    if (mp_.use_ray_cloud_) {
+      const size_t offset=(i/img->width)*img->row_step+
+          (i%img->width)*img->point_step+return_type_offset;
+      return_type=img->data[offset];
+      // Wire contract (plan_env/ground_height.hpp): 0 is invalid, 1 a measured
+      // return without a height estimate, 2 a measured no-return, 3..252 a
+      // measured return carrying its height above the observed local ground
+      // (1 cm steps over [-0.50, +1.99] m), 253..255 reserved and treated as
+      // unknown. Nothing is dropped just because a byte used to be a label.
+      if (return_type<1) continue;
+      if (return_type>plan_env::kHeightLast) return_type=plan_env::kGroundUnknown;
+    }
     const pcl::PointXYZ &pt = latest_cloud.points[i];
     if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
       continue;
@@ -1596,6 +2248,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
       continue;
 
     projected_points.push_back(pt_world);
+    if (mp_.use_ray_cloud_) projected_hits.push_back(return_type==2 ? 0 : return_type);
   }
 
   const auto filtered = std::chrono::steady_clock::now();
@@ -1610,8 +2263,11 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   updateSlidingMap(ray_pos);
   md_.ray_pos_ = ray_pos;
   md_.ray_q_ = ray_q;
+  md_.ray_body_pos_=body_at_scan.position;
+  md_.ray_body_q_=body_at_scan.orientation;
   md_.has_cloud_ = true;
   md_.proj_points_.assign(projected_points.begin(), projected_points.end());
+  md_.proj_hit_flags_=std::move(projected_hits);
   md_.proj_points_cnt = static_cast<int>(projected_points.size());
   md_.use_cloud_update_ = true;
   md_.occ_need_update_ = true;
@@ -1633,83 +2289,155 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
       latest_cloud.points.size(), projected_points.size());
 }
 
-void GridMap::publishMap()
-{
-
-  if (map_pub_->get_subscription_count() == 0)
-    return;
-
-  pcl::PointXYZ pt;
-  pcl::PointCloud<pcl::PointXYZ> cloud;
-
-  Eigen::Vector3i min_cut = mp_.map_bound_min_idx_;
-  Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
-
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
-  {
-    if (map_update_requested_.load())
-      return;
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
-      for (int z = min_cut(2); z <= max_cut(2); ++z)
-      {
-        if (md_.occupancy_buffer_[toAddress(x, y, z)] < mp_.min_occupancy_log_)
-          continue;
-
-        Eigen::Vector3d pos;
-        indexToPos(Eigen::Vector3i(x, y, z), pos);
-        if (md_.has_ray_pose_ && pos(2) > md_.ray_pos_(2) + mp_.vis_height_)
-          continue;
-        pt.x = pos(0);
-        pt.y = pos(1);
-        pt.z = pos(2);
-        cloud.push_back(pt);
-      }
+void GridMap::scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan) {
+  if(!locomotionReady() || !mp_.use_laser_scan_ || scan->ranges.empty() ||
+      scan->ranges.size()>16384 || scan->time_increment!=0. ||
+      !std::isfinite(scan->angle_min) || !std::isfinite(scan->angle_increment) ||
+      scan->angle_increment==0.) return;
+  const int64_t stamp=rclcpp::Time(scan->header.stamp).nanoseconds();
+  if(stamp<=0) return;
+  const int64_t clock_now=node_->now().nanoseconds();
+  if(clock_now<last_laser_clock_ns_) last_laser_stamp_ns_=0;
+  last_laser_clock_ns_=clock_now;
+  if(stamp<=last_laser_stamp_ns_) return;
+  plan_env::TimedPose pose,body_at_scan;
+  bool body_pose_valid=false;
+  plan_env::PoseLookupResult result;
+  { std::shared_lock<std::shared_mutex> lock(map_mutex_);
+    body_pose_valid=bodyPoseAtScanLocked(stamp,body_at_scan);
+    result=plan_env::lookupTimedPose(lidar_pose_history_,stamp,
+        static_cast<int64_t>(mp_.max_interpolation_gap_seconds_*1e9),
+        static_cast<int64_t>(mp_.max_nearest_pose_age_seconds_*1e9),pose); }
+  if(result!=plan_env::PoseLookupResult::EXACT &&
+      result!=plan_env::PoseLookupResult::INTERPOLATED &&
+      result!=plan_env::PoseLookupResult::NEAREST) return;
+  if (!body_pose_valid) return;
+  Eigen::Vector3d origin=pose.position;
+  Eigen::Quaterniond orientation=pose.orientation;
+  if(mp_.need_extrinsic_) {
+    origin+=orientation.toRotationMatrix()*mp_.lidar_extrinsic_.block<3,1>(0,3);
+    orientation=Eigen::Quaterniond(orientation.toRotationMatrix()*
+        mp_.lidar_extrinsic_.block<3,3>(0,0)).normalized();
   }
-
-  cloud.width = cloud.points.size();
-  cloud.height = 1;
-  cloud.is_dense = true;
-  cloud.header.frame_id = mp_.frame_id_;
-  sensor_msgs::msg::PointCloud2 cloud_msg;
-
-  pcl::toROSMsg(cloud, cloud_msg);
-  cloud_msg.header.stamp = node_->now();
-  map_pub_->publish(cloud_msg);
+  if(!origin.allFinite() || !orientation.coeffs().allFinite()) return;
+  std::vector<Eigen::Vector3d> points;std::vector<uint8_t> hits;
+  points.reserve(scan->ranges.size());hits.reserve(scan->ranges.size());
+  for(size_t i=0;i<scan->ranges.size();++i) {
+    const auto ray=plan_env::laserRangeEvidence(scan->ranges[i],scan->range_min,
+        scan->range_max,mp_.no_return_range_);
+    if(!ray.valid) continue;
+    const double angle=scan->angle_min+i*scan->angle_increment;
+    const Eigen::Vector3d delta=orientation*Eigen::Vector3d(
+        ray.length*std::cos(angle),ray.length*std::sin(angle),0.);
+    if(!delta.allFinite()) continue;
+    const bool local=(delta.cwiseAbs().array()<=mp_.local_update_range_.array()).all();
+    if(!local && ray.length<=mp_.max_ray_length_) continue;
+    points.push_back(origin+delta);hits.push_back(ray.hit ? 1 : 0);
+  }
+  if(points.empty()) return;
+  { std::unique_lock<std::shared_mutex> lock(map_mutex_);
+    updateSlidingMap(origin);md_.ray_pos_=origin;md_.ray_q_=orientation;
+    md_.ray_body_pos_=body_at_scan.position;md_.ray_body_q_=body_at_scan.orientation;
+    md_.has_cloud_=true;md_.proj_points_.assign(points.begin(),points.end());
+    md_.proj_hit_flags_=std::move(hits);md_.proj_points_cnt=static_cast<int>(points.size());
+    md_.use_cloud_update_=true;md_.occ_need_update_=true;last_laser_stamp_ns_=stamp; }
+  RCLCPP_INFO_THROTTLE(node_->get_logger(),*node_->get_clock(),2000,
+      "[LASER_RAY_EVIDENCE] stamp=%ld input=%zu accepted=%zu no_return_limit=%.2fm; one original scan, no XYZ re-fusion",
+      static_cast<long>(stamp),scan->ranges.size(),points.size(),mp_.no_return_range_);
 }
 
-void GridMap::publishMapInflate(bool all_info)
+void GridMap::publishTerrainFacts(
+    const std::vector<plan_env::TerrainEvidence>& facts,const rclcpp::Time& stamp)
 {
+  sensor_msgs::msg::PointCloud2 message;
+  message.header.frame_id=mp_.frame_id_;message.header.stamp=stamp;
+  sensor_msgs::PointCloud2Modifier modifier(message);
+  modifier.setPointCloud2Fields(6,
+      "x",1,sensor_msgs::msg::PointField::FLOAT32,
+      "y",1,sensor_msgs::msg::PointField::FLOAT32,
+      "z",1,sensor_msgs::msg::PointField::FLOAT32,
+      "ground_height",1,sensor_msgs::msg::PointField::FLOAT32,
+      "capture_body_z",1,sensor_msgs::msg::PointField::FLOAT32,
+      "observation_scan",1,sensor_msgs::msg::PointField::UINT32);
+  modifier.resize(facts.size());
+  sensor_msgs::PointCloud2Iterator<float> x(message,"x"),y(message,"y"),z(message,"z");
+  sensor_msgs::PointCloud2Iterator<float> h(message,"ground_height"),body(message,"capture_body_z");
+  sensor_msgs::PointCloud2Iterator<uint32_t> scan(message,"observation_scan");
+  for(const auto& fact:facts) {
+    *x=fact.measured.x();*y=fact.measured.y();*z=fact.measured.z();
+    *h=fact.ground_relative_height;*body=fact.capture_body_z;*scan=fact.scan;
+    ++x;++y;++z;++h;++body;++scan;
+  }
+  terrain_evidence_pub_->publish(message);
+}
 
-  if (map_inf_pub_->get_subscription_count() == 0)
-    return;
+void GridMap::publishLowSurfaceReturns(
+    const std::vector<Eigen::Vector3d>& points,const rclcpp::Time& stamp)
+{
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  cloud.points.reserve(points.size());
+  for (const auto& point:points)
+    cloud.points.emplace_back(point.x(),point.y(),point.z());
+  cloud.width=cloud.points.size();cloud.height=1;cloud.is_dense=true;
+  sensor_msgs::msg::PointCloud2 message;
+  pcl::toROSMsg(cloud,message);
+  message.header.frame_id=mp_.frame_id_;message.header.stamp=stamp;
+  low_surface_pub_->publish(message); // publish empty frames too, clearing stale display
+}
 
+void GridMap::publishHighSurfaceReturns(
+    const std::vector<Eigen::Vector3d>& points,const rclcpp::Time& stamp)
+{
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  cloud.points.reserve(points.size());
+  for (const auto& point:points)
+    cloud.points.emplace_back(point.x(),point.y(),point.z());
+  cloud.width=cloud.points.size();cloud.height=1;cloud.is_dense=true;
+  sensor_msgs::msg::PointCloud2 message;
+  pcl::toROSMsg(cloud,message);
+  message.header.frame_id=mp_.frame_id_;message.header.stamp=stamp;
+  high_surface_pub_->publish(message); // publish empty frames too, clearing stale display
+}
+
+void GridMap::publishOccupancyCloud(
+    const std::vector<char>& buffer, const InflatedOccupancySnapshot& snapshot,
+    double maximum_z, const rclcpp::Time& stamp,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher,
+    double minimum_z)
+{
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud;
-
-  Eigen::Vector3i min_cut = mp_.map_bound_min_idx_;
-  Eigen::Vector3i max_cut = mp_.map_bound_max_idx_;
-
-  const std::vector<char> &inflate_buffer = md_.occupancy_buffer_inflate_;
-  for (int x = min_cut(0); x <= max_cut(0); ++x)
+  const double resolution = 1.0 / snapshot.resolution_inv;
+  Eigen::Vector3i maximum = snapshot.bound_max;
+  Eigen::Vector3i minimum = snapshot.bound_min;
+  if (std::isfinite(minimum_z))
+    minimum(2) = std::max(minimum(2), static_cast<int>(
+        std::ceil(minimum_z * snapshot.resolution_inv - 0.5)));
+  if (std::isfinite(maximum_z))
+    maximum(2) = std::min(maximum(2), static_cast<int>(
+        std::floor(maximum_z * snapshot.resolution_inv - 0.5)));
+  auto local_index = [](int index, int size) {
+    const int local = index % size;
+    return local < 0 ? local + size : local;
+  };
+  for (int x = snapshot.bound_min(0); x <= maximum(0); ++x)
   {
-    if (map_update_requested_.load())
-      return;
-    for (int y = min_cut(1); y <= max_cut(1); ++y)
-      for (int z = min_cut(2); z <= max_cut(2); ++z)
+    const int x_address = local_index(x, snapshot.voxel_num(0)) *
+        snapshot.voxel_num(1) * snapshot.voxel_num(2);
+    for (int y = snapshot.bound_min(1); y <= maximum(1); ++y)
+    {
+      const int xy_address = x_address +
+          local_index(y, snapshot.voxel_num(1)) * snapshot.voxel_num(2);
+      for (int z = minimum(2); z <= maximum(2); ++z)
       {
-        if (inflate_buffer[toAddress(x, y, z)] == 0)
+        if (buffer[xy_address + local_index(z, snapshot.voxel_num(2))] == 0)
           continue;
-
-        Eigen::Vector3d pos;
-        indexToPos(Eigen::Vector3i(x, y, z), pos);
-        if (md_.has_ray_pose_ && pos(2) > md_.ray_pos_(2) + mp_.vis_height_)
-          continue;
-
-        pt.x = pos(0);
-        pt.y = pos(1);
-        pt.z = pos(2);
+        pt.x = (x + 0.5) * resolution;
+        pt.y = (y + 0.5) * resolution;
+        pt.z = (z + 0.5) * resolution;
         cloud.push_back(pt);
       }
+    }
   }
 
   cloud.width = cloud.points.size();
@@ -1719,10 +2447,13 @@ void GridMap::publishMapInflate(bool all_info)
   sensor_msgs::msg::PointCloud2 cloud_msg;
 
   pcl::toROSMsg(cloud, cloud_msg);
-  cloud_msg.header.stamp = node_->now();
-  map_inf_pub_->publish(cloud_msg);
-
-  // ROS_INFO("pub map");
+  cloud_msg.header.stamp = stamp;
+  publisher->publish(cloud_msg);
+  if (publisher == map_inf_pub_ || publisher == body_obstacle_pub_)
+    RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+        "[MAP_VISUALIZATION] inflated_points=%u bytes=%zu period=%.3fs source_revision=%lu display_min_z=%.3f collision_buffer=FULL",
+        cloud_msg.width, cloud_msg.data.size(), local_patch_period_,
+        static_cast<unsigned long>(snapshot.revision), minimum_z);
 }
 
 void GridMap::publishSlidingMapFrame()

@@ -15,18 +15,23 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <plan_env/planar_clearance_field.h>
 #include <shared_mutex>
+#include <set>
 #include <rmw/qos_profiles.h>
 #include <tuple>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <scan_planner_msgs/msg/local_map_patch.hpp>
 #include <scan_planner_msgs/msg/locomotion_state.hpp>
+#include <scan_planner_msgs/msg/terrain_tile_summary.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -40,6 +45,7 @@
 #include <message_filters/time_synchronizer.h>
 
 #include <plan_env/raycast.h>
+#include <plan_env/motion_evidence.h>
 
 #define logit(x) (log((x) / (1 - (x))))
 
@@ -79,9 +85,30 @@ bool pointInsideDoubleCylinder(
     const Eigen::Quaterniond& orientation, double radius, double offset,
     double z_down, double z_up);
 int endpointObservation(bool self_filter_enabled, bool inside_self_filter);
+// A body-relative routing gate, not a ground/support classification. A low
+// measured endpoint is kept in the surface channel; only its ray prefix may
+// clear occupancy. A measured low endpoint must never become a no-return.
+bool lowReturnOutsideBodyBand(const Eigen::Vector3d& point,
+    const Eigen::Vector3d& body_position, bool separate_low_returns,
+    double below_body);
+// Symmetric upper gate. A measured endpoint above the body band is overhead
+// structure (timber beams, arches, a low tunnel ceiling) that a planar plan
+// under the body must not treat as an obstacle; it keeps its own channel and
+// only its ray prefix may clear occupancy.
+bool highReturnOutsideBodyBand(const Eigen::Vector3d& point,
+    const Eigen::Vector3d& body_position, bool separate_high_returns,
+    double above_body);
+struct LaserRangeEvidence { bool valid{false}; bool hit{false}; double length{0.}; };
+LaserRangeEvidence laserRangeEvidence(double measured, double minimum,
+    double maximum, double no_return_range);
 bool rayTraversalStopsAtOccupied(bool historically_occupied);
 bool occupiedMissHasEnoughConfirmation(
     uint8_t consecutive_miss_frames, int required_frames);
+int8_t localPatchOccupancy(bool observed, bool inflated_occupied);
+// Sensor hypothesis only: query returns -1 outside, 0 unknown/free, 1 occupied.
+bool observationRayMayReach(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end, double resolution,
+    const std::function<int(const Eigen::Vector3d&)>& query);
 }
 
 // voxel hashing
@@ -112,6 +139,17 @@ struct MappingParameters {
   double obstacles_inflation_z_up, obstacles_inflation_z_down;
   double double_cylinder_radius_, double_cylinder_offset_;
   bool self_filter_enabled_;
+  // Platform capability bounds, not tuning preferences: the vertical extent of
+  // the body that a planar plan must keep clear. Measured endpoints outside
+  // [body - low_return_z_below_body, body + high_return_z_above_body] are
+  // surface / overhead evidence and never become occupancy. A 3-D lidar sees
+  // the floor and any overhead structure; a single band that spans far above
+  // the body turns every beam and arch into a blocked cell for a plan that
+  // never leaves the body plane.
+  bool separate_low_returns_{false};
+  double low_return_z_below_body_{0.25};
+  bool separate_high_returns_{false};
+  double high_return_z_above_body_{0.25};
   double self_filter_z_down_, self_filter_z_up_;
   bool map_sliding_en_;
   double map_sliding_thresh_;
@@ -133,13 +171,28 @@ struct MappingParameters {
       min_occupancy_log_;                   // logit of occupancy probability
   double min_ray_length_, max_ray_length_;  // range of doing raycasting
   int occupied_miss_confirmation_frames_;
+  int terrain_projection_timeout_frames_;
+  // Ground-relative clearance volume for measured returns whose height above
+  // the observed local ground is known (plan_env/ground_height.hpp). Below
+  // terrain_floor_tolerance the return is the ground; up to obstacle_min_height
+  // the legs handle the terrain; the band up to obstacle_max_height can reach
+  // the body and blocks; above it is overhead structure. The body-relative
+  // low/high band (low_return_z_below_body / high_return_z_above_body) remains
+  // the fallback for returns without a height estimate.
+  double terrain_floor_tolerance_{0.035};
+  double obstacle_min_height_{0.22};
+  double obstacle_max_height_{0.55};
 
   /* visualization and computation time display */
   double vis_height_, ground_height_;
+  double body_obstacle_z_below_;
   bool show_occ_time_;
 
   /* mapping sensor input */
   string sensor_type_;
+  bool use_laser_scan_{false};
+  bool use_ray_cloud_{false};
+  double no_return_range_{3.0};
   bool cloud_is_world_;
   bool need_extrinsic_;
   Eigen::Matrix4d lidar_extrinsic_;
@@ -158,6 +211,22 @@ struct MappingData {
   // main map data, occupancy of each voxel and Euclidean distance
 
   std::vector<double> occupancy_buffer_;
+  // Terrain is projected at body height but measured at a different Z. Keep
+  // its provenance separate so renewed support can retract only that source,
+  // without erasing a real wall sharing the same voxel.
+  struct TerrainProjection {
+    Eigen::Vector3i id{Eigen::Vector3i::Zero()};
+    uint8_t hits{0};  // bounded leaky hazard evidence, released at zero
+    uint32_t last_scan{0};
+    plan_env::TerrainEvidence evidence;  // terrain scan index of the last hazard observation
+  };
+  std::map<std::pair<int,int>, TerrainProjection> terrain_projections_;
+  std::vector<char> terrain_projection_buffer_;
+  std::map<plan_env::SourceKey, plan_env::OccupancyEvidence> occupancy_sources_;
+  std::map<std::array<int,2>,plan_env::TerrainColumnEvidence> terrain_facts_;
+  // Monotonic scan counter for terrain provenance. raycast_num_ is a char
+  // used for dedup flags and wraps; an ordered counter cannot.
+  uint32_t terrain_scan_{0};
   std::vector<char> occupancy_buffer_inflate_;
   std::vector<int> occupancy_buffer_inflate_cnt_;
   std::vector<uint8_t> occupied_miss_confirmation_count_;
@@ -167,6 +236,12 @@ struct MappingData {
 
   Eigen::Vector3d ray_pos_;
   Eigen::Quaterniond ray_q_;
+  // Capture-time BODY pose, independent of sensor extrinsics and of newer
+  // odometry callbacks. It belongs to the same pending observation as XYZ.
+  Eigen::Vector3d ray_body_pos_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond ray_body_q_{Eigen::Quaterniond::Identity()};
+  std::vector<Eigen::Vector3d> low_surface_returns_;
+  std::vector<Eigen::Vector3d> high_surface_returns_;
   Eigen::Vector3d sliding_map_frame_pos_;
 
   // depth image data
@@ -183,6 +258,7 @@ struct MappingData {
   // depth image projected point cloud
 
   vector<Eigen::Vector3d> proj_points_;
+  vector<uint8_t> proj_hit_flags_; // empty for legacy cloud/depth; 0 means bounded clearing only
   int proj_points_cnt;
 
   // flag buffers for speeding up raycasting
@@ -226,6 +302,7 @@ public:
   inline void setOccupied(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
+  bool observationRayMayReach(const Eigen::Vector3d& start, const Eigen::Vector3d& end);
   inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
 
   inline void boundIndex(Eigen::Vector3i& id);
@@ -242,6 +319,12 @@ public:
     double resolution_inv{1.0};
     double body_offset{0.0};
     uint64_t revision{0};
+    double body_radius{0.};
+    Eigen::Vector3i inflation_min{Eigen::Vector3i::Zero()}, inflation_max{Eigen::Vector3i::Zero()};
+    std::set<plan_env::SourceKey> inflation_offsets;
+    std::map<plan_env::SourceKey, plan_env::OccupancyEvidence> sources;
+    std::map<std::array<int,2>,plan_env::TerrainColumnEvidence> terrain_facts;
+    plan_env::MotionAssessment assessMotion(const Eigen::Vector3d& pos, double yaw) const;
     mutable std::mutex clearance_mutex;
     mutable std::map<int, std::shared_ptr<const scan_planner::PlanarClearanceField>> clearance_slices;
     int getCylinderOccupancy(const Eigen::Vector3d& point) const;
@@ -253,6 +336,7 @@ public:
   };
   using InflatedOccupancySnapshotPtr = std::shared_ptr<const InflatedOccupancySnapshot>;
 
+  void setTerrainMotionPolicy(const plan_env::TerrainMotionPolicy& policy);
   void initMap(rclcpp::Node* node,
                rclcpp::CallbackGroup::SharedPtr update_callback_group = nullptr,
                rclcpp::CallbackGroup::SharedPtr visualization_callback_group = nullptr);
@@ -266,8 +350,6 @@ public:
   uint64_t getMapRevision() const { return map_revision_.load(); }
   double getMapAgeSeconds() const;
 
-  void publishMap();
-  void publishMapInflate(bool all_info = false);
 
   void publishUnknown();
   void publishDepth();
@@ -288,15 +370,30 @@ public:
 
 private:
   MappingParameters mp_;
+  plan_env::TerrainMotionPolicy terrain_motion_policy_;
   MappingData md_;
   mutable std::shared_mutex map_mutex_;
   std::atomic<uint64_t> map_revision_{0};
   std::atomic<int64_t> last_map_update_ns_{0};
-  std::atomic<bool> map_update_requested_{false};
   std::atomic<bool> perception_pose_valid_{false};
   std::atomic<int64_t> locomotion_state_stamp_ns_{0};
   std::deque<plan_env::TimedPose> lidar_pose_history_;
+  std::deque<plan_env::TimedPose> body_pose_history_;
+  bool bodyPoseAtScanLocked(int64_t stamp_ns, plan_env::TimedPose& pose) const;
   mutable InflatedOccupancySnapshotPtr latest_inflated_snapshot_;
+  struct VisualizationSnapshot
+  {
+    InflatedOccupancySnapshotPtr inflated;
+    std::vector<char> occupied;
+    std::vector<Eigen::Vector3d> low_surface_returns;
+    std::vector<Eigen::Vector3d> high_surface_returns;
+    std::vector<plan_env::TerrainEvidence> terrain_facts;
+    double maximum_z;
+    double body_minimum_z;
+    int64_t stamp_ns;
+  };
+  std::shared_ptr<const VisualizationSnapshot> latest_visualization_snapshot_;
+  std::atomic<bool> visualization_refresh_requested_{true};
   static thread_local const GridMap* tls_snapshot_owner_;
   static thread_local InflatedOccupancySnapshotPtr tls_snapshot_;
   static thread_local const GridMap* tls_clearance_owner_;
@@ -309,6 +406,8 @@ private:
   void sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& img);
+  void scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan);
+  int64_t last_laser_stamp_ns_{0}, last_laser_clock_ns_{0};
   void locomotionStateCallback(
       const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr& msg);
   bool locomotionReady() const;
@@ -316,8 +415,23 @@ private:
   // update occupancy by raycasting
   void updateOccupancyCallback();
   void visCallback();
+  void updateVisualizationSnapshotLocked(InflatedOccupancySnapshotPtr snapshot);
+  void publishTerrainFacts(const std::vector<plan_env::TerrainEvidence>& facts,const rclcpp::Time& stamp);
+  void publishLowSurfaceReturns(const std::vector<Eigen::Vector3d>& points,
+                               const rclcpp::Time& stamp);
+  void publishHighSurfaceReturns(const std::vector<Eigen::Vector3d>& points,
+                                const rclcpp::Time& stamp);
+  void publishOccupancyCloud(
+      const std::vector<char>& buffer, const InflatedOccupancySnapshot& snapshot,
+      double maximum_z, const rclcpp::Time& stamp,
+      const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher,
+      double minimum_z = -std::numeric_limits<double>::infinity());
+  void publishLocalMapPatch();
   bool buildLocalMapPatchLocked(
       scan_planner_msgs::msg::LocalMapPatch& patch) const;
+  void fillTerrainTilesLocked(
+      double origin_x, double origin_y, uint32_t width, uint32_t height,
+      std::vector<scan_planner_msgs::msg::TerrainTileSummary>& tiles) const;
   InflatedOccupancySnapshotPtr buildInflatedOccupancySnapshotLocked() const;
 
   // main update process
@@ -338,6 +452,7 @@ private:
   void resetCellByAddress(int addr);
   void resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask);
   void hashIdToGlobalIndex(int addr, Eigen::Vector3i& id_g) const;
+  void setTerrainProjection(const Eigen::Vector3i& id, bool occupied);
   void applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds);
   void rebuildInflationOffsets();
   void updateInflation(const Eigen::Vector3i& id, int delta, const std::vector<char>* ignore_mask = nullptr);
@@ -364,17 +479,22 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lidar_pose_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sliding_map_frame_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<scan_planner_msgs::msg::LocomotionState>::SharedPtr locomotion_state_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr low_surface_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr high_surface_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr body_obstacle_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr terrain_evidence_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr sliding_map_bbox_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr unknown_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr depth_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr extrinsic_pose_pub_;
   rclcpp::Publisher<scan_planner_msgs::msg::LocalMapPatch>::SharedPtr local_patch_pub_;
-  rclcpp::TimerBase::SharedPtr occ_timer_, vis_timer_;
+  rclcpp::TimerBase::SharedPtr occ_timer_, vis_timer_, local_patch_timer_;
   bool local_patch_enabled_{true};
-  double local_patch_period_{0.5};
+  double local_patch_period_{0.25};
   double local_patch_resolution_{0.2};
   double local_patch_z_{0.3};
   bool local_patch_follow_body_z_{true};
@@ -384,7 +504,11 @@ private:
   double local_patch_reference_z_{0.3};
   int64_t local_patch_reference_stamp_ns_{0};
   uint64_t last_local_patch_revision_{0};
-  std::chrono::steady_clock::time_point last_local_patch_time_{};
+  double local_patch_terrain_tile_size_{2.0};
+  // Written only by the patch timer thread; mutable because the builder is const.
+  mutable uint64_t content_revision_{0};
+  mutable uint64_t last_local_patch_content_hash_{0};
+  mutable bool last_local_patch_content_initialized_{false};
 
   //
   uniform_real_distribution<double> rand_noise_;
@@ -486,6 +610,7 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
+  // Observation visibility sees measured geometry, not a motion capability veto.
   return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
 }
 
@@ -541,6 +666,7 @@ inline int GridMap::getOccupancy(Eigen::Vector3i id) {
   if (!isInMap(id))
     return -1;
 
+  // Observation visibility sees measured geometry, not a motion capability veto.
   return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
 }
 

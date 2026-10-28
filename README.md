@@ -1,3 +1,5 @@
+> **dyn 快照 dyn-20261028-211234**：Ubuntu 22.04 / ROS 2 Humble / Gazebo Fortress / Go2 RL。先阅读 [环境与启动说明](docs/dyn/SETUP_ZH.md)、[世界资源](docs/dyn/WORLD_RESOURCES_ZH.md) 和 [已知问题](docs/dyn/KNOWN_ISSUES_20261028_ZH.md)。NewMine 与当前 RL 权重已随分支保存；Campus 通过官方资源准备脚本生成。本分支保存开发现场，仍包含已列明的恢复与区域显示问题。
+
 <div align="center">
   <h1>SCAN-Planner ROS 2</h1>
   <h2>面向路线引导四足长程导航的空间碰撞感知局部规划器</h2>

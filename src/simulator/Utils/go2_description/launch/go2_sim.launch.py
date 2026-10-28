@@ -56,22 +56,16 @@ def _world_control(world_file, request):
 def _resume_after_controller(event, context):
     if event.returncode != 0:
         return [LogInfo(msg=(
-            "Controllers failed to activate; Gazebo remains paused."
+            "Controller activation / simulation startup verification failed; shutting down."
         )), Shutdown(reason="controller activation failed")]
 
-    # The activation helper advances the world in bounded batches while the
-    # controller switch request is pending and leaves it paused afterwards.
-    # Resume only after the strict switch command has succeeded;
-    # otherwise /clock and the GPU lidar stop after their startup samples and
-    # Explorer waits forever for a second local-map update.
-    world_file = LaunchConfiguration("world").perform(context)
-    return [
-        LogInfo(msg="Controllers activated successfully; resuming Gazebo physics"),
-        TimerAction(
-            period=0.1,
-            actions=[_world_control(world_file, "pause: false")],
-        ),
-    ]
+    # The helper owns the whole paused-step -> continuous-run transition.
+    # Success means finite batches have drained AND native stats prove running.
+    # A second launch-side unpause would race pending iterations in Fortress.
+    return [LogInfo(msg=(
+        "Controllers activated successfully; Gazebo continuous simulation verified"
+    ))]
+
 
 def _start_trajectory_after_broadcaster(event, _context, trajectory_controller):
     if event.returncode != 0:

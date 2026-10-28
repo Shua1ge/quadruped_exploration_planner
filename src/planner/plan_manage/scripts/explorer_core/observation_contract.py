@@ -55,4 +55,6 @@ def bind_task_identity(task, task_id, grid):
     task.task_version = 1
     task.require_sensor_evidence = True
     task.initial_sensor_revision = grid.sensor_revision
+    task.last_evaluated_sensor_revision = grid.sensor_revision
+    task.last_closure_sensor_revision = grid.sensor_revision
     return task

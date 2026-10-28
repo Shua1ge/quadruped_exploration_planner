@@ -1,0 +1,81 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+    <model name="Edgar Mine Virtual STIX 4">
+        <static>true</static>
+        <link name="link">
+            <pose>0 0 0 1.5707 0 0</pose>
+            <collision name="section_04_collision">
+                <geometry>
+                    <mesh>
+                        <uri>meshes/Edgar_Section_04.DAE</uri>
+                    </mesh>
+                </geometry>
+            </collision>
+            <visual name="section_04_visual">
+                <geometry>
+                    <mesh>
+                        <uri>meshes/Edgar_Section_04.DAE</uri>
+                    </mesh>
+                </geometry>
+            </visual>
+        </link>
+        <!--Uncomment <link> to preview detector region-->
+        <!--<link name='body1'>
+        <visual name="v1">
+          <pose>-65.584700 -84.306900 0 0 0 0</pose>
+          <transparency>0.2</transparency>
+          <geometry>
+            <box>
+              <size>10 10 10</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.0 1.0 0.0 1</diffuse>
+          </material>
+        </visual>
+        <cast_shadows>false</cast_shadows>
+      </link>-->
+        <plugin filename="libignition-gazebo-performer-detector-system.so" name="ignition::gazebo::systems::PerformerDetector">
+            <topic>/subt_performer_detector</topic>
+            <pose>-65.584700 -84.306900 0 0 0 0</pose>
+            <geometry>
+                <box>
+                    <size>10 10 10</size>
+                </box>
+            </geometry>
+            <header_data>
+                <key>type</key>
+                <value>decision</value>
+            </header_data>
+        </plugin>
+        <!--Uncomment <link> to preview detector region-->
+        <!--<link name='body2'>
+        <visual name="v1">
+          <pose>-79.104700 -48.958500 0 0 0 0</pose>
+          <transparency>0.2</transparency>
+          <geometry>
+            <box>
+              <size>10 10 10</size>
+            </box>
+          </geometry>
+          <material>
+            <diffuse>0.0 1.0 0.0 1</diffuse>
+          </material>
+        </visual>
+        <cast_shadows>false</cast_shadows>
+      </link>-->
+        <plugin filename="libignition-gazebo-performer-detector-system.so" name="ignition::gazebo::systems::PerformerDetector">
+            <topic>/subt_performer_detector</topic>
+            <pose>-79.104700 -48.958500 0 0 0 0</pose>
+            <geometry>
+                <box>
+                    <size>10 10 10</size>
+                </box>
+            </geometry>
+            <header_data>
+                <key>type</key>
+                <value>decision</value>
+            </header_data>
+        </plugin>
+    </model>
+</sdf>

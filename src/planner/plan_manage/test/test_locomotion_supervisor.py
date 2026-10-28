@@ -11,6 +11,7 @@ import importlib.util
 import math
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -26,6 +27,36 @@ class SupervisorSyntaxTest(unittest.TestCase):
         compile(supervisor.read_text(), str(supervisor), "exec")
 
 
+class PolicyTimingHelpersTest(unittest.TestCase):
+    def test_unknown_source_stamp_is_not_claimed_fresh(self):
+        self.assertIsNone(module.message_stamp_ns(SimpleNamespace()))
+        zero = SimpleNamespace(header=SimpleNamespace(
+            stamp=SimpleNamespace(sec=0, nanosec=0)))
+        self.assertIsNone(module.message_stamp_ns(zero))
+        self.assertIsNone(module.diagnostic_age_ms(1_000_000_000, None))
+
+    def test_source_age_is_independent_of_receipt_age(self):
+        msg = SimpleNamespace(header=SimpleNamespace(
+            stamp=SimpleNamespace(sec=9, nanosec=100_000_000)))
+        source = module.message_stamp_ns(msg)
+        self.assertAlmostEqual(module.diagnostic_age_ms(10_000_000_000, source), 900.)
+        self.assertEqual(module.diagnostic_age_ms(10_000_000_000, 10_000_000_000), 0.)
+
+    def test_future_or_rewound_clock_is_not_clamped_to_zero(self):
+        self.assertEqual(module.diagnostic_age_ms(900_000_000, 1_000_000_000), -100.)
+
+    def test_summary_excludes_unknown_and_preserves_outliers(self):
+        summary = module.summarize_policy_timing([
+            {'inference_wall_ms': 1., 'estimator_interval_wall_ms': None},
+            {'inference_wall_ms': 81., 'estimator_interval_wall_ms': 300.},
+            {'inference_wall_ms': float('nan')},
+        ])
+        self.assertEqual(summary['inference_wall_ms'],
+                         dict(count=2, mean=41., min=1., max=81.))
+        self.assertEqual(summary['estimator_interval_wall_ms']['count'], 1)
+        self.assertNotIn('joint_sample_age_ms', summary)
+
+
 class ProjectedGravityTest(unittest.TestCase):
     def test_identity_points_down(self):
         gravity = module.projected_gravity_from_quaternion(0.0, 0.0, 0.0, 1.0)
@@ -39,6 +70,15 @@ class ProjectedGravityTest(unittest.TestCase):
     def test_rejects_zero_norm(self):
         with self.assertRaises(ValueError):
             module.projected_gravity_from_quaternion(0.0, 0.0, 0.0, 0.0)
+
+    def test_rejects_nonfinite_quaternion_before_foot_reach(self):
+        for value in (float('nan'), float('inf'), -float('inf')):
+            with self.assertRaises(ValueError):
+                module.projected_gravity_from_quaternion(value, 0., 0., 1.)
+
+    def test_large_finite_norm_does_not_overflow_squared_components(self):
+        gravity = module.projected_gravity_from_quaternion(0., 0., 0., 1e300)
+        np.testing.assert_allclose(gravity, [0., 0., -1.])
 
 
 class PdEffortTest(unittest.TestCase):
@@ -118,6 +158,44 @@ class HoldTransitionTest(unittest.TestCase):
         np.testing.assert_allclose(module.blend_effort(policy, hold, 0.0), policy)
         np.testing.assert_allclose(module.blend_effort(policy, hold, 0.5), 5.0)
         np.testing.assert_allclose(module.blend_effort(policy, hold, 1.0), hold)
+
+
+class PhysicalHeightAndFaultSupportTest(unittest.TestCase):
+    def test_foot_reach_matches_the_existing_go2_kinematic_dimensions(self):
+        height = module.leg_extension_height(module.DEFAULT_DOF_POS, module.GRAVITY_WORLD)
+        self.assertGreater(height, .27)
+        self.assertLess(height, .35)
+
+    def test_folded_pose_is_low_even_at_arbitrarily_high_world_elevation(self):
+        folded = module.DEFAULT_DOF_POS.copy()
+        folded[1::3] = 2.6
+        folded[2::3] = -2.7
+        self.assertLess(module.leg_extension_height(folded, module.GRAVITY_WORLD), .15)
+
+    def test_swinging_one_leg_does_not_label_the_stance_as_collapsed(self):
+        q = module.DEFAULT_DOF_POS.copy()
+        q[1:3] = 2.6, -2.7
+        self.assertGreater(module.leg_extension_height(q, module.GRAVITY_WORLD), .24)
+
+    def test_upright_stationary_fault_can_hold_but_never_permits_navigation(self):
+        self.assertEqual(module.fault_support_mode(
+            'BODY_POSE_INVALID_MAP_RESTART_REQUIRED', True, True, .3, 1., 0., 0., 0.), 'SUPPORT_HOLD')
+
+    def test_fall_or_dynamic_motion_gets_damping_not_blind_standup(self):
+        for height, tilt, speed in ((.1, 1., 0.), (.3, .3, 0.), (.3, 1., .7)):
+            self.assertEqual(module.fault_support_mode(
+                'BODY_POSE_INVALID_MAP_RESTART_REQUIRED', True, True, height, tilt, speed, 0., 0.), 'DAMPING_ONLY')
+
+    def test_invalid_feedback_always_disables_support(self):
+        for fresh, finite in ((False, True), (True, False)):
+            self.assertEqual(module.fault_support_mode(
+                'BODY_POSE_INVALID_MAP_RESTART_REQUIRED', fresh, finite, .3, 1., 0., 0., 0.), 'DISABLED')
+
+    def test_nonfinite_joint_or_gravity_is_not_a_valid_height(self):
+        bad = module.DEFAULT_DOF_POS.copy()
+        bad[0] = float('nan')
+        with self.assertRaises(ValueError):
+            module.leg_extension_height(bad, module.GRAVITY_WORLD)
 
 
 class PostureErrorTest(unittest.TestCase):

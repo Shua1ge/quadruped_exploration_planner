@@ -11,6 +11,9 @@ scan_planner_node:
     fsm.reference_path_lookahead: 4.5
     fsm.emergency_time: 1.0
     fsm.rolling_replan_retry_period: 0.25
+    # Moving transit endpoints prepare a successor before their prefix ends.
+    # Observation capture and zero-speed conversion retain their rest gate.
+    fsm.rolling_replan_prepare_time: 1.50
     fsm.rolling_replan_max_start_error: 0.30
     # A future collision first requests a rolling A* + B-spline replacement.
     # HOLD is reserved for the dynamic stopping horizon.
@@ -20,8 +23,10 @@ scan_planner_node:
     fsm.tracking_degraded_error: 0.10
     fsm.tracking_recovery_max_error: 0.30
     fsm.tracking_match_back_time: 0.40
+    # Also bounds Local's candidate start matching. The exact checked match
+    # is sent to Controller; its legacy search window cannot override it.
     fsm.tracking_match_forward_time: 0.80
-    # The physical capsule remains radius=0.35 m with +/-0.18 m body centres.
+    # The planning capsule uses radius=0.25 m with +/-0.18 m body centres.
     # This is an additional hard planning belt checked only against immutable
     # local-map snapshots; it is not baked into the map and does not enlarge
     # Explorer's global obstacles.
@@ -38,16 +43,17 @@ scan_planner_node:
     fsm.clearance_limited_max_lateral_speed: 0.08
     fsm.clearance_limited_max_yaw_rate: 0.50
     fsm.clearance_limited_max_tracking_correction: 0.08
-    # Once Controller ACKs a hard-safe fallback, do not replace it with the
-    # same fallback every time startup tracking error crosses 0.10 m. Preserve
+    # Once Controller ACKs a clearance-limited segment (hard-safe fallback
+    # or stop-limited transit), do not replace it every time startup tracking
+    # error crosses 0.10 m. Preserve
     # one execution version long enough to observe real odometry progress;
     # bounded no-progress becomes local recovery, never another clock reset.
     fsm.clearance_limited_execution_grace: 1.00
     fsm.clearance_limited_no_progress_timeout: 2.00
     fsm.clearance_limited_min_progress: 0.05
-    # Only after ordinary rolling repair fails, try short local anchors that
-    # move away from the hard planning belt before rejoining the unchanged
-    # Explorer reference path. These bounds keep recovery local and cheap.
+    # After ordinary approaches fail, use bounded local recovery without
+    # changing the Explorer task. These distance bounds apply to the
+    # turn-then-drive fallback; fixed-yaw side-steps use 0.15--0.45 m.
     fsm.local_repair_anchor_min_distance: 0.45
     fsm.local_repair_anchor_max_distance: 0.90
     fsm.local_repair_anchor_step: 0.15
@@ -57,15 +63,18 @@ scan_planner_node:
     # It prevents every accepted short segment from opening a fresh candidate
     # family and turning a failed rejoin into an unbounded left/right crawl.
     fsm.local_repair_max_segments_per_transaction: 3
-    # Short escape segments start and end at rest. Keep their initialization
-    # slow enough that spline fitting does not turn a safe 0.45 m sidestep into
-    # a dynamically infeasible normal-speed maneuver.
+    # Recovery segments start and end at rest. The separate lateral limit
+    # below keeps short side-steps from inheriting normal forward speed.
     fsm.local_repair_max_speed: 0.30
     fsm.local_repair_time_margin: 1.20
-    # Arbitrary fixed-yaw strafing is a holonomic-base assumption and is not a
-    # certified Go2 RL locomotion primitive.  Keep it disabled until a bounded
-    # turn/forward-arc primitive has its own controller contract.
-    fsm.enable_holonomic_lateral_repair: false
+    # Go2 supports left/right translation without turning. A bounded recovery
+    # keeps measured body yaw, certifies lateral braking and a rejoin, and
+    # authorizes zero forward command only for this recovery trajectory.
+    fsm.enable_holonomic_lateral_repair: true
+    # Legacy flat-ground probe: 0.15 command gave only 0.11 m in 8 s;
+    # 0.30 gave 0.90 m. Fixed-yaw recovery uses this bounded command rather
+    # than a shrinking spline derivative. Full lateral braking still checked.
+    fsm.local_repair_lateral_speed: 0.30
     # Runtime safety predicts the actual odometry velocity through reaction
     # and braking, sampling a short swept capsule instead of assuming that the
     # robot remains exactly on the theoretical B-spline.
@@ -114,9 +123,10 @@ scan_planner_node:
     grid_map.local_update_range_z: 2.5
     grid_map.map_sliding_en: true
     grid_map.map_sliding_thresh: 0.2
-    # Keep the planned body centre outside the simulator's 0.30 m collision
-    # radius, with a small allowance for voxelization and tracking error.
-    grid_map.double_cylinder_radius: 0.35
+    # Planning envelope (not the Gazebo collision geometry). Keep Explorer's
+    # inflation and footprint radius identical; hard/preferred margins below
+    # remain separate checks, not extra inflation passes.
+    grid_map.double_cylinder_radius: 0.25
     grid_map.double_cylinder_offset: 0.18
     grid_map.self_filter_enabled: true
     grid_map.self_filter_z_down: 0.45
@@ -165,15 +175,52 @@ scan_planner_node:
     grid_map.p_max: 0.98
     grid_map.p_occ: 0.80
     grid_map.max_ray_length: 5.0
+    # Gazebo MID-360 uses identified 3-D rays; the planar input remains an
+    # explicit alternative. No-return limits are never obstacle endpoints.
+    grid_map.use_laser_scan: false
+    grid_map.use_ray_cloud: false
+    # Enabled by the Gazebo lidar launch. Route measured returns below this
+    # body-relative band to low_surface_returns, not obstacle occupancy.
+    # This is not a ground/support estimate and cannot certify a low step.
+    grid_map.separate_low_returns: false
+    grid_map.low_return_z_below_body: 0.25
+    # Upper half of the same platform band, and the reason a 3-D lidar does not
+    # block the corridor it walks through: returns above this boundary are
+    # overhead structure (timber beams, arches, a low ceiling) routed to
+    # high_surface_returns. Both bounds describe the body that a planar plan
+    # must keep clear; they are platform capability values, not preferences.
+    # Explorer derives obstacle_min_z/obstacle_max_z from these same two keys.
+    grid_map.separate_high_returns: false
+    grid_map.high_return_z_above_body: 0.25
+    grid_map.no_return_range: 3.0
     # A historical wall must receive repeated explicit free observations
     # before a miss is allowed to reduce its occupancy probability.
     grid_map.occupied_miss_confirmation_frames: 3
+    # A terrain projection (hazard shown at body height) is released when its
+    # cell stops being observed as a hazard for this many scans: the robot
+    # moved past it or something now occludes it, and a stale block must not
+    # outlive the evidence that made it. At the 10 Hz MID-360 rate, 20 scans
+    # are about two seconds.
+    grid_map.terrain_projection_timeout_frames: 20
+    # Ground-relative clearance volume for measured returns whose height above
+    # the observed local ground is known (encoded in return_type; see
+    # plan_env/ground_height.hpp): below terrain_floor_tolerance the return is
+    # the ground, below obstacle_min_height the legs handle the terrain, the
+    # band up to obstacle_max_height can reach the body and blocks, above it is
+    # overhead structure. These are robot geometry plus capability statements:
+    # raise obstacle_min_height only when the execution layer actually
+    # certifies taller steps. Returns without a height estimate keep using the
+    # body-relative low/high band above.
+    grid_map.terrain_floor_tolerance: 0.035
+    grid_map.obstacle_min_height: 0.22
+    grid_map.obstacle_max_height: 0.55
     grid_map.vis_height: 0.3
+    grid_map.body_obstacle_z_below: 0.12 # Display only; full occupancy remains collision authority.
     grid_map.show_occ_time: false
     # Shadow global-representation input. After a fusion revision completes, it
     # samples the consistent inflated map without acquiring another map lock.
     grid_map.local_patch_enabled: true
-    grid_map.local_patch_period: 0.5
+    grid_map.local_patch_period: 0.25
     grid_map.local_patch_resolution: 0.2
     # Absolute fallback used only before the first valid body_pose. During
     # normal operation the gravity-aligned patch follows a filtered body z.

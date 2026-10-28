@@ -3,7 +3,7 @@
 import bisect
 import math
 import time
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from scipy.ndimage import binary_dilation
@@ -16,6 +16,26 @@ PoseSample = Tuple[int, float, float, float, float, float, float, float]
 UNKNOWN = -1
 FREE = 0
 OCCUPIED = 100
+# Return-type wire contract (single source of truth: plan_env/ground_height.hpp).
+# 0 invalid; 1 measured return without a height estimate; 2 measured no-return;
+# 3..252 measured return whose height above the observed local ground is
+# kHeightBase + (value - 3) * kHeightStep, clamped to [-0.50, +1.99] m at 1 cm
+# resolution; 253..255 reserved and treated as unknown.
+HEIGHT_FIRST = 3
+HEIGHT_LAST = 252
+HEIGHT_BASE = -0.50
+HEIGHT_STEP = 0.01
+GROUND_FLOOR_TOLERANCE = 0.035
+
+
+def decode_ground_height(return_types):
+    """Height above the observed local ground per return; NaN where unknown."""
+    kinds = np.asarray(return_types, dtype=np.int64)
+    heights = np.full(kinds.shape, np.nan)
+    known = (kinds >= HEIGHT_FIRST) & (kinds <= HEIGHT_LAST)
+    heights[known] = HEIGHT_BASE + (kinds[known] - HEIGHT_FIRST) * HEIGHT_STEP
+    return heights
+
 GRID_MOVES = (
     (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
     (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
@@ -172,6 +192,198 @@ def classify_planar_ranges(
     return nearest
 
 
+
+def _project_identified_rays(values, hits, misses, origin, directions,
+        min_z, max_z, mapping_range, no_return_range, ray_count, dilation_bins,
+        resolution, spatial=False, clear_min_z=None, clear_max_z=None,
+        support=None, endpoint_obstacles=None):
+    """Project identified rays into 2-D obstacle and clearing evidence.
+
+    ``min_z``/``max_z`` bound the untyped endpoint fallback. Identified 3-D
+    rays supply their authoritative ``endpoint_obstacles`` mask instead.
+    ``clear_min_z``/``clear_max_z``
+    bound how far a ray may travel before its prefix stops counting as free
+    space; they may be deliberately wider. The two are different decisions: an
+    overhead beam is not an obstacle, yet a ray passing just above the body
+    still proves the cells beneath it are traversable. Sharing one narrow band
+    for both rejects every clearing prefix on a pitched 3-D lidar and leaves
+    only the cells around the robot free, which is how a frontier disappears.
+    """
+    if clear_min_z is None:
+        clear_min_z = min_z
+    if clear_max_z is None:
+        clear_max_z = max_z
+    planar = np.linalg.norm(directions[:, :2], axis=1)
+    valid = (hits | misses) & (planar > 1e-6)
+    extent = np.where(hits, values, no_return_range)
+    extent = np.minimum(extent, mapping_range / np.maximum(planar, 1e-6))
+    endpoint_z = origin[2] + directions[:, 2] * np.where(hits, values, 0.)
+    obstacle = (valid & hits & (endpoint_z >= min_z) & (endpoint_z <= max_z)
+                & (values * planar < mapping_range))
+    if endpoint_obstacles is not None:
+        # The identified 3-D path owns the endpoint classification. Reusing its
+        # mask here prevents the radial and exact-XY channels from disagreeing.
+        obstacle = valid & hits & endpoint_obstacles & (values * planar < mapping_range)
+    elif support is not None:
+        obstacle &= ~support
+    bearings = np.arctan2(directions[:, 1], directions[:, 0])
+    bins = np.clip(np.floor((bearings + math.pi) * ray_count / (2 * math.pi)).astype(int),
+                   0, ray_count - 1)
+    nearest = np.full(ray_count, np.inf)
+    np.minimum.at(nearest, bins[obstacle], values[obstacle] * planar[obstacle])
+    nearest = dilate_hit_ranges(nearest, dilation_bins)
+    prefix = np.zeros(values.size)
+    if clear_min_z <= origin[2] <= clear_max_z:
+        exit_distance = np.full(values.size, np.inf)
+        up = directions[:, 2] > 1e-9
+        down = directions[:, 2] < -1e-9
+        exit_distance[up] = (clear_max_z - origin[2]) / directions[up, 2]
+        exit_distance[down] = (clear_min_z - origin[2]) / directions[down, 2]
+        # A low/ground hit terminates its own ray. Do not clear past the true
+        # endpoint or outside the clearing window.
+        guard = resolution * math.sqrt(2.) / np.maximum(planar, 1e-6)
+        endpoint_limit = np.where(hits & ~obstacle, extent - guard, extent)
+        band_limit = np.where(np.isfinite(exit_distance), exit_distance - guard, exit_distance)
+        prefix[valid] = np.maximum(0., np.minimum(endpoint_limit, band_limit)[valid]) * planar[valid]
+    if support is not None:
+        # Supported, measured ground retains its own visible endpoint even
+        # where it leaves a body-relative height window. Never extend past it.
+        prefix[support & valid] = extent[support & valid] * planar[support & valid]
+    if spatial:
+        # Rays at different elevations have different valid prefixes. A downward
+        # ray leaving the band immediately must not erase a measured horizontal
+        # free prefix. Actual accepted obstacle hits still occlude every prefix.
+        clearing = np.zeros(ray_count)
+        np.maximum.at(clearing, bins[valid], prefix[valid])
+    else:
+        clearing = np.full(ray_count, np.inf)
+        np.minimum.at(clearing, bins[valid], prefix[valid])
+        clearing[~np.isfinite(clearing)] = 0.
+    clearing = np.minimum(clearing, nearest)
+    nearest[~np.isfinite(nearest) & (clearing <= 0.)] = np.nan
+    return nearest, clearing
+
+
+def classify_planar_scan(ranges: Sequence[float], angle_min: float,
+        angle_increment: float, range_min: float, range_max: float,
+        sensor_position: np.ndarray, sensor_rotation: np.ndarray,
+        min_z: float, max_z: float, mapping_range: float,
+        no_return_range: float, ray_count: int, dilation_bins: int,
+        resolution: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Project simultaneous planar rays, preserving their evidence semantics."""
+    values = np.asarray(ranges, dtype=np.float64)
+    origin = np.asarray(sensor_position, dtype=np.float64)
+    rotation = np.asarray(sensor_rotation, dtype=np.float64)
+    if (values.ndim != 1 or origin.shape != (3,) or rotation.shape != (3, 3)
+            or ray_count <= 0 or resolution <= 0
+            or not np.all(np.isfinite(origin)) or not np.all(np.isfinite(rotation))
+            or not all(math.isfinite(x) for x in (angle_min, angle_increment,
+                range_min, range_max, min_z, max_z, mapping_range, no_return_range))
+            or angle_increment == 0 or range_min < 0 or range_max <= range_min
+            or min_z >= max_z or mapping_range <= 0 or no_return_range <= 0):
+        raise ValueError("invalid planar scan geometry")
+    angles = angle_min + np.arange(values.size) * angle_increment
+    local = np.column_stack((np.cos(angles), np.sin(angles), np.zeros(values.size)))
+    directions = local @ rotation.T
+    finite = np.isfinite(values) & (values >= range_min) & (values <= range_max)
+    hits = finite & (values < range_max)
+    misses = np.isposinf(values) | (finite & (values == range_max))
+    return _project_identified_rays(values, hits, misses, origin, directions,
+        min_z, max_z, mapping_range, min(range_max, no_return_range), ray_count,
+        dilation_bins, resolution)
+
+
+class SpatialRayProjection(NamedTuple):
+    """One endpoint classification shared by radial and exact-XY fusion."""
+    ranges: np.ndarray
+    clearing: np.ndarray
+    world: np.ndarray
+    heights: np.ndarray
+    support: np.ndarray
+    obstacle: np.ndarray
+    terrain: np.ndarray
+
+
+def project_spatial_rays(endpoints, return_types, sensor_position, sensor_rotation,
+        min_z, max_z, mapping_range, no_return_range, ray_count, dilation_bins,
+        resolution, clear_min_z=None, clear_max_z=None, *, unknown_min_z=None,
+        floor_tolerance=GROUND_FLOOR_TOLERANCE, obstacle_min_height=.22,
+        obstacle_max_height=.55, body_position=None, body_yaw=0.,
+        self_radius=0., self_offset=0., self_z_down=.45, self_z_up=.20):
+    """Project physical XYZ and typed heights into consistent planar evidence.
+
+    Type 0 is invalid, 2 is a measured no-return, 1 has unknown height, and
+    3..252 carry height above the observed local ground. Invalid and no-return
+    endpoints never create occupied cells. Known heights
+    use the same ground-relative body-clearance interval as Local, including
+    deep drops; low terrain and overhead returns keep their measured heights.
+    Unknown heights use the physical body-slice band supplied by the platform.
+    Clearing retains its independent window and always stops at a measured hit.
+    """
+    points = np.asarray(endpoints, dtype=np.float64)
+    kinds = np.asarray(return_types)
+    origin = np.asarray(sensor_position, dtype=np.float64)
+    rotation = np.asarray(sensor_rotation, dtype=np.float64)
+    if unknown_min_z is None:
+        unknown_min_z = min_z
+    if (points.ndim != 2 or points.shape[1] != 3 or kinds.shape != (len(points),)
+            or origin.shape != (3,) or rotation.shape != (3, 3)
+            or not np.isfinite(origin).all() or not np.isfinite(rotation).all()
+            or ray_count <= 0 or resolution <= 0 or min_z >= max_z
+            or unknown_min_z >= max_z or mapping_range <= 0 or no_return_range <= 0
+            or not 0. < floor_tolerance < obstacle_min_height < obstacle_max_height
+            or not all(math.isfinite(x) for x in (min_z, max_z, unknown_min_z,
+                mapping_range, no_return_range, resolution, floor_tolerance,
+                obstacle_min_height, obstacle_max_height))):
+        raise ValueError("invalid identified 3-D ray geometry")
+    lengths = np.linalg.norm(points, axis=1)
+    valid = np.isfinite(points).all(axis=1) & (lengths >= .1) & (kinds >= 1)
+    points = points[valid]; kinds = kinds[valid]; lengths = lengths[valid]
+    world = points @ rotation.T + origin
+    directions = (points / lengths[:, None]) @ rotation.T
+    hits, misses = kinds != 2, kinds == 2
+    heights = decode_ground_height(kinds)
+    measured = hits.copy()
+    if body_position is not None and self_radius > 0.:
+        body = np.asarray(body_position, dtype=np.float64)
+        if body.shape != (3,) or not np.isfinite(body).all() or not math.isfinite(body_yaw):
+            raise ValueError("invalid capture-time body pose")
+        heading = np.array([math.cos(body_yaw), math.sin(body_yaw)])
+        xy = world[:, :2] - body[:2]
+        self_hit = ((np.minimum(np.linalg.norm(xy-self_offset*heading, axis=1),
+                               np.linalg.norm(xy+self_offset*heading, axis=1)) <= self_radius)
+                    & (world[:, 2] >= body[2]-self_z_down)
+                    & (world[:, 2] <= body[2]+self_z_up))
+        measured &= ~self_hit
+    known = measured & np.isfinite(heights)
+    support = known & (np.abs(heights) <= floor_tolerance)
+    terrain = known & ~support
+    hazard = known & (((heights >= obstacle_min_height) & (heights <= obstacle_max_height))
+                      | (heights <= -obstacle_min_height))
+    unknown_body = (measured & ~known & (world[:, 2] >= unknown_min_z)
+                    & (world[:, 2] <= max_z))
+    obstacle = hazard | unknown_body
+    nearest, clearing = _project_identified_rays(
+        lengths, hits, misses, origin, directions, min_z, max_z, mapping_range,
+        np.minimum(lengths, no_return_range), ray_count, dilation_bins, resolution,
+        spatial=True, clear_min_z=clear_min_z, clear_max_z=clear_max_z,
+        support=support, endpoint_obstacles=obstacle)
+    within_map = np.linalg.norm(world[:, :2]-origin[:2], axis=1) < mapping_range
+    return SpatialRayProjection(nearest, clearing, world, heights,
+        support & within_map, obstacle & within_map, terrain & within_map)
+
+
+def classify_spatial_rays(endpoints, return_types, sensor_position, sensor_rotation,
+        min_z, max_z, mapping_range, no_return_range, ray_count, dilation_bins,
+        resolution, clear_min_z=None, clear_max_z=None, **options):
+    """Range-only interface to the shared identified-ray projection."""
+    result = project_spatial_rays(endpoints, return_types, sensor_position,
+        sensor_rotation, min_z, max_z, mapping_range, no_return_range, ray_count,
+        dilation_bins, resolution, clear_min_z, clear_max_z, **options)
+    return result.ranges, result.clearing
+
+
+
 def bresenham(start: Cell, end: Cell) -> List[Cell]:
     x0, y0 = start
     x1, y1 = end
@@ -289,7 +501,9 @@ class ExplorationGrid:
 
     def integrate_ranges(self, position: Point2, ranges: Sequence[float],
                          max_range: float, min_range: float = 0.35,
-                         no_return_range: Optional[float] = None):
+                         no_return_range: Optional[float] = None,
+                         clearing_ranges: Optional[Sequence[float]] = None,
+                         ground_cells=(), obstacle_cells=()):
         """Fuse one planar scan.
 
         The batched implementation below is cell-for-cell equivalent to
@@ -297,17 +511,25 @@ class ExplorationGrid:
         test_grid_vectorized.py.
         """
         return self._integrate_ranges_vectorized(
-            position, ranges, max_range, min_range, no_return_range)
+            position, ranges, max_range, min_range, no_return_range, clearing_ranges, ground_cells, obstacle_cells)
 
     def _integrate_ranges_reference(self, position: Point2, ranges: Sequence[float],
                                     max_range: float, min_range: float = 0.35,
-                                    no_return_range: Optional[float] = None):
+                                    no_return_range: Optional[float] = None,
+                                    clearing_ranges: Optional[Sequence[float]] = None,
+                         ground_cells=(), obstacle_cells=()):
         origin = self.world_to_cell(*position)
         if not self.in_bounds(origin):
             return
-        free_cells: Set[Cell] = set()
-        occupied_cells: Set[Cell] = set()
+        free_cells: Set[Cell] = {c for c in ground_cells if self.in_bounds(c)}
+        occupied_cells: Set[Cell] = {c for c in obstacle_cells if self.in_bounds(c)}
         ray_count = len(ranges)
+        if clearing_ranges is not None:
+            clearing_ranges=np.asarray(clearing_ranges,dtype=np.float64)
+            if clearing_ranges.shape!=(ray_count,):
+                raise ValueError("clearing_ranges must match ranges")
+            clearing_ranges=np.where(np.isfinite(clearing_ranges),
+                                      np.clip(clearing_ranges,0.,max_range),0.)
         for index, measured_range in enumerate(ranges):
             # NaN is an observed but deliberately ignored 3-D return.  It is
             # neither an obstacle hit in the 2-D projection nor free-space
@@ -317,7 +539,9 @@ class ExplorationGrid:
             hit = math.isfinite(measured_range) and measured_range < max_range
             miss_range = (max_range if no_return_range is None
                           else min(max_range, no_return_range))
-            ray_range = min(measured_range, max_range) if hit else miss_range
+            clear_limit = (None if clearing_ranges is None else float(clearing_ranges[index]))
+            ray_range = min(measured_range, max_range) if hit else (
+                miss_range if clear_limit is None else min(max_range, max(0., clear_limit)))
             if ray_range < min_range:
                 continue
             angle = -math.pi + (index + 0.5) * (2.0 * math.pi / ray_count)
@@ -330,6 +554,9 @@ class ExplorationGrid:
             if hit:
                 occupied_cells.add(line[-1])
             free_line = line[:-1] if hit else line
+            if clear_limit is not None:
+                free_line = [cell for cell in free_line if clear_limit>0.
+                             and math.dist(self.cell_to_world(cell), position) <= clear_limit]
             if free_line:
                 # A missing return is free-space evidence only up to the first
                 # wall already present when this scan began.  Let it weaken
@@ -358,7 +585,9 @@ class ExplorationGrid:
 
     def _integrate_ranges_vectorized(self, position: Point2, ranges: Sequence[float],
                                      max_range: float, min_range: float = 0.35,
-                                     no_return_range: Optional[float] = None):
+                                     no_return_range: Optional[float] = None,
+                                     clearing_ranges: Optional[Sequence[float]] = None,
+                         ground_cells=(), obstacle_cells=()):
         """Exact batched port of _integrate_ranges_reference.
 
         The integer-Bresenham recurrence runs as a short loop over ray steps
@@ -372,7 +601,7 @@ class ExplorationGrid:
         ray_count = len(ranges)
         if ray_count == 0:
             return self._integrate_ranges_reference(
-                position, ranges, max_range, min_range, no_return_range)
+                position, ranges, max_range, min_range, no_return_range, clearing_ranges, ground_cells, obstacle_cells)
         ranges_arr = np.asarray(ranges, dtype=np.float64)
         is_nan = np.isnan(ranges_arr)
         # NaN is an observed but deliberately ignored 3-D return: neither an
@@ -383,11 +612,19 @@ class ExplorationGrid:
         miss = ~is_nan & ~hit
         miss_range = (max_range if no_return_range is None
                       else min(max_range, no_return_range))
-        ray_range = np.where(hit, np.minimum(ranges_arr, max_range), miss_range)
+        clear_limits = None
+        if clearing_ranges is not None:
+            clear_limits = np.asarray(clearing_ranges, dtype=np.float64)
+            if clear_limits.shape != ranges_arr.shape:
+                raise ValueError("clearing_ranges must match ranges")
+            clear_limits = np.where(np.isfinite(clear_limits),
+                                    np.clip(clear_limits, 0., max_range), 0.)
+        ray_range = np.where(hit, np.minimum(ranges_arr, max_range),
+                             miss_range if clear_limits is None else clear_limits)
         valid = (hit | miss) & (ray_range >= min_range)
         if not valid.any():
             return self._integrate_ranges_reference(
-                position, ranges, max_range, min_range, no_return_range)
+                position, ranges, max_range, min_range, no_return_range, clearing_ranges, ground_cells, obstacle_cells)
         idx = np.nonzero(valid)[0]
         is_hit = hit[idx]
         angles = -math.pi + (idx + 0.5) * (2.0 * math.pi / ray_count)
@@ -437,6 +674,11 @@ class ExplorationGrid:
         # Hit rays free everything except their endpoint cell.
         free_mask = in_bounds & np.where(is_hit[None, :],
                                          k_axis < last_ib[None, :], True)
+        if clear_limits is not None:
+            wx = self.origin_x + (px + .5) * self.resolution
+            wy = self.origin_y + (py + .5) * self.resolution
+            free_mask &= (clear_limits[idx][None,:]>0.) & (
+                np.hypot(wx-position[0],wy-position[1])<=clear_limits[idx][None,:])
         # A missing return is free-space evidence only up to the first wall
         # already present when this scan began; the wall cell itself keeps one
         # weakening step and cells behind it are untouched in this scan.
@@ -449,6 +691,12 @@ class ExplorationGrid:
         hit_rays = np.nonzero(is_hit & any_inb)[0]
         occ_mask[last_ib[hit_rays], hit_rays] = True
         occ_flat = np.unique(flat[occ_mask])
+        if ground_cells:
+            extra = [y*self.width+x for x,y in ground_cells if self.in_bounds((x,y))]
+            free_flat = np.union1d(free_flat, np.asarray(extra, dtype=np.int64))
+        if obstacle_cells:
+            extra = [y*self.width+x for x,y in obstacle_cells if self.in_bounds((x,y))]
+            occ_flat = np.union1d(occ_flat, np.asarray(extra, dtype=np.int64))
         free_apply = np.setdiff1d(free_flat, occ_flat)
 
         self.sensor_revision += 1

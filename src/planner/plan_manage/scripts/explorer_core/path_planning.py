@@ -4,6 +4,7 @@ import heapq
 import math
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Sequence, Set
 
 from .grid import (
@@ -56,11 +57,174 @@ def open_start_escape_corridor(
     return adjusted
 
 
+@dataclass
+class ExpansionBudget:
+    limit: int
+    used: int = 0
+
+    @property
+    def remaining(self):
+        return max(0, self.limit-self.used)
+
+    def consume(self):
+        if self.remaining == 0:
+            return False
+        self.used += 1
+        return True
+
+
+class RouteSearchStatus(str, Enum):
+    FOUND = "COARSE_CONNECTED"
+    INCOMPLETE = "SEARCH_INCOMPLETE"
+    NO_ROUTE = "NO_KNOWN_FREE_ROUTE"
+
+
+@dataclass
+class RouteSearchResult:
+    status: RouteSearchStatus
+    path: Optional[List[Cell]] = None
+    expanded: int = 0
+    reason: str = ""
+
+
+class KnownFreeSearch:
+    """Resumable A* facts, invalidated only by inspected cells/edges.
+
+    This is a raw FREE connection witness, never a body certificate. Capacity
+    exhaustion preserves the frontier rather than caching a false no-path.
+    """
+
+    def __init__(self, start, goal):
+        self.start, self.goal = start, goal
+        self.queue = [(0., 0., start)]
+        self.costs = {start: 0.}
+        self.parents = {}
+        self.closed = set()
+        self.cells = {}
+        self.edges = {}
+        self.result = None
+
+    def current(self, grid, forbidden):
+        return (all(grid.value(c) == value for c, value in self.cells.items())
+                and all((edge in forbidden) == blocked
+                        for edge, blocked in self.edges.items()))
+
+    def advance(self, grid, forbidden, budget):
+        if self.result is not None:
+            return self.result
+
+        def free(cell):
+            value = grid.value(cell)
+            self.cells[cell] = value
+            return grid.in_bounds(cell) and value == FREE
+
+        if not free(self.start) or not free(self.goal):
+            self.result = RouteSearchResult(RouteSearchStatus.NO_ROUTE,
+                                            reason="ENDPOINT_NOT_KNOWN_FREE")
+            return self.result
+        while self.queue:
+            _, cost, cell = self.queue[0]
+            if cell in self.closed or cost != self.costs.get(cell):
+                heapq.heappop(self.queue)
+                continue
+            if cell == self.goal:
+                path = [cell]
+                while cell in self.parents:
+                    cell = self.parents[cell]
+                    path.append(cell)
+                self.result = RouteSearchResult(RouteSearchStatus.FOUND,
+                                                list(reversed(path)))
+                return self.result
+            if not budget.consume():
+                return RouteSearchResult(RouteSearchStatus.INCOMPLETE,
+                                         reason="EXPANSION_BUDGET")
+            heapq.heappop(self.queue)
+            self.closed.add(cell)
+            for dx, dy, step in GRID_MOVES:
+                nxt = (cell[0]+dx, cell[1]+dy)
+                edge = (cell, nxt)
+                self.edges[edge] = edge in forbidden
+                if self.edges[edge] or not free(nxt):
+                    continue
+                if dx and dy and (not free((cell[0]+dx, cell[1]))
+                                  or not free((cell[0], cell[1]+dy))):
+                    continue
+                candidate = cost+step
+                if candidate >= self.costs.get(nxt, float("inf")):
+                    continue
+                self.costs[nxt] = candidate
+                self.parents[nxt] = cell
+                heapq.heappush(self.queue, (
+                    candidate+math.dist(nxt, self.goal), candidate, nxt))
+        self.result = RouteSearchResult(RouteSearchStatus.NO_ROUTE,
+                                        reason="KNOWN_FREE_GRAPH_EXHAUSTED")
+        return self.result
+
+
+class CoarseRouteRepair:
+    """Replace conflicting route segments, sharing search across candidates.
+
+    Prefix/suffix cells are revalidated; unchanged anchors reuse their search
+    even if the target, sensor revision or unrelated map content changed.
+    """
+
+    def __init__(self):
+        self.searches = {}
+        self.geometry = None
+
+    def repair(self, grid, path, blocked_edges, budget):
+        used = budget.used
+        geometry = (grid.origin_x, grid.origin_y, grid.width, grid.height,
+                    grid.resolution)
+        if self.geometry != geometry:
+            self.searches.clear()
+            self.geometry = geometry
+        forbidden = blocked_edges or set()
+        route = []
+        for cell in path:
+            if not route:
+                route.append(cell)
+            elif cell != route[-1]:
+                route.extend(bresenham(route[-1], cell)[1:])
+        empty = set()  # no body inflation in the exploration connection model
+        if not route or not grid.planning_free(route[0], empty) or not grid.planning_free(route[-1], empty):
+            return RouteSearchResult(RouteSearchStatus.NO_ROUTE,
+                                     reason="ENDPOINT_NOT_KNOWN_FREE")
+        while True:
+            conflict = next((i for i in range(len(route)-1)
+                             if not segment_known_free(grid, route[i], route[i+1],
+                                                       empty, forbidden)), None)
+            if conflict is None:
+                return RouteSearchResult(RouteSearchStatus.FOUND, route,
+                                         budget.used-used)
+            # Keep the first valid anchor on each side of this conflict. Extend
+            # over newly occupied cells, but leave distant good geometry alone.
+            left = max(0, conflict-2)
+            while left and not grid.planning_free(route[left], empty):
+                left -= 1
+            right = min(len(route)-1, conflict+3)
+            while right < len(route)-1 and not grid.planning_free(route[right], empty):
+                right += 1
+            key = (route[left], route[right])
+            search = self.searches.get(key)
+            if search is None or not search.current(grid, forbidden):
+                search = KnownFreeSearch(*key)
+                if len(self.searches) >= 64:
+                    self.searches.pop(next(iter(self.searches)))
+                self.searches[key] = search
+            result = search.advance(grid, forbidden, budget)
+            if result.status != RouteSearchStatus.FOUND:
+                return RouteSearchResult(result.status, expanded=budget.used-used,
+                                         reason=result.reason)
+            route = route[:left]+result.path+route[right+1:]
+
+
 def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
                 inflated: Set[Cell],
                 blocked_edges: Optional[Set[DirectedEdge]] = None,
                 max_cost_cells: Optional[float] = None,
-                edge_allowed=None, max_expansions: Optional[int] = None) -> Optional[List[Cell]]:
+                edge_allowed=None, max_expansions: Optional[int] = None,
+                expansion_budget: Optional[ExpansionBudget] = None) -> Optional[List[Cell]]:
     if not grid.planning_free(start, inflated) or not grid.planning_free(goal, inflated):
         return None
     queue = [(0.0, 0.0, start)]
@@ -80,9 +244,11 @@ def astar_known(grid: ExplorationGrid, start: Cell, goal: Cell,
                 current = parents[current]
                 path.append(current)
             return list(reversed(path))
-        closed.add(current)
-        if max_expansions is not None and len(closed) > max_expansions:
+        if max_expansions is not None and len(closed) >= max_expansions:
             return None
+        if expansion_budget is not None and not expansion_budget.consume():
+            return None
+        closed.add(current)
         for dx, dy, step_cost in GRID_MOVES:
             nxt = (current[0] + dx, current[1] + dy)
             if (current, nxt) in forbidden:
@@ -220,10 +386,46 @@ def segment_known_free(grid: ExplorationGrid, first: Cell, second: Cell,
                        inflated: Set[Cell],
                        blocked_edges: Optional[Set[DirectedEdge]] = None) -> bool:
     cells = bresenham(first, second)
+    return adjacent_grid_path_is_valid(grid, cells, inflated, blocked_edges)
+
+
+def densified_reference_path(grid: ExplorationGrid, path: Sequence[Cell],
+                             inflated: Set[Cell],
+                             blocked_edges: Optional[Set[DirectedEdge]] = None,
+                             max_segment_cells: int = 1) -> Optional[List[Cell]]:
+    """Return a densified reference path, or None if any segment is blocked.
+
+    A sparse route polyline may join two distant points; sending that straight
+    segment to Local makes its departure/path search fail at a bend even when
+    the current pose is safe. Densify while preserving the original waypoints,
+    and reject the whole path if any original segment crosses non-free cells.
+    """
+    cells = [tuple(int(value) for value in cell) for cell in path]
+    if not cells:
+        return []
     if not all(grid.planning_free(cell, inflated) for cell in cells):
-        return False
-    forbidden = blocked_edges or set()
-    return all((a, b) not in forbidden for a, b in zip(cells[:-1], cells[1:]))
+        return None
+    step = max(1, int(max_segment_cells))
+    result = [cells[0]]
+    for first, second in zip(cells, cells[1:]):
+        if first == second:
+            continue
+        if not segment_known_free(grid, first, second, inflated, blocked_edges):
+            return None
+        # Choose waypoints from the checked raster. Rounded interpolation can
+        # change the raster on a second validation, even with an unchanged map.
+        raster = bresenham(first, second)
+        anchor = 0
+        while anchor < len(raster)-1:
+            end = min(anchor+step, len(raster)-1)
+            while end > anchor+1 and (
+                    math.dist(raster[anchor], raster[end]) > step or
+                    bresenham(raster[anchor], raster[end]) != raster[anchor:end+1]):
+                end -= 1
+            if raster[end] != result[-1]:
+                result.append(raster[end])
+            anchor = end
+    return result
 
 
 def simplify_known_path(grid: ExplorationGrid, path: Sequence[Cell],

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Static TF publisher to connect Go2 TF tree for RViz visualization."""
 
+import math
+import os
+import yaml
+from ament_index_python.packages import get_package_share_directory
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped
@@ -30,10 +35,15 @@ class Go2TFBridge(Node):
         lidar.header.stamp = self.get_clock().now().to_msg()
         lidar.header.frame_id = 'base'
         lidar.child_frame_id = 'go2/base/exploration_lidar'
-        lidar.transform.translation.x = 0.10
-        lidar.transform.translation.y = 0.0
-        lidar.transform.translation.z = 0.12
-        lidar.transform.rotation.w = 1.0
+        with open(os.path.join(get_package_share_directory('go2_description'),
+                               'config', 'mid360.yaml'), encoding='utf-8') as stream:
+            mount = yaml.safe_load(stream)['mount']
+        lidar.transform.translation.x = mount['x']
+        lidar.transform.translation.y = mount['y']
+        lidar.transform.translation.z = mount['z']
+        # Unitree Go2 kit has only a +13deg pitch mounting rotation.
+        lidar.transform.rotation.y = math.sin(mount['pitch'] / 2.)
+        lidar.transform.rotation.w = math.cos(mount['pitch'] / 2.)
         transforms.append(lidar)
         
         # Connect world to go2/odom (fixed at origin for now)

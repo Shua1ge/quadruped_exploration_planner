@@ -12,6 +12,59 @@
 namespace scan_planner
 {
 
+// Local may re-anchor a turn certificate, but cannot widen it or use a stale
+// pose, change the target, revive a deviation, or release a held execution.
+inline bool turnRefreshAcceptable(bool aligning,bool held,bool deviated,
+    int64_t now_ns,int64_t stamp_ns,int64_t previous_stamp,
+    double position_error,double target_error,double allowance,double old_allowance) {
+  return aligning && !held && !deviated && stamp_ns>previous_stamp &&
+      now_ns>=stamp_ns && now_ns-stamp_ns<=100000000LL &&
+      std::isfinite(position_error) && position_error<=.02 &&
+      std::isfinite(target_error) && std::abs(target_error)<=.001 &&
+      std::isfinite(allowance) && allowance>=.02 && allowance<=.10 &&
+      allowance<=old_allowance+1e-9;
+}
+inline double terminalApproachSpeed(double maximum,double terminal,
+    double remaining,double deceleration,double latency) {
+  if(terminal<=0.) return maximum;
+  if(!std::isfinite(terminal) || !std::isfinite(remaining) ||
+     !std::isfinite(deceleration) || deceleration<=0. || !std::isfinite(latency) || latency<0.) return 0.;
+  const double response=deceleration*latency;
+  const double bound=std::sqrt(response*response+terminal*terminal+
+      2.*deceleration*std::max(0.,remaining))-response;
+  return std::min(maximum,std::max(terminal,bound));
+}
+
+// A timer or stale HOLD cannot certify rest. Waiting consumes no candidate.
+struct TaskTransitionRestGate {
+  int settled_samples{0};
+  int64_t last_pose_stamp{0};
+  bool observe(bool hold_confirmed, bool fresh, double speed, double yaw_rate,
+               int64_t pose_stamp) {
+    if (!hold_confirmed || !fresh || !std::isfinite(speed) ||
+        !std::isfinite(yaw_rate) || speed > .05 || std::abs(yaw_rate) > .10) {
+      settled_samples = 0; return false;
+    }
+    if (pose_stamp > last_pose_stamp) {
+      last_pose_stamp = pose_stamp; ++settled_samples;
+    }
+    return settled_samples >= 3;
+  }
+};
+
+// Candidate replacement cannot erase an unfinished certified turn. Ordinary
+// moving tracking still uses its existing hysteresis; interrupted alignment
+// must settle at the newly certified pose before translation resumes.
+inline bool handoffNeedsHeadingAlignment(bool certified, bool fixed_yaw,
+    bool unfinished_alignment, double speed, double heading_error,
+    double tracking_release_threshold) {
+  if(!certified || fixed_yaw) return false;
+  if(unfinished_alignment) return true;
+  return std::isfinite(speed) && std::isfinite(heading_error) &&
+      (speed<=.05 || std::abs(heading_error)>tracking_release_threshold) &&
+      std::abs(heading_error)>.05;
+}
+
 inline bool headingFreezeRequired(bool frozen, double error,
     double enter_threshold, double exit_threshold)
 {
@@ -115,6 +168,7 @@ struct ExecutionProgressBudget
   uint64_t task_version{0};
   uint32_t replacements_used{0};
   int64_t last_stalled_trajectory{0};
+  bool exhausted{false};
 
   void ensureContext(bool task_mode, uint64_t request,
                      uint64_t task, uint64_t version)
@@ -134,11 +188,12 @@ struct ExecutionProgressBudget
     task_version = use_task_scope ? version : 0;
     replacements_used = 0;
     last_stalled_trajectory = 0;
+    exhausted = false;
   }
 
   bool isDuplicateStall(int64_t trajectory) const
   {
-    return trajectory == last_stalled_trajectory;
+    return exhausted || trajectory == last_stalled_trajectory;
   }
 
   ExecutionProgressBudgetResult recordStall(
@@ -148,28 +203,54 @@ struct ExecutionProgressBudget
       return ExecutionProgressBudgetResult::DUPLICATE_STALL;
     last_stalled_trajectory = trajectory;
     if (replacements_used >= replacement_limit)
+    {
+      exhausted = true;
       return ExecutionProgressBudgetResult::EXHAUSTED;
+    }
     ++replacements_used;
     return ExecutionProgressBudgetResult::REPLACEMENT_RESERVED;
   }
 };
 
-// Shared by calibrated-gait execution and candidate certification. The
-// bounded horizon also handles stationary spline tails without a full scan.
+// Shared distance lookahead for calibrated gait and certification. Retiming
+// can make two seconds span only millimetres; steering to such a point from
+// drifting odometry invents a lateral/backward turn. Bound sample count, not
+// temporal reach, so a real forward target survives a slow initial prefix.
+// Monotonic physical progress. Reference-clock age, speed limits and gait
+// command floors do not advance a body that has not actually moved.
+template <typename SamplePosition>
+inline double measuredTrajectoryProgress(double progress,double duration,
+    const Eigen::Vector3d& actual,SamplePosition sample) {
+  const double begin=std::clamp(progress,0.,duration);
+  const double end=std::min(duration,begin+2.);
+  double best=begin,error=(sample(begin)-actual).head(2).squaredNorm();
+  for(double t=begin;t<=end+1e-9;t+=.05) {
+    const double at=std::min(t,end),distance=(sample(at)-actual).head(2).squaredNorm();
+    if(distance<error) {best=at;error=distance;}
+  }
+  if((sample(end)-actual).head(2).squaredNorm()<error) best=end;
+  return best;
+}
+
 template <typename SamplePosition>
 inline double forwardGaitLookaheadTime(
     double progress, double duration, SamplePosition sample)
 {
   double target = std::clamp(progress, 0.0, duration);
-  const double end = std::min(duration, target + 2.0);
-  Eigen::Vector3d previous = sample(target);
+  const double end = duration;
+  const double step = std::max(0.05, (end-target)/256.0);
+  const Eigen::Vector3d origin = sample(target);
+  Eigen::Vector3d previous = origin;
   double length = 0.0;
-  while (target < end && length < 0.15)
+  for (int i=0; i<256 && target<end; ++i)
   {
-    target = std::min(end, target + 0.05);
+    target = std::min(end, target + step);
     const Eigen::Vector3d point = sample(target);
     length += (point - previous).head<2>().norm();
     previous = point;
+    // Arc length alone can be a small loop. A useful heading also needs
+    // a chord larger than tracking/installation noise.
+    if (length >= 0.15 && (point-origin).head<2>().norm() >= 0.10) break;
   }
   return target;
 }
@@ -541,10 +622,11 @@ inline bool safetyLatchAllowsPlanning(
 
 inline bool shouldStartStoppedLocalRepair(
     bool repair_pending, bool have_target, double planar_speed,
-    bool pose_occupied_latched, bool temporal_safety_latched)
+    bool pose_occupied_latched, bool temporal_safety_latched, double yaw_rate=0.)
 {
   return repair_pending && have_target && std::isfinite(planar_speed) &&
-         planar_speed <= 0.05 && !pose_occupied_latched &&
+         planar_speed <= 0.05 && std::isfinite(yaw_rate) && std::abs(yaw_rate)<=.10 &&
+         !pose_occupied_latched &&
          !temporal_safety_latched;
 }
 
@@ -560,9 +642,10 @@ inline bool newPlanMayReleaseSafetyStop(
 inline bool brakingHoldMayReleaseAfterStop(
     double planar_speed, int consecutive_stopped_cycles,
     int required_stopped_cycles, bool pose_occupied_latched,
-    bool planning_clearance_blocked)
+    bool planning_clearance_blocked, double yaw_rate = 0.)
 {
   return std::isfinite(planar_speed) && planar_speed <= 0.05 &&
+         std::isfinite(yaw_rate) && std::abs(yaw_rate)<=.10 &&
          required_stopped_cycles > 0 &&
          consecutive_stopped_cycles >= required_stopped_cycles &&
          !pose_occupied_latched && !planning_clearance_blocked;
@@ -784,6 +867,44 @@ inline TrackingDeviationAction classifyTrackingDeviation(
       odometry_progress < minimum_progress)
     return TrackingDeviationAction::KEEP_EXECUTING;
   return TrackingDeviationAction::ROLLING_REPLAN;
+}
+
+// A conversion may finish anywhere in this region only when Local has
+// certified the entire region and the next departure. Drift outside it is
+// failure, never permission to keep driving or turn toward the old point.
+constexpr double kForwardStageCaptureRadius=.15;
+constexpr double kForwardStageCrossTrackBound=.08;
+constexpr double kForwardStageOvershootBound=.10;
+constexpr double kForwardStageYawBound=.10;
+struct ForwardStageState {
+  double progress{0.}, remaining{0.}, cross_track{0.}, error{0.};
+  const char* failure{nullptr};
+  bool brake{false};
+};
+inline ForwardStageState forwardStageState(const Eigen::Vector2d& start,
+    const Eigen::Vector2d& goal,const Eigen::Vector2d& position,double fixed_yaw,
+    double measured_yaw,double speed,double stop_latency,double deceleration)
+{
+  ForwardStageState out;
+  const Eigen::Vector2d delta=goal-start;
+  const double length=delta.norm();
+  if(!start.allFinite() || !goal.allFinite() || !position.allFinite() ||
+      !std::isfinite(fixed_yaw) || !std::isfinite(measured_yaw) || length<.01 ||
+      !std::isfinite(speed) || speed<0. || !std::isfinite(stop_latency) || stop_latency<0. ||
+      !std::isfinite(deceleration) || deceleration<=0.) {
+    out.failure="FORWARD_STAGE_INVALID_STATE";return out;
+  }
+  const Eigen::Vector2d direction=delta/length;
+  const Eigen::Vector2d left(-direction.y(),direction.x());
+  out.progress=(position-start).dot(direction);out.remaining=length-out.progress;
+  out.cross_track=(position-start).dot(left);out.error=(position-goal).norm();
+  if(-out.remaining>kForwardStageOvershootBound) out.failure="FORWARD_STAGE_OVERSHOOT";
+  else if(std::abs(out.cross_track)>kForwardStageCrossTrackBound) out.failure="FORWARD_STAGE_CROSS_TRACK_DRIFT";
+  else if(std::abs(std::remainder(measured_yaw-fixed_yaw,2.*M_PI))>kForwardStageYawBound) out.failure="FORWARD_STAGE_HEADING_DRIFT";
+  else if(out.progress<-.05) out.failure="FORWARD_STAGE_REGRESSION";
+  const double stop_distance=speed*stop_latency+speed*speed/(2.*deceleration);
+  out.brake=out.remaining<=stop_distance+.01 || out.error<=.03;
+  return out;
 }
 
 inline double calibratedForwardGaitCommand(
@@ -1116,6 +1237,51 @@ inline double normalizePlanarAngle(double angle)
   return std::remainder(angle, 2.0 * M_PI);
 }
 
+// The installation allowance is covered by Local's expanded sweep margin.
+// A stale certificate is a changed initial state, not a failed viewpoint.
+constexpr double kHandoffPositionAllowance = 0.02;
+// A turn may have bounded gait translation only when Local certifies this
+// entire additional footprint envelope. Installation still uses 0.02 m.
+constexpr double kHandoffTurnPositionAllowance = 0.10;
+constexpr double kHandoffYawAllowance = 0.02;
+// Initial stopped alignment completes before translation; Local covers this residual in its sweep.
+constexpr double kHandoffAlignmentTolerance = 0.05;
+constexpr double kMaxCertifiedAlignmentTolerance = 0.12;
+inline bool validCertifiedAlignmentTolerance(double tolerance)
+{
+  return std::isfinite(tolerance) && tolerance >= kHandoffAlignmentTolerance &&
+      tolerance <= kMaxCertifiedAlignmentTolerance;
+}
+
+// Prepare a moving successor before the certified prefix is exhausted.
+// Observation stations and zero-speed conversions keep their rest contract.
+inline bool shouldPrepareRollingSuccessor(double elapsed, double remaining,
+    double terminal_speed, double prepare_time, bool observation_station)
+{
+  return !observation_station && std::isfinite(elapsed) && elapsed >= .2 &&
+      std::isfinite(remaining) && remaining > 0. && remaining <= prepare_time &&
+      std::isfinite(terminal_speed) && terminal_speed > .05;
+}
+inline const char* handoffCertificateFailure(bool certified, double matched_time,
+    double duration, const Eigen::Vector3d& certified_position,
+    const Eigen::Vector3d& actual_position, double certified_yaw,
+    double actual_yaw, double certified_target_yaw, double actual_target_yaw)
+{
+  if (!certified) return "HANDOFF_CERTIFICATE_MISSING";
+  if (!std::isfinite(matched_time) || !std::isfinite(duration) ||
+      matched_time < 0.0 || matched_time > duration ||
+      !certified_position.allFinite() || !actual_position.allFinite() ||
+      !std::isfinite(certified_yaw) || !std::isfinite(actual_yaw) ||
+      !std::isfinite(certified_target_yaw) || !std::isfinite(actual_target_yaw))
+    return "HANDOFF_CERTIFICATE_INVALID";
+  if ((certified_position-actual_position).head<2>().norm() > kHandoffPositionAllowance ||
+      std::abs(normalizePlanarAngle(certified_yaw-actual_yaw)) > kHandoffYawAllowance)
+    return "HANDOFF_CERTIFICATE_STATE_CHANGED";
+  if (std::abs(normalizePlanarAngle(certified_target_yaw-actual_target_yaw)) > kHandoffYawAllowance)
+    return "HANDOFF_CERTIFICATE_HEADING_CHANGED";
+  return nullptr;
+}
+
 inline int planarHandoffSweepSampleCount(
     double translation_distance, double yaw_delta,
     double translation_step, double yaw_step)
@@ -1221,6 +1387,58 @@ inline Eigen::Vector3d projectForwardVelocityToPath(
 inline bool sampledSuffixIsReusable(size_t sample_count, double arc_length)
 {
   return sample_count >= 2 && std::isfinite(arc_length) && arc_length > 1e-4;
+}
+
+// Extend a candidate's prefix by measured planning travel in METRES. Convert
+// through sampled arc length, never by adding distance to spline time. Prefix
+// order is retained; the caller still certifies the connector and entry motion.
+inline double planningTravelMatchEnd(double base_forward_time, double duration,
+    double travel_distance, const std::function<Eigen::Vector3d(double)>& sample,
+    double sample_dt = 0.02)
+{
+  if (!std::isfinite(base_forward_time) || !std::isfinite(duration) ||
+      !std::isfinite(travel_distance) || !std::isfinite(sample_dt) ||
+      duration < 0.0 || sample_dt <= 0.0 || !sample) return 0.0;
+  const double begin = std::clamp(base_forward_time, 0.0, duration);
+  if (travel_distance <= 0.0) return begin;
+  Eigen::Vector3d previous = sample(begin);
+  double arc = 0.0;
+  for (double t = begin; t < duration;)
+  {
+    const double next = std::min(t + sample_dt, duration);
+    const Eigen::Vector3d point = sample(next);
+    if (!point.allFinite() || !previous.allFinite()) return begin;
+    arc += (point - previous).head<2>().norm();
+    if (arc >= travel_distance) return next;
+    previous = point; t = next;
+  }
+  return duration;
+}
+
+// Find the nearest point in this candidate's bounded prefix, including the
+// exact endpoint. No predecessor progress is transplanted onto a new curve.
+inline double nearestTimeInWindow(
+    double window_start, double window_end, double duration,
+    const std::function<Eigen::Vector3d(double)>& sample, double sample_dt,
+    const Eigen::Vector2d& position)
+{
+  if (!std::isfinite(window_start) || !std::isfinite(window_end) ||
+      !std::isfinite(duration) || !std::isfinite(sample_dt) ||
+      sample_dt <= 0.0 || duration < 0.0 || !position.allFinite() || !sample)
+    return 0.0;
+  const double begin = std::clamp(window_start, 0.0, duration);
+  const double end = std::clamp(std::max(window_start, window_end), begin, duration);
+  double best_time = begin;
+  double best = std::numeric_limits<double>::infinity();
+  for (double t = begin; t <= end + 1e-9; t += sample_dt)
+  {
+    const double sample_time = std::min(t, end);
+    const double error2 = (sample(sample_time).head<2>() - position).squaredNorm();
+    if (error2 < best) { best = error2; best_time = sample_time; }
+  }
+  if (end - begin > 1e-9 && (sample(end).head<2>() - position).squaredNorm() < best)
+    best_time = end;
+  return best_time;
 }
 
 inline bool shouldAcceptTrajectoryVersion(

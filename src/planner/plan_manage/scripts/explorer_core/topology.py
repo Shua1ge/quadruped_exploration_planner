@@ -205,7 +205,7 @@ def oracle_metrics(occupancy: np.ndarray, resolution: float,
     """Compare sparse graph queries with the existing known-free dense A*."""
     values = np.asarray(occupancy, dtype=np.int16)
     grid = ExplorationGrid(
-        values.shape[1] * resolution, values.shape[0] * resolution,
+        np.nextafter(values.shape[1] * resolution, 0.0), np.nextafter(values.shape[0] * resolution, 0.0),
         resolution, 0.0, 0.0)
     grid.data[:, :] = np.where(values == FREE, FREE,
                                np.where(values == OCCUPIED, OCCUPIED, UNKNOWN))
@@ -243,3 +243,79 @@ def oracle_metrics(occupancy: np.ndarray, resolution: float,
         "mean_cost_error": float(np.mean(errors)) if errors else 0.0,
         "max_cost_error": float(max(errors)) if errors else 0.0,
     }
+
+
+def routing_oracle_metrics(occupancy, resolution, graph, max_queries=8,
+                          origin=(0., 0.), attachment_radius=3.0):
+    """Probe actual query/attachment/realization from independent free cells.
+
+    No dense rescue is credited to the graph. Misses and unsafe polylines are
+    counted. Empty cohorts have no recall rather than a fabricated 100%.
+    Graph cells use the world lattice; origin applies to the dense array only.
+    """
+    from .grid import bresenham
+    from .path_planning import adjacent_grid_path_is_valid, segment_known_free
+    from .sparse_routing import SparseRouteGraph, SparseNode, SparseEdge
+    values = np.asarray(occupancy, dtype=np.int8)
+    grid = ExplorationGrid(np.nextafter(values.shape[1]*resolution, 0.0), np.nextafter(values.shape[0]*resolution, 0.0),
+                           resolution, *origin)
+    grid.data[:] = values
+    router = SparseRouteGraph()
+    def world(cell):
+        return ((cell[0]+.5)*resolution, (cell[1]+.5)*resolution)
+    for n in graph.nodes.values():
+        router.upsert_node(SparseNode(n.node_id, world(n.cell), n.clearance))
+    for e in graph.edges.values():
+        router.upsert_edge(SparseEdge(e.edge_id, e.source_id, e.target_id,
+            e.length, e.minimum_clearance, tuple(world(c) for c in e.cells)))
+    free = np.argwhere(values == FREE)
+    pairs = []
+    if len(free) >= 2 and max_queries > 0:
+        # The extent pair exposes coverage loss; seeded independent samples
+        # exercise interiors, rather than selecting existing graph nodes.
+        pairs.append((free[0], free[-1]))
+        rng = np.random.default_rng(0)
+        for _ in range(max_queries-1):
+            indices = rng.choice(len(free), 2, replace=False)
+            pairs.append((free[indices[0]], free[indices[1]]))
+    dense_connected = estimate_hits = validated = false_positives = matched = 0
+    graph_hits = graph_validated = direct_validated = 0
+    errors = []
+    def connector(a,b):
+        return (segment_known_free(grid, grid.world_to_cell(*a), grid.world_to_cell(*b), set())
+                and segment_known_free(grid, grid.world_to_cell(*b), grid.world_to_cell(*a), set()))
+    for a,b in pairs:
+        source, target = (int(a[1]), int(a[0])), (int(b[1]), int(b[0]))
+        dense = astar_known(grid, source, target, set())
+        dense_connected += bool(dense)
+        estimate = router.batch_estimates(grid.cell_to_world(source),
+            [grid.cell_to_world(target)], attachment_radius, 8, connector)[0]
+        if estimate is None:
+            continue
+        estimate_hits += 1
+        graph_hits += estimate.route_source == "graph"
+        cells = []
+        vertices = [grid.world_to_cell(*p) for p in estimate.polyline]
+        for p,q in zip(vertices, vertices[1:]):
+            cells.extend(bresenham(p,q)[:-1])
+        if vertices:
+            cells.append(vertices[-1])
+        valid = (bool(cells) and cells[0] == source and cells[-1] == target
+                 and adjacent_grid_path_is_valid(grid,cells,set(),set()))
+        validated += valid
+        graph_validated += valid and estimate.route_source == "graph"
+        direct_validated += valid and estimate.route_source == "direct_connector"
+        false_positives += not valid or not dense
+        if valid and dense:
+            matched += 1
+            cost = path_length_cells(dense, resolution)
+            errors.append(abs(estimate.distance-cost)/max(cost,resolution))
+    return dict(queries=len(pairs), dense_connected=dense_connected,
+        graph_connected=graph_validated, graph_estimate_hits=graph_hits,
+        graph_validated_routes=graph_validated, query_estimate_hits=estimate_hits,
+        query_validated_routes=validated, direct_connector_routes=direct_validated,
+        connectivity_recall=matched/dense_connected if dense_connected else None,
+        false_positive_rate=false_positives/estimate_hits if estimate_hits else None,
+        mean_cost_error=float(np.mean(errors)) if errors else None,
+        max_cost_error=max(errors) if errors else None,
+        oracle_endpoint_sampling="free_cells", oracle_representation="published_query_graph")

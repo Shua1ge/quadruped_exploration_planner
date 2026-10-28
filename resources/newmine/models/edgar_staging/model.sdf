@@ -1,0 +1,23 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+    <model name="Edgar Mine Virtual STIX Staging">
+        <static>true</static>
+        <link name="link">
+            <pose>0 0 0 1.5707 0 0</pose>
+            <collision name="starting_area_collision">
+                <geometry>
+                    <mesh>
+                        <uri>meshes/Edgar_StartingArea.DAE</uri>
+                    </mesh>
+                </geometry>
+            </collision>
+            <visual name="starting_area_visual">
+                <geometry>
+                    <mesh>
+                        <uri>meshes/Edgar_StartingArea.DAE</uri>
+                    </mesh>
+                </geometry>
+            </visual>
+        </link>
+    </model>
+</sdf>

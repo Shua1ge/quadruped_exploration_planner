@@ -1,10 +1,17 @@
-# 普通探索默认策略：stateful Parkour MoE
+# 可选策略：stateful Parkour MoE（普通探索已回退 legacy）
+
+2026-10-12：普通探索、run.launch.py 和直接启动的运动监督器默认改为
+`locomotion_policy=legacy`，读取原文件
+`/home/t1an/ros2_ws/scan_planner_ws/parkour_moe_full_model.onnx`。
+新模型及其配套 actor 保留；需要测试时显式选择 `parkour_moe_stateful`。
+这是策略选择回退，不是机器人动力学、控制循环或整套代码的历史回滚。
+运动合同检查见 `docs/LOCOMOTION_CONTRACT_AUDIT_ZH.md`。
 
 `parkour_moe_full_stateful.onnx` 是用户提供的 estimator 与 actor 的组合图；
 `actor.onnx` 原样取自用户的 `policies.zip`。它们是一对资源，不可独立换版本。
 两者随 scan_planner 的 config 目录安装，不再依赖微信附件位置或测试输出目录。
 
-Go2LocomotionSupervisor 默认 `locomotion_policy=parkour_moe_stateful`，
+显式选择 `locomotion_policy=parkour_moe_stateful` 时，Go2LocomotionSupervisor
 使用 go2_stateful_policy.py 的运行时。actor 按原 policy_dt=0.02 s 运行，
 完整模型每五个已处理的 actor 步刷新 estimator、MCP 与 64 维状态；
 其余步用缓存 MCP 和当前 obs 调用配套 actor。推理放在原来的工作线程，
@@ -17,14 +24,15 @@ Go2LocomotionSupervisor 默认 `locomotion_policy=parkour_moe_stateful`，
 
 当前接入是已在 Gazebo 平地测试过的盲走方式：vision_flag=0、深度为零，
 沿用已有 45 维观测、关节顺序、action_scale=0.25、kp=40、kd=1。
-用户尚未提供新训练/部署配置；此版本不宣称已经接通视觉地形输入。
+用户后来提供了部署 YAML 和脚本；原 MuJoCo 物理模型仍需对照。
+此版本不宣称已经接通视觉地形输入。
 0.15 m/s 是此前平地测试最低通过的命令档，不是矿洞可靠运动下限。
-本次保留 0.30 m/s 命令下限；普通探索入口把该档的有效速度标定由旧策略的
+选择新策略时，受限/恢复轨迹保留 0.30 m/s 命令档；入口把该档的有效速度标定由旧策略的
 0.165 更新为新策略实测约 0.252 的 0.25 m/s，用于样条重定时和跟踪换算。
 制动认证仍使用更保守的 0.30 命令档；不修改 Explorer/Global/SCAN 算法。
 legacy 回退继续读取原 YAML 的 0.165 标定。
 
-原探索命令继续使用，rl_effort 默认选择本策略。显式选择或回退：
+原探索命令继续使用，rl_effort 默认选择 legacy。显式选择新策略或旧策略：
 
 ```bash
 SCAN_ROS_DOMAIN_ID=43 /home/t1an/ros2_ws/scan_planner_ws/launch_exploration.sh \

@@ -1,0 +1,602 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.9">
+  <world name="virtual_stix_geometry">
+    <gravity>0 0 -9.81</gravity>
+    <physics name="2ms_rl_policy" type="ode">
+      <max_step_size>0.002</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>500</real_time_update_rate>
+    </physics>
+    <scene>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.34 0.39 0.43 1</background>
+      <grid>true</grid>
+      <shadows>true</shadows>
+    </scene>
+    <plugin name="ignition::gazebo::systems::Physics" filename="ignition-gazebo-physics-system" />
+    <plugin name="ignition::gazebo::systems::UserCommands" filename="ignition-gazebo-user-commands-system" />
+    <plugin name="ignition::gazebo::systems::SceneBroadcaster" filename="ignition-gazebo-scene-broadcaster-system" />
+    <plugin name="ignition::gazebo::systems::Sensors" filename="ignition-gazebo-sensors-system">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin name="ignition::gazebo::systems::Imu" filename="ignition-gazebo-imu-system" />
+    <plugin name="ignition::gazebo::systems::ApplyLinkWrench" filename="ignition-gazebo-apply-link-wrench-system" />
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic" />
+    <model name="edgar_staging">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 0 1.5707 -0 0</pose>
+        <collision name="starting_area_collision">
+          <geometry>
+            <mesh>
+              <uri>model://edgar_staging/meshes/Edgar_StartingArea.DAE</uri>
+            </mesh>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>1.2</mu>
+                <mu2>1.2</mu2>
+                <slip1>0.0</slip1>
+                <slip2>0.0</slip2>
+              </ode>
+            </friction>
+            <contact>
+              <collide_without_contact>false</collide_without_contact>
+              <ode>
+                <soft_cfm>0.0</soft_cfm>
+                <soft_erp>0.2</soft_erp>
+                <kp>1000000.0</kp>
+                <kd>100.0</kd>
+                <max_vel>0.05</max_vel>
+                <min_depth>0.001</min_depth>
+              </ode>
+            </contact>
+          </surface>
+        </collision>
+        <visual name="starting_area_visual">
+          <geometry>
+            <mesh>
+              <uri>model://edgar_staging/meshes/Edgar_StartingArea.DAE</uri>
+            </mesh>
+          </geometry>
+        </visual>
+        <inertial>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
+          <inertia>
+            <ixx>1</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>1</iyy>
+            <iyz>0</iyz>
+            <izz>1</izz>
+          </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <pose>117 0 0.455351 0 0 -1.92335</pose>
+      <self_collide>false</self_collide>
+    </model>
+    <model name="staging_safety_rails">
+      <static>true</static>
+      <link name="rails">
+        <collision name="rear_collision">
+          <pose>-4 0 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.20 8.0 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="rear_visual">
+          <pose>-4 0 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.20 8.0 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+        <collision name="north_collision">
+          <pose>2 4 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.0 0.20 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="north_visual">
+          <pose>2 4 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.0 0.20 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+        <collision name="south_collision">
+          <pose>2 -4 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.0 0.20 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="south_visual">
+          <pose>2 -4 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>12.0 0.20 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+        <collision name="front_north_collision">
+          <pose>8 2.75 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.20 2.50 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="front_north_visual">
+          <pose>8 2.75 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.20 2.50 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+        <collision name="front_south_collision">
+          <pose>8 -2.75 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.20 2.50 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="front_south_visual">
+          <pose>8 -2.75 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.20 2.50 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+        <collision name="portal_throat_north_collision">
+          <pose>9.75 1.50 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>3.50 0.20 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="portal_throat_north_visual">
+          <pose>9.75 1.50 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>3.50 0.20 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+        <collision name="portal_throat_south_collision">
+          <pose>9.75 -1.50 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>3.50 0.20 1.10</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="portal_throat_south_visual">
+          <pose>9.75 -1.50 0.55 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>3.50 0.20 1.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.32 0.28 0.20 1</ambient>
+            <diffuse>0.42 0.36 0.24 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+    <model name="edgar1">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 0 1.5707 -0 0</pose>
+        <collision name="section_01_collision">
+          <geometry>
+            <mesh>
+              <uri>model://edgar1/meshes/Edgar_Section_01.DAE</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="section_01_visual">
+          <geometry>
+            <mesh>
+              <uri>model://edgar1/meshes/Edgar_Section_01.DAE</uri>
+            </mesh>
+          </geometry>
+        </visual>
+        <inertial>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
+          <inertia>
+            <ixx>1</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>1</iyy>
+            <iyz>0</iyz>
+            <izz>1</izz>
+          </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>19.033200 -51.688900 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <pose>117 0 0.455351 0 0 -1.92335</pose>
+      <self_collide>false</self_collide>
+    </model>
+    <model name="edgar2">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 0 1.5707 -0 0</pose>
+        <collision name="section_02_collision">
+          <geometry>
+            <mesh>
+              <uri>model://edgar2/meshes/Edgar_Section_02.DAE</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="section_02_visual">
+          <geometry>
+            <mesh>
+              <uri>model://edgar2/meshes/Edgar_Section_02.DAE</uri>
+            </mesh>
+          </geometry>
+        </visual>
+        <inertial>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
+          <inertia>
+            <ixx>1</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>1</iyy>
+            <iyz>0</iyz>
+            <izz>1</izz>
+          </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>0.479761 -60.302100 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-12.414900 -70.922100 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <pose>117 0 0.455351 0 0 -1.92335</pose>
+      <self_collide>false</self_collide>
+    </model>
+    <model name="edgar3">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 0 1.5707 -0 0</pose>
+        <collision name="section_03_collision">
+          <geometry>
+            <mesh>
+              <uri>model://edgar3/meshes/Edgar_Section_03.DAE</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="section_03_visual">
+          <geometry>
+            <mesh>
+              <uri>model://edgar3/meshes/Edgar_Section_03.DAE</uri>
+            </mesh>
+          </geometry>
+        </visual>
+        <inertial>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
+          <inertia>
+            <ixx>1</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>1</iyy>
+            <iyz>0</iyz>
+            <izz>1</izz>
+          </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-29.885100 -83.034300 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <pose>117 0 0.455351 0 0 -1.92335</pose>
+      <self_collide>false</self_collide>
+    </model>
+    <model name="edgar4">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 0 1.5707 -0 0</pose>
+        <collision name="section_04_collision">
+          <geometry>
+            <mesh>
+              <uri>model://edgar4/meshes/Edgar_Section_04.DAE</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="section_04_visual">
+          <geometry>
+            <mesh>
+              <uri>model://edgar4/meshes/Edgar_Section_04.DAE</uri>
+            </mesh>
+          </geometry>
+        </visual>
+        <inertial>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
+          <inertia>
+            <ixx>1</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>1</iyy>
+            <iyz>0</iyz>
+            <izz>1</izz>
+          </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-65.584700 -84.306900 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-79.104700 -48.958500 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <pose>117 0 0.455351 0 0 -1.92335</pose>
+      <self_collide>false</self_collide>
+    </model>
+    <model name="edgar5">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 0 1.5707 -0 0</pose>
+        <collision name="section_05_collision">
+          <geometry>
+            <mesh>
+              <uri>model://edgar5/meshes/Edgar_Section_05.DAE</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="section_05_visual">
+          <geometry>
+            <mesh>
+              <uri>model://edgar5/meshes/Edgar_Section_05.DAE</uri>
+            </mesh>
+          </geometry>
+        </visual>
+        <inertial>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
+          <inertia>
+            <ixx>1</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>1</iyy>
+            <iyz>0</iyz>
+            <izz>1</izz>
+          </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-63.967200 -16.918000 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-46.721700 -12.286900 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-30.184800 -5.169870 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <plugin name="ignition::gazebo::systems::PerformerDetector" filename="libignition-gazebo-performer-detector-system.so">
+        <topic>/subt_performer_detector</topic>
+        <pose>-9.462700 0.133511 0 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>10 10 10</size>
+          </box>
+        </geometry>
+        <header_data>
+          <key>type</key>
+          <value>decision</value>
+        </header_data>
+      </plugin>
+      <pose>117 0 0.455351 0 0 -1.92335</pose>
+      <self_collide>false</self_collide>
+    </model>
+    <light name="sun" type="directional">
+      <pose>0 0 100 0 -0 0</pose>
+      <cast_shadows>true</cast_shadows>
+      <intensity>1</intensity>
+      <direction>0.5 0.1 -0.9</direction>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>10</range>
+        <linear>1</linear>
+        <constant>1</constant>
+        <quadratic>0</quadratic>
+      </attenuation>
+      <spot>
+        <inner_angle>0</inner_angle>
+        <outer_angle>0</outer_angle>
+        <falloff>0</falloff>
+      </spot>
+    </light>
+    <model name="tunnel_cap_edgar1_to_10">
+      <static>true</static>
+      <pose>64.3200 -4.9200 4.0000 0 0 -1.518436</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.800 10.000 10.000</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.800 10.000 10.000</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.18 0.16 0.13 1</ambient>
+            <diffuse>0.25 0.22 0.18 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+    <model name="tunnel_cap_edgar5_to_6">
+      <static>true</static>
+      <pose>125.1633 7.6707 4.0000 0 0 -0.419752</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.800 10.000 10.000</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.800 10.000 10.000</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.18 0.16 0.13 1</ambient>
+            <diffuse>0.25 0.22 0.18 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <algorithm>
@@ -35,7 +36,9 @@ struct LocalTaskCandidate {
   bool observation_station = false;
 };
 
-// A departure is rotate-then-drive, never a fixed-yaw lateral displacement.
+// Certify one specific rotate-then-drive action, not all possible departures.
+// The caller compares it with a fixed-yaw staging action. Left/right recovery
+// retains its separate physical-family budget and execution contract.
 // The callback supplies the same footprint/margin semantics as final validation.
 inline bool taskDepartureCertified(const Eigen::Vector2d& start, double measured_yaw,
     double departure_yaw, double stopping_distance,
@@ -56,6 +59,227 @@ inline bool taskDepartureCertified(const Eigen::Vector2d& start, double measured
     if(!footprint_safe(start+direction*(stopping_distance*i/steps),departure_yaw)) return false;
   return true;
 }
+
+// A narrow departure may be able to drive before it can rotate. The finite
+// staging positions preserve measured yaw, then certify the required turn
+// and its forward braking at the new position. No free point alone qualifies.
+inline std::optional<Eigen::Vector2d> taskForwardTurnStage(
+    const Eigen::Vector2d& start,double yaw,const Eigen::Vector2d& goal,
+    double stopping_distance,
+    const std::function<bool(const Eigen::Vector2d&,double)>& safe,
+    const std::function<bool(const Eigen::Vector2d&,double)>& turn_safe={}) {
+  if(!start.allFinite() || !goal.allFinite() || !std::isfinite(yaw) || !safe)
+    return std::nullopt;
+  const Eigen::Vector2d forward(std::cos(yaw),std::sin(yaw));
+  for(double distance : {.4,.8,1.2}) {
+    const Eigen::Vector2d stage=start+distance*forward;
+    const Eigen::Vector2d delta=goal-stage;
+    if(delta.norm()<.20) continue;
+    // Include ability to stop at the end of the incoming straight segment.
+    if(!taskDepartureCertified(start,yaw,yaw,distance+stopping_distance,safe)) continue;
+    bool can_turn=true;
+    // Cover early capture and settling around the planned stopping point.
+    // The actual stopped pose will still need a new handoff certificate.
+    for(double offset : {-.15,0.,.15}) {
+      const Eigen::Vector2d stop=stage+offset*forward;
+      const Eigen::Vector2d outgoing=goal-stop;
+      if(!taskDepartureCertified(stop,yaw,std::atan2(outgoing.y(),outgoing.x()),
+                                 stopping_distance,turn_safe ? turn_safe : safe)) {can_turn=false;break;}
+    }
+    if(can_turn) return stage;
+  }
+  return std::nullopt;
+}
+
+enum class TaskDepartureKind { DIRECT, FORWARD_STAGE };
+
+struct TaskDeparturePlan {
+  TaskDepartureKind kind{TaskDepartureKind::DIRECT};
+  Eigen::Vector2d target{Eigen::Vector2d::Zero()};
+  Eigen::Vector2d objective{Eigen::Vector2d::Zero()};
+  double body_yaw{0.};
+};
+
+// Geometry chooses an action before spline generation. A failed direct turn
+// does not reject its objective when a certified straight conversion exists.
+inline std::optional<TaskDeparturePlan> taskPlanDeparture(
+    const Eigen::Vector2d& start,double yaw,const Eigen::Vector2d& objective,
+    double stopping_distance,
+    const std::function<bool(const Eigen::Vector2d&,double)>& safe,
+    const std::function<bool(const Eigen::Vector2d&,double)>& turn_safe={}) {
+  if(!start.allFinite() || !objective.allFinite() ||
+      (objective-start).norm()<.20 || !std::isfinite(yaw)) return std::nullopt;
+  const Eigen::Vector2d direction=objective-start;
+  if(taskDepartureCertified(start,yaw,std::atan2(direction.y(),direction.x()),
+      stopping_distance,turn_safe ? turn_safe : safe))
+    return TaskDeparturePlan{TaskDepartureKind::DIRECT,objective,objective,yaw};
+  const auto stage=taskForwardTurnStage(start,yaw,objective,stopping_distance,safe,turn_safe);
+  if(stage) return TaskDeparturePlan{TaskDepartureKind::FORWARD_STAGE,*stage,objective,yaw};
+  return std::nullopt;
+}
+
+struct TaskTerminalExit {
+  TaskDepartureKind kind{TaskDepartureKind::DIRECT};
+  Eigen::Vector2d waypoint{Eigen::Vector2d::Zero()};
+  double departure_yaw{0.};
+};
+
+// A station needs one coherent exit over its capture band, not every possible
+// future heading. Prefer the supplied route connection; if it needs a turn,
+// compare a straight-then-turn conversion before other bounded exits. This is
+// geometry evidence only: every actual successor still needs fresh validation.
+inline std::optional<TaskTerminalExit> taskTerminalExitPlan(
+    const Eigen::Vector2d& position,double yaw,double stopping_distance,
+    const std::function<bool(const Eigen::Vector2d&,double)>& safe,
+    double preferred_exit_yaw=std::numeric_limits<double>::quiet_NaN()) {
+  if(!position.allFinite() || !std::isfinite(yaw) || !safe ||
+      !std::isfinite(stopping_distance) || stopping_distance<=0. || stopping_distance>4.)
+    return std::nullopt;
+  const Eigen::Vector2d forward(std::cos(yaw),std::sin(yaw));
+  const auto direct=[&](double heading) {
+    for(double offset : {-.15,0.,.15})
+      if(!taskDepartureCertified(position+offset*forward,yaw,heading,stopping_distance,safe))
+        return false;
+    return true;
+  };
+  if(std::isfinite(preferred_exit_yaw)) {
+    if(direct(preferred_exit_yaw))
+      return TaskTerminalExit{TaskDepartureKind::DIRECT,position+stopping_distance*
+          Eigen::Vector2d(std::cos(preferred_exit_yaw),std::sin(preferred_exit_yaw)),preferred_exit_yaw};
+    for(double distance : {.4,.8,1.2}) {
+      bool valid=true;
+      for(double offset : {-.15,0.,.15}) {
+        const Eigen::Vector2d start=position+offset*forward,stage=start+distance*forward;
+        if(!taskDepartureCertified(start,yaw,yaw,distance+stopping_distance,safe) ||
+            !taskDepartureCertified(stage,yaw,preferred_exit_yaw,stopping_distance,safe)) {
+          valid=false;break;
+        }
+      }
+      if(valid) return TaskTerminalExit{TaskDepartureKind::FORWARD_STAGE,
+          position+distance*forward,preferred_exit_yaw};
+    }
+  }
+  for(double turn : {0.,M_PI/4,-M_PI/4,M_PI/2,-M_PI/2,3*M_PI/4,-3*M_PI/4,M_PI}) {
+    const double heading=yaw+turn;
+    if(direct(heading))
+      return TaskTerminalExit{TaskDepartureKind::DIRECT,position+stopping_distance*
+          Eigen::Vector2d(std::cos(heading),std::sin(heading)),heading};
+  }
+  return std::nullopt;
+}
+
+// Kept as the shared Boolean admission interface; selection, final validation
+// and actual arrival now use the same exit semantics instead of forcing yaw+pi.
+inline bool taskTerminalRestartCertified(const Eigen::Vector2d& position,double yaw,
+    double stopping_distance,
+    const std::function<bool(const Eigen::Vector2d&,double)>& safe,
+    double preferred_exit_yaw=std::numeric_limits<double>::quiet_NaN()) {
+  return taskTerminalExitPlan(position,yaw,stopping_distance,safe,preferred_exit_yaw).has_value();
+}
+
+// A dwell objective persists until capture or explicit invalidation. Transit
+// endpoints instead extend ahead before capture; rebuilding the same near end
+// is not a rolling successor and eventually forces a stop.
+inline bool taskKeepLocalTarget(bool station,double distance,double measured_speed,
+                                double prepare_time) {
+  if(!std::isfinite(distance) || !std::isfinite(measured_speed) ||
+      !std::isfinite(prepare_time)) return false;
+  return distance>(station ? .20 : std::max(.40,std::max(0.,measured_speed)*
+      std::max(0.,prepare_time)+.20));
+}
+
+// Preserve transit velocity only at a speed whose complete stopping prefix
+// is certified. If only the gait floor fits, the FSM installs matching slow
+// controller limits; a geometric short edge never decides this by itself.
+inline double taskTransitTerminalSpeed(const Eigen::Vector2d& position,double yaw,
+    double maximum_speed,double command_floor,double latency,double deceleration,
+    const std::function<bool(const Eigen::Vector2d&,double)>& safe) {
+  if(!std::isfinite(maximum_speed) || maximum_speed<=0. ||
+      !std::isfinite(command_floor) || command_floor<=0. ||
+      !std::isfinite(latency) || latency<0. || !std::isfinite(deceleration) || deceleration<=0.) return 0.;
+  for(double speed : {maximum_speed,std::min(maximum_speed,command_floor)}) {
+    const double distance=speed*latency+speed*speed/(2*deceleration);
+    if(taskDepartureCertified(position,yaw,yaw,distance,safe)) return speed;
+  }
+  return 0.;
+}
+
+// At least one certified exit is required at a stopped task station. Ordinary
+// exits rotate then drive; Go2 side exits translate at measured yaw and include
+// lateral braking. This does not certify an arbitrary future task or trajectory.
+inline uint16_t taskStationExitMask(const Eigen::Vector2d& position, double yaw,
+    double forward_distance, double lateral_distance, bool lateral_enabled,
+    const std::function<bool(const Eigen::Vector2d&,double)>& safe) {
+  if (!position.allFinite() || !std::isfinite(yaw) || !safe ||
+      !std::isfinite(forward_distance) || forward_distance<=0 || forward_distance>4 ||
+      !std::isfinite(lateral_distance) || lateral_distance<=0 || lateral_distance>4) return 0;
+  uint16_t mask=0;
+  for(int i=0;i<8;++i)
+    if(taskDepartureCertified(position,yaw,yaw+i*std::acos(-1.0)/4,forward_distance,safe))
+      mask |= uint16_t(1)<<i;
+  if(lateral_enabled) {
+    const Eigen::Vector2d left(-std::sin(yaw),std::cos(yaw));
+    const int steps=std::max(1,static_cast<int>(std::ceil(lateral_distance/.02)));
+    for(int side=0;side<2;++side) {
+      bool valid=true;
+      for(int i=0;i<=steps && valid;++i)
+        valid=safe(position+(side ? -1.0 : 1.0)*left*(lateral_distance*i/steps),yaw);
+      if(valid) mask |= uint16_t(1)<<(8+side);
+    }
+  }
+  return mask;
+}
+
+// Shared, explicitly certified capture envelope for fixed-yaw side recovery.
+// Final progress may fall short by at most 3 cm; this extra sweep permits settling
+// compensation during the same bounded primitive, never unplanned reversing.
+constexpr double kLateralRecoveryCaptureExtension=.10;
+constexpr double kLateralRecoveryLongitudinalBound=.10;
+
+inline double lateralRecoveryTolerance(double length) {
+  return std::isfinite(length) && length>=.05 ? std::min(.03,.20*length) : 0.0;
+}
+
+// Check the actual final pose, again after settling. A reference clock or a
+// FINISHED message alone cannot establish useful physical recovery.
+inline bool lateralRecoveryReached(const Eigen::Vector2d& start,
+    const Eigen::Vector2d& goal, const Eigen::Vector2d& actual,
+    double body_yaw, double actual_yaw) {
+  if(!start.allFinite() || !goal.allFinite() || !actual.allFinite() ||
+      !std::isfinite(body_yaw) || !std::isfinite(actual_yaw)) return false;
+  const double length=(goal-start).norm(), tolerance=lateralRecoveryTolerance(length);
+  if(tolerance<=0 ||
+      std::abs(std::remainder(actual_yaw-body_yaw,2*std::acos(-1.0)))>.10) return false;
+  const Eigen::Vector2d direction=(goal-start)/length;
+  const Eigen::Vector2d forward(std::cos(body_yaw),std::sin(body_yaw));
+  // Side-step completion is measured transverse progress. The real policy
+  // can drift longitudinally; bound that drift by the existing 0.10 m
+  // tracking corridor, then Local recertifies its actual stopped pose/rejoin.
+  // This is a departure recovery, not an observation station. More progress
+  // inside the explicitly certified capture extension is useful; falling
+  // short still has the strict 3 cm / 20 percent lower tolerance.
+  const double progress=(actual-start).dot(direction);
+  return progress<=length+kLateralRecoveryCaptureExtension &&
+      std::abs((actual-start).dot(forward))<=kLateralRecoveryLongitudinalBound &&
+      progress>=length-tolerance;
+}
+
+// One recovery family belongs to a physical departure, across task/request
+// changes. A new certified exit, substantial measured translation or rotation
+// can reopen it; elapsed time, a new goal and a map revision cannot.
+struct DepartureRecoveryMemory {
+  bool used{false};
+  Eigen::Vector2d position{Eigen::Vector2d::Zero()};
+  double yaw{0};
+  uint16_t exits{0};
+  bool blocks(const Eigen::Vector2d& actual, double heading, uint16_t current_exits) const {
+    if(!used) return false;
+    if(!actual.allFinite() || !std::isfinite(heading)) return true;
+    return (actual-position).norm()<.30 &&
+        std::abs(std::remainder(heading-yaw,2*std::acos(-1.0)))<std::acos(-1.0)/4 &&
+        (current_exits & ~exits)==0;
+  }
+};
 
 inline bool taskDeparturePreviouslyRejected(double yaw, const std::vector<double>& rejected) {
   if(!std::isfinite(yaw)) return true;
@@ -108,12 +332,12 @@ inline bool taskNeedsDwell(const LocalTaskDomain& domain,
       std::min(0.8, domain.observation_radius);
 }
 
-inline bool taskStationCaptureReady(bool autonomous, bool heading_aligning,
+inline bool taskStationCaptureReady(bool /*autonomous*/, bool heading_aligning,
                                     double measured_station_error) {
-  // ObservationTask carries a position, not a demanded final yaw. In
-  // autonomy mode arrival ends translation/turning and starts sensor capture.
+  // Task capture must not interrupt an active heading transition. The FSM
+  // additionally requires exact terminal feedback, measured rest and an exit.
   return std::isfinite(measured_station_error) && measured_station_error>=0 &&
-      measured_station_error<=0.20 && (autonomous || !heading_aligning);
+      measured_station_error<=0.20 && !heading_aligning;
 }
 
 inline bool taskRollingDirectionAllowed(const Eigen::Vector2d& displacement,
@@ -179,6 +403,9 @@ inline double taskSeedArcDistance(double length, double start_displacement,
       (6*length-3*start_displacement-3*end_displacement)*std::pow(u,5);
 }
 
+// Shape statistics describe the optimized curve; they are not safety limits.
+// valid checks finite geometry and departure consistency only. Footprint, task
+// domain, braking and dynamic feasibility are certified by the caller afterwards.
 struct TaskShapeResult {
   bool valid{false};
   const char* reason{"invalid_input"};
@@ -206,6 +433,16 @@ inline TaskShapeResult taskShapeResult(const std::vector<Eigen::Vector2d>& path,
   result.length=actual.first; result.turn=actual.second;
   result.guide_length=expected.first; result.guide_turn=expected.second;
   if(!std::isfinite(actual.first) || !std::isfinite(expected.first)) return result;
+  double maximum_progress=taskRouteProgress(guide,path.front());
+  for(const auto& point:path) {
+    double distance=std::numeric_limits<double>::infinity();
+    for(size_t i=1;i<guide.size();++i)
+      distance=std::min(distance,taskSegmentDistance(point,guide[i-1],guide[i]));
+    const double progress=taskRouteProgress(guide,point);
+    result.deviation=std::max(result.deviation,distance);
+    result.regression=std::max(result.regression,maximum_progress-progress);
+    maximum_progress=std::max(maximum_progress,progress);
+  }
   // A short reversed prefix can be invisible to both the 2 cm turn sampling
   // and the clamped route-progress projection. It still makes the controller
   // turn around. Compare to the LOCAL approach, not the full route endpoints.
@@ -222,26 +459,7 @@ inline TaskShapeResult taskShapeResult(const std::vector<Eigen::Vector2d>& path,
       break;
     }
   }
-  if(actual.first>1.5*expected.first+0.2) {result.reason="length"; return result;}
-  if(actual.second>expected.second+0.8) {result.reason="turn"; return result;}
-  double maximum_progress=taskRouteProgress(guide,path.front());
-  for(const auto& point:path) {
-    double distance=std::numeric_limits<double>::infinity();
-    for(size_t i=1;i<guide.size();++i)
-      distance=std::min(distance,taskSegmentDistance(point,guide[i-1],guide[i]));
-    const double progress=taskRouteProgress(guide,point);
-    result.deviation=std::max(result.deviation,distance);
-    result.regression=std::max(result.regression,maximum_progress-progress);
-    if(distance>0.4) {result.reason="guide_deviation"; return result;}
-    if(progress<maximum_progress-0.15) {result.reason="progress_regression"; return result;}
-    maximum_progress=std::max(maximum_progress,progress);
-  }
   result.valid=true; result.reason="ok"; return result;
-}
-
-inline bool taskShapeFollowsGuide(const std::vector<Eigen::Vector2d>& path,
-                                 const std::vector<Eigen::Vector2d>& guide) {
-  return taskShapeResult(path,guide).valid;
 }
 
 inline bool taskDomainContains(const LocalTaskDomain& domain,
@@ -278,7 +496,11 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const std::function<bool(const Eigen::Vector2d&)>& goal_allowed = {},
     double initial_yaw = std::numeric_limits<double>::quiet_NaN(),
     const std::function<double(const Eigen::Vector2d&,const Eigen::Vector2d&)>& edge_cost = {},
-    const Eigen::Vector2d* fixed_goal = nullptr) {
+    const Eigen::Vector2d* fixed_goal = nullptr,
+    const std::function<bool(const Eigen::Vector2d&,double,double)>& turn_safe = {},
+    const std::function<bool(const Eigen::Vector2d&,double,bool)>& terminal_safe = {},
+    size_t* expansion_count = nullptr) {
+  if(expansion_count) *expansion_count=0;
   std::vector<LocalTaskCandidate> result;
   if (!start.allFinite() || !preferred.allFinite() || !edge_safe || !visible ||
       !std::isfinite(step) || step <= 0.0 || !std::isfinite(window) ||
@@ -300,17 +522,23 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     return Eigen::Vector2d(start+basis*Eigen::Vector2d(step*n.x,step*n.y));
   };
   size_t expanded = 0;
-  while (!open.empty() && expanded++ < max_expansions) {
+  while (!open.empty() && expanded < max_expansions) {
+    ++expanded;
     const size_t index = open.top().second; open.pop();
     const Node current = nodes[index];
     if(current.cost>best[{current.x,current.y,current.heading}]+1e-9) continue;
     const Eigen::Vector2d p = point(current);
     const Eigen::Vector2d goal = fixed_goal ? *fixed_goal : p;
-    const bool connects = !fixed_goal || ((p-goal).norm() <= 1.5*step && edge_safe(p,goal));
+    const double incoming=current.heading<8 ?
+        basis_yaw+std::atan2(moves[current.heading][1],moves[current.heading][0]) : basis_yaw;
+    const double arrival=(goal-p).norm()>1e-6 ? std::atan2(goal.y()-p.y(),goal.x()-p.x()) : incoming;
+    const bool connects = !fixed_goal || ((p-goal).norm() <= 1.5*step && edge_safe(p,goal) &&
+        (!turn_safe || turn_safe(p,incoming,arrival)));
+    const bool station=taskNeedsDwell(domain,goal,visible(goal));
     const double extra = fixed_goal && connects && edge_cost ? edge_cost(p,goal) : 0.0;
     if (index > 0 && connects && std::isfinite(extra) && extra>=0 &&
-        (!goal_allowed || goal_allowed(goal))) {
-      const bool station = taskNeedsDwell(domain, goal, visible(goal));
+        (!goal_allowed || goal_allowed(goal)) &&
+        (!terminal_safe || terminal_safe(goal,arrival,station))) {
       LocalTaskCandidate candidate;
       candidate.goal = goal;
       candidate.observation_station = station;
@@ -339,6 +567,7 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
           basis_yaw+std::atan2(moves[current.heading][1],moves[current.heading][0]) : initial_yaw;
       const double turn=std::isfinite(previous_yaw) ?
           std::abs(std::remainder(yaw-previous_yaw,2*std::acos(-1.0))) : 0.0;
+      if(turn_safe && !turn_safe(p,previous_yaw,yaw)) continue;
       const double extra=edge_cost ? edge_cost(p,next) : 0.0;
       if(!std::isfinite(extra) || extra<0) continue;
       const double cost=current.cost+(next-p).norm()+0.35*turn+extra;
@@ -350,6 +579,7 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
       open.push({cost+(next-preferred).norm(),nodes.size()-1});
     }
   }
+  if(expansion_count) *expansion_count=expanded;
   return result;
 }
 

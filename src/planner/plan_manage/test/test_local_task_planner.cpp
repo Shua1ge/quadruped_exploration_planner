@@ -44,8 +44,8 @@ TEST(LocalTaskPlanner, NarrowDepartureLatticeFollowsMeasuredHeading) {
   EXPECT_NEAR(candidates.front().approach[1].dot(normal),0,1e-9);
 }
 
-TEST(LocalTaskPlanner, AutonomousStationArrivalEndsMotionEvenDuringHeadingAlignment) {
-  EXPECT_TRUE(taskStationCaptureReady(true,true,.1));
+TEST(LocalTaskPlanner, StationArrivalDoesNotInterruptHeadingAlignment) {
+  EXPECT_FALSE(taskStationCaptureReady(true,true,.1));
   EXPECT_TRUE(taskStationCaptureReady(true,false,.2));
   EXPECT_FALSE(taskStationCaptureReady(true,true,.21));
   EXPECT_FALSE(taskStationCaptureReady(false,true,.1));
@@ -166,22 +166,32 @@ TEST(LocalTaskPlanner, SeedStopsSmoothlyInsteadOfUniformEndpointMotion) {
   EXPECT_NEAR(taskSeedArcDistance(2,.6,0,1),2,1e-9);
 }
 
-TEST(LocalTaskPlanner, ShapeFailureExplainsRejectedCandidate) {
-  auto result=taskShapeResult({{0,0},{.5,.3},{1,-.3},{1.5,.3},{2,0}},{{0,0},{2,0}});
-  EXPECT_FALSE(result.valid); EXPECT_STREQ(result.reason,"turn");
-  EXPECT_GT(result.turn,result.guide_turn+.8);
-  auto deviation=taskShapeResult({{0,.5},{2,.5}},{{0,0},{2,0}});
-  EXPECT_STREQ(deviation.reason,"guide_deviation");
+TEST(LocalTaskPlanner, SmoothingShapeMetricsCannotVetoCandidate) {
+  const std::vector<Eigen::Vector2d> straight{{0,0},{2,0}};
+  auto turns=taskShapeResult({{0,0},{.5,.3},{1,-.3},{1.5,.3},{2,0}},straight);
+  EXPECT_TRUE(turns.valid);
+  EXPECT_GT(turns.turn,turns.guide_turn+.8);
+  // A wide detour can be necessary for footprint clearance. Shape assessment
+  // must let the actual map/domain checks decide whether it is executable.
+  auto detour=taskShapeResult({{0,0},{.3,0},{.3,1},{1.7,1},{1.7,0},{2,0}},straight);
+  EXPECT_TRUE(detour.valid);
+  EXPECT_GT(detour.length,1.5*detour.guide_length+.2);
+  EXPECT_GT(detour.deviation,.4);
+  auto projection=taskShapeResult({{0,0},{1,0},{.5,0},{2,0}},straight);
+  EXPECT_TRUE(projection.valid);
+  EXPECT_GT(projection.regression,.15);
+  const std::vector<Eigen::Vector2d> corner{{0,0},{1,0},{1,1}};
+  EXPECT_TRUE(taskShapeResult(corner,corner).valid);
+  EXPECT_NEAR(taskRouteProgress(corner,{1,.5}),1.5,1e-6);
 }
 
-TEST(LocalTaskPlanner, ShapeAllowsNecessaryCornerButRejectsShortZigzag) {
-  const std::vector<Eigen::Vector2d> straight{{0,0},{2,0}};
-  EXPECT_TRUE(taskShapeFollowsGuide({{0,0},{1,0.1},{2,0}},straight));
-  EXPECT_FALSE(taskShapeFollowsGuide({{0,0},{.5,.3},{1,-.3},{1.5,.3},{2,0}},straight));
-  EXPECT_FALSE(taskShapeFollowsGuide({{0,0},{1,0},{.5,0},{2,0}},straight));
-  const std::vector<Eigen::Vector2d> corner{{0,0},{1,0},{1,1}};
-  EXPECT_TRUE(taskShapeFollowsGuide(corner,corner));
-  EXPECT_NEAR(taskRouteProgress(corner,{1,.5}),1.5,1e-6);
+TEST(LocalTaskPlanner, InvalidCurveCannotReachSafetyCertification) {
+  const std::vector<Eigen::Vector2d> guide{{0,0},{2,0}};
+  EXPECT_FALSE(taskShapeResult({},guide).valid);
+  const double nan=std::numeric_limits<double>::quiet_NaN();
+  const double inf=std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(taskShapeResult({{0,0},{nan,0},{2,0}},guide).valid);
+  EXPECT_FALSE(taskShapeResult(guide,{{0,0},{inf,0}}).valid);
 }
 
 TEST(LocalTaskPlanner, SimplificationNeverShortcutsAcrossObstacle) {
@@ -319,4 +329,243 @@ TEST(LocalTaskPlanner, ExcludedStationDoesNotPreventLeavingIt) {
       [](const Eigen::Vector2d& p) {return p.norm()>.4;});
   ASSERT_FALSE(candidates.empty());
   for(const auto& candidate:candidates) EXPECT_GT(candidate.goal.norm(),.4);
+}
+
+
+TEST(LocalTaskPlanner, StationCanDepartByCrabWithoutTurning) {
+  const auto safe=[](const Eigen::Vector2d& p,double yaw) {
+    return std::abs(yaw)<.05 && std::abs(p.x())<.01 && std::abs(p.y())<.31;
+  };
+  EXPECT_EQ(taskStationExitMask({0,0},0,.30,.28,false,safe),0);
+  const auto exits=taskStationExitMask({0,0},0,.30,.28,true,safe);
+  EXPECT_TRUE(exits & (1<<8));EXPECT_TRUE(exits & (1<<9));
+}
+
+TEST(LocalTaskPlanner, StationRejectsStaticSafePoseWithNoDeparture) {
+  EXPECT_EQ(taskStationExitMask({0,0},0,.30,.28,true,
+      [](const Eigen::Vector2d& p,double){return p.norm()<.01;}),0);
+  EXPECT_EQ(taskStationExitMask({0,0},0,.30,.28,true,
+      [](const Eigen::Vector2d&,double){return false;}),0);
+}
+
+TEST(LocalTaskPlanner, RecoveryRequiresUsefulMeasuredProgressAndHeading) {
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{0,.02},0,0));
+  EXPECT_TRUE(lateralRecoveryReached({0,0},{0,.15},{0,.13},0,0));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{0,0},0,0));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{0,.15},0,.2));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{0,-.15},0,0));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.01},{0,.01},0,0));
+  EXPECT_NEAR(lateralRecoveryTolerance(.15),.03,1e-9);
+}
+
+TEST(LocalTaskPlanner, RecoveryCaptureBoundsBothMeasuredAxes) {
+  EXPECT_TRUE(lateralRecoveryReached({0,0},{0,.15},{.08,.14},0,0));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{.11,.14},0,0));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{.08,.08},0,0));
+  EXPECT_TRUE(lateralRecoveryReached({0,0},{0,.15},{.08,.22},0,0));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{0,.15},{.08,.26},0,0));
+}
+
+TEST(LocalTaskPlanner, RecoveryProgressUsesBodyAxesAtRotatedYaw) {
+  EXPECT_TRUE(lateralRecoveryReached({0,0},{-.15,0},{-.13,0},M_PI/2,M_PI/2));
+  EXPECT_FALSE(lateralRecoveryReached({0,0},{-.15,0},{0,.13},M_PI/2,M_PI/2));
+}
+
+TEST(LocalTaskPlanner, PhysicalRecoveryMemorySurvivesGoalAndTaskChanges) {
+  DepartureRecoveryMemory memory{true,{1,2},3.10,1};
+  EXPECT_TRUE(memory.blocks({1,2},-3.10,1));
+  EXPECT_TRUE(memory.blocks({1.02,2},3.10,1));
+  EXPECT_TRUE(memory.blocks({1,2},3.10,0)); // Losing an exit cannot refill the budget.
+  EXPECT_FALSE(memory.blocks({1.4,2},3.10,1));
+  EXPECT_FALSE(memory.blocks({1,2},2.0,1));
+  EXPECT_FALSE(memory.blocks({1,2},3.10,3)); // A new fully certified exit is relevant evidence.
+}
+
+TEST(LocalTaskPlanner, ForwardStageMovesBeforeTurningAndCoversSettling) {
+  const auto safe=[](const Eigen::Vector2d& p,double yaw) {
+    return std::abs(p.y())<2 && p.x()<3 && (p.x()>=1.0 || std::abs(yaw)<.05);
+  };
+  EXPECT_FALSE(taskDepartureCertified({0,0},0,std::acos(-1.0)/2,.2,safe));
+  const auto stage=taskForwardTurnStage({0,0},0,{1.2,1.0},.2,safe);
+  ASSERT_TRUE(stage); EXPECT_NEAR(stage->x(),1.2,1e-9);EXPECT_NEAR(stage->y(),0,1e-9);
+  // A blocked incoming line or unknown future rotation cannot qualify.
+  EXPECT_FALSE(taskForwardTurnStage({0,0},0,{1.2,1.0},.2,
+      [](const auto& p,double yaw){return p.x()<.3 && std::abs(yaw)<.05;}));
+  EXPECT_FALSE(taskForwardTurnStage({0,0},0,{1.2,1.0},.2,
+      [](const auto&,double yaw){return std::abs(yaw)<.05;}));
+  EXPECT_FALSE(taskForwardTurnStage({0,0},0,{1.2,1.0},-.2,safe));
+}
+
+TEST(LocalTaskPlanner, ForwardStageRespectsBodyAxisAndCanPrepareReverseGoal) {
+  const double pi=std::acos(-1.0);
+  const auto stage=taskForwardTurnStage({0,0},pi/2,{-1,0},.2,
+      [pi](const auto& p,double yaw){return p.y()>=.8 || std::abs(yaw-pi/2)<.05;});
+  ASSERT_TRUE(stage); EXPECT_NEAR(stage->x(),0,1e-9);EXPECT_NEAR(stage->y(),1.2,1e-9);
+  const auto reverse=taskForwardTurnStage({0,0},0,{-2,0},.2,
+      [](const auto& p,double yaw){return p.x()>=.8 || std::abs(yaw)<.05;});
+  ASSERT_TRUE(reverse);EXPECT_NEAR(reverse->x(),1.2,1e-9);
+}
+
+
+TEST(LocalTaskPlanner, TerminalArrivalRequiresCoherentExitAndSettlingEnvelope) {
+  const auto one_way=[](const Eigen::Vector2d& p,double yaw) {
+    return p.x()>-.5 && p.x()<1. && std::abs(std::remainder(yaw,2*M_PI))<.2;
+  };
+  EXPECT_TRUE(taskDepartureCertified({0,0},0,0,.3,one_way));
+  // A coherent forward continuation is valid even without an in-place U-turn.
+  EXPECT_TRUE(taskTerminalRestartCertified({0,0},0,.3,one_way));
+  EXPECT_TRUE(taskTerminalRestartCertified({0,0},0,.3,
+      [](const auto& p,double){return p.norm()<.6;}));
+  EXPECT_TRUE(taskTerminalRestartCertified({0,0},0,.3,
+      [](const auto& p,double){return p.x()>-.35 && p.x()<.6;}));
+}
+
+TEST(LocalTaskPlanner, TerminalExitUsesOneDirectionAcrossWholeCaptureBand) {
+  // Each capture pose has some exit, but there is no common action. Mixing
+  // successful directions from different hypothetical poses must not certify it.
+  const auto safe=[](const Eigen::Vector2d& p,double yaw) {
+    if(std::abs(p.y())>.01) return false;
+    if(p.x()<-.10) return std::abs(yaw)<.1;
+    if(p.x()>.10) return std::abs(std::remainder(yaw-M_PI,2*M_PI))<.1;
+    return true;
+  };
+  EXPECT_FALSE(taskTerminalExitPlan({0,0},0,.3,safe));
+  EXPECT_FALSE(taskTerminalExitPlan({0,0},0,.3,
+      [](const auto&,double){return false;}));
+}
+
+TEST(LocalTaskPlanner, ReturnExitPlansForwardConversionInsteadOfTurningInNarrowStation) {
+  const auto safe=[](const Eigen::Vector2d& p,double yaw) {
+    return p.x()>-.5 && p.x()<2. && std::abs(p.y())<.2 &&
+        (p.x()>.5 || std::abs(std::remainder(yaw,2*M_PI))<.1);
+  };
+  const auto exit=taskTerminalExitPlan({0,0},0,.3,safe,M_PI);
+  ASSERT_TRUE(exit);
+  EXPECT_EQ(exit->kind,TaskDepartureKind::FORWARD_STAGE);
+  // The .8 m turn fits, but its return braking prefix would re-enter the
+  // narrow throat. Only the 1.2 m stage fits the complete action chain.
+  EXPECT_NEAR(exit->waypoint.x(),1.2,1e-9);
+  EXPECT_NEAR(exit->departure_yaw,M_PI,1e-9);
+  // The actual incoming/action route is independently certified by the same model.
+  const auto departure=taskPlanDeparture({0,0},0,{-2,0},.3,safe);
+  ASSERT_TRUE(departure);
+  EXPECT_EQ(departure->kind,TaskDepartureKind::FORWARD_STAGE);
+  EXPECT_NEAR((departure->objective-Eigen::Vector2d(-2,0)).norm(),0,1e-9);
+  EXPECT_FALSE(taskPlanDeparture({0,0},0,{-2,0},.3,
+      [&](const auto& p,double y){return p.x()<.3 && safe(p,y);}));
+}
+
+TEST(LocalTaskPlanner, RollingTransitExtendsButObservationObjectivePersists) {
+  EXPECT_FALSE(taskKeepLocalTarget(false,.6,.4,1.5));
+  EXPECT_TRUE(taskKeepLocalTarget(false,2.,.4,1.5));
+  EXPECT_TRUE(taskKeepLocalTarget(true,.6,.4,1.5));
+  EXPECT_FALSE(taskKeepLocalTarget(true,.19,.4,1.5));
+}
+
+TEST(LocalTaskPlanner, SearchComparesRestartableTerminalBeforeNearestGoal) {
+  LocalTaskDomain domain;domain.route={{0,0},{2,0}};domain.corridor_radius=1.;
+  domain.observation_center={2,0};domain.observation_radius=3.;
+  size_t used=0;
+  const auto candidates=selectLocalTaskCandidates(domain,{0,0},{2,0},
+      [](const auto&,const auto&){return true;},[](const auto&){return true;},
+      .2,2.,256,8,[](const auto& p){return p.x()>.5;},0.,{},nullptr,{},
+      [](const auto& p,double,bool){return p.x()<1.5;},&used);
+  ASSERT_FALSE(candidates.empty());EXPECT_LT(candidates.front().goal.x(),1.5);
+  EXPECT_LE(used,256u);
+}
+
+TEST(LocalTaskPlanner, CornersCannotRotateInsideTheNarrowApproach) {
+  LocalTaskDomain domain;domain.route={{0,0},{1,0},{1,1}};
+  domain.corridor_radius=1.;domain.observation_center={5,5};domain.observation_radius=.2;
+  const auto body_safe=[](const Eigen::Vector2d& p,double yaw) {
+    if(p.x()>=.7) return true;
+    return std::abs(p.y())+.18*std::abs(std::sin(yaw))+.35<.45;
+  };
+  const auto edge=[&](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
+    const double yaw=std::atan2(b.y()-a.y(),b.x()-a.x());
+    for(int i=0;i<=10;++i) if(!body_safe(a+(b-a)*i/10.,yaw)) return false;
+    return true;
+  };
+  const auto turn=[&](const auto& p,double a,double b){return taskDepartureCertified(p,a,b,0.,body_safe);};
+  const auto candidates=selectLocalTaskCandidates(domain,{0,0},{1,1},edge,
+      [](const auto&){return false;},.2,2.,512,8,[](const auto& p){return p.y()>.5;},0.,{},nullptr,turn);
+  ASSERT_FALSE(candidates.empty());
+  const auto& path=candidates.front().approach;double yaw=0.;
+  for(size_t i=1;i<path.size();++i) {
+    const double next=std::atan2(path[i].y()-path[i-1].y(),path[i].x()-path[i-1].x());
+    EXPECT_TRUE(turn(path[i-1],yaw,next));yaw=next;
+  }
+}
+
+
+TEST(LocalTaskPlanner, TransitSpeedUsesItsOwnFullBrakingHorizon) {
+  const auto safe=[](const auto& p,double){return p.x()<.9 && std::abs(p.y())<.1;};
+  EXPECT_DOUBLE_EQ(taskTransitTerminalSpeed({.2,0},0,.75,.30,.55,.32,safe),.30);
+  EXPECT_DOUBLE_EQ(taskTransitTerminalSpeed({.7,0},0,.75,.30,.55,.32,safe),0.);
+  EXPECT_DOUBLE_EQ(taskTransitTerminalSpeed({.2,0},0,.75,.30,.55,.32,
+      [](const auto&,double){return true;}),.75);
+}
+
+TEST(LocalTaskPlanner, NarrowStraightEntryUsesSeparateWideTurnCertificate) {
+  const auto incoming=[](const Eigen::Vector2d&,double yaw) {
+    return std::abs(yaw)<1e-6;
+  };
+  const auto turning=[](const Eigen::Vector2d& p,double) {
+    return p.x()>=1.0;
+  };
+  const auto stage=taskForwardTurnStage({0,0},0,{2,1},.2,incoming,turning);
+  ASSERT_TRUE(stage);
+  EXPECT_NEAR(stage->x(),1.2,1e-6);
+  EXPECT_FALSE(taskForwardTurnStage({0,0},0,{2,1},.2,turning));
+}
+
+#include <plan_manage/boundary_escape.h>
+namespace {
+plan_env::MotionAssessment contacts(std::initializer_list<std::pair<plan_env::SourceKey,double>> items,
+    uint8_t layer=1) {
+  plan_env::MotionAssessment result;
+  for(const auto& item:items) result.contacts[item.first]={item.first,layer,item.second,{}};
+  return result;
+}
+}
+TEST(BoundaryEscape, MonotonicExitCannotExchangeSourcesWithEqualCounts) {
+  const plan_env::SourceKey a{1,2,3}, b{4,5,6};
+  std::map<plan_env::SourceKey,double> remaining{{a,.08}};
+  EXPECT_FALSE(advanceEscapeContacts(remaining,contacts({{b,.02}})));
+  ASSERT_TRUE(advanceEscapeContacts(remaining,contacts({{a,.04}})));
+  EXPECT_FALSE(advanceEscapeContacts(remaining,contacts({{a,.05}})));
+  EXPECT_TRUE(advanceEscapeContacts(remaining,contacts({})));
+  EXPECT_TRUE(remaining.empty());
+  EXPECT_FALSE(advanceEscapeContacts(remaining,contacts({{a,.01}})));
+}
+TEST(BoundaryEscape, NoiseAllowanceCannotAccumulateIntoDeeperPenetration) {
+  const plan_env::SourceKey a{1,2,3};
+  std::map<plan_env::SourceKey,double> remaining{{a,.06}};
+  EXPECT_TRUE(advanceEscapeContacts(remaining,contacts({{a,.08}}),.025));
+  EXPECT_FALSE(advanceEscapeContacts(remaining,contacts({{a,.10}}),.025));
+  EXPECT_DOUBLE_EQ(remaining.begin()->second,.06);
+}
+TEST(BoundaryEscape, TerrainOrUnknownSourceCannotBorrowGeometryGrant) {
+  const plan_env::SourceKey a{1,2,3};
+  std::map<plan_env::SourceKey,double> remaining{{a,.05}};
+  EXPECT_FALSE(advanceEscapeContacts(remaining,contacts({{a,.01}},2)));
+  auto unknown=contacts({});unknown.outside_map=true;
+  EXPECT_FALSE(advanceEscapeContacts(remaining,unknown));
+  unknown.outside_map=false;unknown.unexplained_inflation=true;
+  EXPECT_FALSE(advanceEscapeContacts(remaining,unknown));
+}
+TEST(BoundaryEscape, CertificateConstrainsYawZCrossDriftOvershootAndTime) {
+  BoundaryEscapeCertificate c;c.goal={0.,.3,0.};c.expires=15.;
+  EXPECT_TRUE(boundaryEscapePoseAllowed(c,{0.,.15,.01},.02,1.));
+  EXPECT_FALSE(boundaryEscapePoseAllowed(c,{.11,.15,0.},0.,1.));
+  EXPECT_FALSE(boundaryEscapePoseAllowed(c,{0.,.15,.10},0.,1.));
+  EXPECT_FALSE(boundaryEscapePoseAllowed(c,{0.,.15,0.},.11,1.));
+  EXPECT_FALSE(boundaryEscapePoseAllowed(c,{0.,.41,0.},0.,1.));
+  EXPECT_FALSE(boundaryEscapePoseAllowed(c,{0.,.15,0.},0.,16.));
+}
+TEST(BoundaryEscape, CaptureStopsBeforeEndpointUsingMeasuredBrakingDistance) {
+  EXPECT_NEAR(lateralCaptureStopLead(.3,.32,.3),.230625,1e-9);
+  EXPECT_DOUBLE_EQ(lateralCaptureStopLead(0.,.32,.3),0.);
+  EXPECT_DOUBLE_EQ(lateralCaptureStopLead(-.3,.32,.3),0.);
+  EXPECT_DOUBLE_EQ(lateralCaptureStopLead(.3,0.,.3),0.);
 }

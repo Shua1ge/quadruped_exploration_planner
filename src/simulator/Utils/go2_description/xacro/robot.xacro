@@ -2,6 +2,8 @@
 
 <robot name="go2" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
+    <xacro:property name="mid360" value="${xacro.load_yaml('$(find go2_description)/config/mid360.yaml')}"/>
+
     <xacro:arg name="DEBUG" default="false"/>
     <xacro:arg name="use_gazebo" default="true"/>
     <xacro:arg name="terrain_velocity_control" default="false"/>
@@ -111,7 +113,10 @@
     <joint name="lidar_joint" type="fixed">
         <parent link="trunk"/>
         <child link="lidar_link"/>
-        <origin rpy="0 0 0" xyz="0.10 0 0.12"/>
+        <!-- Unitree kit is pitched down 13deg. Keep TF and both mappers
+             on the same profile; sensor-local elevation remains -7..52deg. -->
+        <origin rpy="${mid360.mount.roll} ${mid360.mount.pitch} ${mid360.mount.yaw}"
+                xyz="${mid360.mount.x} ${mid360.mount.y} ${mid360.mount.z}"/>
     </joint>
 
     <link name="lidar_link">

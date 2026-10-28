@@ -60,8 +60,17 @@ target_link_libraries(planar_cmd_vel_adapter
   ignition-transport11::ignition-transport11
   ignition-msgs8::ignition-msgs8)
 
+add_executable(mid360_ray_bridge src/mid360_ray_bridge.cpp)
+target_include_directories(mid360_ray_bridge PRIVATE include)
+ament_target_dependencies(mid360_ray_bridge rclcpp sensor_msgs nav_msgs plan_env)
+target_link_libraries(mid360_ray_bridge Eigen3::Eigen)
+# Ground fitting runs at sensor rate even in the default (unoptimised) build.
+target_compile_options(mid360_ray_bridge PRIVATE -O2)
+target_link_libraries(mid360_ray_bridge
+  ignition-transport11::ignition-transport11 ignition-msgs8::ignition-msgs8)
+
 install(TARGETS
-  scan_planner_node open_loop_controller closed_loop_controller
+  mid360_ray_bridge scan_planner_node open_loop_controller closed_loop_controller
   go2_kinematic_sim go2_gait_publisher planar_cmd_vel_adapter
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
@@ -79,6 +88,7 @@ install(PROGRAMS
   scripts/go2_locomotion_supervisor.py
   scripts/go2_locomotion_logic.py
   scripts/go2_stateful_policy.py
+  scripts/go2_rl_lab_policy.py
   DESTINATION lib/${PROJECT_NAME} OPTIONAL)
 install(DIRECTORY scripts/explorer_core
   DESTINATION lib/${PROJECT_NAME}
@@ -89,14 +99,33 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_observed_ground test/test_observed_ground.cpp)
+  if(TARGET test_observed_ground)
+    target_include_directories(test_observed_ground PRIVATE include)
+    # The height wire contract lives in plan_env so Local and Explorer cannot
+    # drift apart; the estimator itself is header-only.
+    ament_target_dependencies(test_observed_ground plan_env)
+    target_link_libraries(test_observed_ground Eigen3::Eigen)
+  endif()
+  ament_add_gtest(test_mid360_ray_bridge test/test_mid360_ray_bridge.cpp)
+  if(TARGET test_mid360_ray_bridge)
+    target_include_directories(test_mid360_ray_bridge PRIVATE include)
+    ament_target_dependencies(test_mid360_ray_bridge sensor_msgs)
+    target_link_libraries(test_mid360_ray_bridge ignition-msgs8::ignition-msgs8)
+  endif()
   ament_add_pytest_test(test_global_astar test/test_global_astar.py)
   ament_add_pytest_test(test_frontier_explorer test/test_frontier_explorer.py)
+  ament_add_pytest_test(test_spatial_fusion_contract test/test_spatial_fusion_contract.py)
   ament_add_pytest_test(test_global_path_correction test/test_global_path_correction.py)
   ament_add_pytest_test(test_observation_task_contract test/test_observation_task_contract.py)
   ament_add_pytest_test(test_observation_task_bridge test/test_observation_task_bridge.py)
   ament_add_pytest_test(test_sparse_routing test/test_sparse_routing.py)
   ament_add_pytest_test(test_region_commitment test/test_region_commitment.py)
+  ament_add_pytest_test(test_branch_commitment test/test_branch_commitment.py)
+  ament_add_pytest_test(test_adaptive_global_routes test/test_adaptive_global_routes.py)
   ament_add_pytest_test(test_topology test/test_topology.py)
+  ament_add_pytest_test(test_wavefront_graph test/test_wavefront_graph.py)
+  ament_add_pytest_test(test_global_representation_node test/test_global_representation_node.py)
   ament_add_pytest_test(test_topology_persistence test/test_topology_persistence.py)
   ament_add_pytest_test(test_safe_region_graph test/test_safe_region_graph.py)
   ament_add_pytest_test(test_portal_connectivity test/test_portal_connectivity.py)
@@ -106,6 +135,8 @@ if(BUILD_TESTING)
   # pytest cannot start in this workspace (broken anyio plugin), so a pytest
   # target here would silently never run.
   find_package(PythonInterp REQUIRED)
+  add_test(NAME test_mid360_explorer_projection
+    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mid360_explorer_projection.py)
   add_test(NAME test_locomotion_supervisor
     COMMAND ${PYTHON_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test/test_locomotion_supervisor.py)
@@ -114,7 +145,12 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/test/test_go2_policy_loading.py)
   add_test(NAME test_observation_task_runtime
     COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_observation_task_runtime.py)
-  set_tests_properties(test_observation_task_runtime PROPERTIES TIMEOUT 40)
+  # The full real-process chain needs 113-116 s; a 120 s bound leaves 3-6%
+  # headroom and turns any scheduling hiccup into a red CI run.
+  set_tests_properties(test_observation_task_runtime PROPERTIES TIMEOUT 300)
+  add_test(NAME test_mid360_mapping_runtime
+    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mid360_mapping_runtime.py)
+  set_tests_properties(test_mid360_mapping_runtime PROPERTIES TIMEOUT 45)
   ament_add_gtest(test_replan_fsm_utils test/test_replan_fsm_utils.cpp)
   ament_add_gtest(test_local_task_planner test/test_local_task_planner.cpp)
   if(TARGET test_local_task_planner)

@@ -29,6 +29,7 @@
 #include <scan_planner_msgs/msg/observation_task.hpp>
 #include <scan_planner_msgs/msg/observation_feedback.hpp>
 #include <plan_manage/local_task_planner.h>
+#include <plan_manage/boundary_escape.h>
 #include <plan_manage/task_protocol.h>
 #include <plan_manage/planner_manager.h>
 #include <plan_manage/replan_fsm_utils.h>
@@ -74,6 +75,7 @@ namespace scan_planner
     double reference_path_lookahead_;
     double emergency_time_;
     double rolling_replan_retry_period_;
+    double rolling_replan_prepare_time_{1.5};
     double rolling_replan_max_start_error_;
     double predictive_replan_reaction_time_{0.25};
     double predictive_hard_stop_min_time_{0.35};
@@ -92,7 +94,8 @@ namespace scan_planner
     double clearance_limited_execution_grace_{1.00};
     double clearance_limited_no_progress_timeout_{2.00};
     double clearance_limited_min_progress_{0.05};
-    bool enable_holonomic_lateral_repair_{false};
+    bool enable_holonomic_lateral_repair_{true};
+    double local_repair_lateral_speed_{0.30};
     double local_repair_anchor_min_distance_{0.45};
     double local_repair_anchor_max_distance_{0.90};
     double local_repair_anchor_step_{0.15};
@@ -158,17 +161,50 @@ namespace scan_planner
     rclcpp::Subscription<scan_planner_msgs::msg::ObservationTask>::SharedPtr task_sub_;
     rclcpp::Publisher<scan_planner_msgs::msg::ObservationFeedback>::SharedPtr task_feedback_pub_;
     std::atomic<uint64_t> task_id_{0}, task_version_{0}, task_candidate_id_{0};
+    // A local authorization fence is not proof of Controller retirement.
     TaskVersion retired_task_{0, 0};
+    TaskVersion confirmed_retired_task_{0, 0};
     TaskVersion retiring_task_{0, 0};
     std::atomic<uint64_t> rolling_predecessor_id_{0}, rolling_predecessor_version_{0};
     std::atomic<bool> rolling_task_handoff_{false};
+    std::atomic<bool> task_restart_from_rest_requested_{false};
+    std::atomic<bool> task_restart_current_turn_{false};
+    std::atomic<int64_t> task_transition_hold_stamp_{0};
+    std::atomic<bool> task_restart_from_rest_used_{false};
+    std::atomic<bool> task_lateral_repair_used_{false}; // Also fenced by physical departure memory.
+    std::atomic<bool> task_lateral_repair_authorized_{false}; // Current bounded family, across all entry points.
+    DepartureRecoveryMemory departure_recovery_memory_;
+    std::mutex departure_recovery_mutex_;
+    TaskTransitionRestGate task_station_rest_gate_;
+    std::atomic<bool> task_turn_stage_active_{false};
+    std::atomic<int64_t> task_turn_stage_trajectory_id_{0};
+    std::atomic<bool> task_forward_stage_failed_{false};
+    Eigen::Vector2d task_turn_stage_objective_{Eigen::Vector2d::Zero()};
+    bool task_turn_stage_used_{false}; // One stage per task version; never a timer-driven crawl.
+    int64_t task_turn_stage_wait_started_{0};
+    TaskTransitionRestGate task_turn_stage_rest_gate_;
+    int last_task_proposed_trajectory_id_{0};
+    int64_t task_restart_wait_started_{0};
+    TaskTransitionRestGate task_restart_rest_gate_;
+    TaskTransitionRestGate structured_rejoin_rest_gate_;
+    int64_t structured_rejoin_wait_started_{0};
     std::atomic<bool> task_retirement_pending_{false};
     std::mutex task_event_mutex_;
-    TaskVersion task_retirement_confirmation_{0,0};
+    std::mutex task_failure_trace_mutex_;
+    std::string task_failure_trigger_, task_failure_recovery_, task_failure_planning_;
+    std::vector<TaskVersion> task_retirement_confirmations_;
     std::vector<std::pair<TaskVersion,Eigen::Vector2d>> task_failed_goals_;
     int64_t last_task_retirement_ns_{0};
+    int64_t task_retirement_started_ns_{0};
+    double task_retirement_timeout_{10.0};
+    bool task_retirement_unconfirmed_{false};
     uint64_t task_terminal_request_{0};
     bool task_station_target_{false}, task_goal_available_{false};
+    // A bounded search/fit failure does not invalidate the station objective.
+    bool task_selection_retry_{false};
+    double task_station_arrival_yaw_{0.};
+    std::optional<TaskDeparturePlan> task_departure_plan_;
+    bool task_transit_speed_limited_{false};
     Eigen::Vector3d task_station_{Eigen::Vector3d::Zero()};
     std::vector<Eigen::Vector2d> task_rejected_stations_;
     std::vector<Eigen::Vector2d> task_visited_stations_;
@@ -184,9 +220,14 @@ namespace scan_planner
     std::atomic<bool> execution_no_progress_exhausted_{false};
     void observationTaskCallback(const scan_planner_msgs::msg::ObservationTask::ConstSharedPtr &msg);
     bool processObservationTaskTransitions();
+    bool requestTaskRestartFromRest(const std::string& reason, bool current_turn=false);
     void retireObservationTask(TaskVersion version);
     void confirmObservationTaskRetirement(TaskVersion version);
-    bool selectObservationTaskTarget();
+    bool selectObservationTaskTarget(bool report_failure=true, bool preferred_only=false, size_t* geometry_remaining=nullptr);
+    void refreshDepartureRecoveryBudget();
+    bool observationStationRestartCertified(const Eigen::Vector3d& position,double yaw) const;
+    bool forwardStageRestartCertified(const Eigen::Vector3d& position,double yaw,bool capture_region) const;
+    uint16_t observationStationExitMask(const Eigen::Vector3d& position, double yaw) const;
     void observationTaskRejected(const std::string &reason);
     void publishObservationFeedback(uint8_t state, const std::string &reason);
     size_t reference_progress_idx_{0};
@@ -208,8 +249,12 @@ namespace scan_planner
     std::atomic<bool> stopped_local_repair_active_{false};
     std::atomic<bool> structured_local_repair_active_{false};
     std::atomic<bool> structured_local_repair_executing_{false};
-    std::atomic<bool> structured_local_repair_finished_{false};
+    std::atomic<bool> structured_local_repair_finished_{false}; // Terminal feedback received, not success.
+    std::atomic<bool> structured_local_repair_terminal_success_{false};
     std::atomic<bool> structured_local_repair_rejoin_pending_{false};
+    // One ordinary, fully certified rejoin family from measured rest after
+    // failed recovery. It never reauthorizes another escape primitive.
+    std::atomic<bool> structured_failed_rejoin_pending_{false};
     std::atomic<bool> structured_local_repair_interrupted_{false};
     std::atomic<uint64_t> structured_local_repair_request_id_{0};
     std::atomic<int64_t> structured_local_repair_trajectory_id_{0};
@@ -227,9 +272,18 @@ namespace scan_planner
       rclcpp::Time start_time;
       double duration{0.0};
       double controller_execution_time{0.0};
+      double handoff_matched_time{0.0};
+      double handoff_target_yaw{std::numeric_limits<double>::quiet_NaN()};
+      double handoff_turn_position_allowance{kHandoffPositionAllowance};
+      double handoff_alignment_tolerance{kHandoffAlignmentTolerance};
+      uint8_t controller_state{scan_planner_msgs::msg::ExecutionState::STATE_IDLE};
+      bool terminal_settling{false};
       uint64_t request_id{0};
       uint64_t task_id{0}, task_version{0}, candidate_id{0};
       int64_t trajectory_id{0};
+      std::shared_ptr<const BoundaryEscapeCertificate> boundary_escape;
+      std::map<plan_env::SourceKey,double> boundary_remaining;
+      bool boundary_escape_failed{false};
       bool clearance_escape_active{false};
       double clearance_escape_deadline{0.0};
       size_t initial_clearance_violations{0};
@@ -240,6 +294,7 @@ namespace scan_planner
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
       uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
+      bool use_measured_progress{false};
       std::chrono::steady_clock::time_point accepted_at{};
       Eigen::Vector3d accepted_position{Eigen::Vector3d::Zero()};
       bool valid{false};
@@ -255,16 +310,21 @@ namespace scan_planner
       uint64_t request_id{0};
       uint64_t task_id{0}, task_version{0}, candidate_id{0};
       int64_t trajectory_id{0};
+      std::shared_ptr<const BoundaryEscapeCertificate> boundary_escape;
       bool clearance_escape_active{false};
       double clearance_escape_deadline{0.0};
       size_t initial_clearance_violations{0};
       bool fixed_body_yaw{false};
       double body_yaw{0.0};
       uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
+      bool use_measured_progress{false};
       // Recovery is a transaction spanning two controller handoffs: the
       // short clearance-escape segment and the trajectory that rejoins the
       // unchanged reference path.  Keep the phase on the pending handoff so
       // merely publishing a candidate can never clear recovery ownership.
+      double handoff_target_yaw{std::numeric_limits<double>::quiet_NaN()};
+      double handoff_turn_position_allowance{kHandoffPositionAllowance};
+      double handoff_alignment_tolerance{kHandoffAlignmentTolerance};
       bool structured_repair_segment{false};
       bool structured_repair_rejoin{false};
       bool reference_path_update{false};
@@ -309,6 +369,7 @@ namespace scan_planner
     std::atomic<int> pose_free_confirmation_cycles_{0};
     std::atomic<bool> predictive_hold_latched_{false};
     std::atomic<int> predictive_hold_release_cycles_{0};
+    TaskTransitionRestGate predictive_hold_rest_gate_; // realtime callback owns this gate
     std::atomic<bool> temporal_safety_latched_{false};
     std::atomic<int> temporal_safety_release_cycles_{0};
     std::atomic<bool> invalid_odom_latched_{false};
@@ -370,6 +431,8 @@ namespace scan_planner
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
     bool tryStructuredLocalRepair();
+    bool tryBoundaryEscape(std::string& rejection);
+    TaskTransitionRestGate boundary_departure_rest_gate_;
     void setStartStateFromOdomOrCurrentTraj();
     double executionProgressTime(const LocalTrajData &info);
     void refreshPlanningOdomFromSafety();
@@ -385,8 +448,8 @@ namespace scan_planner
     bool planNextWaypoint();
     bool isWaypointSequenceMode() const;
     bool adjustGlobalTargetIfOccupied();
-    void getLocalTarget();
-    void getReferencePathLocalTarget();
+    void getLocalTarget(size_t* geometry_remaining=nullptr);
+    void getReferencePathLocalTarget(size_t* geometry_remaining=nullptr);
     void finishProcess();
     void publishSelfInflationMarker();
     bool recoveryTransactionOwnsReferenceRequest();
@@ -411,10 +474,13 @@ namespace scan_planner
                                 bool has_path_segment = false,
                                 Eigen::Vector3d path_start = Eigen::Vector3d::Zero(),
                                 Eigen::Vector3d path_end = Eigen::Vector3d::Zero());
+    void publishTaskCancellationFeedback(TaskVersion version, uint8_t state,
+                                         const std::string &reason);
     void handleExecutionNoProgress(uint64_t request_id, uint64_t task_id,
                                    uint64_t task_version,
                                    int64_t trajectory_id,
-                                   double terminal_error);
+                                   double terminal_error,
+                                   const std::string& turn_failure="");
     void publishBlockedSegment();
     void updateExecutionTrajectorySnapshot(const LocalTrajData &info,
                                            uint64_t request_id,
@@ -424,7 +490,8 @@ namespace scan_planner
                                            bool fixed_body_yaw = false,
                                            double body_yaw = 0.0,
                                            uint8_t execution_mode =
-                                               scan_planner_msgs::msg::Bspline::MODE_NORMAL);
+                                               scan_planner_msgs::msg::Bspline::MODE_NORMAL,
+                                           bool use_measured_progress = false);
     void setLocalRecoveryState(LocalRecoveryState state,
                                double tracking_error,
                                const char *reason);

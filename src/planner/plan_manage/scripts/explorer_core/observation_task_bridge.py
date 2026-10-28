@@ -18,6 +18,9 @@ class PendingObservationHandoff:
     published_ns: int = 0
     state: str = "PREPARING"
     cancel_publish_ns: int = 0
+    cancel_started_ns: int = 0
+    transition_phase: int = 0
+    transition_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,9 @@ class LocalMotionAttempt:
     reason: str
     blocked_cells: frozenset
     departure_yaw: float = math.nan
+    retry_after_ns: int = 0
+    route_yaw: float = math.nan
+    pose_wide: bool = False
 
 
 class ObservationTaskBridge:
@@ -131,7 +137,11 @@ class ObservationTaskBridge:
         message.max_station_adjustments = self.task_max_station_adjustments
         origin = getattr(self, "commitment_direction_origin", None)
         direction = getattr(self, "commitment_direction_vector", None)
-        preparing = task is not self.active_observation
+        active = self.active_observation
+        same_identity = (active is not None and task.task_id != 0
+                         and (task.task_id, task.task_version)
+                         == (active.task_id, active.task_version))
+        preparing = task is not active and not same_identity
         if preparing:
             origin = self.position
             target = next((pose.pose.position for pose in path.poses[1:]
@@ -153,44 +163,86 @@ class ObservationTaskBridge:
             self.pending_observation_station = None
             self.blocked_execution_context = None
 
-    def cancel_pending_observation_handoff(self, reason):
+    def cancel_pending_observation_handoff(self, reason, *, pose_wide=False):
         pending = getattr(self,"pending_observation_handoff",None)
         if pending is None or pending.state == "CANCELLING":
             return
         pending.state = "CANCELLING"
         pending.cancel_publish_ns = self.get_clock().now().nanoseconds
+        pending.cancel_started_ns = pending.cancel_publish_ns
         if getattr(self, "task_geometry_autonomy", False):
-            self.remember_local_motion_attempt(pending.task.goal, reason)
+            self.remember_local_motion_attempt(pending.task.goal, reason, cells=pending.path, pose_wide=pose_wide)
         self.retire_observation_task(pending.task,TaskMessage.CANCELLED)
         # Failed connection is not permanent viewpoint/region evidence.
         excluded = list(getattr(self,"handoff_excluded_goals",()))
         if pending.task.goal not in excluded:
             excluded.append(pending.task.goal)
         self.handoff_excluded_goals = excluded[-16:]
+        if not hasattr(self, 'handoff_excluded_until'):
+            self.handoff_excluded_until = {}
+        self.handoff_excluded_until[pending.task.goal] = pending.cancel_started_ns + 5000000000
         self.publish_status("OBSERVATION_HANDOFF_CANCELLING reason="+reason)
 
+    def current_handoff_exclusions(self):
+        """Failed realizations are exact, temporary candidates, not 1.5 m bans."""
+        now = self.get_clock().now().nanoseconds
+        deadlines = getattr(self, 'handoff_excluded_until', {})
+        self.handoff_excluded_goals = [goal for goal in getattr(self, 'handoff_excluded_goals', ())
+                                      if goal not in deadlines or now < deadlines[goal]]
+        self.handoff_excluded_until = {goal: deadlines[goal] for goal in self.handoff_excluded_goals
+                                       if goal in deadlines}
+        return tuple(self.handoff_excluded_goals)
+
     def continue_pending_observation_handoff(self):
+        if getattr(self, "unconfirmed_observation_handoff", None) is not None:
+            # Terminated pending, unresolved remote ownership. Do not publish
+            # a replacement or resume old motion until an exact CANCEL_ACK.
+            self.publish_status("OBSERVATION_HANDOFF_CANCEL_UNCONFIRMED")
+            return True
         pending = getattr(self,"pending_observation_handoff",None)
         if pending is None:
             return False
         now = self.get_clock().now().nanoseconds
         limit = int(self.path_request_timeout*1e9)
+        if pending.transition_phase == ObservationFeedback.TRANSITION_WAIT_STOP:
+            # A certified forward stage is <=1.2 m (~7.3 s at the measured
+            # 0.165 m/s response), followed by <=5 s rest confirmation. This
+            # finite phase must not be cancelled by the ordinary 5 s ACK wait.
+            stage_wait = pending.transition_reason == 'WAITING_FOR_TURN_STAGE'
+            limit = max(limit, 15000000000 if stage_wait else 6000000000)
         if pending.state == "PREPARING" and now-pending.published_ns >= limit:
             self.cancel_pending_observation_handoff("EXECUTION_READY_TIMEOUT")
-        elif pending.state == "CANCELLING" and now-pending.cancel_publish_ns >= limit:
-            self.retire_observation_task(pending.task,TaskMessage.CANCELLED,repeat=True)
-            pending.cancel_publish_ns = now
+        elif pending.state == "CANCELLING":
+            cancel_limit = int(getattr(self, "task_cancel_timeout", 10.0)*1e9)
+            if now-pending.cancel_started_ns >= cancel_limit:
+                pending.state = "CANCEL_UNCONFIRMED"
+                self.unconfirmed_observation_handoff = pending
+                self.pending_observation_handoff = None
+                self.publish_status("OBSERVATION_HANDOFF_CANCEL_UNCONFIRMED")
+                return True
+            if now-pending.cancel_publish_ns >= limit:
+                self.retire_observation_task(pending.task,TaskMessage.CANCELLED,repeat=True)
+                pending.cancel_publish_ns = now
         self.publish_status("OBSERVATION_HANDOFF_"+pending.state)
         return True
 
     def pending_observation_feedback(self, message):
-        pending = getattr(self,"pending_observation_handoff",None)
+        pending = (getattr(self, "unconfirmed_observation_handoff", None)
+                   or getattr(self,"pending_observation_handoff",None))
         if pending is None or (message.task_id,message.task_version) != \
                 (pending.task.task_id,pending.task.task_version):
             return False
-        if message.state == ObservationFeedback.CANCEL_ACK:
+        if message.state == ObservationFeedback.CANCEL_UNCONFIRMED:
             if pending.state == "CANCELLING":
+                pending.state = "CANCEL_UNCONFIRMED"
+                self.unconfirmed_observation_handoff = pending
                 self.pending_observation_handoff = None
+                self.publish_status("OBSERVATION_HANDOFF_CANCEL_UNCONFIRMED")
+            return True
+        if message.state == ObservationFeedback.CANCEL_ACK:
+            if pending.state in ("CANCELLING", "CANCEL_UNCONFIRMED"):
+                self.pending_observation_handoff = None
+                self.unconfirmed_observation_handoff = None
                 # Both predecessor and successor are fenced after cancel.
                 # G1 remains the satisfied information ledger, not a resumable
                 # execution. A later replacement starts without a predecessor.
@@ -207,6 +259,14 @@ class ObservationTaskBridge:
         if message.request_id != pending.request_id or pending.state != "PREPARING":
             self.task_stale_feedback += 1
             return True
+        if message.state in (ObservationFeedback.TRANSITION_WAIT_STOP,
+                             ObservationFeedback.TRANSITION_RESTARTING):
+            if message.state > pending.transition_phase:
+                pending.transition_phase = message.state
+                pending.transition_reason = message.reason
+                pending.published_ns = self.get_clock().now().nanoseconds
+                self.publish_status('OBSERVATION_HANDOFF_PHASE reason='+message.reason)
+            return True  # Duplicate phase events cannot extend a timeout.
         if message.state == ObservationFeedback.EXECUTION_READY:
             if message.trajectory_id <= 0 or not message.candidate_id:
                 self.task_stale_feedback += 1
@@ -218,7 +278,10 @@ class ObservationTaskBridge:
         elif message.state in (ObservationFeedback.PATH_REJECTED,
                 ObservationFeedback.VIEWPOINT_REJECTED,ObservationFeedback.TASK_EXHAUSTED,
                 ObservationFeedback.EXECUTION_BLOCKED,ObservationFeedback.LOCAL_MOTION_EXHAUSTED):
-            self.cancel_pending_observation_handoff(message.reason)
+            if message.failure_scope==ObservationFeedback.FAILURE_CURRENT_POSE:
+                self.cancel_pending_observation_handoff(message.reason,pose_wide=True)
+            else:
+                self.cancel_pending_observation_handoff(message.reason)
         return True
 
     def pending_observation_status(self, status, request_id, fields):
@@ -364,8 +427,64 @@ class ObservationTaskBridge:
             self.publish_reference_path(self.active_raw_path)
         return True
 
-    def remember_local_motion_attempt(self, goal, reason):
-        """Keep a motion attempt out of arbitration until relevant conditions change."""
+    def departure_route_yaw(self, goal, cells=()):
+        """Initial route direction is an arbitration key, never a motion grant."""
+        return self.departure_polyline_yaw(goal,[self.grid.cell_to_world(cell) for cell in (cells or ())])
+
+    def departure_polyline_yaw(self, goal, points):
+        points=list(points)
+        if not points or points[-1]!=goal:
+            points.append(goal)
+        # A failed task may have travelled far along its original route. Begin
+        # at the nearest segment, never at the old task's distant route start.
+        nearest=math.inf; first=0
+        for i,(a,b) in enumerate(zip(points,points[1:])):
+            dx,dy=b[0]-a[0],b[1]-a[1];norm=dx*dx+dy*dy
+            t=max(0.,min(1.,((self.position[0]-a[0])*dx+(self.position[1]-a[1])*dy)/norm)) if norm>1e-12 else 0.
+            distance=math.dist(self.position,(a[0]+t*dx,a[1]+t*dy))
+            if distance<nearest:
+                nearest=distance;first=i+1
+        for point in points[first:]:
+            dx,dy=point[0]-self.position[0],point[1]-self.position[1]
+            if math.hypot(dx,dy)>=.50:
+                return math.atan2(dy,dx)
+        dx,dy=goal[0]-self.position[0],goal[1]-self.position[1]
+        return math.atan2(dy,dx) if math.hypot(dx,dy)>1e-6 else math.nan
+
+    def departure_attempt_changed(self, attempt):
+        yaw=getattr(self,"body_yaw",math.nan)
+        return (math.dist(self.position,attempt.position)>=.30 or
+            (math.isfinite(yaw) and math.isfinite(attempt.departure_yaw) and
+             abs(math.remainder(yaw-attempt.departure_yaw,2*math.pi))>=math.pi/4) or
+            any(self.grid.in_bounds(cell) and self.grid.value(cell)==FREE
+                for cell in attempt.blocked_cells))
+
+    def local_departure_candidate_allowed(self, candidate, *, cells=None):
+        attempts=getattr(self,"departure_action_failures",[])
+        if not attempts:
+            return True
+        attempts=[a for a in attempts if not self.departure_attempt_changed(a)]
+        self.departure_action_failures=attempts
+        if not attempts:
+            return True
+        explicit_cells=cells is not None
+        cells=(getattr(candidate,"path",()) if cells is None else cells) or ()
+        sparse=None if explicit_cells else getattr(candidate,"sparse_route",None)
+        if not cells and sparse is not None:
+            yaw=self.departure_polyline_yaw(candidate.goal,sparse.polyline)
+        else:
+            yaw=self.departure_route_yaw(candidate.goal,cells)
+        # Missing direction cannot establish a different action. Failed route
+        # sectors are retained across Goals and clocks. Accepted alternatives
+        # differ by at least 45 degrees, so a stationary state has finite trials.
+        allowed=math.isfinite(yaw) and all(math.isfinite(a.route_yaw) and
+            abs(math.remainder(yaw-a.route_yaw,2*math.pi))>=math.pi/4-1e-9 for a in attempts)
+        if not allowed:
+            self.departure_action_suppressed=True
+        return allowed
+
+    def remember_local_motion_attempt(self, goal, reason, *, cells=None, pose_wide=False):
+        """Temporary motion cooldown; expiry allows revalidation, not execution."""
         if not hasattr(self, "local_motion_goal_cooldowns"):
             self.local_motion_goal_cooldowns = {}
         x, y = self.grid.world_to_cell(*self.position)
@@ -374,29 +493,49 @@ class ObservationTaskBridge:
                             for i in range(x-radius, x+radius+1)
                             if self.grid.in_bounds((i, j)) and self.grid.value((i, j)) == OCCUPIED)
         self.local_motion_goal_cooldowns[goal] = LocalMotionAttempt(
-            tuple(self.position), reason, blocked, getattr(self,"body_yaw",math.nan))
+            tuple(self.position), reason, blocked, getattr(self,"body_yaw",math.nan),
+            self.get_clock().now().nanoseconds + 5000000000,
+            self.departure_route_yaw(goal, getattr(self,"active_raw_path",()) if cells is None else cells),
+            pose_wide or reason=="RECOVERY_START_FOOTPRINT_OCCUPIED")
+        if reason.startswith("LATERAL_RECOVERY_") or pose_wide or reason=="RECOVERY_START_FOOTPRINT_OCCUPIED":
+            attempt=self.local_motion_goal_cooldowns[goal]
+            if attempt.pose_wide:
+                self.local_departure_failure=attempt
+            else:
+                attempts=[a for a in getattr(self,"departure_action_failures",[])
+                          if not self.departure_attempt_changed(a)]
+                if not any(math.isfinite(a.route_yaw) and math.isfinite(attempt.route_yaw) and
+                    abs(math.remainder(a.route_yaw-attempt.route_yaw,2*math.pi))<math.pi/4-1e-9 for a in attempts):
+                    attempts.append(attempt)
+                self.departure_action_failures=attempts
 
     def local_motion_retry_allowed(self, attempt):
-        # Heading-bin jitter and unrelated map updates cannot reopen an
-        # exhausted approach. A different departure requires leaving its area.
+        departure_failure=(attempt.pose_wide or attempt.reason in ("DEPARTURE_UNSAFE", "RECOVERY_START_FOOTPRINT_OCCUPIED") or
+                           attempt.reason.startswith("LATERAL_RECOVERY_"))
+        if not departure_failure and self.get_clock().now().nanoseconds >= attempt.retry_after_ns:
+            return True  # Generic scheduling cooldown, not a refill of Local recovery.
+        # Heading jitter and unrelated map updates are not a different
+        # departure, even after the scheduling cooldown has elapsed. Every
+        # retry still needs full Local certification.
         if math.dist(self.position, attempt.position) >= max(
                 1.0, 2.0*getattr(self, "task_corridor_radius", .8)):
             return True
         # A substantial externally measured reorientation is a new departure,
         # not a new task or a map revision. Local must certify it again.
         yaw=getattr(self,"body_yaw",math.nan)
-        if (attempt.reason == "DEPARTURE_UNSAFE" and math.isfinite(yaw)
+        if (departure_failure and math.isfinite(yaw)
                 and math.isfinite(attempt.departure_yaw)
                 and abs(math.remainder(yaw-attempt.departure_yaw,2*math.pi))>=math.pi/4):
             return True
         # Only a departure-obstacle failure may be reconsidered on obstacle
         # removal. Other causes require a different physical departure.
-        return (attempt.reason == "DEPARTURE_UNSAFE" and bool(attempt.blocked_cells)
+        return (departure_failure and bool(attempt.blocked_cells)
                 and any(self.grid.in_bounds(cell) and self.grid.value(cell) == FREE
                         for cell in attempt.blocked_cells))
 
-    def handle_local_motion_exhausted(self, message):
-        """Motion terminal, not geometric evidence or a second Local retry loop."""
+    def handle_local_motion_exhausted(self, message=None, *, reason=None):
+        """Consume typed feedback or a matched legacy status as one motion terminal."""
+        reason = reason or (message.reason if message is not None else "LOCAL_MOTION_EXHAUSTED")
         previous_goal=self.active_goal
         scope=getattr(self,"active_commitment_scope",None)
         if scope is None and self.active_region_id is not None:
@@ -406,8 +545,15 @@ class ObservationTaskBridge:
         # motion problem. Do NOT insert an edge/viewpoint/region constraint or
         # mark information complete. CANCEL fences any late candidate/ACK.
         if previous_goal is not None:
-            self.remember_local_motion_attempt(previous_goal, message.reason)
+            self.remember_local_motion_attempt(previous_goal, reason,
+                pose_wide=message is not None and message.failure_scope==ObservationFeedback.FAILURE_CURRENT_POSE)
         self.terminate_active_observation("LOCAL_MOTION_EXHAUSTED")
+        if not self.local_departure_replan_allowed():
+            return
+        if message is not None:
+            self.publish_status("LOCAL_MOTION_FAILURE_TRACE reason="+reason+
+                " trigger="+message.trigger_reason+" recovery="+message.recovery_reason+
+                " planning="+message.planning_reason)
         self.replan_gate.reset() # New task arbitration input, NOT new map/geometry evidence.
         excluded=() if previous_goal is None else (previous_goal,)
         if self.plan_from_current_position(excluded_goals=excluded,required_scope=scope,
@@ -420,7 +566,19 @@ class ObservationTaskBridge:
             if self.plan_from_current_position(excluded_goals=excluded):
                 self.publish_status("LOCAL_MOTION_EXHAUSTED_OTHER_TASK_SELECTED")
             else:
-                self.publish_status("LOCAL_MOTION_EXHAUSTED_WAITING_FOR_ALTERNATIVE")
+                self.publish_status("LOCAL_DEPARTURE_ACTIONS_EXHAUSTED" if
+                    getattr(self,"departure_action_suppressed",False) else
+                    "LOCAL_MOTION_EXHAUSTED_WAITING_FOR_ALTERNATIVE")
+
+    def local_departure_replan_allowed(self):
+        attempt=getattr(self,"local_departure_failure",None)
+        if attempt is None:
+            return True
+        if self.departure_attempt_changed(attempt):
+            self.local_departure_failure=None
+            return True
+        self.publish_status("LOCAL_DEPARTURE_WAITING_FOR_STATE_CHANGE")
+        return False
 
     def build_route_portals(self, task, path):
         """Freeze checkpoints from selected directed edges; never infer IDs by proximity."""
