@@ -1,0 +1,66 @@
+{
+ "sensor": {
+  "az_deg": 360,
+  "elevation_deg": [
+   -7,
+   52
+  ],
+  "range_m": [
+   0.1,
+   40.0
+  ],
+  "mount_xyz": [
+   0.187,
+   0,
+   0.0803
+  ],
+  "pitch_deg": 13,
+  "sensor_height_m": 0.53,
+  "rays_planning": "360x32",
+  "rays_validation": "720x64"
+ },
+ "walkable_area_m2": 25488.1,
+ "route": {
+  "file": "route_on_graph.csv",
+  "length_m": 4704.0,
+  "points": 3884,
+  "start": [
+   0.02,
+   0.64
+  ],
+  "end": [
+   -95.98,
+   53.44
+  ]
+ },
+ "coverage": {
+  "strict_pct": 95.53,
+  "dilate_0_3m_pct": 98.59,
+  "dilate_0_6m_pct": 99.25,
+  "strict_uncovered_m2": 1138.6,
+  "strict_uncovered_clusters": 2261,
+  "largest_uncovered_clusters_m2": [
+   29.5,
+   23.5,
+   23.1,
+   20.2,
+   19.7,
+   17.2,
+   16.1,
+   16.0,
+   15.8,
+   15.1
+  ]
+ },
+ "achievable_upper_bound_pct": 97.01,
+ "params": {
+  "walkable_cell_m": 0.3,
+  "walkable_slope_deg": 30,
+  "step_m": 0.2,
+  "clearance_m": 0.35,
+  "routing_cell_m": 1.2,
+  "initial_route_coverage_pct": 76.9,
+  "inserts": 120
+ },
+ "source": "Campus collision mesh 1,929,134 triangles; spawn (0,0,0.45)"
+}

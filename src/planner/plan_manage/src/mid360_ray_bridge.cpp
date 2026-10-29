@@ -16,6 +16,10 @@ public:
     no_return_range_=declare_parameter("no_return_range",3.0);
     topic_=declare_parameter<std::string>("gazebo_topic","/quad_0/lidar/points");
     ground_enabled_=declare_parameter("classify_observed_ground",false);
+    const double slope_degrees=declare_parameter("observed_ground_max_slope_degrees",30.0);
+    if(!std::isfinite(slope_degrees) || slope_degrees<=0. || slope_degrees>=60.)
+      throw std::invalid_argument("invalid observed ground measurement angle");
+    ground_options_.max_slope_radians=slope_degrees*std::acos(-1.0)/180.;
     mount_={declare_parameter("lidar_extrinsic_x",.187),declare_parameter("lidar_extrinsic_y",0.),declare_parameter("lidar_extrinsic_z",.0803)};
     const double roll=declare_parameter("lidar_extrinsic_roll",0.);
     const double pitch=declare_parameter("lidar_extrinsic_pitch",.22689280275926285);
@@ -78,7 +82,17 @@ private:
       float xyz[3];std::memcpy(xyz,cloud.data.data()+16*i,sizeof(xyz));
       points.push_back(rotation*Eigen::Vector3d(xyz[0],xyz[1],xyz[2])+origin);kinds.push_back(cloud.data[16*i+12]);
     }
-    const auto ground=estimateObservedGroundHeights(points,kinds,body.position);
+    const int64_t capture_ns=rclcpp::Time(cloud.header.stamp).nanoseconds();
+    const bool recent=last_ground_.valid && capture_ns>=last_ground_stamp_ &&
+        capture_ns-last_ground_stamp_<=500000000LL;
+    const auto ground=estimateObservedGroundHeights(points,kinds,body.position,
+        ground_options_,recent ? &last_ground_ : nullptr);
+    if(ground.valid) {
+      // Retain only the tiny fitted reference, never the previous point cloud
+      // or per-point heights. Invalid fresh input is still published unknown.
+      last_ground_.valid=true;last_ground_.plane=ground.plane;
+      last_ground_.body_origin=ground.body_origin;last_ground_stamp_=capture_ns;
+    }
     size_t measured=0;
     std::vector<float> measured_heights;measured_heights.reserve(ground.heights.size());
     for(size_t i=0;i<kinds.size();++i) {
@@ -95,11 +109,17 @@ private:
       h50=measured_heights[measured_heights.size()/2];
     }
     RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
-        "[OBSERVED_GROUND] valid=%d support_cells=%zu measured=%zu known=%zu unknown=%zu h50=%.2fm slope=%.3f processing=%.2fms",
+        "[OBSERVED_GROUND] valid=%d support_cells=%zu measured=%zu known=%zu unknown=%zu h50=%.2fm slope=%.3f processing=%.2fms reason=%s candidate_cells=%zu inliers=%zu slope_rejected=%zu height_rejected=%zu ground_world_z=%.3f",
         ground.valid,ground.support_cells,measured,measured_heights.size(),
-        measured-measured_heights.size(),h50,ground.plane.head<2>().norm(),ms);
+        measured-measured_heights.size(),h50,ground.plane.head<2>().norm(),ms,
+        ground.reason,ground.candidate_cells,ground.best_inliers,ground.rejected_slope,
+        ground.rejected_height,ground.valid ? ground.worldPlane().head<2>().dot(body.position.head<2>())+
+            ground.worldPlane().z() : std::numeric_limits<double>::quiet_NaN());
   }
   double no_return_range_;bool ground_enabled_;std::string topic_;
+  ObservedGroundOptions ground_options_;
+  ObservedGround last_ground_;
+  int64_t last_ground_stamp_{0};
   Eigen::Vector3d mount_;Eigen::Matrix3d rotation_;
   std::mutex mutex_;std::deque<plan_env::TimedPose> poses_;
   std::deque<std::pair<sensor_msgs::msg::PointCloud2,std::chrono::steady_clock::time_point>> pending_;

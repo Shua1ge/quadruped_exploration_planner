@@ -3,7 +3,7 @@
 import heapq
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -38,6 +38,8 @@ class TopologyGraph:
     nodes: Dict[int, TopologyNode]
     edges: Dict[int, TopologyEdge]
     skeleton_cells: Set[Cell]
+    # Optional world-grid support domains for the sparse query representation.
+    supports: dict = field(default_factory=dict)
 
 
 NEIGHBOURS_8 = tuple(
@@ -268,6 +270,8 @@ def routing_oracle_metrics(occupancy, resolution, graph, max_queries=8,
     for e in graph.edges.values():
         router.upsert_edge(SparseEdge(e.edge_id, e.source_id, e.target_id,
             e.length, e.minimum_clearance, tuple(world(c) for c in e.cells)))
+    if graph.supports:
+        router.update_supports(graph.supports)
     free = np.argwhere(values == FREE)
     pairs = []
     if len(free) >= 2 and max_queries > 0:
@@ -279,7 +283,7 @@ def routing_oracle_metrics(occupancy, resolution, graph, max_queries=8,
             indices = rng.choice(len(free), 2, replace=False)
             pairs.append((free[indices[0]], free[indices[1]]))
     dense_connected = estimate_hits = validated = false_positives = matched = 0
-    graph_hits = graph_validated = direct_validated = 0
+    graph_hits = graph_validated = direct_validated = space_validated = 0
     errors = []
     def connector(a,b):
         return (segment_known_free(grid, grid.world_to_cell(*a), grid.world_to_cell(*b), set())
@@ -305,6 +309,7 @@ def routing_oracle_metrics(occupancy, resolution, graph, max_queries=8,
         validated += valid
         graph_validated += valid and estimate.route_source == "graph"
         direct_validated += valid and estimate.route_source == "direct_connector"
+        space_validated += valid and estimate.route_source == "space_connector"
         false_positives += not valid or not dense
         if valid and dense:
             matched += 1
@@ -314,6 +319,7 @@ def routing_oracle_metrics(occupancy, resolution, graph, max_queries=8,
         graph_connected=graph_validated, graph_estimate_hits=graph_hits,
         graph_validated_routes=graph_validated, query_estimate_hits=estimate_hits,
         query_validated_routes=validated, direct_connector_routes=direct_validated,
+        space_connector_routes=space_validated,
         connectivity_recall=matched/dense_connected if dense_connected else None,
         false_positive_rate=false_positives/estimate_hits if estimate_hits else None,
         mean_cost_error=float(np.mean(errors)) if errors else None,

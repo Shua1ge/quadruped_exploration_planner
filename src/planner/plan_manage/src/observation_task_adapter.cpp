@@ -148,7 +148,6 @@ void SCANReplanFSM::confirmObservationTaskRetirement(TaskVersion version) {
   structured_failed_rejoin_pending_.store(false);
   stopped_local_repair_pending_.store(false);
   stopped_local_repair_active_.store(false);
-  task_lateral_repair_authorized_.store(false);
   // Cancellation may name a queued successor, not observation_task_.
   // Confirm the cancelled identity so Explorer can finish its transaction.
   publishTaskCancellationFeedback(version,
@@ -268,7 +267,9 @@ void SCANReplanFSM::observationTaskCallback(
   if (deferred_task_ && std::make_tuple(msg->task_id, msg->task_version, msg->request_id) <=
       std::make_tuple(deferred_task_->task_id, deferred_task_->task_version, deferred_task_->request_id)) return;
   deferred_task_ = msg;
-  if(task_turn_stage_active_.load() && msg->predecessor_task_id) {
+  const bool recovery_owns=have_target_ && (structured_local_repair_active_.load() ||
+      stopped_local_repair_pending_.load() || stopped_local_repair_active_.load());
+  if(recovery_owns || (task_turn_stage_active_.load() && msg->predecessor_task_id)) {
     // This is the queued successor's phase, not the active stage's identity.
     // It grants no motion or information completion. Explorer must allow
     // the finite straight leg and confirmed stopping before its ready ACK.
@@ -277,10 +278,10 @@ void SCANReplanFSM::observationTaskCallback(
     feedback.task_id=msg->task_id;feedback.task_version=msg->task_version;
     feedback.request_id=msg->request_id;
     feedback.state=scan_planner_msgs::msg::ObservationFeedback::TRANSITION_WAIT_STOP;
-    feedback.reason="WAITING_FOR_TURN_STAGE";
+    feedback.reason=recovery_owns ? "DEPARTURE_RETRY_PENDING" : "WAITING_FOR_TURN_STAGE";
     task_feedback_pub_->publish(feedback);
   }
-  if (current.first != 0 && incoming != current && !msg->predecessor_task_id)
+  if (!recovery_owns && current.first != 0 && incoming != current && !msg->predecessor_task_id)
     retireObservationTask(current);
 }
 
@@ -336,6 +337,8 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
   // A prepared successor waits for the certified straight staging leg to
   // finish and settle. It must not reintroduce an early turn in the narrow
   // approach. Explicit cancellation still fences execution immediately.
+  if (deferred_task_ && have_target_ && (structured_local_repair_active_.load() ||
+      stopped_local_repair_pending_.load() || stopped_local_repair_active_.load())) return false;
   if (deferred_task_ && !task_turn_stage_active_.load()) {
     // Do not consume the finite candidate budget before the first accepted
     // sensor update. Keep the request queued while startup safety is holding.
@@ -375,7 +378,6 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
     // Rest evidence belongs to this request's exact terminal execution.
     // A same-task observation retry must also collect three new samples.
     task_station_rest_gate_={};
-    task_lateral_repair_authorized_.store(false);
     task_turn_stage_active_=false;task_turn_stage_trajectory_id_=0;task_turn_stage_rest_gate_={};
     if (!same_task) {
       { std::lock_guard<std::mutex> lock(task_failure_trace_mutex_);
@@ -384,14 +386,7 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
       task_restart_from_rest_requested_.store(false);
       task_restart_from_rest_used_.store(false);
       task_restart_current_turn_.store(false);
-      {
-        std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
-        const auto& memory=departure_recovery_memory_;
-        const bool blocked=memory.used && memory.blocks(odom_pos_.head<2>(),getOdomYaw(),
-            observationStationExitMask({memory.position.x(),memory.position.y(),odom_pos_.z()},memory.yaw));
-        task_lateral_repair_used_.store(blocked);
-        if(!blocked) departure_recovery_memory_.used=false;
-      }
+      // The Local departure episode survives information task replacement.
       task_restart_wait_started_ = 0;
       task_restart_rest_gate_ = {};
       task_visited_stations_.clear(); task_station_adjustments_ = 0;
@@ -900,21 +895,45 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
 }
 
 void SCANReplanFSM::refreshDepartureRecoveryBudget() {
-  if(!observation_task_ || structured_local_repair_active_.load() ||
-      stopped_local_repair_pending_.load() || structured_failed_rejoin_pending_.load()) return;
+  if(!observation_task_ || structured_local_repair_executing_.load()) return;
   refreshPlanningOdomFromSafety();
   std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
   auto& memory=departure_recovery_memory_;
-  if(!memory.used) return;
+  if(memory.started_at < 0.0) return;
+  const double now=node_->now().seconds();
+  if(memory.evidence_checked_at>=0.0 && now>=memory.evidence_checked_at &&
+      now-memory.evidence_checked_at<.25) return;
+  memory.evidence_checked_at=now;
+  // Only related geometry reopening an exit renews a failed episode. Pose
+  // jitter, a different task corridor and an unrelated map revision do not.
   const auto exits=observationStationExitMask(
-      {memory.position.x(),memory.position.y(),odom_pos_.z()},memory.yaw);
-  const bool blocked=memory.blocks(odom_pos_.head<2>(),getOdomYaw(),exits);
-  task_lateral_repair_used_.store(blocked);
-  if(!blocked) {
-    memory.used=false;
-    RCLCPP_INFO(node_->get_logger(),"[DEPARTURE_RECOVERY_REOPENED] task=%llu actual=(%.3f,%.3f) yaw=%.3f; physical departure changed, no clock or goal reset",
-        static_cast<unsigned long long>(task_id_.load()),odom_pos_.x(),odom_pos_.y(),getOdomYaw());
+      {memory.position.x(),memory.position.y(),odom_pos_.z()},memory.yaw,false);
+  if(memory.observeExits(exits)) {
+    memory={};
+    RCLCPP_INFO(node_->get_logger(),"[DEPARTURE_RECOVERY_REOPENED] related physical exit changed");
   }
+}
+
+bool SCANReplanFSM::deferDepartureRecoverySearch() {
+  if(!task_mode_) return false;
+  refreshDepartureRecoveryBudget();
+  DepartureRecoveryMemory::Search state;bool announce=false;
+  { std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+    auto& memory=departure_recovery_memory_;
+    state=memory.searchState(node_->now().seconds());
+    announce=state==DepartureRecoveryMemory::Search::WAIT && memory.reported_searches<memory.searches;
+    if(announce) memory.reported_searches=memory.searches;
+  }
+  if(state==DepartureRecoveryMemory::Search::READY) return false;
+  if(state==DepartureRecoveryMemory::Search::EXHAUSTED) {
+    observationTaskRejected("DEPARTURE_EPISODE_EXHAUSTED");
+  } else {
+    if(announce) publishObservationFeedback(scan_planner_msgs::msg::ObservationFeedback::TRANSITION_RESTARTING,
+        "DEPARTURE_RETRY_PENDING");
+    RCLCPP_INFO_THROTTLE(node_->get_logger(),*node_->get_clock(),1000,
+        "[DEPARTURE_RETRY_PENDING] awaiting one bounded revalidation; no physical action charged");
+  }
+  return true;
 }
 
 void SCANReplanFSM::observationTaskRejected(const std::string& requested_reason) {
@@ -925,6 +944,10 @@ void SCANReplanFSM::observationTaskRejected(const std::string& requested_reason)
     task_failure_planning_=requested_reason;
     if(task_failure_trigger_.empty()) task_failure_trigger_=requested_reason; }
   const bool failed_rejoin=structured_failed_rejoin_pending_.exchange(false);
+  if(failed_rejoin) {
+    std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+    departure_recovery_memory_.motion_failed=departure_recovery_memory_.used;
+  }
   if (failed_rejoin) {
     if (reason.rfind("LATERAL_RECOVERY_REJOIN_",0)!=0)
       reason="LATERAL_RECOVERY_REJOIN_FAILED";
@@ -933,7 +956,7 @@ void SCANReplanFSM::observationTaskRejected(const std::string& requested_reason)
         static_cast<unsigned long long>(active_reference_request_id_.load()),
         requested_reason.c_str(),reason.c_str());
   }
-  if (failed_rejoin || reason.rfind("LATERAL_RECOVERY_",0)==0) {
+  if (failed_rejoin || reason.rfind("LATERAL_RECOVERY_",0)==0 || reason=="DEPARTURE_EPISODE_EXHAUSTED") {
     // Terminal lateral failures, including unconfirmed rest, release motion
     // ownership. They retain physical departure memory and consumed budget.
     structured_local_repair_active_.store(false);
@@ -955,14 +978,9 @@ void SCANReplanFSM::observationTaskRejected(const std::string& requested_reason)
   // failed target search. The task, information demand and candidate budget
   // survive HOLD; only an exact trajectory activation ACK releases motion.
   if(!failed_rejoin) refreshDepartureRecoveryBudget();
-  if (enable_holonomic_lateral_repair_ && !task_lateral_repair_used_.load() &&
+  if (enable_holonomic_lateral_repair_ &&
       !structured_local_repair_active_.load() && reference_path_active_ && have_target_ &&
       (reason=="DEPARTURE_UNSAFE" || reason=="LOCAL_PATH_FAMILY_EXHAUSTED")) {
-    task_lateral_repair_used_.store(true);
-    task_lateral_repair_authorized_.store(true);
-    { std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
-      departure_recovery_memory_={true,odom_pos_.head<2>(),getOdomYaw(),
-          observationStationExitMask(odom_pos_,getOdomYaw())}; }
     stopped_local_repair_pending_.store(true);
     stopped_local_repair_active_.store(false);
     safety_stop_active_.store(true);
@@ -976,7 +994,6 @@ void SCANReplanFSM::observationTaskRejected(const std::string& requested_reason)
         static_cast<unsigned long long>(active_reference_request_id_.load()),reason.c_str());
     return;
   }
-  task_lateral_repair_authorized_.store(false);
   task_terminal_request_=active_reference_request_id_.load();
   const bool spatial = reason == "OBSERVATION_STATION_BUDGET_EXHAUSTED" ||
                        reason == "NO_NEW_OBSERVATION_STATION";
@@ -1028,7 +1045,7 @@ bool SCANReplanFSM::observationStationRestartCertified(const Eigen::Vector3d& po
       },return_yaw);
 }
 
-uint16_t SCANReplanFSM::observationStationExitMask(const Eigen::Vector3d& position,double yaw) const {
+uint16_t SCANReplanFSM::observationStationExitMask(const Eigen::Vector3d& position,double yaw,bool task_domain) const {
   const auto domain=observationTaskDomain();
   const auto map=planner_manager_->grid_map_;
   const double forward_stop=min_forward_command_*(command_stop_latency_+predictive_replan_reaction_time_)+
@@ -1038,7 +1055,7 @@ uint16_t SCANReplanFSM::observationStationExitMask(const Eigen::Vector3d& positi
   return taskStationExitMask(position.head<2>(),yaw,std::max(.30,forward_stop),
       .15+lateral_stop,enable_holonomic_lateral_repair_,
       [&](const Eigen::Vector2d& point,double heading) {
-        return taskDomainContains(domain,point) && !footprintOccupiedWithMargin(
+        return (!task_domain || taskDomainContains(domain,point)) && !footprintOccupiedWithMargin(
             map,{point.x(),point.y(),position.z()},heading,planning_clearance_margin_);
       });
 }

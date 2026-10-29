@@ -17,7 +17,7 @@ from tf2_geometry_msgs import do_transform_point
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scan_planner_msgs.msg import (
     FailureEvidence, LocalMapPatch, TopoEdge, TopoGraphDelta, TopoNode)
-from std_msgs.msg import String
+from std_msgs.msg import String, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
 from explorer_core.topology import (
@@ -32,6 +32,7 @@ from explorer_core.topology_persistence import (
 from explorer_core.terrain_graph import (
     STATE_NAMES, UNKNOWN, TerrainTileStore, experience_summary)
 from explorer_core.wavefront_graph import IncrementalWavefrontGraph
+from explorer_core.region_overlay import region_rgb
 
 
 class GlobalRepresentationNode(Node):
@@ -61,11 +62,13 @@ class GlobalRepresentationNode(Node):
         self.traversal_transformed_samples = 0
         self.topology_oracle_period_revisions = max(1, int(self.declare_parameter(
             "topology_oracle_period_revisions", 10).value))
+        self.topology_oracle_enabled = bool(self.declare_parameter(
+            "topology_oracle_enabled", False).value)
         self.last_topology_oracle = {}
         self.snapshot_period_revisions = max(1, int(
             self.declare_parameter("snapshot_period_revisions", 10).value))
         self.safe_region_shadow_enabled = bool(self.declare_parameter(
-            "safe_region_shadow_enabled", True).value)
+            "safe_region_shadow_enabled", False).value)
         self.safe_region_tile_size = float(self.declare_parameter(
             "safe_region_tile_size", 2.0).value)
         self.portal_bottleneck_width = float(self.declare_parameter(
@@ -101,10 +104,6 @@ class GlobalRepresentationNode(Node):
         self.global_edges: Dict[int, TopologyEdge] = {}
         self.global_node_messages: Dict[int, TopoNode] = {}
         self.global_edge_messages: Dict[int, TopoEdge] = {}
-        self.patch_inflation_radius = float(self.declare_parameter(
-            "patch_inflation_radius", 0.30).value)
-        if not math.isfinite(self.patch_inflation_radius) or self.patch_inflation_radius < 0.0:
-            raise ValueError("patch_inflation_radius must be finite and non-negative")
         self.node_attribute_radius = float(self.declare_parameter(
             "terrain_node_radius", 0.50).value)
         if not math.isfinite(self.node_attribute_radius) or self.node_attribute_radius <= 0.0:
@@ -144,12 +143,24 @@ class GlobalRepresentationNode(Node):
         self.failure_evidence_received = 0
         self.failure_evidence_forwarded = 0
 
+        self.global_update_period = float(self.declare_parameter(
+            "global_update_period", 0.5).value)
+        if not math.isfinite(self.global_update_period) or self.global_update_period < 0.1:
+            raise ValueError("global_update_period must be finite and >= 0.1 seconds")
+        self.skip_unchanged_patches = bool(self.declare_parameter(
+            "skip_unchanged_patches", True).value)
+        self._pending_patch = None
+        self.received_patches = self.replaced_pending_patches = self.unchanged_patches = 0
+        self._last_patch_key = None
+        self._traversal_cost_revision = 0
+        self.create_timer(self.global_update_period, self.process_pending_patch)
+
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         sensor_qos.durability = DurabilityPolicy.VOLATILE
         self.create_subscription(
             LocalMapPatch, "grid_map/local_map_patch",
-            self.patch_callback, sensor_qos)
+            self.queue_patch, sensor_qos)
         self.create_subscription(Odometry, "body_pose", self.traversal_callback, sensor_qos)
         self.delta_pub = self.create_publisher(
             TopoGraphDelta, "global_representation/topology_delta", 10)
@@ -176,7 +187,8 @@ class GlobalRepresentationNode(Node):
             String, "global_representation/oracle_metrics", 10)
         self.get_logger().info(
             f"[SPATIAL_ENGINE] engine={self.spatial_engine} "
-            f"tile_size={self.wavefront.tile_size:.2f}m; geometry and execution constraints separate")
+            f"tile_size={self.wavefront.tile_size:.2f}m update_period={self.global_update_period:.2f}s "
+            "raw connectivity; no Global body inflation; audit oracle disabled by default")
 
     @staticmethod
     def node_message(node: TopologyNode, patch: LocalMapPatch) -> TopoNode:
@@ -245,6 +257,7 @@ class GlobalRepresentationNode(Node):
         self.traversal_body_z = body_z
         self.wavefront.record_traversal(
             previous[1], point, dz, stamp * 1e-9)
+        self._traversal_cost_revision = getattr(self, "_traversal_cost_revision", 0) + 1
 
     @staticmethod
     def edge_message(edge: TopologyEdge, patch: LocalMapPatch) -> TopoEdge:
@@ -279,19 +292,15 @@ class GlobalRepresentationNode(Node):
         self.last_safe_shadow_metrics = {}
         self.graph_changes = ({}, {}, set(), {}, {}, set())
         self.last_map_revision = 0
+        self._last_patch_key = None
+        self._published_spatial_revision = -1
+        self._spatial_fill_marker = None
+        self._force_graph_snapshot = True
+        self._spatial_fill_marker = None
+        self._last_metrics = {}
         self.traversal_anchor = None
         self.terrain_reset_count += 1
         self.get_logger().warning(f"[GLOBAL_WORLD_RESET] reason={reason}")
-
-    def inflate_patch(self, occupancy, resolution):
-        """Raw Local slice in, Global clearance out: one inflation owner."""
-        free = occupancy == 0
-        if not free.any() or free.all():
-            return occupancy
-        distance = clearance_field(free, float(resolution))
-        inflated = occupancy.copy()
-        inflated[free & (distance < self.patch_inflation_radius)] = 100
-        return inflated
 
     @staticmethod
     def tile_occupancy_revision(raw, resolution, origin, key, tile_size):
@@ -372,9 +381,14 @@ class GlobalRepresentationNode(Node):
         for element_id, message in self.global_node_messages.items():
             x, y = float(message.position.x), float(message.position.y)
             radius = self.node_attribute_radius
-            aggregate = self.terrain.aggregate(
-                [(x, y), (x + radius, y), (x - radius, y),
-                 (x, y + radius), (x, y - radius)])
+            domain = (self.wavefront.spatial_view.domains.get(element_id)
+                      if getattr(self, "wavefront_compact_routes", False) else None)
+            points = ([((self.wavefront.nodes[k].cell[0]+.5)*self.wavefront.resolution,
+                        (self.wavefront.nodes[k].cell[1]+.5)*self.wavefront.resolution)
+                       for k in domain.members] if domain else
+                      [(x, y), (x + radius, y), (x - radius, y),
+                       (x, y + radius), (x, y - radius)])
+            aggregate = self.terrain.aggregate(points)
             state, traversability, traversals, experience, changed = (
                 self._element_terrain(
                     element_id, aggregate, now_seconds, self.node_attribute_hash))
@@ -545,6 +559,35 @@ class GlobalRepresentationNode(Node):
         output.markers[2].points = [
             Point(x=item["x"], y=item["y"], z=0.10)
             for item in self.viewpoint_constraints.values()]
+        # Stable spatial floor identity comes from this same geometry view,
+        # never from Explorer frontier groups or its current active task.
+        fill_revision = (self.wavefront.spatial_view.floor_revision
+                         if getattr(self, "spatial_engine", None) == "wavefront"
+                         and getattr(self, "wavefront_compact_routes", True) else -1)
+        fill = getattr(self, "_spatial_fill_marker", None)
+        if fill is None or getattr(self, "_spatial_fill_revision", None) != fill_revision:
+            fill = Marker()
+            fill.ns, fill.id = "spatial_domains", 3
+            fill.type, fill.action = Marker.TRIANGLE_LIST, Marker.ADD
+            fill.pose.orientation.w = 1.
+            fill.color.a = 1.
+            fill.scale.x = fill.scale.y = fill.scale.z = 1.
+            if fill_revision >= 0:
+                resolution = self.wavefront.resolution or 1.
+                for domain in self.wavefront.spatial_view.domains.values():
+                    rgb = region_rgb(domain.place_id)
+                    color = ColorRGBA(r=rgb[0], g=rgb[1], b=rgb[2], a=.30)
+                    for x0, y0, x1, y1 in domain.rectangles:
+                        a = Point(x=float(x0*resolution), y=float(y0*resolution), z=.04)
+                        b = Point(x=float(x1*resolution), y=float(y0*resolution), z=.04)
+                        c = Point(x=float(x1*resolution), y=float(y1*resolution), z=.04)
+                        d = Point(x=float(x0*resolution), y=float(y1*resolution), z=.04)
+                        fill.points.extend((a, b, c, a, c, d))
+                        fill.colors.extend((color,)*6)
+            self._spatial_fill_marker = fill
+            self._spatial_fill_revision = fill_revision
+        fill.header = header
+        output.markers.append(fill)  # empty ADD also clears an obsolete fill
         self.graph_vis_pub.publish(output)
 
     def safe_region_snapshot(self, map_revision=None):
@@ -570,6 +613,12 @@ class GlobalRepresentationNode(Node):
                 item for item in self.global_safe_portals.values()
                 if item["source"] in self.global_safe_regions
                 and item["target"] in self.global_safe_regions],
+            "spatial_supports": dict(
+                self.wavefront.routing_view().supports,
+                source_map_revision=int(self.last_map_revision if map_revision is None else map_revision),
+                world_epoch=int(getattr(self, "terrain_reset_count", 0)))
+                if getattr(self, "spatial_engine", None) == "wavefront"
+                and getattr(self, "wavefront_compact_routes", True) else {},
             "region_terrain": region_terrain,
             "portal_state": portal_state,
             "route_cost": route_cost,
@@ -662,6 +711,45 @@ class GlobalRepresentationNode(Node):
         self.failure_evidence_pub.publish(evidence)
         self.failure_evidence_forwarded += 1
 
+    def queue_patch(self, patch):
+        """Bound work to one latest patch; never accumulate a historical queue."""
+        self.received_patches += 1
+        if self._pending_patch is not None:
+            self.replaced_pending_patches += 1
+        self._pending_patch = patch
+
+    def process_pending_patch(self):
+        patch, self._pending_patch = self._pending_patch, None
+        if patch is not None:
+            self.patch_callback(patch)
+
+    def patch_work_key(self, patch, raw):
+        # Arrival/content counters and last_scan are freshness, not new terrain.
+        # A bounded 2 s refresh still applies expiry and experience decay. Origin
+        # XY is essential: the producer's content hash does not encode it.
+        fields = ("tile_x", "tile_y", "tile_size", "ground_min", "ground_median",
+                  "ground_max", "slope", "roughness", "support_cells", "rise_cells",
+                  "drop_cells", "overhead_cells", "measured_columns")
+        normalized = lambda value: value if math.isfinite(value) else None
+        terrain = tuple(sorted(tuple(normalized(float(getattr(tile, name)))
+                                     for name in fields) for tile in patch.terrain_tiles))
+        return (float(patch.origin.x), float(patch.origin.y), float(patch.resolution),
+                int(patch.width), int(patch.height), raw.tobytes(), terrain,
+                getattr(self, "_traversal_cost_revision", 0),
+                int(patch.header.stamp.sec) // 2)
+
+    def publish_graph_snapshot(self, patch):
+        if (self.graph_revision == 1 or getattr(self, "_force_graph_snapshot", False)
+                or self.graph_revision % self.snapshot_period_revisions == 0):
+            snapshot = TopoGraphDelta()
+            snapshot.header = patch.header
+            snapshot.source_map_revision = patch.map_revision
+            snapshot.graph_revision = self.graph_revision
+            snapshot.added_nodes = list(self.global_node_messages.values())
+            snapshot.added_edges = list(self.global_edge_messages.values())
+            self.snapshot_pub.publish(snapshot)
+            self._force_graph_snapshot = False
+
     def patch_callback(self, patch: LocalMapPatch):
         expected = int(patch.width) * int(patch.height)
         if (expected == 0 or len(patch.occupancy) != expected
@@ -686,16 +774,52 @@ class GlobalRepresentationNode(Node):
         raw_occupancy = np.asarray(patch.occupancy, dtype=np.int8).reshape(
             (patch.height, patch.width))
         raw_free = int(np.count_nonzero(raw_occupancy == 0))
-        occupancy = self.inflate_patch(
-            raw_occupancy, float(patch.resolution))
+        # Global preserves raw connection evidence. Body certification is Local.
+        occupancy = raw_occupancy.copy()
         terrain_changed, terrain_tiles_observed = self.ingest_terrain(
             patch, raw_occupancy)
+        work_key = self.patch_work_key(patch, raw_occupancy)
+        if (getattr(self, "skip_unchanged_patches", False)
+                and work_key == getattr(self, "_last_patch_key", None)):
+            self.last_map_revision = patch.map_revision
+            self.graph_revision += 1  # transport sequence; geometry stays cached
+            self.unchanged_patches = getattr(self, "unchanged_patches", 0) + 1
+            delta = TopoGraphDelta()
+            delta.header = patch.header
+            delta.source_map_revision = patch.map_revision
+            delta.graph_revision = self.graph_revision
+            self.delta_pub.publish(delta)
+            self.publish_graph_snapshot(patch)
+            if self.graph_revision % self.snapshot_period_revisions == 0:
+                self.publish_safe_region_snapshot(patch.map_revision)
+            metrics = dict(getattr(self, "_last_metrics", {}))
+            metrics.update(map_revision=int(patch.map_revision),
+                           graph_revision=self.graph_revision,
+                           patch_scan=int(patch.scan),
+                           patch_content_revision=int(patch.content_revision),
+                           input_stamp=patch.header.stamp.sec + patch.header.stamp.nanosec * 1e-9,
+                           unchanged_patch=True, unchanged_patches=self.unchanged_patches,
+                           wavefront_changed_cells=0, wavefront_dirty_tiles=0,
+                           topology_oracle_sampled=False, topology_oracle_ms=0.0,
+                           received_patches=getattr(self, "received_patches", 0),
+                           replaced_pending_patches=getattr(self, "replaced_pending_patches", 0),
+                           processing_ms=(time.perf_counter() - started) * 1000.)
+            for name in ("clearance_ms", "wavefront_ms", "graph_compression_ms",
+                         "graph_delta_update_ms", "safe_region_extraction_ms", "safe_region_oracle_ms"):
+                metrics[name] = 0.0
+            metrics["safe_region_shadow_sampled"] = False
+            metrics["safe_region_oracle_sampled"] = False
+            message = String()
+            message.data = json.dumps(metrics, separators=(",", ":"))
+            self.metrics_pub.publish(message)
+            return
         dense_free = int(np.count_nonzero(occupancy == 0))
         destructive_updates_allowed = (
             dense_free >= self.min_free_cells_for_destructive_update)
         clearance_started = time.perf_counter()
-        shared_clearance = clearance_field(
-            occupancy == 0, float(patch.resolution))
+        shared_clearance = (clearance_field(occupancy == 0, float(patch.resolution))
+                            if self.spatial_engine != "wavefront" or self.safe_region_shadow_enabled
+                            else None)
         stage_timings = {
             "clearance_ms": (time.perf_counter() - clearance_started) * 1000.0}
         wave_update = None
@@ -717,13 +841,15 @@ class GlobalRepresentationNode(Node):
             query_graph = (self.wavefront.routing_view() if self.wavefront_compact_routes
                            else TopologyGraph(self.wavefront.nodes,self.wavefront.edges,set()))
             stage_timings['graph_compression_ms'] = (time.perf_counter()-compression_started)*1000.
+            stage_timings.update(self.wavefront.spatial_view.metrics)
         else:
             local_graph = extract_topology(
                 occupancy, float(patch.resolution),
                 (patch.origin.x, patch.origin.y), shared_clearance, stage_timings)
         oracle_started = time.perf_counter()
-        sample_topology_oracle = (not self.last_topology_oracle or
-            (self.graph_revision+1) % self.topology_oracle_period_revisions == 0)
+        sample_topology_oracle = (getattr(self, "topology_oracle_enabled", True) and
+            (not self.last_topology_oracle or
+             (self.graph_revision+1) % self.topology_oracle_period_revisions == 0))
         if sample_topology_oracle:
             if wave_update is not None:
                 # Compare against the same accumulated world facts as the
@@ -888,15 +1014,12 @@ class GlobalRepresentationNode(Node):
         delta.removed_edge_ids = sorted(removed_edge_ids)
         self.delta_pub.publish(delta)
         self.publish_graph_markers(patch.header)
-        if (self.graph_revision == 1
+        self.publish_graph_snapshot(patch)
+        spatial_revision = self.wavefront.spatial_view.revision
+        if (getattr(self, "_published_spatial_revision", -1) != spatial_revision
                 or self.graph_revision % self.snapshot_period_revisions == 0):
-            snapshot = TopoGraphDelta()
-            snapshot.header = patch.header
-            snapshot.source_map_revision = patch.map_revision
-            snapshot.graph_revision = self.graph_revision
-            snapshot.added_nodes = list(self.global_node_messages.values())
-            snapshot.added_edges = list(self.global_edge_messages.values())
-            self.snapshot_pub.publish(snapshot)
+            self.publish_safe_region_snapshot(patch.map_revision)
+            self._published_spatial_revision = spatial_revision
 
         processing_ms = (time.perf_counter() - started) * 1000.0
         element_states = {}
@@ -930,7 +1053,13 @@ class GlobalRepresentationNode(Node):
             "raw_free_cells": raw_free,
             "patch_scan": int(patch.scan),
             "patch_content_revision": int(patch.content_revision),
-            "patch_inflation_radius": self.patch_inflation_radius,
+            "patch_inflation_radius": 0.0,
+            "geometry_input": "raw",
+            "unchanged_patch": False,
+            "unchanged_patches": getattr(self, "unchanged_patches", 0),
+            "input_stamp": stamp_seconds,
+            "received_patches": getattr(self, "received_patches", 0),
+            "replaced_pending_patches": getattr(self, "replaced_pending_patches", 0),
             "terrain_tiles": len(self.terrain.tiles),
             "terrain_tiles_observed": terrain_tiles_observed,
             "terrain_changed_tiles": int(terrain_changed),
@@ -944,6 +1073,8 @@ class GlobalRepresentationNode(Node):
         metrics_msg = String()
         metrics_msg.data = json.dumps(metrics, separators=(",", ":"))
         self.metrics_pub.publish(metrics_msg)
+        self._last_patch_key = work_key
+        self._last_metrics = metrics
         self.get_logger().info(
             f"[SPATIAL_GRAPH_UPDATE] engine={self.spatial_engine} map_revision={patch.map_revision} "
             f"local=({len(local_graph.nodes)},{len(local_graph.edges)}) "

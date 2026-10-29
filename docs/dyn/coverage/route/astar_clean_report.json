@@ -1,0 +1,15 @@
+{
+ "input": "route_final.csv",
+ "waypoint_m": 4.0,
+ "segments_failed": 2,
+ "points": 3884,
+ "length_m": 4703.9,
+ "start": [
+  0.02,
+  0.64
+ ],
+ "end": [
+  -95.98,
+  53.44
+ ]
+}

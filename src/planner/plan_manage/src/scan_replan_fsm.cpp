@@ -78,6 +78,10 @@ namespace scan_planner
         node_, "fsm.planning_clearance_margin", 0.10);
     preferred_clearance_margin_ = load_parameter<double>(
         node_, "fsm.preferred_clearance_margin", 0.20);
+    const double walk_degrees=load_parameter<double>(node_,"fsm.maximum_walk_slope_degrees",25.0);
+    if(!std::isfinite(walk_degrees) || walk_degrees<=0.0 || walk_degrees>=60.0)
+      throw std::invalid_argument("invalid Local walk slope capability");
+    maximum_walk_slope_radians_=walk_degrees*std::acos(-1.0)/180.0;
     clearance_limited_max_forward_speed_ = load_parameter<double>(
         node_, "fsm.clearance_limited_max_forward_speed", 0.30);
     min_forward_command_ = load_parameter<double>(
@@ -1514,6 +1518,14 @@ namespace scan_planner
       }
       execution_command_pub_->publish(command);
     }
+    if(!handoff.structured_repair_segment && !structured_local_repair_active_.load()) {
+      std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+      auto& episode=departure_recovery_memory_;
+      // A normal plan installed after real departure progress establishes a
+      // new navigable context; pose jitter or merely receiving a Goal does not.
+      if(episode.started_at>=0.0 && (odom_pos_.head<2>()-episode.position).norm()>=.30)
+        episode={};
+    }
     if (handoff.structured_repair_segment)
     {
       structured_local_repair_active_.store(true);
@@ -1533,6 +1545,8 @@ namespace scan_planner
       predictive_hold_release_cycles_.store(0);
       predictive_replan_requested_.store(false);
       tracking_recovery_active_ = false;
+      { std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+        departure_recovery_memory_.activated(node_->now().seconds()); }
       const int committed_segments =
           structured_local_repair_segments_committed_.fetch_add(1) + 1;
       // Do not reset a transaction-wide budget here.  The previous behavior
@@ -1551,6 +1565,8 @@ namespace scan_planner
                  handoff.structured_repair_segment,
                  handoff.structured_repair_rejoin, true))
     {
+      { std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+        departure_recovery_memory_={}; }
       // This exact candidate is now the controller's execution version.  The
       // recovery transaction ends here, not when SCAN merely generated or
       // published the candidate.
@@ -1571,7 +1587,6 @@ namespace scan_planner
       setLocalRecoveryState(
           LocalRecoveryState::TRACKING, 0.0,
           "structured_repair_rejoin_acknowledged");
-      task_lateral_repair_authorized_.store(false);
       RCLCPP_INFO(
           node_->get_logger(),
           "[STRUCTURED_LOCAL_REPAIR_COMPLETE] request_id=%llu trajectory=%lld; controller accepted the reference-path rejoin",
@@ -2097,6 +2112,14 @@ namespace scan_planner
         return;
       }
     }
+    if (task_mode_ && have_target_ && (structured_local_repair_active_.load() ||
+        stopped_local_repair_active_.load() || stopped_local_repair_pending_.load())) {
+      bool expired=false;
+      { std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+        expired=departure_recovery_memory_.timedOut(node_->now().seconds(),
+            structured_local_repair_executing_.load()); }
+      if(expired) { observationTaskRejected("DEPARTURE_EPISODE_EXHAUSTED"); return; }
+    }
     if (activateDeferredReferencePathIfReady())
       return;
     refreshPlanningOdomFromSafety();
@@ -2170,11 +2193,13 @@ namespace scan_planner
           !boundary_departure_rest_gate_.observe(true,stamp>0 && now>=stamp &&
               now-stamp<=250000000LL,safety_planar_speed,safety_heading_rate,stamp)) return;
       refreshPlanningOdomFromSafety();
+      if(deferDepartureRecoverySearch()) return;
       std::string rejection;
       const bool submitted=tryBoundaryEscape(rejection);
       boundary_departure_rest_gate_={};
       if(!submitted && rejection!="WAIT_FREE_CONFIRMATION")
-        observationTaskRejected("LATERAL_RECOVERY_BOUNDARY_"+rejection);
+        RCLCPP_WARN_THROTTLE(node_->get_logger(),*node_->get_clock(),1000,
+            "[BOUNDARY_ESCAPE_SEARCH_FAILED] reason=%s; bounded retry retains HOLD",rejection.c_str());
       return;
     }
     if (!structured_failed_rejoin_pending_.load() &&
@@ -2279,7 +2304,6 @@ namespace scan_planner
         // cannot depart. Keep the task and certify one ordinary rejoin family
         // from that pose. No new escape, budget reset or fabricated FINISHED.
         structured_failed_rejoin_pending_.store(true);
-        task_lateral_repair_authorized_.store(false);
         stopped_local_repair_pending_.store(false);
         stopped_local_repair_active_.store(false);
         RCLCPP_WARN(node_->get_logger(),
@@ -2482,13 +2506,17 @@ namespace scan_planner
       // whose future prefix merely promises to leave the clearance belt.
       const bool stopped_structured_repair =
           stopped_local_repair_active_.load();
+      if (stopped_structured_repair && deferDepartureRecoverySearch()) return;
       bool success = stopped_structured_repair
                          ? tryStructuredLocalRepair()
                          : callReboundReplan(true, task_mode_ ? false : flag_random_poly_init);
       if (!success && !stopped_structured_repair && flag_random_poly_init &&
           reference_path_active_ &&
           (emergency_path_pending_ || safety_stop_active_.load()))
+      {
+        if(deferDepartureRecoverySearch()) return;
         success = tryStructuredLocalRepair();
+      }
       if (success)
       {
         // callReboundReplan() has only submitted a candidate.  The matching
@@ -2501,6 +2529,7 @@ namespace scan_planner
       }
       else
       {
+        if(task_mode_ && !have_target_) return;
         replan_fail_count_++;
         changeFSMExecState(GEN_NEW_TRAJ, "FSM");
       }
@@ -3129,16 +3158,20 @@ namespace scan_planner
     if (!task_mode_ || !observation_task_ || !have_target_ ||
         !enable_holonomic_lateral_repair_) return false;
     refreshDepartureRecoveryBudget();
-    if (task_lateral_repair_used_.load()) {
-      rejection="FAMILY_EXHAUSTED";
-      RCLCPP_WARN(node_->get_logger(),"[BOUNDARY_ESCAPE_REJECTED] reason=PHYSICAL_FAMILY_ALREADY_USED");
-      return false;
-    }
+
     const auto map=planner_manager_->grid_map_;
     const auto snapshot=map->captureInflatedOccupancySnapshot();
     const double yaw=getOdomYaw();
     const auto initial=snapshot->assessMotion(odom_pos_,yaw);
     if(initial.clear()) {rejection="WAIT_FREE_CONFIRMATION";return false;}
+    { std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+      if(!departure_recovery_memory_.beginSearch(node_->now().seconds(),odom_pos_.head<2>(),
+          yaw,observationStationExitMask(odom_pos_,yaw,false))) {
+        rejection="SEARCH_DEFERRED"; return false;
+      }
+      RCLCPP_INFO(node_->get_logger(),"[DEPARTURE_SEARCH] attempt=%u activated=%d kind=boundary",
+          departure_recovery_memory_.searches,departure_recovery_memory_.used);
+    }
     if(initial.outside_map) {rejection="OUTSIDE_MAP";return false;}
     if(initial.unexplained_inflation) {rejection="UNEXPLAINED_SOURCE";return false;}
     auto certificate=std::make_shared<BoundaryEscapeCertificate>();
@@ -3163,14 +3196,6 @@ namespace scan_planner
       }
       if(source.penetration>.10) {rejection="DEEP_OVERLAP";return false;}
       certificate->initial_contacts[contact.first]=source.penetration;
-    }
-    // Spend the physical family once, even when no direction is feasible.
-    // A replacement Goal must not buy another attempt at the same state.
-    task_lateral_repair_used_.store(true);
-    task_lateral_repair_authorized_.store(true);
-    {
-      std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
-      departure_recovery_memory_={true,odom_pos_.head<2>(),yaw,observationStationExitMask(odom_pos_,yaw)};
     }
     const auto domain=observationTaskDomain();
     const Eigen::Vector2d left(-std::sin(yaw),std::cos(yaw));
@@ -3278,23 +3303,6 @@ namespace scan_planner
         !have_target_)
       return false;
 
-    if (task_mode_ && !task_lateral_repair_authorized_.load())
-    {
-      // Safety-stop recovery also enters here directly. It must consume the
-      // same physical-departure family as the task-search failure path.
-      refreshDepartureRecoveryBudget();
-      if (task_lateral_repair_used_.load())
-      {
-        observationTaskRejected("LATERAL_RECOVERY_ALREADY_USED");
-        return false;
-      }
-      task_lateral_repair_used_.store(true);
-      task_lateral_repair_authorized_.store(true);
-      std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
-      departure_recovery_memory_={true,odom_pos_.head<2>(),getOdomYaw(),
-          observationStationExitMask(odom_pos_,getOdomYaw())};
-    }
-
     // From this point until a validated candidate succeeds (or the bounded
     // retry budget is exhausted), SCAN owns the request as LOCAL_REPAIR.  A
     // failed optimizer call must not silently downgrade it to generic
@@ -3365,6 +3373,14 @@ namespace scan_planner
           static_cast<unsigned long long>(
               active_reference_request_id_.load()));
       return false;
+    }
+
+    if(task_mode_) {
+      std::lock_guard<std::mutex> lock(departure_recovery_mutex_);
+      if(!departure_recovery_memory_.beginSearch(node_->now().seconds(),odom_pos_.head<2>(),
+          getOdomYaw(),observationStationExitMask(odom_pos_,getOdomYaw(),false))) return false;
+      RCLCPP_INFO(node_->get_logger(),"[DEPARTURE_SEARCH] attempt=%u activated=%d kind=lateral",
+          departure_recovery_memory_.searches,departure_recovery_memory_.used);
     }
 
     ReferencePathLookahead reference_entry = projectReferencePathLookahead(
@@ -5259,7 +5275,11 @@ namespace scan_planner
             current_margin_blocked, current_physical_blocked,
             map->getInflateOccupancy(point, yaw) != 0, planning_clearance_margin_);
       };
-      double sampled_distance = 0.0;
+      double sampled_distance = 0.0, next_support_check=0.0;
+      std::vector<Eigen::Vector3d> measured_support;measured_support.reserve(81);
+      uint32_t newest_terrain_scan=0;
+      for(const auto& fact:validation_snapshot->terrain_facts)
+        newest_terrain_scan=std::max(newest_terrain_scan,fact.second.scan);
       Eigen::Vector3d previous_sample = info->position_traj_.evaluateDeBoorT(0.0);
       for (double t = 0.0; t <= info->duration_; t += validation_dt)
       {
@@ -5277,6 +5297,36 @@ namespace scan_planner
             (low_speed_local_repair && fixed_body_yaw_repair) || task_turn_stage_active_
                 ? (task_turn_stage_active_ ? getOdomYaw() : local_repair_body_yaw)
                 : estimateYawFromSegment(pos, pos_next);
+        if(sampled_distance+1e-9>=next_support_check && !validation_snapshot->terrain_facts.empty()) {
+          next_support_check=sampled_distance+.10;
+          measured_support.clear();
+          const double inv=validation_snapshot->resolution_inv;
+          const int ix=std::floor(pos.x()*inv),iy=std::floor(pos.y()*inv);
+          const int radius=std::max(1,static_cast<int>(std::ceil(.4*inv)));
+          const int stride=std::max(1,static_cast<int>(std::lround(.10*inv)));
+          for(int dx=-radius;dx<=radius;dx+=stride) for(int dy=-radius;dy<=radius;dy+=stride) {
+            const auto it=validation_snapshot->terrain_facts.find({ix+dx,iy+dy});
+            if(it==validation_snapshot->terrain_facts.end() || !it->second.scan ||
+                newest_terrain_scan-it->second.scan>30) continue;
+            const auto& fact=it->second.lowest;
+            // Overhead and rock returns have a fitted height, but are not
+            // themselves measured floor support (and may be wire-clamped).
+            if(!std::isfinite(fact.ground_relative_height) ||
+                std::abs(fact.ground_relative_height)>.035) continue;
+            measured_support.emplace_back(fact.measured.x(),fact.measured.y(),
+                fact.measured.z()-fact.ground_relative_height);
+          }
+          const auto slope=measuredSupportSlope(measured_support);
+          if(slope && *slope>maximum_walk_slope_radians_+1e-6) {
+            RCLCPP_WARN(node_->get_logger(),
+                "[LOCAL_TERRAIN_LIMIT] reason=GROUND_SLOPE_LIMIT measured_deg=%.2f maximum_deg=%.2f support=%zu revision=%llu; geometry retained, candidate rejected",
+                *slope*180.0/std::acos(-1.0),maximum_walk_slope_radians_*180.0/std::acos(-1.0),
+                measured_support.size(),static_cast<unsigned long long>(validation_snapshot->revision));
+            log_validation_failure("TERRAIN_CAPABILITY",t,sampled_distance,pos,candidate_yaw,
+                info->duration_-t<=validation_dt+1e-9,"GROUND_SLOPE_LIMIT");
+            return reject_planned_trajectory();
+          }
+        }
         if (task_mode_ && !taskDomainContains(task_domain, pos.head<2>()))
         {
           log_validation_failure("TASK_DOMAIN", t, sampled_distance, pos, candidate_yaw,
@@ -5428,7 +5478,9 @@ namespace scan_planner
                 (blocked && !handoffClearanceViolationIsAdmissible(true,tube_started[transverse],tube_exited[transverse],
                     map->getInflateOccupancy(point,local_repair_body_yaw)!=0,count,tube_counts[transverse]))) {
               log_validation_failure("LATERAL_RECOVERY_BRAKING",t,distance,point,
-                  local_repair_body_yaw,t>=info->duration_,"LATERAL_SWEEP_REJECTED");
+                  local_repair_body_yaw,t>=info->duration_,
+                  (task_mode_ && !taskDomainContains(task_domain,point.head<2>()))
+                    ? "LATERAL_TASK_DOMAIN_REJECTED" : "LATERAL_BRAKING_MARGIN_REJECTED");
               return reject_planned_trajectory();
             }
             tube_exited[transverse]=tube_exited[transverse] || !blocked;

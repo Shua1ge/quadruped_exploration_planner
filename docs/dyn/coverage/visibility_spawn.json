@@ -1,0 +1,8 @@
+{
+ "rays": 46080,
+ "hits": 23346,
+ "ground_hits": 5435,
+ "visible_cells": 1293,
+ "nearest_ground_hit_m": 1.6278155063391995,
+ "visible_area_m2": 116.36999999999999
+}

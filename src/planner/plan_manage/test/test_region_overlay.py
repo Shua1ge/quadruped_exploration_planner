@@ -46,7 +46,7 @@ def test_overlay_clears_previous_markers_first():
     assert message.markers[0].action == Marker.DELETEALL
 
 
-def test_regions_fill_the_floor_with_distinct_colors():
+def test_information_groups_show_boundary_points_without_repainting_floor():
     message = overlay(
         regions=[region(3, [(10, 10), (11, 10), (12, 10)], (1.1, 1.0))],
         region_colors={3: (0.9, 0.4, 0.1)},
@@ -55,12 +55,12 @@ def test_regions_fill_the_floor_with_distinct_colors():
                                   goal=(1.1, 1.0), unknown_gain=42)],
         robot=(1.0, 1.0), region_sequence=[3])
     grouped = markers_by_namespace(message)
-    fill = grouped["regions"][0]
-    assert fill.type == Marker.CUBE_LIST
+    fill = grouped["information_regions"][0]
+    assert fill.type == Marker.POINTS
     assert len(fill.points) == 3
-    assert len(fill.colors) == 3
-    assert fill.colors[0].a == pytest.approx(0.60)
-    assert (fill.colors[0].r, fill.colors[0].g, fill.colors[0].b) == pytest.approx(
+    assert not fill.colors
+    assert fill.color.a == pytest.approx(0.85)
+    assert (fill.color.r, fill.color.g, fill.color.b) == pytest.approx(
         (0.9, 0.4, 0.1))
     assert "region_labels" not in grouped
     assert "decision" not in grouped
@@ -105,18 +105,16 @@ def test_region_cell_budget_and_empty_inputs():
         regions=[region(0, cells, (0.0, 0.0))],
         cell_to_world=cell_to_world, max_cells_per_region=1000)
     grouped = markers_by_namespace(message)
-    assert len(grouped["regions"][0].points) <= 1000
+    assert len(grouped["information_regions"][0].points) <= 1000
     empty = overlay()
     assert len(empty.markers) == 1  # only DELETEALL
 
 
-def test_region_area_override_covers_more_than_frontier_cells():
-    message = overlay(
-        regions=[region(3, [(10, 10)], (1.0, 1.0))],
-        region_areas={3: [(10, 10), (11, 10), (11, 11), (10, 11)]},
-        cell_to_world=cell_to_world)
+def test_information_overlay_contains_only_current_information_boundary():
+    message = overlay(regions=[region(3, [(10, 10)], (1.0, 1.0))])
     grouped = markers_by_namespace(message)
-    assert len(grouped["regions"][0].points) == 4
+    assert len(grouped["information_regions"][0].points) == 1
+    assert all(m.type != Marker.CUBE_LIST for m in message.markers)
 
 
 class _Publisher:
@@ -147,7 +145,7 @@ def test_explorer_publishes_overlay_without_ros_node_context():
     assert len(publisher.messages) == 1
     message = publisher.messages[0]
     namespaces = {marker.ns for marker in message.markers}
-    assert "regions" in namespaces
+    assert "information_regions" in namespaces
     assert "region_labels" not in namespaces and "decision" not in namespaces
     assert message.markers[0].action == Marker.DELETEALL
     assert all(marker.type != Marker.TEXT_VIEW_FACING
@@ -175,29 +173,110 @@ def test_region_colors_persist_while_region_expands():
     churn = FrontierExplorer.region_color_map(
         fake, [region(1, [(0, 0)], (0.5, 0.5)),
                region(9, [(50, 50)], (3.05, 3.0))])
-    assert churn[9] == added[2]
+    # A different persistent ID is a new region, even at the old centroid.
+    assert churn[9] != added[2]
+    assert churn[1] == first[1]
 
 
-def test_region_area_bfs_respects_walls_and_partitions_free_space():
-    import numpy as np
-    from types import SimpleNamespace as NS
+def test_frontier_seed_motion_and_new_ids_do_not_allocate_floor_territory():
+    first = overlay(regions=[region(1, [(2, 5)], (.2, .5))])
+    second = overlay(regions=[region(2, [(20, 5)], (2., .5))])
+    for message in (first, second):
+        points = [m for m in message.markers if m.ns == "information_regions"]
+        assert len(points) == 1 and len(points[0].points) == 1
+        assert not any(m.type in (Marker.CUBE_LIST, Marker.TRIANGLE_LIST) for m in message.markers)
 
+
+def test_region_colors_do_not_collapse_after_twelve_or_depend_on_refresh_order():
     from frontier_explorer import FrontierExplorer
 
-    data = np.full((12, 30), -1, dtype=np.int8)
-    data[4:8, :] = 0
-    data[4:8, 15] = 100  # solid wall splits the corridor
-    grid = NS(data=data, resolution=0.1,
-              in_bounds=lambda cell: 0 <= cell[0] < 30 and 0 <= cell[1] < 12)
-    fake = NS(grid=grid, map_content_revision=5)
-    left = region(1, [(2, 5)], (0.2, 0.5))
-    right = region(2, [(27, 5)], (2.7, 0.5))
+    fake = SimpleNamespace()
+    regions = [region(i, [(i, 0)], (float(i), 0.0)) for i in range(47)]
+    first = FrontierExplorer.region_color_map(fake, regions)
+    assert len(set(first.values())) == 47
+    # Filtering, reordered candidates and lower IDs must not steal colours.
+    subset = [regions[46], regions[12], regions[0]]
+    refreshed = FrontierExplorer.region_color_map(fake, subset)
+    assert refreshed == {item.region_id: first[item.region_id] for item in subset}
+    assert FrontierExplorer.region_color_map(fake, list(reversed(regions))) == first
 
-    areas = FrontierExplorer.region_area_cells(fake, [left, right])
 
-    assert (2, 5) in areas[1] and (27, 5) in areas[2]
-    assert all(cell[0] < 15 for cell in areas[1])
-    assert all(cell[0] > 15 for cell in areas[2])
-    assert all(4 <= cell[1] <= 7 for cell in areas[1])
-    assert (5, 15) not in areas[1] and (5, 15) not in areas[2]
-    assert FrontierExplorer.region_area_cells(fake, [left, right]) is areas
+def test_region_color_survives_absence_and_centroid_motion(monkeypatch):
+    from frontier_explorer import FrontierExplorer
+    import frontier_explorer
+
+    fake = SimpleNamespace()
+    monkeypatch.setattr(frontier_explorer.time, "monotonic", lambda: 10.0)
+    first = FrontierExplorer.region_color_map(fake, [region(18, [(0, 0)], (0., 0.))])
+    monkeypatch.setattr(frontier_explorer.time, "monotonic", lambda: 1000.0)
+    FrontierExplorer.region_color_map(fake, [])
+    returned = FrontierExplorer.region_color_map(
+        fake, [region(18, [(80, 0)], (8., 0.)), region(2, [(0, 0)], (0., 0.))])
+    assert returned[18] == first[18]
+    assert returned[2] != first[18]
+
+
+def test_split_retains_parent_color_and_assigns_new_child_color():
+    from frontier_explorer import FrontierExplorer
+    from explorer_core.frontier_regions import FrontierRegion, PersistentRegionTracker
+
+    def observation(cells):
+        cells = set(cells)
+        centroid = (sum(x for x, _ in cells) / len(cells), 0.)
+        return FrontierRegion(-1, [sorted(cells)], centroid, cells)
+
+    tracker = PersistentRegionTracker(match_distance_cells=20.)
+    parent = tracker.update([observation((x, 0) for x in range(8))])[0]
+    fake = SimpleNamespace()
+    original = FrontierExplorer.region_color_map(fake, [parent])[parent.region_id]
+    children = tracker.update(
+        [observation([(0, 0), (1, 0)]), observation((x, 0) for x in range(3, 8))],
+        preferred_region_id=parent.region_id)
+    colors = FrontierExplorer.region_color_map(fake, children)
+    assert colors[parent.region_id] == original
+    assert len(set(colors.values())) == 2
+    assert {child.lineage_id for child in children} == {parent.lineage_id}
+    survivor = next(child for child in children if child.region_id == parent.region_id)
+    assert (7, 0) in survivor.cells
+
+
+def test_refresh_preserves_marker_slots_and_deletes_only_retired_items():
+    first = overlay(
+        regions=[region(1, [(0, 0)], (0., 0.)), region(2, [(1, 0)], (.1, 0.))],
+        accepted=[SimpleNamespace(cell=(0, 0))])
+    keys = {(m.ns, m.id) for m in first.markers if m.action == Marker.ADD}
+    refreshed = overlay(
+        regions=[region(2, [(1, 0), (2, 0)], (.15, 0.)),
+                 region(3, [(3, 0)], (.3, 0.))],
+        previous_marker_keys=keys)
+    assert not any(m.action == Marker.DELETEALL for m in refreshed.markers)
+    assert {(m.ns, m.id) for m in refreshed.markers if m.action == Marker.DELETE} == {
+        ("information_regions", 1), ("accepted", 0)}
+    # A late subscriber gets every current region in the latest snapshot.
+    adds = [m for m in refreshed.markers if m.action == Marker.ADD]
+    assert {(m.ns, m.id) for m in adds} == {("information_regions", 2), ("information_regions", 3)}
+    assert len(next(m for m in adds if m.id == 2).points) == 2
+    emptied = overlay(previous_marker_keys={(m.ns, m.id) for m in adds})
+    assert {(m.ns, m.id) for m in emptied.markers} == {("information_regions", 2), ("information_regions", 3)}
+    assert all(m.action == Marker.DELETE for m in emptied.markers)
+
+
+def test_explorer_refresh_does_not_clear_the_whole_layer(monkeypatch):
+    from frontier_explorer import FrontierExplorer
+    import frontier_explorer
+
+    publisher = _Publisher()
+    fake = SimpleNamespace(
+        frame_id="map", position=(0., 0.),
+        grid=SimpleNamespace(cell_to_world=cell_to_world, resolution=.1),
+        region_overlay_pub=publisher,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time())),
+        get_logger=lambda: SimpleNamespace(warning=lambda *a, **k: None))
+    monkeypatch.setattr(frontier_explorer.time, "monotonic", lambda: 100.)
+    FrontierExplorer.publish_region_overlay(fake, [region(1, [(0, 0)], (0., 0.))], [])
+    assert any(m.action == Marker.DELETEALL for m in publisher.messages[0].markers)
+    monkeypatch.setattr(frontier_explorer.time, "monotonic", lambda: 101.)
+    FrontierExplorer.publish_region_overlay(fake, [region(1, [(1, 0)], (.1, 0.))], [])
+    assert len(publisher.messages) == 2
+    assert all(m.action == Marker.ADD for m in publisher.messages[1].markers)
+    assert fake._region_overlay_marker_keys == {("information_regions", 1)}

@@ -1,0 +1,19 @@
+{
+ "input": "route_improved.csv",
+ "input_points": 5950,
+ "snapped_points": 3382,
+ "moved_points": 267,
+ "final_points": 6602,
+ "length_m": 4927.1,
+ "occupancy_samples": 16424,
+ "occupancy_bad": 472,
+ "occupancy_bad_pct": 2.87,
+ "start": [
+  0.02,
+  0.64
+ ],
+ "end": [
+  -95.98,
+  53.44
+ ]
+}

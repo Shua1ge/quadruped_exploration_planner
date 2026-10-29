@@ -128,6 +128,8 @@ def generate_launch_description():
         DeclareLaunchArgument("auto_start", default_value="true"),
         DeclareLaunchArgument("task_mode", default_value="false"),
         DeclareLaunchArgument("sparse_routing_enabled", default_value="true"),
+        DeclareLaunchArgument("global_usage_mode", default_value="shadow",
+                              choices=["off", "shadow", "route_cost"]),
         DeclareLaunchArgument("task_geometry_autonomy", default_value="true"),
         DeclareLaunchArgument("selection_strategy", default_value="hierarchical"),
         DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
@@ -287,6 +289,8 @@ def generate_launch_description():
                 "region_max_path_ratio": 1.5,
                 "region_max_detour_ratio": 1.75,
                 "region_match_distance": 6.0,
+                "global_usage_mode": ParameterValue(
+                    LaunchConfiguration("global_usage_mode"), value_type=str),
                 "sparse_routing_enabled": ParameterValue(
                     LaunchConfiguration("sparse_routing_enabled"), value_type=bool),
                 "sparse_attachment_radius": 3.0,
@@ -335,12 +339,17 @@ def generate_launch_description():
             executable="global_representation_node.py",
             name="global_representation",
             output="screen",
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration("global_usage_mode"), "' != 'off'"])),
             parameters=[{
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
                 "spatial_engine": "wavefront",
                 "wavefront_tile_size": 2.0,
                 "wavefront_compact_routes": True,
+                "topology_oracle_enabled": False,
                 "topology_oracle_period_revisions": 10,
+                "safe_region_shadow_enabled": False,
+                "global_update_period": 0.5,
                 "max_oracle_queries": 8,
                 # Deltas and RViz update per patch. Full recovery snapshots
                 # need not serialize the entire long-range graph at 4 Hz.

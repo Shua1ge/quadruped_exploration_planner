@@ -74,7 +74,7 @@ from explorer_core.planning_coordinator import (
 from explorer_core.portal_connectivity import SafeRegionConnectivity
 from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import BranchCommitment, ResidualCommitmentGate
-from explorer_core.region_overlay import REGION_PALETTE, build_region_overlay
+from explorer_core.region_overlay import build_region_overlay, region_rgb
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
 )
@@ -473,8 +473,12 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self.declare_parameter("region_max_path_ratio", 1.5).value)
         self.region_max_detour_ratio = float(
             self.declare_parameter("region_max_detour_ratio", 1.75).value)
-        self.sparse_routing_enabled = bool(
-            self.declare_parameter("sparse_routing_enabled", True).value)
+        self.global_usage_mode = str(self.declare_parameter(
+            "global_usage_mode", "shadow").value)
+        if self.global_usage_mode not in ("off", "shadow", "route_cost"):
+            raise ValueError("global_usage_mode must be off, shadow or route_cost")
+        sparse_requested = bool(self.declare_parameter("sparse_routing_enabled", True).value)
+        self.sparse_routing_enabled = self.global_usage_mode == "route_cost" and sparse_requested
         self.sparse_attachment_radius = float(
             self.declare_parameter("sparse_attachment_radius", 3.0).value)
         self.sparse_attachment_limit = int(
@@ -773,10 +777,11 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.create_subscription(
             String, "planning/status", self.planning_status_callback, 10,
             callback_group=self.planning_callback_group)
-        self.create_subscription(
-            FailureEvidence, "global_representation/failure_evidence",
-            self.failure_evidence_callback, 20,
-            callback_group=self.planning_callback_group)
+        if self.global_usage_mode == "route_cost":
+            self.create_subscription(
+                FailureEvidence, "global_representation/failure_evidence",
+                self.failure_evidence_callback, 20,
+                callback_group=self.planning_callback_group)
         self.create_subscription(
             TrajectoryAck, "planning/trajectory_ack",
             self.trajectory_ack_callback, 20,
@@ -801,22 +806,25 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             LocomotionState, "/robot/locomotion_state",
             self.locomotion_state_callback, locomotion_qos,
             callback_group=self.locomotion_callback_group)
-        self.create_subscription(
-            TopoGraphDelta, "global_representation/topology_delta",
-            self.topology_delta_callback, 10,
-            callback_group=self.planning_callback_group)
+        if self.global_usage_mode == "route_cost":
+            self.create_subscription(
+                TopoGraphDelta, "global_representation/topology_delta",
+                self.topology_delta_callback, 10,
+                callback_group=self.planning_callback_group)
 
         transient_qos = QoSProfile(depth=1)
         transient_qos.reliability = ReliabilityPolicy.RELIABLE
         transient_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        self.create_subscription(
-            TopoGraphDelta, "global_representation/topology_snapshot",
-            self.topology_snapshot_callback, transient_qos,
-            callback_group=self.planning_callback_group)
-        self.create_subscription(
-            String, "global_representation/safe_region_snapshot",
-            self.safe_region_snapshot_callback, transient_qos,
-            callback_group=self.planning_callback_group)
+        if self.global_usage_mode == "route_cost":
+            self.create_subscription(
+                TopoGraphDelta, "global_representation/topology_snapshot",
+                self.topology_snapshot_callback, transient_qos,
+                callback_group=self.planning_callback_group)
+        if self.global_usage_mode == "route_cost":
+            self.create_subscription(
+                String, "global_representation/safe_region_snapshot",
+                self.safe_region_snapshot_callback, transient_qos,
+                callback_group=self.planning_callback_group)
         self.path_pub = self.create_publisher(Path, "initial_path", 10)
         self.observation_task_pub = self.create_publisher(TaskMessage, "observation_task", 20)
         self.create_subscription(ObservationFeedback, "planning/observation_feedback",
@@ -851,7 +859,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             f"observation_preplanning={self.observation_preplanning_enabled}, "
             f"observation_prepare={self.observation_prepare_ratio:.2f}, "
             f"observation_done={self.observation_done_ratio:.2f}, "
-            f"sparse_routing={self.sparse_routing_enabled}")
+            f"sparse_routing={self.sparse_routing_enabled} "
+            f"global_usage_mode={self.global_usage_mode}")
 
     def locomotion_state_callback(self, msg: LocomotionState):
         self.locomotion_actuation_ready = msg.actuation_ready
@@ -902,6 +911,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         transition authority.  Viewpoint-scoped evidence may immediately
         change route scoring/cooldown, but it never clears the active request.
         """
+        if getattr(self, "global_usage_mode", "route_cost") != "route_cost":
+            return
         self.failure_evidence_received += 1
         if getattr(self, "task_mode", False):
             task = self.active_observation
@@ -1053,11 +1064,20 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.status_pub.publish(msg)
 
     def safe_region_snapshot_callback(self, msg: String):
+        if getattr(self, "global_usage_mode", "route_cost") != "route_cost":
+            return
         try:
             payload = json.loads(msg.data)
         except (TypeError, ValueError):
             payload = None
         if isinstance(payload, dict):
+            supports = payload.get("spatial_supports")
+            if isinstance(supports, dict):
+                try:
+                    if self.sparse_router.update_supports(supports):
+                        self._global_space_supports = supports
+                except (TypeError, ValueError, KeyError) as error:
+                    self.get_logger().warning(f"Rejected spatial support snapshot: {error}")
             for item in payload.get("viewpoint_constraints", ()):
                 try:
                     self.apply_global_viewpoint_constraint(
@@ -1078,6 +1098,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self, request_id: int, point: Point2, radius: float,
             reason: str) -> bool:
         """Install one graph-owned rejected-viewpoint constraint exactly once."""
+        if getattr(self, "global_usage_mode", "route_cost") != "route_cost":
+            return False
         requests = getattr(self, "global_viewpoint_constraint_requests", None)
         if requests is None:
             requests = set()
@@ -1110,6 +1132,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self, candidates: Sequence[FrontierCandidate],
             inflated: Set[Cell]) -> None:
         """Promote only unambiguous, known-free safe-region attachments."""
+        if getattr(self, "global_usage_mode", "route_cost") != "route_cost":
+            return
         by_region: Dict[int, List[FrontierCandidate]] = {}
         for candidate in candidates:
             by_region.setdefault(candidate.region_id, []).append(candidate)
@@ -1155,7 +1179,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
 
     def topology_delta_callback(self, msg: TopoGraphDelta):
         """Keep a lightweight query index of the independently maintained graph."""
-        if not self.sparse_routing_enabled:
+        if (getattr(self, "global_usage_mode", "route_cost") != "route_cost"
+                or not self.sparse_routing_enabled):
             return
         self.topology_messages_received += 1
         revision_before = self.sparse_router.graph_revision
@@ -1186,7 +1211,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
 
     def topology_snapshot_callback(self, msg: TopoGraphDelta):
         """Atomically restore a complete graph after launch races or restarts."""
-        if not self.sparse_routing_enabled:
+        if (getattr(self, "global_usage_mode", "route_cost") != "route_cost"
+                or not self.sparse_routing_enabled):
             return
         self.topology_messages_received += 1
         if msg.graph_revision < self.sparse_router.graph_revision:
@@ -1209,6 +1235,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 f"{traceback.format_exc()}",
                 throttle_duration_sec=1.0)
             return
+        if getattr(self, "_global_space_supports", None) is not None:
+            replacement.update_supports(self._global_space_supports)
         self.sparse_router = replacement
         self.topology_messages_applied += 1
         self.topology_snapshot_recovery_count += 1
@@ -1228,7 +1256,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         if blocked_edges:
             return ([None] * len(targets),
                     ["blocked_disabled"] * len(targets))
-        if not self.sparse_routing_enabled or not self.sparse_router.ready:
+        if (getattr(self, "global_usage_mode", "route_cost") != "route_cost"
+                or not self.sparse_routing_enabled or not self.sparse_router.ready):
             return ([None] * len(targets),
                     ["start_unattached"] * len(targets))
 
@@ -1938,9 +1967,6 @@ class FrontierExplorer(ObservationTaskBridge, Node):
     def activate_candidate(self, path: Sequence[Cell], candidate: FrontierCandidate,
                            acknowledged_task=None):
         """Publish a candidate while keeping region accounting in one place."""
-        if acknowledged_task is None and not self.local_departure_candidate_allowed(candidate,cells=path):
-            self.publish_status("LOCAL_DEPARTURE_ACTION_REJECTED")
-            return False # Simplification/preparation must not restore a failed entry.
         if (getattr(self,"task_mode",False) and acknowledged_task is None
                 and getattr(self,"completion_handoff_in_progress",False)):
             return self.stage_observation_handoff(path,candidate)
@@ -2119,8 +2145,6 @@ class FrontierExplorer(ObservationTaskBridge, Node):
     def directional_candidate_allowed(
             self, candidate: FrontierCandidate,
             candidate_scope: Tuple[str, int]) -> bool:
-        if not self.local_departure_candidate_allowed(candidate):
-            return False
         intent = getattr(self, "branch_commitment", None)
         if intent is not None and candidate_scope == self.active_commitment_scope:
             return intent.contains(self.grid, {candidate.frontier_cell}, self.branch_domain(intent))
@@ -3228,11 +3252,12 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 return
             request_age = ((self.get_clock().now().nanoseconds
                             - self.pending_path_publish_ns) * 1e-9)
-            if request_age >= self.path_request_timeout:
+            request_limit=self.motion_request_timeout()
+            if request_age >= request_limit:
                 request_id = self.pending_path_request_generation
                 self.get_logger().error(
                     f"[PATH_REQUEST_TIMEOUT] request_id={request_id} "
-                    f"age={request_age:.2f}s limit={self.path_request_timeout:.2f}s; "
+                    f"age={request_age:.2f}s limit={request_limit:.2f}s; "
                     "ending the request instead of waiting indefinitely")
                 timeout = String()
                 timeout.data = (
@@ -3300,12 +3325,15 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             return False
         if self.coarse_repair_pending():
             return self.activate_prepared_observation()
-        # Only current-pose occupancy blocks all arbitration. An exhausted
-        # action is filtered by initial route direction, before publication.
-        self.departure_action_suppressed=False
+        # Recovery failure is not an Explorer body/turn certificate.
         if not self.local_departure_replan_allowed():
             return False
 
+        departure_context=(self.local_execution_context(),self.map_content_revision,
+                           self.route_constraint_revision)
+        if getattr(self,"exhausted_departure_context",None)==departure_context:
+            self.publish_status("LOCAL_NAVIGATION_BLOCKED waiting_for=related_input_or_new_work")
+            return False
         now_ns = self.get_clock().now().nanoseconds
         context = ReplanContext(
             self.grid.world_to_cell(*self.position),
@@ -3370,12 +3398,16 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 getattr(self, 'branch_commitment', None) is None),
             map_preprocess_prefix_ms=preprocess_ms)
         if best is None:
+            if any(a.reason=="DEPARTURE_EPISODE_EXHAUSTED" and
+                   not self.local_motion_retry_allowed(a)
+                   for a in getattr(self,"local_motion_goal_cooldowns",{}).values()):
+                self.exhausted_departure_context=departure_context
+                self.publish_status("LOCAL_NAVIGATION_BLOCKED waiting_for=related_input_or_new_work")
+                return False
             if self.coarse_repair_pending():
                 self.publish_status("WAITING_FOR_COARSE_ROUTE_REPAIR")
                 return False
-            status = ("LOCAL_DEPARTURE_ACTIONS_EXHAUSTED" if
-                      getattr(self,"departure_action_suppressed",False) else
-                      self.no_frontier_status(inflated) if not filtered_frontiers
+            status = (self.no_frontier_status(inflated) if not filtered_frontiers
                       else "FRONTIERS_PRESENT_BUT_UNREACHABLE")
             if filtered_frontiers:
                 self.unreachable_context = (
@@ -3499,7 +3531,6 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 hypothesis.source_id, hypothesis.target_id)
 
         def select_candidate(options: Sequence[FrontierCandidate]):
-            options=[c for c in options if self.local_departure_candidate_allowed(c)]
             if required_scope is not None:
                 options = [candidate for candidate in options
                            if candidate.commitment_scope == required_scope]
@@ -3545,8 +3576,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                     throttle_duration_sec=2.0)
             candidates = [candidate for candidate in candidates
                           if candidate is not result]
-            if (allow_region_release and required_scope is None and
-                    not (materialized is not None and not self.local_departure_candidate_allowed(materialized))):
+            if allow_region_release and required_scope is None:
                 self.handle_dense_invalid_region(
                     rejected_region_id, candidates)
             result = select_candidate(candidates)
@@ -3916,87 +3946,16 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         return records
 
     def region_color_map(self, regions):
-        """Keep one colour per region while it expands; new areas get new colours."""
-        history = getattr(self, "_region_color_history", None)
-        if history is None:
-            history = {}
-            self._region_color_history = history
-        now = time.monotonic()
-        previous = dict(history)
-        result, used = {}, set()
-        for region in sorted(regions, key=lambda item: item.region_id):
-            region_id = int(region.region_id)
-            centroid = getattr(region, "centroid", (0.0, 0.0))
-            entry = previous.get(region_id)
-            index = None if entry is None else entry[0]
-            if index is None:
-                # An id renumbered by a split/merge may still own the same
-                # physical area; inherit its colour when it is close and free.
-                best = None
-                for old_id, old in previous.items():
-                    distance = math.hypot(
-                        centroid[0] - old[1], centroid[1] - old[2])
-                    if distance <= 2.0 and (best is None or distance < best[0]):
-                        best = (distance, old_id)
-                if best is not None:
-                    candidate = previous[best[1]][0]
-                    if candidate not in used:
-                        index = candidate
-            if index is None or index in used:
-                index = next((slot for slot in range(len(REGION_PALETTE))
-                              if slot not in used), 0)
-            used.add(index)
-            result[region_id] = REGION_PALETTE[index]
-            history[region_id] = (index, centroid[0], centroid[1], now)
-        for region_id in [key for key, value in history.items()
-                          if now - value[3] > 60.0]:
-            del history[region_id]
-        return result
+        """Use the persistent region ID as the sole colour identity.
 
-    def region_area_cells(self, regions):
-        """Partition known-free cells to their nearest frontier region.
-
-        Regions are groups of frontier cells, not areas. Multi-source BFS over
-        FREE cells gives each region a contiguous floor territory for display;
-        walls and unknown space stop the wavefront. Cached per map revision.
+        The tracker keeps one ID on a split and gives the other children new
+        IDs. Sharing lineage or a nearby centroid does not share a colour.
+        Reuse the overlay's unbounded deterministic palette so refresh order,
+        temporary absence and regions beyond the first twelve cannot recolour
+        an existing region. This is display-only; it never changes ownership.
         """
-        grid = self.grid
-        signature = (
-            getattr(self, "map_content_revision", -1), id(grid),
-            tuple(int(region.region_id) for region in regions),
-            tuple(len(region.cells) for region in regions))
-        cached = getattr(self, "_region_area_cache", None)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
-        from collections import deque
-        labels = {}
-        queue = deque()
-        for region in sorted(regions, key=lambda item: item.region_id):
-            region_id = int(region.region_id)
-            for cell in region.cells:
-                if cell in labels:
-                    continue
-                labels[cell] = region_id
-                queue.append(cell)
-        data = grid.data
-        limit = 15000
-        while queue and len(labels) < limit:
-            x, y = queue.popleft()
-            region_id = labels[(x, y)]
-            for neighbour in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                if neighbour in labels:
-                    continue
-                if not grid.in_bounds(neighbour):
-                    continue
-                if data[neighbour[1], neighbour[0]] != FREE:
-                    continue
-                labels[neighbour] = region_id
-                queue.append(neighbour)
-        areas = {}
-        for cell, region_id in labels.items():
-            areas.setdefault(region_id, []).append(cell)
-        self._region_area_cache = (signature, areas)
-        return areas
+        return {int(region.region_id): region_rgb(int(region.region_id))
+                for region in regions}
 
     def publish_region_overlay(self, regions, accepted):
         """Publish the current region/candidate decision for RViz only."""
@@ -4006,10 +3965,6 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self._region_overlay_last_publish = now
         if getattr(self, "position", None) is None:
             return
-        try:
-            areas = self.region_area_cells(regions)
-        except Exception:  # area fill is visualization only
-            areas = {}
         try:
             colors = self.region_color_map(regions)
         except Exception:  # colour allocation is visualization only
@@ -4026,15 +3981,18 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 prepared=getattr(self, "prepared_candidate", None),
                 active_region=getattr(self, "active_region_id", None),
                 region_sequence=getattr(self, "region_sequence", ()),
-                region_areas=areas,
                 region_colors=colors,
                 resolution=float(self.grid.resolution),
-                cell_to_world=self.grid.cell_to_world)
+                cell_to_world=self.grid.cell_to_world,
+                previous_marker_keys=getattr(self, "_region_overlay_marker_keys", None))
         except Exception as error:  # overlay must never break planning
             self.get_logger().warning(
                 f"[REGION_OVERLAY_FAILED] {error}", throttle_duration_sec=5.0)
             return
         self.region_overlay_pub.publish(overlay)
+        self._region_overlay_marker_keys = {
+            (marker.ns, marker.id) for marker in overlay.markers
+            if marker.action == marker.ADD}
 
     def coarse_repair_pending(self):
         result = getattr(self, "last_coarse_route_result", None)
@@ -4097,9 +4055,10 @@ class FrontierExplorer(ObservationTaskBridge, Node):
 
     def candidate_departure_penalty(self, candidate):
         """Soft access cost from measured heading, not a world-space no-return gate."""
+        history=self.local_departure_history_penalty(candidate)
         if not (getattr(self, "task_mode", False) and
                 getattr(self, "task_geometry_autonomy", False)):
-            return 0.0
+            return history
         yaw = getattr(self, "body_yaw", None)
         if yaw is None or not math.isfinite(yaw):
             return 0.0
@@ -4110,8 +4069,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             dx, dy = point[0]-self.position[0], point[1]-self.position[1]
             if math.hypot(dx, dy) >= 0.5:
                 angle = abs(math.remainder(math.atan2(dy, dx)-yaw, 2*math.pi))
-                return angle/math.pi
-        return 0.0
+                return angle/math.pi+history
+        return history
 
     def choose_greedy_candidate(self, candidates: Sequence[FrontierCandidate]):
         best = None
@@ -4649,6 +4608,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.pending_path_publish_ns = (self.get_clock().now().nanoseconds
                                         if published_ns is None else published_ns)
         self.pending_path_deferred = False
+        self.local_recovery_request = None
         self.pending_path_request_generation = request_generation
         self.active_path_request_generation = request_generation
         self.active_path_trajectory_id = None

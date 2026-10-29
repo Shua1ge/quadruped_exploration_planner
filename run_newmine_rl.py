@@ -79,9 +79,15 @@ def main():
                         help="start the Ignition GUI (not headless)")
     parser.add_argument("--show-rviz", action="store_true")
     parser.add_argument("--task-mode", action="store_true", default=True)
+    parser.add_argument("--global-mode", choices=("off", "shadow", "route_cost"),
+                        default="shadow", help="Global usage: default observes only")
     parser.add_argument("--sparse-routing", action=argparse.BooleanOptionalAction,
                         default=True,
-                        help="use Global sparse topology (default: true)")
+                        help="legacy sparse-route switch; used only with --global-mode route_cost")
+    parser.add_argument("--actual-route", type=Path, default=None,
+                        help="actual odometry CSV; default: metrics name + _actual_route.csv")
+    parser.add_argument("--record-route", action=argparse.BooleanOptionalAction,
+                        default=True, help="record measured 3D route independently at 5 Hz")
     parser.add_argument("--metrics", type=Path, default=None)
     parser.add_argument("--log", type=Path, default=None)
     args = parser.parse_args()
@@ -104,6 +110,13 @@ def main():
     log_path = args.log or Path(f"/tmp/scan_newmine_rl_{stamp}.log")
     metrics_path = args.metrics or Path(f"/tmp/scan_newmine_rl_{stamp}.csv")
 
+    route_path = (args.actual_route or
+                  metrics_path.with_name(metrics_path.stem + "_actual_route.csv")).expanduser().resolve()
+    if args.record_route and route_path in (metrics_path.expanduser().resolve(), log_path.expanduser().resolve()):
+        parser.error("--actual-route must differ from --metrics and --log")
+    if args.record_route and not args.dry_run and (route_path.exists() or route_path.with_suffix('.json').exists()):
+        parser.error(f"actual route output already exists: {route_path}; choose --actual-route")
+
     env = os.environ.copy()
     env["ROS_DOMAIN_ID"] = str(args.domain)
     env["IGN_PARTITION"] = f"scan_newmine_{args.domain}"
@@ -122,6 +135,7 @@ def main():
         f"show_rviz:={'true' if args.show_rviz else 'false'}",
         "auto_start:=true",
         f"task_mode:={'true' if args.task_mode else 'false'}",
+        f"global_usage_mode:={args.global_mode}",
         f"sparse_routing_enabled:={'true' if args.sparse_routing else 'false'}",
         "locomotion_mode:=rl_effort",
         "locomotion_policy:=go2_rl_lab",
@@ -147,8 +161,17 @@ def main():
     proc = subprocess.Popen(
         launch_cmd, cwd=WS, env=env, stdout=log_file,
         stderr=subprocess.STDOUT, start_new_session=True, text=True)
+    recorder = None
     armed = False
     try:
+        if args.record_route:
+            record_cmd = ["python3", str(REPO / "tools/record_actual_route.py"),
+                          "--output", str(route_path), "--world", str(args.world)]
+            recorder = subprocess.Popen(
+                ["bash", "-lc", SETUP + "exec " + shlex.join(record_cmd)],
+                cwd=WS, env=env, stdout=log_file, stderr=subprocess.STDOUT,
+                start_new_session=True, text=True)
+            print(f"  actual_route={route_path}")
         for attempt in range(1, 19):
             time.sleep(5.0)
             if proc.poll() is not None:
@@ -203,6 +226,20 @@ def main():
                     except ProcessLookupError:
                         pass
                     proc.wait(timeout=5.0)
+        if recorder is not None:
+            if recorder.poll() is None:
+                try:
+                    os.killpg(recorder.pid, signal.SIGINT)
+                    recorder.wait(timeout=5.)
+                except ProcessLookupError:
+                    pass
+                except subprocess.TimeoutExpired:
+                    os.killpg(recorder.pid, signal.SIGTERM)
+                    recorder.wait(timeout=5.)
+            if recorder.returncode not in (0, 130, -signal.SIGINT):
+                print(f"route recorder exited with code={recorder.returncode}; inspect {log_path}",
+                      file=sys.stderr)
+            print(f"actual_route={route_path}")
         log_file.flush()
         log_file.close()
         print(f"metrics={metrics_path}")

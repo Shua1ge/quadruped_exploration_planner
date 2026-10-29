@@ -1,0 +1,34 @@
+{
+ "initial_coverage_pct": 92.68,
+ "final_coverage_pct": 91.88,
+ "final_coverage_of_achievable_pct": 94.7,
+ "achievable_pct": 97.01,
+ "walkable_area_m2": 25488.1,
+ "route_length_m": 4916.6,
+ "inserts": 120,
+ "route_nodes": 2570,
+ "missed_clusters_top_m2": [
+  46.9,
+  23.8,
+  14.0,
+  13.0,
+  11.0,
+  10.5,
+  10.5,
+  8.6,
+  8.0,
+  7.9,
+  7.9,
+  7.2,
+  6.3,
+  6.2,
+  6.2
+ ],
+ "missed_cluster_count": 6424,
+ "target_frac_of_achievable": 0.99,
+ "rays": [
+  360,
+  32
+ ],
+ "route_res_m": 1.2
+}

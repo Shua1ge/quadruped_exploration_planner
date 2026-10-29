@@ -1,155 +1,79 @@
-> **dyn 快照 dyn-20261028-211234**：Ubuntu 22.04 / ROS 2 Humble / Gazebo Fortress / Go2 RL。先阅读 [环境与启动说明](docs/dyn/SETUP_ZH.md)、[世界资源](docs/dyn/WORLD_RESOURCES_ZH.md) 和 [已知问题](docs/dyn/KNOWN_ISSUES_20261028_ZH.md)。NewMine 与当前 RL 权重已随分支保存；Campus 通过官方资源准备脚本生成。本分支保存开发现场，仍包含已列明的恢复与区域显示问题。
+# dyn：Go2 长程自主探索
 
-<div align="center">
-  <h1>SCAN-Planner ROS 2</h1>
-  <h2>面向路线引导四足长程导航的空间碰撞感知局部规划器</h2>
-  <a href="https://arxiv.org/abs/2606.19555"><img alt="论文" src="https://img.shields.io/badge/论文-arXiv-b31b1b?logo=arxiv&logoColor=white"/></a>
-  <a href="https://www.bilibili.com/video/BV15a7P6UEXb/"><img alt="视频" src="https://img.shields.io/badge/视频-Bilibili-FB7299?logo=bilibili&logoColor=white"/></a>
-  <a href="https://wuyi2121.github.io/SCAN-Planner/"><img alt="项目主页" src="https://img.shields.io/badge/项目主页-Website-4A90E2?logo=googlechrome&logoColor=white"/></a>
-</div>
+Ubuntu 22.04 · ROS 2 Humble · Gazebo Fortress · Go2 RL。当前推荐使用 LiDAR 和本体感知，Vision 不启用；Global 保持 `shadow`，先独立验证空间表示和计算开销。
 
-<p align="center">
-  <img src="assets/images/abstract_real.jpg" width="100%"/>
-</p>
+本页对应包含本页的提交。历史分支快照 `7d48e6f` 的参数和行为不同，不包含后续 Global 观察模式等改动；部署和复现实验时请记录完整 commit。
 
-SCAN-Planner 是一款面向四足机器人导航的空间碰撞感知局部规划器。本分支是原生 ROS 2 自移植版本，适配 Ubuntu 22.04、ROS 2 Humble、C++17 和 `colcon` 构建系统。
+从终端开始请按 [启动探索步骤](docs/dyn/START_EXPLORATION_ZH.md) 操作；新部署使用本页指定的时间分支。
 
-本仓库是 [wuyi2121/SCAN-Planner](https://github.com/wuyi2121/SCAN-Planner) 的衍生 ROS 2 移植版。核心算法、项目设计与原始研究工作归功于 Han Zheng、Zhe Chen、Yiwen Fu、Ming Yang 和 Tong Qin；ROS 2 适配由本仓库维护者完成，不代表原作者的官方发布或认可。
+## 环境与构建
 
-当前维护版本为 `v0.2.0`。第一次了解项目建议先阅读[简明架构说明](docs/ARCHITECTURE_SIMPLE_ZH.md)，版本改动和验证范围见 [v0.2.0 版本说明](docs/RELEASE_V0.2.0_ZH.md)，完整技术交接见[项目交接文档](docs/PROJECT_HANDOFF_ZH.md)。
-
-## 构建
-
-安装 ROS 2 Humble 及包依赖后，在工作空间根目录下执行构建：
+先按 [环境安装说明](docs/dyn/SETUP_ZH.md#1-系统与依赖) 安装 Humble、Fortress、控制插件及系统 Python 的策略依赖。运行推理无需 Isaac Lab。使用英文、无空格的工作区路径。
 
 ```bash
-sudo apt update
+mkdir -p ~/ros2_ws/scan_planner_dyn_ws/src
+cd ~/ros2_ws/scan_planner_dyn_ws/src
+git clone --branch dyn-20261029-214547 \
+  https://github.com/Shua1ge/quadruped_exploration_planner.git SCAN-Planner
+cd ..
+source /opt/ros/humble/setup.bash
+# 首次使用 rosdep 时执行一次：sudo rosdep init
 rosdep update
-rosdep install --from-paths src --ignore-src -r -y
-sudo apt install libarmadillo-dev libglew-dev libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev
-
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+rosdep install --from-paths src --ignore-src --rosdistro humble -r -y
+colcon build --symlink-install --parallel-workers 2 --cmake-args \
+  -DCMAKE_BUILD_TYPE=Release -DUSE_GPU=OFF \
+  -DPython3_EXECUTABLE=/usr/bin/python3 -DPYTHON_EXECUTABLE=/usr/bin/python3
 source install/setup.bash
 ```
 
-默认构建 CPU 端本地感知后端，如需构建 OpenGL 后端可执行：
+`USE_GPU=OFF` 是规划器感知后端选项；Gazebo GPU LiDAR 仍需可用的 OpenGL/EGL 驱动。完整环境和无界面运行要求见 [SETUP_ZH.md](docs/dyn/SETUP_ZH.md)。
+
+## NewMine：推荐启动入口
+
+NewMine 的世界、所需模型和纹理，以及当前 TorchScript 权重已随仓库保存。
 
 ```bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_GPU=ON
+cd ~/ros2_ws/scan_planner_dyn_ws/src/SCAN-Planner
+./run_newmine_rl.py --dry-run --duration 0 --gui --show-rviz --global-mode shadow
+./run_newmine_rl.py --duration 0 --gui --show-rviz --global-mode shadow --domain 148
 ```
-仓库不再链接自带的 x86_64 架构 GLFW 动态库，GPU 构建依赖系统安装的 GLFW、GLEW 和 OpenGL 相关包。
 
-## 快速启动
+第一条只检查并打印命令。第二条启动 Gazebo、策略和探索，传感器就绪后会自动调用起身授权；`--duration 0` 持续运行到 Ctrl-C。仅检查世界和传感器、暂不起身时，使用 [不自动起身的启动方式](docs/dyn/SETUP_ZH.md#5-不自动起身的检查方式)。
 
-启动自定义确定性仿真器与规划器：
+从仓库根目录运行包装器；其他布局通过 `--workspace /path/to/colcon_ws` 指定已构建工作区。日志和 metrics 默认写入 `/tmp/scan_newmine_rl_时间戳.*`，当前包装器还记录实际里程计路径 CSV。参数以本提交的 `./run_newmine_rl.py --help` 为准。
+
+`shadow` 中 Global 计算和显示，但 Explorer 不消费其路线或空间划分。`--global-mode off` 用于开销对照。`route_cost` 是待单独验收的规划模式，不是当前推荐启动项。
+
+## Campus：先准备外部资源
+
+Campus 大型原始资源不随 Git 分发。按 [来源与资源说明](docs/dyn/WORLD_RESOURCES_ZH.md) 获取官方 environments ZIP，再执行：
 
 ```bash
-source install/setup.bash
-ros2 launch scan_planner run.launch.py \
-  is_real_world:=false navi_mode:=1 sensor_type:=lidar \
-  controller_mode:=closed_loop use_gpu:=false
+python3 tools/worlds/prepare_campus.py --archive /path/to/environments.zip
+# 也支持 --download 或 --source /path/to/campus，三者选一
+./run_newmine_rl.py --duration 0 --gui --show-rviz --global-mode shadow --domain 148 \
+  --world "$PWD/assets/runtime_worlds/campus/campus_fortress_runtime.sdf" \
+  --map-size-x 460 --map-size-y 400 \
+  --init-x 0 --init-y 0 --init-z 0.45
 ```
 
+使用转换后的 Z_UP OBJ 视觉与 STL 碰撞世界；不要直接将原始大型 DAE 当作 Fortress 碰撞体。下载、转换、资源路径和坐标说明见 [Campus 接入](docs/dyn/SETUP_ZH.md#4-campus下载导入与-fortress-适配)。
+
+## 发布验收
+
+发布候选先形成明确提交，再验证该提交导出的干净源码；不要用当前机器的旧 `install/` 证明新提交可运行。
 
 ```bash
-source install/setup.bash
-ros2 launch scan_planner run.launch.py \
-  is_real_world:=false navi_mode:=1 sensor_type:=lidar \
-  controller_mode:=closed_loop use_gpu:=false \
-  use_pcd_map:=true pcd_map_file:=/home/xiaoqi_wen/Desktop/scan/SCAN-Planner/map.pcd
+# 无仿真、无运动：资源与文档检查，独立导出 HEAD
+python3 tools/validate_release.py --ref HEAD --output /tmp/dyn-release-source
+# 独立源码 + 全量编译 + 安装入口 + 离线策略检查
+python3 tools/validate_release.py --ref HEAD --build --output /tmp/dyn-release-build
 ```
 
+报告记录实际 commit、未包含的工作树改动、逐项结果和日志。`--build` 也不会启动 Gazebo 或起身；仿真就绪和长程探索分别验收，不能用离线通过替代。详见 [发布验收流程](docs/dyn/RELEASE_CHECK_ZH.md)。历史结果保留在 [快照验证记录](docs/dyn/SNAPSHOT_VALIDATION.md)。
 
+## 当前开发范围
 
-在另一个终端启动 RViz2：
+[无 Vision 的 Global 设计与替代计划](docs/dyn/GLOBAL_NO_VISION_DESIGN_ZH.md) 定义空间身份、增量维护、候选接入及批量路线服务。它是后续实现与验收约束，不表示已完成；现有观察模式见 [GLOBAL_OBSERVATION_ZH.md](docs/dyn/GLOBAL_OBSERVATION_ZH.md)。历史停车与地图问题见 [已知问题记录](docs/dyn/KNOWN_ISSUES_20261028_ZH.md)，其中的现场状态对应记录日期。
 
-```bash
-source install/setup.bash
-ros2 launch scan_planner rviz.launch.py
-```
-
-RViz2 配置已适配 ROS 2 Humble：Go2 的 RobotModel 使用现有的 `meshes/base.dae`，Sliding Map Bounds 订阅 `/grid_map/sliding_map_bbox`，Goal 订阅 `/goal_point`。
-
-
-
-导航模式说明：
-- `navi_mode:=1`：使用 RViz2 的 2D 目标点工具选择导航目标
-- `navi_mode:=2`：按照 ROS 2 参数文件中预设的 `fsm.waypoints` 路径点序列导航
-- `navi_mode:=3`：订阅 `initial_path` 话题获取全局路径，并在局部范围内进行避障
-
-控制器模式分为 `open_loop`（开环）和 `closed_loop`（闭环）两种。本次移植保留的核心启动参数包括：`is_real_world`、`navi_mode`、`sensor_type`、`controller_mode`、`use_gpu`、`use_pcd_map` 和 `pcd_map_file`。
-
-当 `use_pcd_map:=true` 时，必须提供已有的 PCD 点云地图文件：
-
-```bash
-ros2 launch scan_planner run.launch.py \
-  use_pcd_map:=true pcd_map_file:=/absolute/path/to/map.pcd
-```
-
-无需启动 Gazebo 也可以直接从 SDF collision geometry 建立仿真真值。SDF
-与 PCD 模式互斥；加载器会读取 COLLADA 单位、SDF 位姿、mesh 与 box，并只在
-内存中发布点云：
-
-```bash
-ros2 launch scan_planner newmine_exploration.launch.py \
-  world_file:=/home/t1an/ros2_ws/mine_tunnel_world/worlds/NewMine.sdf \
-  metrics_file:=/tmp/newmine_long_horizon_01.csv
-```
-
-`newmine_exploration.launch.py` 默认将约 150 m × 150 m 的 NewMine 几何居中到
-160 m × 160 m Explorer 栅格。专用 LiDAR 节点直接读取 SDF/DAE collision mesh，
-只发布机器人当前位置的射线命中，不生成 PCD，也不发布全局真值点云或启动
-Gazebo。首次启动需要约十几秒建立私有三维射线加速结构；日志出现
-`SDF mesh ready` 后才开始收到局部扫描。
-
-实际硬件部署时，激光惯导里程计（LIO）、相机和宇树（Unitree）驱动均为外部依赖，默认启动会将规划器输入映射到 `/LIO/odom_vehicle`、`/LIO/odom_imu`、`/LIO/clouds_lidar` 话题以及 RealSense 对齐深度图话题，可根据实际安装的驱动栈修改话题重映射配置。
-
-## 配置与接口
-
-规划器、控制器和仿真器的参数分别位于：
-- `src/planner/plan_manage/config/planner.yaml`
-- `src/planner/plan_manage/config/controllers.yaml`
-- `src/planner/plan_manage/config/simulator.yaml`
-
-ROS 2 参数名称使用点号分隔，例如 `grid_map.resolution`。预设路径点是由 xyz 三元组组成的浮点数组：
-
-```yaml
-scan_planner_node:
-  ros__parameters:
-    fsm.navi_mode: 2
-    fsm.waypoints: [0.0, 0.0, 0.3, 5.0, 1.0, 0.3]
-```
-
-自定义消息类型包括 `scan_planner_msgs/msg/Bspline`、`ExecutionCommand`、`ExecutionState` 和 `DataDisp`。规划器相关话题均为相对话题，支持重映射。SCAN 与控制器通过 `planning/bspline`、`planning/execution_command` 和 `planning/execution_state` 交换带 `request_id + trajectory_id` 的版本化执行信息；物理碰撞仍通过独立的安全链路触发不可自动解除的硬急停。
-
-关键点记录器现在是原生的 `rclpy` 可执行程序：
-
-```bash
-ros2 run scan_planner keypoint_recorder.py --output keypoints.yaml
-```
-
-## Gazebo Fortress / Go2 仿真
-
-Go2 四足机器人物理模型基于 Gazebo Fortress、`ros_gz_sim` 和 `gz_ros2_control` 构建，对外提供 12 关节的 `joint_trajectory_controller`、`/joint_states` 话题、IMU 数据、四个足端接触力话题以及 `/clock` 时钟话题：
-
-```bash
-ros2 launch go2_description go2_sim.launch.py
-```
-
-如需在不启动物理仿真时查看模型，可运行：
-
-```bash
-ros2 launch go2_description go2_rviz.launch.py
-```
-旧版 Gazebo Classic 的轨迹/力可视化插件、外力插件以及宇树 ROS 1 专用插件已不在本 ROS 2 仿真版本中提供。
-
-
-## 致谢
-
-首先感谢原项目 [SCAN-Planner](https://github.com/wuyi2121/SCAN-Planner) 的作者 Han Zheng、Zhe Chen、Yiwen Fu、Ming Yang 和 Tong Qin 开源其研究成果与实现。本仓库在保留原项目 Apache-2.0 许可证的前提下完成 ROS 2 移植，完整署名见 [NOTICE](NOTICE)。
-
-SCAN-Planner 的实现借鉴了 EGO-Planner、ROG-Map、MARSIM、Mockamap 和 Leg-KILO 的算法思路与开源代码，真实机器人定位方案基于 Elevator-LIO / FAST-LIO2 实现。
-
-## 许可证
-
-本仓库遵循 [Apache License 2.0](LICENSE)。分发或派生本项目时，请保留 [NOTICE](NOTICE) 中的原项目署名与许可证信息。
+本项目衍生自 [wuyi2121/SCAN-Planner](https://github.com/wuyi2121/SCAN-Planner)，原始算法与研究署名保留于 [NOTICE](NOTICE)。许可证见 [LICENSE](LICENSE)；世界资源和策略的来源及许可单独记录于资源说明和 `models/`。

@@ -1,6 +1,6 @@
 # dyn 时间快照：环境、构建与运行
 
-本目录对应 2026-10-28 的 dyn 开发快照。它保留当前规划、观测任务、Go2 RL 执行和代码审计工具；不是所有已知问题均已修复的稳定发布。恢复候选预算提前耗尽、Explorer departure 限制、区域配色/高度/截断、地面拟合限制见 [已知问题](KNOWN_ISSUES_20261028_ZH.md)。本轮归档没有顺手修改这些运动行为。
+推荐入口见 [仓库首页](../../README.md)。本页区分 2026-10-28 历史快照与后续工作树；实际参数以所部署提交的 `run_newmine_rl.py --help` 为准。历史恢复、地面与显示问题见 [日期化记录](KNOWN_ISSUES_20261028_ZH.md)，不能将历史审计状态当作当前已验收状态。当前默认 Global shadow；无 Vision 的后续设计见 [空间记忆与计算替代计划](GLOBAL_NO_VISION_DESIGN_ZH.md)，发布步骤见 [发布验收](RELEASE_CHECK_ZH.md)。
 
 ## 1. 系统与依赖
 
@@ -10,7 +10,7 @@
 
 ```bash
 sudo apt update
-sudo apt install ros-humble-desktop python3-colcon-common-extensions python3-rosdep \
+sudo apt install build-essential cmake pkg-config ros-humble-desktop python3-colcon-common-extensions python3-rosdep \
   ros-humble-ros-gz ros-humble-gz-ros2-control \
   ros-humble-ros2-control ros-humble-ros2-controllers \
   ros-humble-xacro ros-humble-joint-state-publisher-gui \
@@ -39,15 +39,19 @@ sudo apt install ros-humble-desktop python3-colcon-common-extensions python3-ros
 ```bash
 mkdir -p ~/ros2_ws/scan_planner_dyn_ws/src
 cd ~/ros2_ws/scan_planner_dyn_ws/src
-git clone --branch dyn-20261028-211234 https://github.com/Shua1ge/quadruped_exploration_planner.git SCAN-Planner
+git clone --branch dyn-20261029-214547 https://github.com/Shua1ge/quadruped_exploration_planner.git SCAN-Planner
 cd ..
 source /opt/ros/humble/setup.bash
 # rosdep 未初始化时仅执行一次 sudo rosdep init
 rosdep update
 rosdep install --from-paths src --ignore-src --rosdistro humble -r -y
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_GPU=OFF
+colcon build --symlink-install --parallel-workers 2 --cmake-args \
+  -DCMAKE_BUILD_TYPE=Release -DUSE_GPU=OFF \
+  -DPython3_EXECUTABLE=/usr/bin/python3 -DPYTHON_EXECUTABLE=/usr/bin/python3
 source install/setup.bash
 ```
+
+使用英文、无空格的工作区路径；ROSIDL 在包含中文路径的本轮隔离构建中失败，改用 ASCII 路径后通过。
 
 用 `-DUSE_GPU=ON` 构建本地感知 OpenGL 后端也是现有选项；先用 OFF 建立可重复的 CPU 规划器基线。仓库的模型和 Python 脚本通过现有 ament 安装规则提供。根目录 `run_newmine_rl.py` 会向上查找 `install/setup.bash`；自定义布局用 `--workspace /path/to/colcon_ws` 或 `SCAN_DYN_WS` 指定，不要求用户名是 t1an。
 
@@ -57,13 +61,13 @@ source install/setup.bash
 
 ```bash
 cd ~/ros2_ws/scan_planner_dyn_ws/src/SCAN-Planner
-./run_newmine_rl.py --dry-run --duration 0 --no-sparse-routing --gui --show-rviz --domain 148
-./run_newmine_rl.py --duration 0 --no-sparse-routing --gui --show-rviz --domain 148
+./run_newmine_rl.py --dry-run --duration 0 --global-mode shadow --gui --show-rviz --domain 148
+./run_newmine_rl.py --duration 0 --global-mode shadow --gui --show-rviz --domain 148
 ```
 
 `--dry-run` 只打印 launch 命令，不启动仿真或起身。正式运行时，包装器隔离 ROS domain / IGN partition，等待关节、IMU 和 odom 后调用 `/robot/enter_navigation`，开始策略起身与探索。`--duration 0` 持续到 Ctrl-C；`--duration 90` 是起身授权成功后的 90 秒墙钟运行。Ctrl-C 只清理该包装器创建的进程组。
 
-`--no-sparse-routing` 禁止 Explorer 用 Global 稀疏路线做选路，不会关闭 Global 节点、地图摘要或它们的全部计算。省略该参数会使用已有稀疏选路。需要观察完整差异时单独对照，不把这两个模式混成同一个性能结果。
+当前默认 `--global-mode shadow`：Global 计算并显示粗连通图，Explorer 不消费其路线、safe-region 或转发失败约束。`--global-mode off` 则不启动 Global，可用于资源开销对照。原 `--no-sparse-routing` 保留兼容；省略它也不会越过 shadow 隔离。只有显式 `--global-mode route_cost` 才接回既有 Global 规划入口，本轮先不启用。说明和验证边界见 [Global 观察模式](GLOBAL_OBSERVATION_ZH.md)。
 
 ## 4. Campus：下载／导入与 Fortress 适配
 
@@ -84,7 +88,7 @@ python3 tools/worlds/prepare_campus.py --source /path/to/campus
 脚本先用 Gazebo MeshManager 提取原始三角形供 STL 碰撞使用，再用保留 Z_UP 的 Assimp 导出 OBJ 视觉网格；每个三角形的位置必须与原始参考在1毫米内一致，才生成部署世界。纹理降到最长边2048，保留9个材质；原点支撑高度按此前几何求交作0.000157343m平移。不是简单给 GO 或重力旋转90度，也不改变场景大小。
 
 ```bash
-./run_newmine_rl.py --duration 0 --no-sparse-routing --gui --show-rviz --domain 148 \
+./run_newmine_rl.py --duration 0 --global-mode shadow --gui --show-rviz --domain 148 \
   --world "$PWD/assets/runtime_worlds/campus/campus_fortress_runtime.sdf" \
   --map-size-x 460 --map-size-y 400 \
   --init-x 0 --init-y 0 --init-z 0.45
@@ -114,7 +118,9 @@ ros2 launch scan_planner newmine_exploration.launch.py \
 
 ## 6. RViz 与排错
 
-默认 RViz 中的 `Explorer Region Decision` 订阅 `/explorer/region_overlay`，是 Frontier 分组的显示扩展，不是已验收的地面语义区域或承诺状态。此快照仍有12色耗尽后同红、固定世界Z、15000格截断问题，见已知问题，不能用颜色证明可通行/不可通行。
+当前工作树的 `/global_representation/graph_markers` 显示 Global 空间支撑与投影地面，`/explorer/region_overlay` 显示 Explorer 信息边界、候选和任务。二者分别表示空间结构与信息工作集。Global 的 `place_id` 划分仍存在非凸空间合并及观测顺序依赖，不是已验收的语义房间；固定 XY 投影也不能作为地面高程或通行认证。计划与边界见 [无 Vision 的 Global 设计](GLOBAL_NO_VISION_DESIGN_ZH.md)。
+
+历史 `7d48e6f` 的显示仍是 Frontier 分组向地面扩色，参数也没有 `--global-mode`。部署历史快照时使用该提交文档，不将新工作树显示说明套回旧版。
 
 离线代码下钻和终端原因码反查使用 `docs/CONTRACT_STACK_INTERACTIVE_ZH.html`；生成器与说明在 `tools/code_audit/`。旧页面是历史生成产物；修改代码后用 `python3 tools/code_audit/generate.py` 和 `python3 tools/code_audit/test_index.py` 更新并检查索引。
 
@@ -122,7 +128,7 @@ ros2 launch scan_planner newmine_exploration.launch.py \
 
 已有启动与坐标修复测试证明 Campus / NewMine 控制器启动后时钟持续推进，Campus visual/collision全部1,929,134三角形一致。Campus 完整栈只读加载验证获得正常地面支撑和渲染，未以此宣称长期探索稳定。当前长程运行暴露的恢复死锁与地面拟合问题仍在此快照中。
 
-本轮归档的测试结果见 `SNAPSHOT_VALIDATION.md`。可以复跑：
+历史归档结果见 [SNAPSHOT_VALIDATION.md](SNAPSHOT_VALIDATION.md)。发布候选先按 [RELEASE_CHECK_ZH.md](RELEASE_CHECK_ZH.md) 从指定提交导出并验证；以下是开发工作树的回归命令，不代表远端提交已包含这些文件：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -132,6 +138,7 @@ python3 tools/test_snapshot_portability.py
 # 纯 Python/静态合同回归；ROS 进程测试另用已构建工作区中的 colcon test
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q src/planner/plan_manage/test \
   --ignore=src/planner/plan_manage/test/test_observation_task_runtime.py \
+  --ignore=src/planner/plan_manage/test/test_mid360_mapping_runtime.py \
   --ignore=src/planner/plan_manage/test/test_planner_startup.py \
   --ignore=src/planner/plan_manage/test/test_waypoint_parameters.py
 ```

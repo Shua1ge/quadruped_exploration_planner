@@ -16,10 +16,10 @@ from typing import Dict, Set, Tuple
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
-from scipy.spatial import cKDTree
 
 from .grid import FREE, OCCUPIED, UNKNOWN, bresenham
 from .topology import TopologyEdge, TopologyGraph, TopologyNode, stable_edge_id
+from .spatial_domains import SpatialDomainView
 
 Cell = Tuple[int, int]
 STEPS = ((-1, 0), (0, -1), (0, 1), (1, 0))
@@ -68,10 +68,11 @@ class IncrementalWavefrontGraph:
         # 2 m tile -> [total traversal count, newest stamp]; matches Local's
         # terrain tile origin so Global can aggregate both on one element.
         self.experience_tiles = dict()
-        # Keep fine representatives where measured travel changed direction
-        # or body height materially. This is route complexity, not ground truth.
+        # Compatibility diagnostic: body motion never creates spatial structure.
         self.complex_traversal_cells = set()
         self.traversal_direction = None
+        self.spatial_view = SpatialDomainView()
+        self.spatial_dirty = set()
         self.experience_dirty = set()
         self.experience_revision = 0
         self.routing_revision = 0
@@ -96,23 +97,14 @@ class IncrementalWavefrontGraph:
                for x, y in zip(cells, cells[1:])):
             self.traversal_direction = None
             return False
-        vector = np.asarray(end, dtype=float)-np.asarray(start, dtype=float)
-        distance = float(np.linalg.norm(vector))
-        direction = vector/distance if distance > 1e-6 else None
-        turn = (direction is not None and self.traversal_direction is not None and
-                float(direction @ self.traversal_direction) < math.cos(math.radians(25)))
-        height_change = math.isfinite(body_height_change) and abs(body_height_change) >= max(.04, .15*distance)
-        complex_new = set(cells)-self.complex_traversal_cells if turn or height_change else set()
-        if direction is not None:
-            self.traversal_direction = direction
         new = [p for p in cells if p not in self.traversed_cells]
         revisited = any(p in self.traversed_cells for p in cells)
-        if not new and not complex_new and not revisited:
+        if not new and not revisited:
             return False
         stamp = time.time() if stamp is None else float(stamp)
         if not math.isfinite(stamp):
             return False
-        if not new and not complex_new:
+        if not new:
             # Reuse of an already-accepted corridor refreshes recency only; it
             # is not new experience and must not rebuild graph structure.
             for p in cells:
@@ -122,11 +114,6 @@ class IncrementalWavefrontGraph:
                         record[0] + 1, max(record[1], stamp))
                     self._experience_add(p, 1, stamp)
             return False
-        self.complex_traversal_cells.update(complex_new)
-        for p in complex_new:
-            self.experience_dirty.add(self.tile_key(p))
-        # Complexity changes affect compression even when occupancy is static.
-        self._routing_cache = None
         for p in cells:
             record = self.traversed_cells.get(p)
             if record is None:
@@ -134,14 +121,12 @@ class IncrementalWavefrontGraph:
             else:
                 self.traversed_cells[p] = (record[0] + 1, max(record[1], stamp))
             self._experience_add(p, 1, stamp)
-            self.experience_dirty.add(self.tile_key(p))
         # FIFO budget, with explicit invalidation of evicted preferences.
         while len(self.traversed_cells) > 8192:
             p = next(iter(self.traversed_cells))
             count, _ = self.traversed_cells.pop(p)
             self._experience_add(p, -count, 0.0)
             self.complex_traversal_cells.discard(p)
-            self.experience_dirty.add(self.tile_key(p))
         self.experience_revision += 1
         return True
 
@@ -228,11 +213,10 @@ class IncrementalWavefrontGraph:
             peak = max(clearance[p] for p in cells)
             central = lambda p: (p[0]-cx)**2+(p[1]-cy)**2
             best = min((p for p in cells if clearance[p] >= .95*peak),
-                       key=lambda p: (p not in self.traversed_cells, central(p), -clearance[p], p))
+                       key=lambda p: (central(p), -clearance[p], p))
             old_node = before_nodes.get(node_id)
             seed = (old_node.cell if old_node and old_node.cell in cells
                     and clearance[old_node.cell] >= .95*peak
-                    and (best not in self.traversed_cells or old_node.cell in self.traversed_cells)
                     and central(old_node.cell) <= central(best)+.5 else best)
             created[node_id] = TopologyNode(node_id, seed, 0, clearance[seed])
             result.components[node_id] = cells
@@ -256,7 +240,7 @@ class IncrementalWavefrontGraph:
                             continue
                         step = math.hypot(dx, dy)
                         new_cost = cost + step * (1.+.1*self.resolution/clearance[nxt]
-                                                 - (.05 if nxt in self.traversed_cells else 0.))
+                                                 )
                         if new_cost < costs.get(nxt, math.inf)-1e-10:
                             costs[nxt] = new_cost
                             result.owners[nxt] = node_id
@@ -313,7 +297,7 @@ class IncrementalWavefrontGraph:
         if self.resolution is None:
             self.resolution = float(resolution)
             self.tile_cells = max(2, round(self.tile_size/resolution))
-        changed, dirty = 0, set(self.experience_dirty)
+        changed, dirty = 0, set()
         self.experience_dirty.clear()
         for y, x in np.argwhere(values != UNKNOWN):
             cell = (origin_cell[0]+int(x), origin_cell[1]+int(y))
@@ -378,6 +362,7 @@ class IncrementalWavefrontGraph:
             node = self.nodes[node_id]
             self.nodes[node_id] = TopologyNode(node_id, node.cell, len(self.adjacency[node_id]), node.clearance)
         if dirty:
+            self.spatial_dirty.update(dirty)
             self.routing_revision += 1
             self._routing_cache = None
         return GraphUpdate(
@@ -395,7 +380,7 @@ class IncrementalWavefrontGraph:
              'wavefront_experience_tiles': len(self.experience_tiles),
              'wavefront_complex_traversal_cells': len(self.complex_traversal_cells)})
 
-    def _free_hull(self, points, interior=None):
+    def _free_hull(self, points, interior=None, max_span=None):
         """A local loop is redundant only inside fully observed free space.
 
         Unknown/occupied holes preserve alternate routes. The complete local
@@ -405,7 +390,7 @@ class IncrementalWavefrontGraph:
         if len(points) < 3:
             return False
         if math.hypot(points[-1][0]-points[0][0],
-                max(p[1] for p in points)-min(p[1] for p in points))*self.resolution > 4*self.tile_size:
+                max(p[1] for p in points)-min(p[1] for p in points))*self.resolution > (4*self.tile_size if max_span is None else max_span):
             return False
         def cross(a, b, c):
             return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
@@ -441,192 +426,15 @@ class IncrementalWavefrontGraph:
             return None
         return cells
 
-    def _shortcut(self, a, b, nodes):
-        cells = self._free_segment(nodes[a].cell, nodes[b].cell)
-        if cells is None:
-            return None
-        clearance = min(self.tiles[self.tile_key(c)].clearance[c] for c in cells)
-        return TopologyEdge(stable_edge_id(a,b), a,b,cells,
-            sum(math.dist(p,q) for p,q in zip(cells,cells[1:]))*self.resolution, clearance)
-
-    def _compress_open_space(self, nodes, edges, adjacency):
-        # Each retained anchor must cover the original free component cells,
-        # not merely neighbouring graph seeds. Otherwise pruning a room from
-        # left to right strands query points beyond the attachment radius.
-        coverage = {key: set(self.tiles[self.tile_key(node.cell)].components[key])
-                    for key, node in nodes.items()}
-        for key in sorted(tuple(nodes),key=lambda k:(nodes[k].clearance,k)):
-            if coverage[key] & self.complex_traversal_cells:
-                continue  # Retain fine anchors at real travel transitions.
-            incident = sorted(adjacency[key])
-            if not 2 <= len(incident) <= 6:
-                continue
-            neighbours = sorted({edges[e].target_id if edges[e].source_id == key
-                                 else edges[e].source_id for e in incident})
-            positions = [nodes[k].cell for k in neighbours]
-            if max(math.dist(a,b) for a in positions for b in positions)*self.resolution > 3.1*self.tile_size:
-                continue
-            # Seed clearance may vary merely because a boundary tile is
-            # partially observed. Actual connection clearances, full free
-            # hull and attachment coverage decide interchangeability below.
-            # Include boundary anchors and the complete old paths. A tile
-            # corner is not a physical branch. A loop enclosing occupied or
-            # unknown space, however, must keep both actual alternatives.
-            hull_points = list(coverage[key]) + [nodes[key].cell] + positions
-            hull_points += [p for e in incident for p in edges[e].cells]
-            replacements = []
-            safe = True
-            clearance_by_neighbour = {edges[e].target_id if edges[e].source_id == key
-                else edges[e].source_id: edges[e].minimum_clearance for e in incident}
-            for i,a in enumerate(neighbours):
-                for b in neighbours[i+1:]:
-                    shortcut = self._shortcut(a,b,nodes)
-                    if shortcut is None or shortcut.minimum_clearance+1e-8 < min(
-                            clearance_by_neighbour[a],clearance_by_neighbour[b]):
-                        safe = False
-                        break
-                    old = edges.get(shortcut.edge_id)
-                    if old is not None:
-                        hull_points += list(old.cells)
-                        # Do not discard a material cost/clearance tradeoff.
-                        if old.minimum_clearance > shortcut.minimum_clearance+1e-8:
-                            if old.length > shortcut.length*1.25:
-                                safe = False
-                                break
-                            shortcut = old
-                        elif old.length < shortcut.length:
-                            shortcut = old
-                    replacements.append(shortcut)
-                if not safe:
-                    break
-            if len({e.edge_id for e in replacements if e.edge_id not in edges}) > len(incident):
-                continue  # Removing a node must not buy a denser clique.
-            if not safe or not self._free_hull(hull_points):
-                continue
-            samples = np.asarray([p for edge in replacements for p in edge.cells],dtype=float)
-            owned = np.asarray(sorted(coverage[key]),dtype=float)
-            # Reserve slack for a cell and the published 0.5 m vertex spacing.
-            # Within the fully FREE hull every attachment is also visible.
-            if np.max(cKDTree(samples).query(owned)[0])*self.resolution > self.attachment_radius-max(self.resolution,.25):
-                continue
-            for old in incident:
-                edge = edges.pop(old)
-                adjacency[edge.source_id].discard(old)
-                adjacency[edge.target_id].discard(old)
-            del nodes[key]; del adjacency[key]
-            for edge in replacements:
-                edges[edge.edge_id] = edge
-                adjacency[edge.source_id].add(edge.edge_id)
-                adjacency[edge.target_id].add(edge.edge_id)
-            # Carry removed coverage forward; later elimination must preserve
-            # the same attachment reach rather than forgetting earlier cells.
-            nearest = np.argmin(np.sum((owned[:,None,:]-np.asarray(positions)[None,:,:])**2,axis=2),axis=1)
-            for point,index in zip(owned,nearest):
-                coverage[neighbours[int(index)]].add(tuple(map(int,point)))
-            del coverage[key]
-        # A shortcut clique is not the query representation either. Remove a
-        # connection only if a <=15% longer, equally safe alternative exists
-        # and their entire local hull is known free. This preserves meaningful
-        # routes around holes; dense A* is not used to claim graph connectivity.
-        for key in sorted(tuple(edges), key=lambda k:(-edges[k].length,k)):
-            edge = edges[key]
-            queue, best = [(0.,edge.source_id,())], {edge.source_id:0.}
-            alternative = None
-            while queue:
-                cost, node, trail = heapq.heappop(queue)
-                if cost > best[node] or cost > edge.length*1.15:
-                    continue
-                if node == edge.target_id:
-                    alternative = trail
-                    break
-                for next_id in sorted(adjacency[node]):
-                    if next_id == key:
-                        continue
-                    nxt = edges[next_id]
-                    if nxt.minimum_clearance+1e-8 < edge.minimum_clearance:
-                        continue
-                    target = nxt.target_id if nxt.source_id == node else nxt.source_id
-                    distance = cost+nxt.length
-                    if distance <= edge.length*1.15 and distance < best.get(target,float('inf')):
-                        best[target] = distance
-                        heapq.heappush(queue,(distance,target,trail+(next_id,)))
-            if alternative is not None and self._free_hull(
-                    list(edge.cells)+[p for k in alternative for p in edges[k].cells]):
-                owned = sorted(coverage[edge.source_id] | coverage[edge.target_id])
-                nearby = (adjacency[edge.source_id] | adjacency[edge.target_id] | set(alternative))-{key}
-                samples = [p for k in sorted(nearby) for p in edges[k].cells]
-                distances,nearest = cKDTree(samples).query(owned)
-                if (np.max(distances)*self.resolution > self.attachment_radius-max(self.resolution,.25) or
-                        any(self._free_segment(p,samples[int(index)]) is None
-                            for p,index in zip(owned,nearest))):
-                    continue
-                del edges[key]
-                adjacency[edge.source_id].discard(key)
-                adjacency[edge.target_id].discard(key)
-
     def routing_view(self):
-        """Adapt density to geometry, then compress straight degree-two chains.
+        """Publish spatial decisions and support domains from dirty geometry.
 
-        This is a cached query representation of the same geometry, not a
-        second map. All joined paths keep their exact certified cell sequence.
-        Rings around occupied/unknown space and material clearance tradeoffs
-        retain their alternatives. Free-space tile loops are interchangeable;
-        query coverage and actual certified polylines govern their removal.
+        Calculation tiles stay internal. Support-domain attachment replaces
+        the old fixed-radius coverage mesh; odometry cannot pin topology.
         """
-        if self._routing_cache is not None:
-            return self._routing_cache
-        nodes, edges = dict(self.nodes), dict(self.edges)
-        adjacency = {k: set(v) for k, v in self.adjacency.items()}
-        self._compress_open_space(nodes, edges, adjacency)
-        for key in sorted(nodes):
-            if self.tiles[self.tile_key(nodes[key].cell)].components[key] & self.complex_traversal_cells:
-                continue
-            incident = adjacency[key]
-            if len(incident) != 2:
-                continue
-            first, second = (edges[k] for k in sorted(incident))
-            a = first.target_id if first.source_id == key else first.source_id
-            b = second.target_id if second.source_id == key else second.source_id
-            if a == b:
-                continue
-            merged_id = stable_edge_id(a, b)
-            if merged_id in edges:
-                continue
-            p, q, r = nodes[a].cell, nodes[key].cell, nodes[b].cell
-            u, v = (q[0]-p[0], q[1]-p[1]), (r[0]-q[0], r[1]-q[1])
-            denominator = math.hypot(*u)*math.hypot(*v)
-            if denominator == 0 or (u[0]*v[0]+u[1]*v[1])/denominator < math.cos(math.radians(20)):
-                continue
-            clearances = (nodes[a].clearance, nodes[key].clearance, nodes[b].clearance)
-            if max(clearances)-min(clearances) > max(self.resolution, .2*max(clearances)):
-                continue
-            left = first.cells if first.source_id == a else tuple(reversed(first.cells))
-            right = second.cells if second.source_id == key else tuple(reversed(second.cells))
-            merged = TopologyEdge(merged_id, a, b, left+right[1:],
-                first.length+second.length, min(first.minimum_clearance, second.minimum_clearance))
-            for old in (first, second):
-                del edges[old.edge_id]
-                adjacency[old.source_id].discard(old.edge_id)
-                adjacency[old.target_id].discard(old.edge_id)
-            del nodes[key]
-            adjacency[a].add(merged_id); adjacency[b].add(merged_id)
-            edges[merged_id] = merged
-        # Keep bounded-spaced attachment samples as well as bends: Explorer's
-        # spatial index attaches to polyline vertices, not arbitrary segments.
-        # Remove collinear intermediate vertices ONLY; no geometric shortcuts.
-        for key, edge in tuple(edges.items()):
-            cells = edge.cells
-            compact = [cells[0]]
-            for previous, current, following in zip(cells, cells[1:], cells[2:]):
-                if (current[0]-previous[0], current[1]-previous[1]) != (
-                        following[0]-current[0], following[1]-current[1]) or \
-                        math.dist(compact[-1], following)*self.resolution > .5:
-                    compact.append(current)
-            compact.append(cells[-1])
-            edges[key] = TopologyEdge(key, edge.source_id, edge.target_id,
-                                     tuple(compact), edge.length, edge.minimum_clearance)
-        nodes = {k: TopologyNode(k, n.cell, len(adjacency[k]), n.clearance) for k, n in nodes.items()}
-        self._routing_cache = TopologyGraph(nodes, edges, set())
+        if self._routing_cache is None:
+            self._routing_cache = self.spatial_view.update(self, self.spatial_dirty)
+            self.spatial_dirty.clear()
         return self._routing_cache
 
     def local_view(self, shape, origin):

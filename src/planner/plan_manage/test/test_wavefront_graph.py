@@ -75,7 +75,7 @@ def test_routing_compression_preserves_corridor_cost_and_caches_static_geometry(
     assert e.routing_view() is view
 
 
-def test_actual_travel_reuses_safe_seed_without_new_occupancy_or_identity():
+def test_actual_travel_updates_experience_without_moving_spatial_seeds():
     e = IncrementalWavefrontGraph()
     grid = np.zeros((10, 30), dtype=np.int8)
     apply(e, grid)
@@ -84,9 +84,9 @@ def test_actual_travel_reuses_safe_seed_without_new_occupancy_or_identity():
     assert e.record_traversal((.5, 1.1), (5.3, 1.1))
     update = apply(e, grid)
     assert update.metrics['wavefront_changed_cells'] == 0
-    assert update.updated_nodes and update.updated_edges
-    assert set(e.nodes) == set(original_nodes) and e.occupancy == original_facts
-    assert all(n.cell[1] == 5 for n in e.nodes.values())
+    assert not update.updated_nodes and not update.updated_edges
+    assert e.nodes == original_nodes and e.occupancy == original_facts
+    assert e.experience_tiles
     assert not e.record_traversal((.5, 1.1), (5.3, 1.1))
     assert apply(e, grid).metrics['wavefront_dirty_tiles'] == 0
     grid[5, 12] = OCCUPIED
@@ -223,31 +223,17 @@ def test_random_dynamic_edits_keep_dense_and_sparse_connectivity_equal():
             assert connected(e, p.node_id, q.node_id) == (labels[p.cell[1], p.cell[0]] == labels[q.cell[1], q.cell[0]])
 
 
-def test_real_corner_and_height_change_keep_fine_anchors_without_inventing_occupancy():
+def test_body_corner_and_height_change_do_not_pin_fine_anchors():
     engine = IncrementalWavefrontGraph()
     grid = np.zeros((40, 60), dtype=np.int8)
     apply(engine, grid)
     ordinary = engine.routing_view()
-    facts, fine_ids = dict(engine.occupancy), set(engine.nodes)
-    removed_id = next(k for k in engine.nodes if k not in ordinary.nodes)
-    seed = engine.nodes[removed_id].cell
-    x,y = ((v+.5)*engine.resolution for v in seed)
-    assert engine.record_traversal((x-.4, y), (x, y))
-    assert engine.record_traversal((x, y), (x, y+.4))
-    apply(engine, grid)
-    complex_view = engine.routing_view()
-    assert engine.complex_traversal_cells
-    assert removed_id in complex_view.nodes and removed_id not in ordinary.nodes
-    retained = {k for k,n in engine.nodes.items()
-                if engine.tiles[engine.tile_key(n.cell)].components[k] & engine.complex_traversal_cells}
-    assert retained <= set(complex_view.nodes)
-    assert engine.occupancy == facts and set(engine.nodes) == fine_ids
-    assert engine.record_traversal((7.1, 5.1), (9.1, 5.1), .4)
-    apply(engine, grid)
-    assert (40,25) in engine.complex_traversal_cells
-    grid[25,40] = OCCUPIED
-    apply(engine,grid)
-    assert (40,25) not in engine.complex_traversal_cells
+    assert engine.record_traversal((2., 2.), (3., 2.))
+    assert engine.record_traversal((3., 2.), (3., 3.), .4)
+    assert apply(engine, grid).metrics['wavefront_dirty_tiles'] == 0
+    assert engine.routing_view() is ordinary
+    assert not engine.complex_traversal_cells
+    assert engine.traversed_cells
 
 
 def test_straight_flat_travel_does_not_pin_fine_density_or_promote_jitter():

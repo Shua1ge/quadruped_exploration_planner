@@ -114,7 +114,7 @@ def test_legacy_motion_failure_without_message_keeps_reason_and_arbitrates():
     assert reasons[-1]=="LOCAL_MOTION_EXHAUSTED"
 
 
-def test_failed_side_step_blocks_same_departure_but_allows_certified_alternative_task():
+def test_failed_side_step_penalizes_same_departure_without_vetoing_local():
     value=bridge();value.task_geometry_autonomy=True;value.body_yaw=0.
     value.active_goal=(3.,2.);value.active_region_id=7
     decisions=[];statuses=[]
@@ -128,39 +128,36 @@ def test_failed_side_step_blocks_same_departure_but_allows_certified_alternative
     assert len(decisions)==1 and value.local_departure_replan_allowed()
     east=SimpleNamespace(goal=(8.,2.),path=[])
     north=SimpleNamespace(goal=(2.,8.),path=[])
-    assert not value.local_departure_candidate_allowed(east)
-    assert value.local_departure_candidate_allowed(north)
+    assert value.local_departure_history_penalty(east)>value.local_departure_history_penalty(north)
     assert any("trigger=HANDOFF_ALIGNMENT_DEVIATED" in s and "recovery=LATERAL_RECOVERY_OVERSHOOT" in s for s in statuses)
     value.position=(2.02,2.);value.body_yaw=.02
     value.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=100_000_000_000))
-    assert not value.local_departure_candidate_allowed(east) # No clock/Goal refill.
+    assert value.local_departure_history_penalty(east)>0 # Clock does not erase evidence.
     value.position=(2.31,2.)
-    assert value.local_departure_candidate_allowed(east)
+    assert value.local_departure_history_penalty(east)==0.
 
 
-def test_stationary_departure_alternatives_have_finite_direction_budget():
+def test_budget_rejections_cannot_fabricate_eight_blocked_directions():
     import math
     value=bridge();value.body_yaw=0.
     for i in range(8):
         angle=i*math.pi/4
         goal=(2.+5*math.cos(angle),2.+5*math.sin(angle))
-        candidate=SimpleNamespace(goal=goal,path=[])
-        assert value.local_departure_candidate_allowed(candidate)
         value.remember_local_motion_attempt(goal,"LATERAL_RECOVERY_ALREADY_USED")
-    assert len(value.departure_action_failures)==8
+    assert not getattr(value,"departure_action_failures",[])
     for i in range(64):
         angle=i*2*math.pi/64
-        assert not value.local_departure_candidate_allowed(SimpleNamespace(
-            goal=(2.+5*math.cos(angle),2.+5*math.sin(angle)),path=[]))
-    assert value.departure_action_suppressed
+        assert value.local_departure_history_penalty(SimpleNamespace(
+            goal=(2.+5*math.cos(angle),2.+5*math.sin(angle)),path=[]))==0.
 
 
-def test_same_entry_different_remote_goal_is_blocked_but_different_entry_allowed():
+def test_same_entry_history_is_a_cost_and_another_branch_still_reaches_local():
     value=bridge();value.body_yaw=0.
     value.remember_local_motion_attempt((9.,2.),"LATERAL_RECOVERY_REJOIN_FAILED",cells=[(2,2),(5,2),(9,2)])
     # Route first goes east then turns north; its distant goal must not bypass memory.
-    assert not value.local_departure_candidate_allowed(SimpleNamespace(goal=(5.,9.),path=[(2,2),(5,2),(5,9)]))
-    assert value.local_departure_candidate_allowed(SimpleNamespace(goal=(5.,9.),path=[(2,2),(2,5),(5,9)]))
+    east=SimpleNamespace(goal=(5.,9.),path=[(2,2),(5,2),(5,9)])
+    north=SimpleNamespace(goal=(5.,9.),path=[(2,2),(2,5),(5,9)])
+    assert value.local_departure_history_penalty(east)>value.local_departure_history_penalty(north)
 
 
 def test_departure_key_uses_remaining_route_not_old_task_start():
@@ -772,8 +769,8 @@ def test_prepared_successor_action_failure_survives_cancel_without_freezing_all_
     message.state=ObservationFeedback.CANCEL_ACK
     assert value.pending_observation_feedback(message)
     assert value.pending_observation_handoff is None and value.local_departure_replan_allowed()
-    assert not value.local_departure_candidate_allowed(SimpleNamespace(goal=(9.,2.),path=[]))
-    assert value.local_departure_candidate_allowed(SimpleNamespace(goal=(2.,9.),path=[]))
+    same=SimpleNamespace(goal=(9.,2.),path=[])
+    assert value.local_departure_history_penalty(same)>0
 
 
 def test_prepared_successor_occupied_departure_survives_cancel_ack():
@@ -792,3 +789,63 @@ def test_prepared_successor_occupied_departure_survives_cancel_ack():
     assert value.pending_observation_feedback(message)
     assert value.pending_observation_handoff is None
     assert not value.local_departure_replan_allowed()
+
+
+def test_exhausted_goal_does_not_reopen_with_task_id_or_time_but_other_goal_is_allowed():
+    value=bridge();value.body_yaw=0.;value.grid.data.fill(0)
+    value.remember_local_motion_attempt((3.,2.),"DEPARTURE_EPISODE_EXHAUSTED")
+    attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+    value.get_clock().now().nanoseconds+=100_000_000_000
+    value.active_observation=ObservationTask(99,(4.,2.),{(5,5)})
+    assert not value.local_motion_retry_allowed(attempt)
+    assert value.local_departure_replan_allowed()
+    value.position=(2.4,2.)
+    assert value.local_motion_retry_allowed(attempt)
+
+
+def test_installation_busy_and_budget_failures_are_temporary_and_not_directional():
+    value=bridge();value.grid.data.fill(0);value.body_yaw=0.
+    for reason in ("INSTALLATION_EVIDENCE_CHANGED", "LATERAL_RECOVERY_ALREADY_USED"):
+        value.remember_local_motion_attempt((3.,2.),reason)
+        attempt=value.local_motion_goal_cooldowns[(3.,2.)]
+        assert not value.local_motion_retry_allowed(attempt)
+        value.get_clock().now().nanoseconds+=2_000_000_000
+        assert value.local_motion_retry_allowed(attempt)
+        assert not getattr(value,"departure_action_failures",[])
+
+
+def test_recovery_phase_wait_has_a_fixed_deadline_and_duplicate_does_not_extend_it():
+    from explorer_core.observation_task_bridge import PendingObservationHandoff
+    value=bridge();value.publish_status=lambda status:None
+    value.path_request_timeout=5.
+    task=SimpleNamespace(task_id=101,task_version=1,goal=(3.5,2.))
+    pending=PendingObservationHandoff(value.active_observation,task,[],None,request_id=99)
+    value.pending_observation_handoff=pending
+    message=ObservationFeedback(task_id=101,task_version=1,request_id=99,
+        state=ObservationFeedback.TRANSITION_RESTARTING,reason="DEPARTURE_RETRY_PENDING")
+    assert value.pending_observation_feedback(message)
+    started=pending.published_ns
+    value.get_clock().now().nanoseconds+=6_000_000_000
+    assert value.pending_observation_feedback(message)
+    assert pending.published_ns==started
+    assert value.continue_pending_observation_handoff() and pending.state=="PREPARING"
+    cancelled=[];value.cancel_pending_observation_handoff=cancelled.append
+    value.get_clock().now().nanoseconds=started+15_000_000_000
+    value.continue_pending_observation_handoff()
+    assert cancelled==["EXECUTION_READY_TIMEOUT"]
+
+
+def test_initial_task_recovery_wait_extends_only_its_own_original_request_deadline():
+    value=bridge();value.publish_observation_task(path(),100)
+    value.active_path_request_generation=value.pending_path_request_generation=100
+    value.pending_path_publish_ns=1_000_000_000;value.path_request_timeout=5.
+    feedback=ObservationFeedback(task_id=100,task_version=1,request_id=100,
+        state=ObservationFeedback.TRANSITION_RESTARTING,reason="DEPARTURE_RETRY_PENDING")
+    value.observation_feedback_callback(feedback)
+    assert value.motion_request_timeout()==15.
+    value.get_clock().now().nanoseconds+=6_000_000_000
+    value.observation_feedback_callback(feedback)
+    assert value.pending_path_publish_ns==1_000_000_000
+    assert value.motion_request_timeout()==15. # Duplicate phase cannot extend it.
+    value.pending_path_request_generation=101
+    assert value.motion_request_timeout()==5.

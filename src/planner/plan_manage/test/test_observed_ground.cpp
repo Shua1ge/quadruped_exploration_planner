@@ -73,7 +73,7 @@ TEST(ObservedGroundHeights, GradualRampAheadKeepsGroundHeights) {
 }
 
 TEST(ObservedGroundHeights, SteepSlopeCannotBecomeGround) {
-  Scene s;s.floor(.4);
+  Scene s;s.floor(std::tan(40.*std::acos(-1.)/180.));
   auto r=estimateObservedGroundHeights(s.p,s.k,{0.,0.,.30});
   EXPECT_FALSE(r.valid);
 }
@@ -135,4 +135,57 @@ TEST(GroundHeightWire, RoundTripsAtOneCentimetreAndClamps) {
 TEST(GroundHeightWire, UnknownAndReservedValuesDecodeToNaN) {
   for(uint8_t v:{0,1,2,253,254,255})
     EXPECT_FALSE(std::isfinite(plan_env::decodeGroundHeight(v)));
+}
+
+TEST(ObservedGroundHeights, BodyHeightChangesDoNotMoveMeasuredWorldFloor) {
+  Scene scene;scene.floor(0.);
+  ObservedGround prior;
+  for(double height:{.18,.30,.46,.60}) {
+    auto floor=estimateObservedGroundHeights(scene.p,scene.k,{0.,0.,height},
+        ObservedGroundOptions{},prior.valid ? &prior : nullptr);
+    ASSERT_TRUE(floor.valid)<<height;
+    EXPECT_NEAR(floor.worldPlane().z(),0.,.015);
+    EXPECT_NEAR(floor.plane.z(),-height,.015);
+    prior=floor;
+  }
+}
+
+TEST(ObservedGroundHeights, WorldZTranslationAndNegativeAltitudeAreInvariant) {
+  Scene scene;scene.floor(.15);
+  auto a=estimateObservedGroundHeights(scene.p,scene.k,{0,0,.42});
+  for(auto& p:scene.p) p.z()-=5.;
+  auto b=estimateObservedGroundHeights(scene.p,scene.k,{0,0,-4.58});
+  ASSERT_TRUE(a.valid);ASSERT_TRUE(b.valid);
+  for(size_t i=0;i<a.heights.size();++i) {
+    EXPECT_EQ(std::isfinite(a.heights[i]),std::isfinite(b.heights[i]));
+    if(std::isfinite(a.heights[i])) { EXPECT_NEAR(a.heights[i],b.heights[i],1e-6); }
+  }
+  EXPECT_NEAR(b.worldPlane().z(),a.worldPlane().z()-5.,1e-6);
+}
+
+TEST(ObservedGroundHeights, MeasurementIncludesTwentyFiveToThirtyDegreeRamps) {
+  for(double degrees:{25.,28.,30.}) {
+    Scene scene;double slope=std::tan(degrees*std::acos(-1.)/180.);
+    for(double x=-2.;x<=7.;x+=.25) for(double y=-2.;y<=2.;y+=.25)
+      scene.add(x,y,slope*x);
+    auto r=estimateObservedGroundHeights(scene.p,scene.k,{0,0,.30});
+    ASSERT_TRUE(r.valid)<<degrees;
+    EXPECT_NEAR(r.plane.x(),slope,.005);
+    size_t known=0,total=0;
+    for(size_t i=0;i<scene.p.size();++i) if(scene.p[i].x()>=1.5 && scene.p[i].x()<=3.) {
+      ++total;if(std::isfinite(r.heights[i])) {++known;EXPECT_NEAR(r.heights[i],0.,.03);}
+    }
+    EXPECT_GT(known,.8*total)<<degrees;
+  }
+}
+
+TEST(ObservedGroundHeights, PriorCannotSupplyMissingOrWallOnlyGround) {
+  Scene floor;floor.floor();auto prior=estimateObservedGroundHeights(floor.p,floor.k,{0,0,.3});
+  ASSERT_TRUE(prior.valid);
+  Scene wall;for(double y=-2;y<=2;y+=.1)for(double z=0;z<=2;z+=.1)wall.add(1,y,z);
+  auto r=estimateObservedGroundHeights(wall.p,wall.k,{0,0,.45},ObservedGroundOptions{},&prior);
+  EXPECT_FALSE(r.valid);
+  for(double h:r.heights) EXPECT_FALSE(std::isfinite(h));
+  auto empty=estimateObservedGroundHeights({}, {}, {0,0,.45},ObservedGroundOptions{},&prior);
+  EXPECT_FALSE(empty.valid);
 }

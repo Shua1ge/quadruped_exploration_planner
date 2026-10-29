@@ -3,6 +3,7 @@
 #include <optional>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <Eigen/Cholesky>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,36 @@
 #include <vector>
 
 namespace scan_planner {
+
+// Fit only already measured support heights. No IMU-derived floor, occupancy
+// edits or permission to traverse unknown terrain is produced by this query.
+inline std::optional<double> measuredSupportSlope(
+    const std::vector<Eigen::Vector3d>& points) {
+  if(points.size()<6) return std::nullopt;
+  Eigen::Vector3d center=Eigen::Vector3d::Zero();
+  for(const auto& point:points) {
+    if(!point.allFinite()) return std::nullopt;
+    center+=point;
+  }
+  center/=points.size();
+  Eigen::Matrix3d system=Eigen::Matrix3d::Zero();
+  Eigen::Vector3d rhs=Eigen::Vector3d::Zero();
+  for(const auto& point:points) {
+    const Eigen::Vector3d row(point.x()-center.x(),point.y()-center.y(),1.);
+    system+=row*row.transpose();rhs+=row*(point.z()-center.z());
+  }
+  if(system.determinant()<1e-6) return std::nullopt;
+  const Eigen::Vector3d plane=system.ldlt().solve(rhs);
+  if(!plane.allFinite()) return std::nullopt;
+  double squared_error=0.;
+  for(const auto& point:points) {
+    const double error=point.z()-center.z()-plane.x()*(point.x()-center.x())-
+        plane.y()*(point.y()-center.y())-plane.z();
+    squared_error+=error*error;
+  }
+  if(std::sqrt(squared_error/points.size())>.035) return std::nullopt;
+  return std::atan(plane.head<2>().norm());
+}
 
 // Goal selection only: the FSM remains the sole trajectory/ACK owner.
 struct LocalTaskDomain {
@@ -264,21 +295,56 @@ inline bool lateralRecoveryReached(const Eigen::Vector2d& start,
       progress>=length-tolerance;
 }
 
-// One recovery family belongs to a physical departure, across task/request
-// changes. A new certified exit, substantial measured translation or rotation
-// can reopen it; elapsed time, a new goal and a map revision cannot.
+// One bounded Local search episode survives task/request changes. Search
+// retries and activated motion have separate accounting; only related new
+// geometry or a certified continuation after escape closes the context.
 struct DepartureRecoveryMemory {
   bool used{false};
   Eigen::Vector2d position{Eigen::Vector2d::Zero()};
   double yaw{0};
   uint16_t exits{0};
-  bool blocks(const Eigen::Vector2d& actual, double heading, uint16_t current_exits) const {
-    if(!used) return false;
-    if(!actual.allFinite() || !std::isfinite(heading)) return true;
-    return (actual-position).norm()<.30 &&
-        std::abs(std::remainder(heading-yaw,2*std::acos(-1.0)))<std::acos(-1.0)/4 &&
-        (current_exits & ~exits)==0;
+  // One Local-owned bounded search episode, independent of task/request IDs.
+  // `used` counts activated physical motion only; search attempts are separate.
+  double started_at{-1.0}, retry_at{0.0}, action_started_at{-1.0}, evidence_checked_at{-1.0};
+  unsigned searches{0}, reported_searches{0}, new_exit_confirmations{0};
+  bool motion_failed{false};
+  uint16_t pending_new_exits{0};
+  bool observeExits(uint16_t current_exits) {
+    const uint16_t added=current_exits & ~exits;
+    if(!added) {pending_new_exits=0;new_exit_confirmations=0;return false;}
+    const uint16_t common=pending_new_exits & added;
+    pending_new_exits=common ? common : added;
+    new_exit_confirmations=common ? new_exit_confirmations+1 : 1;
+    return new_exit_confirmations>=3;
   }
+  enum class Search { READY, WAIT, EXHAUSTED };
+  Search searchState(double now) const {
+    if (motion_failed) return Search::EXHAUSTED;
+    if (started_at < 0.0) return Search::READY;
+    if (!std::isfinite(now) || now < started_at || now-started_at >= 15.0)
+      return Search::EXHAUSTED;
+    return searches >= 2 ? Search::EXHAUSTED :
+        now < retry_at ? Search::WAIT : Search::READY;
+  }
+  bool beginSearch(double now, const Eigen::Vector2d& actual,
+                   double heading, uint16_t current_exits) {
+    if (!std::isfinite(now) || now<0.0 || !actual.allFinite() || !std::isfinite(heading) ||
+        searchState(now) != Search::READY) return false;
+    if (started_at < 0.0) {
+      started_at=now; position=actual; yaw=heading; exits=current_exits;
+    }
+    ++searches; retry_at=now+2.0;
+    return true;
+  }
+  // A pending/active candidate retains its owner; exhausting the search count
+  // does not cancel the last search's successful submission.
+  bool timedOut(double now, bool executing) const {
+    return started_at >= 0.0 && (!std::isfinite(now) || now < started_at ||
+        now-started_at >= 15.0 || (executing && action_started_at >= 0.0 &&
+        now-action_started_at >= 10.0));
+  }
+  void activated(double now) { used=true; action_started_at=now; }
+
 };
 
 inline bool taskDeparturePreviouslyRejected(double yaw, const std::vector<double>& rejected) {

@@ -21,15 +21,15 @@ from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import Odometry, OccupancyGrid
 from scan_planner_msgs.msg import LocalMapPatch, Bspline, ObservationTask, ObservationFeedback, TrajectoryAck, ExecutionState, ExecutionCommand, LocomotionState, RoutePortal
 from std_msgs.msg import String
-from sensor_msgs.msg import PointCloud2, LaserScan
-from sensor_msgs_py.point_cloud2 import create_cloud_xyz32
+from sensor_msgs.msg import PointCloud2, PointField, LaserScan
+from sensor_msgs_py.point_cloud2 import create_cloud_xyz32, create_cloud
 
 
 class TestTaskRuntime(unittest.TestCase):
     def setUp(self):
         cls=self  # Each scenario gets fresh processes and odometry filters.
         cls.context=Context()
-        cls.domain=150+os.getpid()%50
+        cls.domain=int(os.environ.get("SCAN_TEST_ROS_DOMAIN",150+os.getpid()%50))
         rclpy.init(context=cls.context,domain_id=cls.domain)
         cls.node=rclpy.create_node("observation_task_contract_probe",context=cls.context)
         cls.executor=SingleThreadedExecutor(context=cls.context)
@@ -38,7 +38,8 @@ class TestTaskRuntime(unittest.TestCase):
         cls.logs=[]
         env=dict(os.environ,ROS_DOMAIN_ID=str(cls.domain))
         root=pathlib.Path(__file__).resolve().parents[1]
-        binary=pathlib.Path(get_package_prefix("scan_planner"))/"lib"/"scan_planner"
+        binary=pathlib.Path(os.environ.get("SCAN_TEST_BINARY_DIR",
+            str(pathlib.Path(get_package_prefix("scan_planner"))/"lib"/"scan_planner")))
         processes = (
             ("scan_planner_node",["--params-file",str(root/"config"/"planner.yaml"),
                                   "-p","fsm.task_mode:=true","-p","fsm.navi_mode:=3"]),
@@ -70,6 +71,9 @@ class TestTaskRuntime(unittest.TestCase):
                 extra += ["-r", "planning/bspline:=controller_spline_proxy"]
             if executable=="scan_planner_node" and self._testMethodName=="test_original_laser_no_return_updates_local_patch":
                 extra += ["-p","grid_map.use_laser_scan:=true","-p","grid_map.need_extrinsic:=false"]
+            if executable=="scan_planner_node" and self._testMethodName.startswith("test_measured_ground_slope_"):
+                extra += ["-p","grid_map.use_ray_cloud:=true","-p","grid_map.cloud_is_world:=true",
+                          "-p","grid_map.need_extrinsic:=false"]
             log=tempfile.TemporaryFile(mode="w+")
             cls.logs.append(log)
             cls.children.append(subprocess.Popen([str(binary/executable),"--ros-args"]+extra,
@@ -164,7 +168,8 @@ class TestTaskRuntime(unittest.TestCase):
             if self.cloud_counter%5==0:
                 points=getattr(self,"cloud_points",None) or [(4.*math.cos(i*math.pi/32),4.*math.sin(i*math.pi/32),z)
                         for i in range(64) for z in (.4,.7)]
-                self.cloud_pub.publish(create_cloud_xyz32(odom.header,points))
+                factory=getattr(self,"cloud_message_factory",create_cloud_xyz32)
+                self.cloud_pub.publish(factory(odom.header,points))
                 if getattr(self,'use_original_scan',False):
                     scan=LaserScan();scan.header=copy.deepcopy(odom.header)
                     scan.header.frame_id="lidar"
@@ -2015,6 +2020,67 @@ rclpy.spin(e)
         self.task_pub.publish(invalid)
         self.spin_until(lambda:len([f for f in self.feedback if f.task_id==10003 and
             f.state==ObservationFeedback.CANCEL_ACK]) > count)
+
+
+
+    def test_failed_recovery_search_has_one_probe_and_no_physical_charge(self):
+        # A closed near-field box has no certified departure. This exercises
+        # the real Local timers and terminal feedback, without any actuator.
+        self.cloud_points=[(x,y,z) for x in [i*.04 for i in range(-15,16)]
+            for y in (-.38,.38) for z in (.4,.7)]
+        self.cloud_points += [(x,y,z) for x in (-.60,.60)
+            for y in [i*.04 for i in range(-10,11)] for z in (.4,.7)]
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0)
+        self.spin_until(lambda:self.cloud_counter>30)
+        task=self.task(8991);self.task_pub.publish(task)
+        self.spin_until(lambda:any(f.task_id==8991 and f.reason=="DEPARTURE_EPISODE_EXHAUSTED"
+            for f in self.feedback),timeout=16)
+        log=self.read_child_log(0)
+        self.assertEqual(log.count("[DEPARTURE_SEARCH]"),2)
+        self.assertNotIn("[STRUCTURED_LOCAL_REPAIR_BUDGET]",log)
+        self.assertNotIn("LATERAL_RECOVERY_ALREADY_USED",log)
+        self.assertTrue(any(f.task_id==8991 and f.reason=="DEPARTURE_RETRY_PENDING"
+            for f in self.feedback))
+        self.assertFalse(any(f.task_id==8991 and f.state==ObservationFeedback.EXECUTION_READY
+            for f in self.feedback))
+        # New task IDs do not buy a third search. A normal alternative is
+        # still evaluated before its recovery phase reaches this same fence.
+        sibling=self.task(8992);sibling.goal.y=.5;sibling.coarse_route[-1]=sibling.goal
+        self.task_pub.publish(sibling)
+        self.spin_until(lambda:any(a.task_id==8991 and a.status==TrajectoryAck.STATUS_TASK_RETIRED for a in self.acks))
+        self.ack_pub.publish(next(a for a in self.acks if a.task_id==8991 and a.status==TrajectoryAck.STATUS_TASK_RETIRED))
+        self.spin_until(lambda:any(f.task_id==8992 and f.reason=="DEPARTURE_EPISODE_EXHAUSTED"
+            for f in self.feedback),timeout=8)
+        self.assertEqual(self.read_child_log(0).count("[DEPARTURE_SEARCH]"),2)
+
+
+
+    def prepare_measured_ground_slope(self,degrees):
+        slope=math.tan(math.radians(degrees))
+        self.cloud_points=[(ix*.10,iy*.10,slope*ix*.10) for ix in range(-20,41) for iy in range(-20,21)]
+        fields=[PointField(name='x',offset=0,datatype=PointField.FLOAT32,count=1),
+                PointField(name='y',offset=4,datatype=PointField.FLOAT32,count=1),
+                PointField(name='z',offset=8,datatype=PointField.FLOAT32,count=1),
+                PointField(name='return_type',offset=12,datatype=PointField.UINT8,count=1)]
+        # Typed h=0 means an observed support surface, independent of whether
+        # the current walk capability permits this surface's inclination.
+        self.cloud_message_factory=lambda header,points:create_cloud(header,fields,[(*p,53) for p in points])
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0)
+        self.spin_until(lambda:self.cloud_counter>35)
+
+    def test_measured_ground_slope_below_capability_keeps_normal_candidate(self):
+        self.prepare_measured_ground_slope(24.)
+        task=self.task(8993);self.task_pub.publish(task)
+        self.spin_until(lambda:any(s.task_id==8993 and s.execution_mode!=Bspline.MODE_RECOVERY_PRIMITIVE
+            for s in self.splines),timeout=8)
+        self.assertNotIn('[LOCAL_TERRAIN_LIMIT]',self.read_child_log(0))
+
+    def test_measured_ground_slope_above_capability_is_rejected_without_wall(self):
+        self.prepare_measured_ground_slope(28.)
+        task=self.task(8994);self.task_pub.publish(task)
+        self.spin_until(lambda:'[LOCAL_TERRAIN_LIMIT]' in self.read_child_log(0),timeout=8)
+        self.assertIn('reason=GROUND_SLOPE_LIMIT',self.read_child_log(0))
+        self.assertFalse(any(f.task_id==8994 and f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
 
 
 if __name__=="__main__": unittest.main()

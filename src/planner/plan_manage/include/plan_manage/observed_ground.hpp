@@ -24,36 +24,70 @@ namespace scan_planner {
 // encodes and decodes the same one byte, and no extra PointCloud2 field or
 // topic is needed.
 
+struct ObservedGroundOptions {
+  // Measurement range is distinct from the Local walk capability.
+  double max_slope_radians{std::acos(-1.0)/6.0};
+  double nominal_body_height{.30};
+};
+
 struct ObservedGround {
   bool valid{false};
   Eigen::Vector3d plane{Eigen::Vector3d::Zero()}; // z = ax + by + c in body-centred XY
-  size_t support_cells{0};
+  size_t support_cells{0}, candidate_cells{0}, best_inliers{0};
+  size_t rejected_slope{0}, rejected_height{0};
+  Eigen::Vector3d body_origin{Eigen::Vector3d::Zero()};
+  const char* reason{"insufficient_support"};
+  // The plane is body-centred for existing consumers; this conversion keeps
+  // the measured world support fixed when body height changes.
+  Eigen::Vector3d worldPlane() const {
+    Eigen::Vector3d out=plane;
+    out.z()+=body_origin.z()-plane.head<2>().dot(body_origin.head<2>());
+    return out;
+  }
   // Height above the fitted local ground per input point; NaN = unknown.
   std::vector<float> heights;
 };
 
 inline ObservedGround estimateObservedGroundHeights(const std::vector<Eigen::Vector3d>& points,
-    const std::vector<uint8_t>& types, const Eigen::Vector3d& body) {
+    const std::vector<uint8_t>& types, const Eigen::Vector3d& body,
+    const ObservedGroundOptions& options=ObservedGroundOptions{},
+    const ObservedGround* previous=nullptr) {
   ObservedGround result;
   result.heights.assign(points.size(),
       std::numeric_limits<float>::quiet_NaN());
   if(points.size()!=types.size() || !body.allFinite()) return result;
-  constexpr double cell=.25, residual=.025, max_slope=.35, body_height=.30;
+  result.body_origin=body;
+  if(!std::isfinite(options.max_slope_radians) || options.max_slope_radians<=0.0 ||
+      options.max_slope_radians>=std::acos(-1.0)/3.0 ||
+      !std::isfinite(options.nominal_body_height) || options.nominal_body_height<=0.0)
+    { result.reason="invalid_options"; return result; }
+  constexpr double cell=.25, residual=.025;
+  const double max_slope=std::tan(options.max_slope_radians);
+  // A recent reference is only a preference. It cannot create support, assign
+  // heights without returns or force a new plane to follow a moving body.
+  const bool have_previous=previous && previous->valid &&
+      (previous->body_origin.head<2>()-body.head<2>()).norm()<=1.0;
+  const Eigen::Vector3d prior=have_previous ? previous->worldPlane() : Eigen::Vector3d::Zero();
   std::map<std::pair<int,int>,Eigen::Vector3d> lowest;
   for(size_t i=0;i<points.size();++i) {
     if(types[i]!=1 || !points[i].allFinite()) continue;
     const auto p=(points[i]-body).eval();const double radius=p.head<2>().norm();
-    if(radius<.55 || radius>8. || p.z()<-.9 || p.z()>.55) continue;
+    // Permit observed uphill support above the current body. Near-body
+    // anchoring below prevents distant elevated surfaces from seeding ground.
+    if(radius<.55 || radius>8. || p.z()<-.9 ||
+        p.z()>max_slope*radius+.55) continue;
     const auto key=std::make_pair(static_cast<int>(std::floor(p.x()/cell)),
                                   static_cast<int>(std::floor(p.y()/cell)));
     auto it=lowest.find(key);
     if(it==lowest.end() || p.z()<it->second.z()) lowest[key]=p;
   }
+  result.candidate_cells=lowest.size();
   if(lowest.size()<12) return result;
   std::vector<Eigen::Vector3d> samples;for(const auto& item:lowest) samples.push_back(item.second);
   // Deterministic bounded RANSAC; each XY cell has one vote, so a densely
   // sampled wall cannot dominate the sparse floor. Require near-body support.
-  std::mt19937 random(7341);size_t best=0;Eigen::Vector3d model=Eigen::Vector3d::Zero();
+  std::mt19937 random(7341);size_t best=0;double best_score=-1.;
+  Eigen::Vector3d model=Eigen::Vector3d::Zero();
   for(int trial=0;trial<96;++trial) {
     const auto& a=samples[random()%samples.size()];
     const auto& b=samples[random()%samples.size()];
@@ -62,16 +96,27 @@ inline ObservedGround estimateObservedGroundHeights(const std::vector<Eigen::Vec
     if(std::abs(normal.z())<.05) continue;
     Eigen::Vector3d plane(-normal.x()/normal.z(),-normal.y()/normal.z(),0.);
     plane.z()=a.z()-plane.head<2>().dot(a.head<2>());
-    // The robot's known stance anchors which surface is its support, rather
-    // than accepting a parallel raised step or a remote trench floor.
-    if(plane.head<2>().norm()>max_slope || std::abs(plane.z()+body_height)>.06) continue;
+    if(plane.head<2>().norm()>max_slope+1e-9) {++result.rejected_slope;continue;}
+    // Broad physical seed range, not a fixed 0.30 +/- 0.06 m stance. A body
+    // that squats or rises must not turn its measured floor into UNKNOWN.
+    if(plane.z()>-.10 || plane.z()<-.75) {++result.rejected_height;continue;}
     size_t count=0,near=0;
+    Eigen::Vector2d sum=Eigen::Vector2d::Zero();Eigen::Matrix2d moment=Eigen::Matrix2d::Zero();
     for(const auto& p:samples) if(std::abs(p.z()-plane.head<2>().dot(p.head<2>())-plane.z())<=residual) {
-      ++count;if(p.head<2>().norm()<1.5) ++near;
+      ++count;if(p.head<2>().norm()<1.5) {++near;sum+=p.head<2>();moment+=p.head<2>()*p.head<2>().transpose();}
     }
-    if(near>=3 && count>best) {best=count;model=plane;}
+    if(near<3) continue;
+    const Eigen::Matrix2d covariance=moment/near-(sum/near)*(sum/near).transpose();
+    if(covariance.determinant()<.00003) continue; // no wall-base/collinear seed
+    const double prior_height=have_previous ?
+        prior.head<2>().dot(body.head<2>())+prior.z()-body.z() : -options.nominal_body_height;
+    const double preference=std::min(1.0,std::abs(plane.z()-prior_height)/.30);
+    const double score=count*(1.0-.15*preference);
+    if(score>best_score) {best=count;best_score=score;model=plane;}
   }
-  if(best<12) return result;
+  result.best_inliers=best;
+  if(best<12) {result.reason="no_supported_plane";return result;}
+  result.reason="measured";
   std::vector<Eigen::Vector3d> support;
   for(const auto& p:samples) if(std::abs(p.z()-model.head<2>().dot(p.head<2>())-model.z())<=residual)
     support.push_back(p);

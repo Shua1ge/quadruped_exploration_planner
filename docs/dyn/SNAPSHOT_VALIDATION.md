@@ -1,5 +1,7 @@
 # 2026-10-28 dyn 快照验证
 
+本文保留历史结果。后续提交使用 [发布验收流程](RELEASE_CHECK_ZH.md) 和 `tools/validate_release.py` 生成新的 commit 对应 JSON；不得将下列结果沿用为新工作树的通过记录。2026-10-29 对 `7d48e6f` 的独立编译补验范围也见该流程。
+
 分支 `dyn-20261028-211234`，基于本地 `a461e29cbeaff7c95bc57b85aaddc2acdf655575`，保存归档前现有开发改动。此分支是可复现开发快照，不宣称已解决全部长程探索问题。
 
 本轮新增整理：仓库根目录便携 run_newmine_rl.py（显式权重与资源路径）；NewMine模型及11份共享纹理离线闭包；固定当前TorchScript权重及来源；Campus本地适配工具与SDF模板；环境/构建/启动和已知问题文档。仅同步了一个 legacy 策略时序测试夹具缺失的 policy_command_scale 字段，没有在归档中修改运动策略或恢复逻辑。

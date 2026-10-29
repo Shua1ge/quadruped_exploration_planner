@@ -136,8 +136,8 @@ def test_graph_markers_replace_stable_slots_and_remove_stale_evidence():
     node.viewpoint_constraints = {1: {"x": 2., "y": 3.}}
     node.publish_graph_markers(Header(frame_id="world"))
     markers = node.graph_vis_pub.messages[-1].markers
-    assert [m.id for m in markers] == [0, 1, 2]
-    assert [len(m.points) for m in markers] == [2, 2, 1]
+    assert [m.id for m in markers] == [0, 1, 2, 3]
+    assert [len(m.points) for m in markers] == [2, 2, 1, 0]
     assert all(m.action == Marker.ADD for m in markers)
     node.viewpoint_constraints.clear()
     node.publish_graph_markers(Header(frame_id="world"))
@@ -174,6 +174,7 @@ def make_wavefront_node():
     node.spatial_engine = 'wavefront'
     node.wavefront = IncrementalWavefrontGraph(2.)
     node.wavefront_tile_size = 2.0
+    node.query_attachment_radius = 3.0
     node.patch_inflation_radius = 0.0
     node.node_attribute_radius = 0.5
     node.experience_half_life = 300.0
@@ -382,9 +383,211 @@ def test_published_room_graph_and_markers_use_the_same_compacted_geometry():
     update=node.wavefront.update(np.zeros((20,20),dtype=np.int8),.2,(0.,0.))
     node.commit_wavefront_update(patch,update)
     assert len(node.wavefront.nodes)==4
-    assert len(node.global_nodes)==2 and len(node.global_edges)==1
+    assert len(node.global_nodes)==1 and not node.global_edges
     node.publish_graph_markers(patch.header)
     markers=node.graph_vis_pub.messages[-1].markers
     assert len(markers[0].points)==len(node.global_node_messages)
     assert len(markers[1].points)==sum(2*(len(e.polyline)-1) for e in node.global_edge_messages.values())
     assert all(e.source_id in node.global_nodes and e.target_id in node.global_nodes for e in node.global_edges.values())
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_observation_modes_cannot_apply_global_planning_inputs(mode):
+    from frontier_explorer import FrontierExplorer
+    # These entrypoints must return before reading a graph or changing state.
+    fake = SimpleNamespace(global_usage_mode=mode, sparse_routing_enabled=True)
+    FrontierExplorer.failure_evidence_callback(fake, object())
+    FrontierExplorer.safe_region_snapshot_callback(fake, object())
+    FrontierExplorer.topology_delta_callback(fake, object())
+    FrontierExplorer.topology_snapshot_callback(fake, object())
+    candidate = SimpleNamespace(commitment_scope=("branch_option", 4))
+    FrontierExplorer.attach_safe_region_commitment_scopes(fake, [candidate], set())
+    assert candidate.commitment_scope == ("branch_option", 4)
+    assert not FrontierExplorer.apply_global_viewpoint_constraint(fake, 1, (0., 0.), .5, "test")
+    routes, _ = FrontierExplorer.sparse_route_estimates(fake, (0, 0), [(1, 0)], set(), set())
+    assert routes == [None]
+    assert vars(fake) == {"global_usage_mode": mode, "sparse_routing_enabled": True}
+
+
+def local_patch(revision, grid=None, x=0., stamp=100):
+    import numpy as np
+    from scan_planner_msgs.msg import LocalMapPatch
+    values = np.zeros((10, 30), dtype=np.int8) if grid is None else grid
+    patch = LocalMapPatch(map_revision=revision, resolution=.2,
+                          width=values.shape[1], height=values.shape[0],
+                          occupancy=values.ravel().tolist())
+    patch.header.frame_id = "world"
+    patch.header.stamp.sec = stamp
+    patch.origin.x = x
+    return patch
+
+
+def test_global_raw_connectivity_retains_narrow_opening_for_local_certification():
+    import numpy as np
+    from explorer_core.sparse_routing import SparseRouteGraph, SparseNode, SparseEdge
+    node = make_wavefront_node()
+    # The obsolete radius must no longer rewrite raw FREE as OCCUPIED.
+    node.patch_inflation_radius = .3
+    grid = np.zeros((10, 30), dtype=np.int8)
+    grid[:, 14] = 100
+    grid[4, 14] = 0
+    node.patch_callback(local_patch(1, grid))
+    assert node.wavefront.occupancy[(14, 4)] == 0
+    mirror = SparseRouteGraph()
+    mirror.apply_delta(node.graph_revision, 1,
+        [SparseNode(m.id, (m.position.x, m.position.y), m.clearance)
+         for m in node.global_node_messages.values()], [], [],
+        [SparseEdge(m.id, m.source_id, m.target_id, m.length, m.minimum_clearance,
+                    tuple((p.x, p.y) for p in m.polyline))
+         for m in node.global_edge_messages.values()], [], [])
+    assert mirror.batch_estimates((1., 1.), [(5., 1.)], .5)[0] is not None
+    # An actually observed closed wall still removes the connection.
+    grid[4, 14] = 100
+    node.patch_callback(local_patch(2, grid))
+    assert node.wavefront.occupancy[(14, 4)] == 100
+    closed = SparseRouteGraph()
+    closed.apply_delta(node.graph_revision, 2,
+        [SparseNode(m.id, (m.position.x, m.position.y), m.clearance)
+         for m in node.global_node_messages.values()], [], [],
+        [SparseEdge(m.id, m.source_id, m.target_id, m.length, m.minimum_clearance,
+                    tuple((p.x, p.y) for p in m.polyline))
+         for m in node.global_edge_messages.values()], [], [])
+    assert closed.batch_estimates((1., 1.), [(5., 1.)], .5)[0] is None
+
+
+def test_unchanged_patch_skips_graph_and_attributes_but_keeps_input_liveness(monkeypatch):
+    node = make_wavefront_node()
+    node.skip_unchanged_patches = True
+    node.topology_oracle_enabled = False
+    node.patch_callback(local_patch(1))
+    before = (dict(node.global_nodes), dict(node.global_edges))
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unchanged input performed full graph work")
+    monkeypatch.setattr(node.wavefront, "update", forbidden)
+    monkeypatch.setattr(node, "apply_terrain_attributes", forbidden)
+    patch = local_patch(2)
+    patch.content_revision = 99  # input counter alone is not a geometry change
+    patch.header.stamp.nanosec = 500_000_000
+    node.patch_callback(patch)
+    metrics = json.loads(node.metrics_pub.messages[-1].data)
+    assert metrics["unchanged_patch"] and metrics["input_stamp"] == 100.5
+    assert metrics["map_revision"] == 2 and metrics["graph_revision"] == 2
+    assert not metrics["topology_oracle_sampled"]
+    assert (node.global_nodes, node.global_edges) == before
+    delta = node.delta_pub.messages[-1]
+    assert not delta.added_nodes and not delta.updated_edges
+
+
+def test_changed_origin_geometry_and_age_bucket_are_not_deduplicated():
+    import numpy as np
+    node = make_wavefront_node()
+    node.skip_unchanged_patches = True
+    node.topology_oracle_enabled = False
+    node.patch_callback(local_patch(1))
+    key = node._last_patch_key
+    node.patch_callback(local_patch(2, x=2.))
+    assert node._last_patch_key != key
+    assert not json.loads(node.metrics_pub.messages[-1].data)["unchanged_patch"]
+    node.patch_callback(local_patch(3, x=2., stamp=102))
+    assert not json.loads(node.metrics_pub.messages[-1].data)["unchanged_patch"]
+    grid = np.zeros((10, 30), dtype=np.int8)
+    grid[:, 14] = 100
+    node.patch_callback(local_patch(4, grid, x=2., stamp=102))
+    assert not json.loads(node.metrics_pub.messages[-1].data)["unchanged_patch"]
+
+
+def test_nan_terrain_facts_have_stable_semantics_but_changed_facts_do_not():
+    from scan_planner_msgs.msg import TerrainTileSummary
+    node = make_wavefront_node()
+    node.skip_unchanged_patches = True
+    node.topology_oracle_enabled = False
+    def patch(revision, slope=float("nan")):
+        message = local_patch(revision)
+        message.scan = revision
+        message.terrain_tiles = [TerrainTileSummary(tile_size=2., ground_min=float("nan"),
+            ground_median=float("nan"), ground_max=float("nan"), slope=slope,
+            roughness=float("nan"), last_scan=revision, content_revision=revision)]
+        return message
+    node.patch_callback(patch(1))
+    node.patch_callback(patch(2))
+    assert json.loads(node.metrics_pub.messages[-1].data)["unchanged_patch"]
+    node.patch_callback(patch(3, slope=.2))
+    assert not json.loads(node.metrics_pub.messages[-1].data)["unchanged_patch"]
+
+
+def test_global_patch_admission_keeps_only_latest_pending_input():
+    node = make_wavefront_node()
+    node._pending_patch = None
+    node.received_patches = node.replaced_pending_patches = 0
+    for revision in (1, 2, 3):
+        node.queue_patch(local_patch(revision))
+    assert node.received_patches == 3 and node.replaced_pending_patches == 2
+    node.process_pending_patch()
+    assert node.last_map_revision == 3 and node._pending_patch is None
+    assert len(node.delta_pub.messages) == 1
+
+
+@pytest.mark.parametrize("mode,enabled", [("off", False), ("shadow", True), ("route_cost", True)])
+def test_global_launch_mode_controls_only_global_process(mode, enabled):
+    from launch import LaunchContext
+    from launch_ros.actions import Node
+    spec = importlib.util.spec_from_file_location(
+        "newmine_launch_test", ROOT / "launch" / "newmine_exploration.launch.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    description = module.generate_launch_description()
+    context = LaunchContext()
+    context.launch_configurations["global_usage_mode"] = mode
+    global_node = next(action for action in description.entities
+                       if isinstance(action, Node)
+                       and action.node_executable == "global_representation_node.py")
+    assert global_node.condition.evaluate(context) is enabled
+
+
+def test_spatial_floor_uses_one_stable_identity_and_cached_rectangle_geometry():
+    import numpy as np
+    from visualization_msgs.msg import Marker
+    node = make_wavefront_node(); node.wavefront_compact_routes = True
+    node.topology_oracle_enabled = False
+    node.patch_callback(local_patch(1, np.zeros((40, 60), dtype=np.int8)))
+    fill = node.graph_vis_pub.messages[-1].markers[3]
+    assert fill.ns == 'spatial_domains' and fill.type == Marker.TRIANGLE_LIST
+    assert len(fill.points) == 6  # whole rectangle, not 2400 floor cubes
+    assert len({(c.r, c.g, c.b) for c in fill.colors}) == 1
+    # Unrelated Explorer information IDs, goals and active state have no input.
+    original_colors = [(c.r, c.g, c.b) for c in fill.colors]
+    node.active_region_id = 92
+    node.active_goal = (30., 8.)
+    node.wavefront.record_traversal((1., 1.), (2., 1.), .5, stamp=100.)
+    node.patch_callback(local_patch(2, np.zeros((40, 60), dtype=np.int8)))
+    refreshed = node.graph_vis_pub.messages[-1].markers[3]
+    assert refreshed is fill
+    assert [(c.r, c.g, c.b) for c in refreshed.colors] == original_colors
+    # The existing JSON channel carries query support and the map epoch.
+    payload = json.loads(node.safe_region_pub.messages[-1].data)['spatial_supports']
+    assert len(payload['domains']) == 1 and payload['world_epoch'] == 0
+
+
+def test_spatial_support_sync_survives_message_order_and_world_epoch_reset():
+    import numpy as np
+    from frontier_explorer import FrontierExplorer
+    from explorer_core.sparse_routing import SparseRouteGraph
+    node = make_wavefront_node(); node.wavefront_compact_routes = True
+    node.topology_oracle_enabled = False
+    node.patch_callback(local_patch(30, np.zeros((20, 20), dtype=np.int8)))
+    mirror = SparseRouteGraph()
+    support = json.loads(node.safe_region_pub.messages[-1].data)['spatial_supports']
+    assert mirror.update_supports(support)  # support arrives before graph
+    snapshot = node.snapshot_pub.messages[-1]
+    mirror.apply_delta(snapshot.graph_revision, snapshot.source_map_revision,
+        [FrontierExplorer.sparse_node_from_message(n) for n in snapshot.added_nodes], [], [],
+        [FrontierExplorer.sparse_edge_from_message(e) for e in snapshot.added_edges], [], [])
+    assert mirror.ready and mirror.support_nodes((.1, .1))
+    node.patch_callback(local_patch(1, np.zeros((20, 20), dtype=np.int8), x=10.))
+    replacement = node.snapshot_pub.messages[-1]
+    assert replacement.source_map_revision == 1  # forced full reset snapshot
+    assert node.terrain_reset_count == 1
+    payload = json.loads(node.safe_region_pub.messages[-1].data)['spatial_supports']
+    assert mirror.update_supports(payload)  # lower map revision, new epoch
+    assert not mirror.update_supports(support)  # delayed old-world support
+    assert payload['world_epoch'] == 1

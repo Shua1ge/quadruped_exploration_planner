@@ -1,0 +1,28 @@
+{
+ "route": "route_on_graph.csv",
+ "length_m": 4703.9,
+ "samples": 3882,
+ "rays": [
+  720,
+  64
+ ],
+ "walkable_cells": 283201,
+ "coverage": {
+  "dilate_0_cells": {
+   "pct_walkable": 95.53,
+   "area_m2": 24349.5
+  },
+  "dilate_1_cells": {
+   "pct_walkable": 98.59,
+   "area_m2": 25129.6
+  },
+  "dilate_2_cells": {
+   "pct_walkable": 99.25,
+   "area_m2": 25295.9
+  },
+  "dilate_3_cells": {
+   "pct_walkable": 99.56,
+   "area_m2": 25375.3
+  }
+ }
+}

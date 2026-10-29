@@ -32,7 +32,7 @@ def test_legacy_blocked_callback_passes_reason_and_ignores_stale_identity():
     assert len(received)==1 and explorer.task_stale_feedback==1
 
 
-def test_simplified_publication_cannot_bypass_failed_departure_direction():
+def test_simplified_publication_delegates_motion_despite_direction_history():
     explorer=object.__new__(MODULE.FrontierExplorer)
     explorer.grid=MODULE.ExplorationGrid(12,12,1,0,0)
     explorer.grid.data.fill(MODULE.FREE)
@@ -40,10 +40,12 @@ def test_simplified_publication_cannot_bypass_failed_departure_direction():
     explorer.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=1))
     explorer.remember_local_motion_attempt((9.,2.),"LATERAL_RECOVERY_REJOIN_FAILED",cells=[(2,2),(5,2)])
     candidate=SimpleNamespace(goal=(5.,9.),path=[(2,2),(2,5),(5,9)])
-    assert explorer.local_departure_candidate_allowed(candidate)
     statuses=[];explorer.publish_status=statuses.append
+    submitted=[]
+    explorer.publish_path=lambda cells,candidate,**kwargs: submitted.append(tuple(cells)) or False
+    # Reaching publication still does not grant motion: Local certifies it.
     assert explorer.activate_candidate([(2,2),(5,2),(5,9)],candidate) is False
-    assert statuses==["LOCAL_DEPARTURE_ACTION_REJECTED"]
+    assert submitted==[((2,2),(5,2),(5,9))] and not statuses
 
 
 def test_autonomy_does_not_repair_coarse_hint_or_apply_world_half_plane():

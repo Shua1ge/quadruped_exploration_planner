@@ -29,6 +29,7 @@ class PortableSnapshotTest(unittest.TestCase):
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('sparse_routing_enabled:=false', result.stdout)
+        self.assertIn('global_usage_mode:=shadow', result.stdout)
         self.assertIn('policy_model_path:=', result.stdout)
         self.assertIn('gazebo_resource_path:=', result.stdout)
         self.assertNotIn('/home/t1an/ros2_ws/mine_tunnel_world', result.stdout)

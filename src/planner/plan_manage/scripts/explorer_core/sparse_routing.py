@@ -102,10 +102,15 @@ class SparseRouteGraph:
         self._edge_sample_keys: Dict[int, List[Tuple[Tuple[int, int], Tuple[int, int]]]] = {}
         self._component_ids: Dict[int, int] = {}
         self._components_dirty = True
+        self._support_rows = {}
+        self._support_anchors = {}
+        self._support_resolution = None
+        self._support_map_revision = -1
+        self._support_epoch = -1
 
     @property
     def ready(self) -> bool:
-        return bool(self.nodes and self.edges)
+        return bool(self.nodes and (self.edges or self._support_rows))
 
     def clear(self):
         self.nodes.clear()
@@ -119,6 +124,11 @@ class SparseRouteGraph:
         self._components_dirty = True
         self.graph_revision = 0
         self.source_map_revision = 0
+        self._support_rows.clear()
+        self._support_anchors.clear()
+        self._support_resolution = None
+        self._support_map_revision = -1
+        self._support_epoch = -1
 
     def _bucket(self, point: Point2) -> Tuple[int, int]:
         return (math.floor(point[0] / self.bucket_size),
@@ -366,6 +376,54 @@ class SparseRouteGraph:
             for by in range(first_y, last_y + 1):
                 yield bx, by
 
+    def update_supports(self, payload):
+        """Replace the derived spatial support index, independently of tasks.
+
+        World-grid row intervals are geometry references, not executable space.
+        Far connectors ALWAYS require the caller's current map check. Node
+        anchors must still match; stale snapshot data cannot move an anchor.
+        """
+        resolution = float(payload.get('resolution') or 0.)
+        domains = payload.get('domains', ())
+        revision = int(payload.get('source_map_revision', 0))
+        epoch = int(payload.get('world_epoch', 0))
+        if epoch < self._support_epoch or (epoch == self._support_epoch and revision < self._support_map_revision):
+            return False
+        if not domains:
+            rows, anchors = {}, {}
+        else:
+            if not math.isfinite(resolution) or resolution <= 0:
+                raise ValueError('invalid spatial support resolution')
+            rows, anchors = {}, {}
+            for item in domains:
+                node_id = int(item['id']); anchor = tuple(map(float, item['anchor']))
+                self._validate_point(anchor, 'support anchor')
+                if node_id < 0 or node_id in anchors:
+                    raise ValueError('invalid/duplicate support node')
+                anchors[node_id] = anchor
+                for row in item['rows']:
+                    if len(row) != 3 or any(int(v) != v for v in row):
+                        raise ValueError('support intervals must use integer world cells')
+                    y, x0, x1 = map(int, row)
+                    if x1 < x0:
+                        raise ValueError('invalid support interval')
+                    rows.setdefault(y, []).append((x0, x1, node_id))
+        self._support_rows = {y: sorted(v) for y, v in rows.items()}
+        self._support_anchors = anchors
+        self._support_resolution = resolution
+        self._support_map_revision = revision
+        self._support_epoch = epoch
+        return True
+
+    def support_nodes(self, point):
+        if not self._support_rows:
+            return ()
+        x, y = (math.floor(v/self._support_resolution) for v in point)
+        return tuple(node_id for lo, hi, node_id in self._support_rows.get(y, ())
+                     if lo <= x <= hi and node_id in self.nodes and
+                     math.dist(self.nodes[node_id].position,
+                               self._support_anchors[node_id]) < 1e-5)
+
     def attachment_details(
             self, point: Point2, radius: float, limit: int = 8,
             connector_allowed: Optional[Callable[[Point2, Point2], bool]] = None
@@ -431,6 +489,23 @@ class SparseRouteGraph:
                     node_paths[edge.target_id] = self._join_points(
                         (point, position), edge.polyline[sample_index:])
                     node_connections[edge.target_id]=((edge_id,edge.source_id,edge.target_id),) if sample_index<len(edge.polyline)-1 else ()
+        # Spatial support removes the fixed-radius coverage requirement. It
+        # does not authorize an unobserved shortcut through a concave domain.
+        if connector_allowed is not None:
+            for node_id in self.support_nodes(point):
+                position = self.nodes[node_id].position
+                nearby_count += 1
+                if not (allowed(point, position) and allowed(position, point)):
+                    rejected_count += 1
+                    continue
+                distance = math.dist(point, position)
+                multiplier = self.nodes[node_id].traversability
+                cost = distance*multiplier
+                if cost < options.get(node_id, math.inf):
+                    options[node_id] = cost
+                    penalties[node_id] = distance*(multiplier-1.)
+                    node_paths[node_id] = (point, position)
+                    node_connections[node_id] = ()
         node_options = sorted(
             options.items(), key=lambda item: (item[1], item[0]))[
                 :max(1, int(limit))]
@@ -596,6 +671,17 @@ class SparseRouteGraph:
         results: List[Optional[SparseRouteEstimate]] = []
         reasons: List[Optional[str]] = []
         for target, details in zip(targets, target_details):
+            common_support = set(self.support_nodes(start)) & set(self.support_nodes(target))
+            if (common_support and connector_allowed is not None
+                    and connector_allowed(start, target) and connector_allowed(target, start)):
+                node_id = min(common_support)
+                distance = math.dist(start, target)
+                price = self.nodes[node_id].traversability
+                results.append(SparseRouteEstimate(distance*price, 0., node_id, node_id,
+                    (start, target), self.graph_revision, (), "space_connector",
+                    distance*(price-1.)))
+                reasons.append(None)
+                continue
             if (connector_allowed is not None and math.dist(start,target) <= attachment_radius
                     and connector_allowed(start,target) and connector_allowed(target,start)):
                 # Short visible motion needs no detour through a graph anchor.

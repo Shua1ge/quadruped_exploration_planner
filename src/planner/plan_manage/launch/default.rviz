@@ -479,8 +479,8 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Global Spatial Graph
-      Namespaces: {spatial_nodes: true, spatial_edges: true, viewpoint_evidence: true}
+      Name: Global Spatial Memory (Observation)
+      Namespaces: {spatial_nodes: true, spatial_edges: true, spatial_domains: true, viewpoint_evidence: true}
       Topic:
         Depth: 1
         Durability Policy: Transient Local
@@ -515,8 +515,8 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Explorer Region Decision
-      Namespaces: {regions: true, rejected: true, accepted: true, prepared: true, active_goal: true, region_sequence: true}
+      Name: Explorer Information Decision
+      Namespaces: {information_regions: true, rejected: true, accepted: true, prepared: true, active_goal: true, region_sequence: true}
       Topic:
         Depth: 1
         Durability Policy: Transient Local

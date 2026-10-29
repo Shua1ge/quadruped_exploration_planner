@@ -37,8 +37,7 @@ def test_room_compresses_tile_grid_and_retains_real_query_coverage():
     assert metrics['queries'] == 32
     assert metrics['query_validated_routes'] == 32
     assert metrics['false_positive_rate'] == 0
-    assert metrics['graph_validated_routes'] > 0
-    assert metrics['direct_connector_routes'] > 0
+    assert metrics['space_connector_routes'] == 32
     assert metrics['max_cost_error'] < .2
 
 
@@ -102,7 +101,7 @@ def test_free_room_removes_tile_loop_and_partial_boundary_anchors(shape):
     engine=IncrementalWavefrontGraph();engine.update(grid,.2,(0.,0.))
     view=engine.routing_view()
     assert len(engine.nodes)==4 and len(engine.edges)==4
-    assert len(view.nodes)==2 and len(view.edges)==1
+    assert len(view.nodes)==1 and not view.edges
     assert min(n.clearance for n in view.nodes.values())==pytest.approx(max(n.clearance for n in engine.nodes.values()))
     check_certified(engine,view)
     metrics=routing_oracle_metrics(grid,.2,view,64)
@@ -132,12 +131,13 @@ def test_unknown_hole_keeps_upper_and_lower_route_geometry():
     assert metrics['query_validated_routes']==64 and metrics['false_positive_rate']==0
 
 
-def test_attachment_radius_limits_compression_and_repeated_scans_reuse_view():
+def test_attachment_radius_no_longer_forces_spatial_node_density():
     grid=np.zeros((20,20),dtype=np.int8)
     small=IncrementalWavefrontGraph(attachment_radius=1.)
     small.update(grid,.2,(0.,0.));small_view=small.routing_view()
     large=IncrementalWavefrontGraph();large.update(grid,.2,(0.,0.))
-    assert len(small_view.nodes)>len(large.routing_view().nodes)
+    assert small_view.nodes == large.routing_view().nodes
+    assert small_view.supports == large.routing_view().supports
     small.update(grid,.2,(0.,0.));assert small.routing_view() is small_view
     with pytest.raises(ValueError):IncrementalWavefrontGraph(attachment_radius=0.)
 

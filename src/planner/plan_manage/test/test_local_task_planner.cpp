@@ -371,15 +371,6 @@ TEST(LocalTaskPlanner, RecoveryProgressUsesBodyAxesAtRotatedYaw) {
   EXPECT_FALSE(lateralRecoveryReached({0,0},{-.15,0},{0,.13},M_PI/2,M_PI/2));
 }
 
-TEST(LocalTaskPlanner, PhysicalRecoveryMemorySurvivesGoalAndTaskChanges) {
-  DepartureRecoveryMemory memory{true,{1,2},3.10,1};
-  EXPECT_TRUE(memory.blocks({1,2},-3.10,1));
-  EXPECT_TRUE(memory.blocks({1.02,2},3.10,1));
-  EXPECT_TRUE(memory.blocks({1,2},3.10,0)); // Losing an exit cannot refill the budget.
-  EXPECT_FALSE(memory.blocks({1.4,2},3.10,1));
-  EXPECT_FALSE(memory.blocks({1,2},2.0,1));
-  EXPECT_FALSE(memory.blocks({1,2},3.10,3)); // A new fully certified exit is relevant evidence.
-}
 
 TEST(LocalTaskPlanner, ForwardStageMovesBeforeTurningAndCoversSettling) {
   const auto safe=[](const Eigen::Vector2d& p,double yaw) {
@@ -568,4 +559,77 @@ TEST(BoundaryEscape, CaptureStopsBeforeEndpointUsingMeasuredBrakingDistance) {
   EXPECT_DOUBLE_EQ(lateralCaptureStopLead(0.,.32,.3),0.);
   EXPECT_DOUBLE_EQ(lateralCaptureStopLead(-.3,.32,.3),0.);
   EXPECT_DOUBLE_EQ(lateralCaptureStopLead(.3,0.,.3),0.);
+}
+
+TEST(LocalTaskPlanner, RejectedSearchConsumesNoPhysicalMotionAndHasOneProbe) {
+  DepartureRecoveryMemory m;
+  ASSERT_TRUE(m.beginSearch(10.,{1,2},.3,1));
+  EXPECT_FALSE(m.used);EXPECT_EQ(m.searches,1u);
+  EXPECT_EQ(m.searchState(10.01),DepartureRecoveryMemory::Search::WAIT);
+  EXPECT_FALSE(m.beginSearch(11.99,{1,2},.3,1));
+  ASSERT_TRUE(m.beginSearch(12.,{1,2},.3,1));
+  EXPECT_FALSE(m.used);EXPECT_EQ(m.searches,2u);
+  EXPECT_EQ(m.searchState(12.01),DepartureRecoveryMemory::Search::EXHAUSTED);
+  EXPECT_FALSE(m.beginSearch(100.,{1,2},.3,1));
+}
+
+TEST(LocalTaskPlanner, EpisodeCannotRefillFromTaskPoseOrClockChanges) {
+  DepartureRecoveryMemory m;
+  ASSERT_TRUE(m.beginSearch(0.,{1,2},.3,1));
+  ASSERT_TRUE(m.beginSearch(2.,{1.4,2},1.5,1));
+  EXPECT_EQ(m.searches,2u);
+  EXPECT_FALSE(m.beginSearch(4.,{1,2},.3,1));
+  EXPECT_TRUE(m.timedOut(15.,false));
+  EXPECT_TRUE(m.timedOut(-1.,false));
+}
+
+TEST(LocalTaskPlanner, OnlyActivationConsumesPhysicalBudgetAndIsBounded) {
+  DepartureRecoveryMemory m;
+  ASSERT_TRUE(m.beginSearch(10.,{1,2},.3,1));
+  EXPECT_FALSE(m.used);
+  m.activated(11.);
+  EXPECT_TRUE(m.used);
+  EXPECT_FALSE(m.timedOut(20.9,true));
+  EXPECT_TRUE(m.timedOut(21.,true));
+  EXPECT_TRUE(m.timedOut(25.,false));
+  // The second successful proposal still has time to install/execute;
+  // the search counter alone must not cancel it.
+  EXPECT_FALSE(m.timedOut(12.,false));
+}
+
+TEST(LocalTaskPlanner, OnlyPersistentNewPhysicalExitReopensAnEpisode) {
+  DepartureRecoveryMemory m;ASSERT_TRUE(m.beginSearch(10.,{1,2},0.,1));
+  EXPECT_FALSE(m.observeExits(1));
+  EXPECT_FALSE(m.observeExits(3));
+  EXPECT_FALSE(m.observeExits(1)); // a flickering clear query is not new evidence
+  EXPECT_FALSE(m.observeExits(3));
+  EXPECT_FALSE(m.observeExits(5)); // different exits cannot accumulate
+  EXPECT_FALSE(m.observeExits(5));
+  EXPECT_TRUE(m.observeExits(5));
+  EXPECT_EQ(m.searches,1u); // the owner, not the observation method, resets it
+}
+
+TEST(LocalTaskPlanner, ActualFailedMotionDoesNotBuyAnotherEscapeOnANewGoal) {
+  DepartureRecoveryMemory m;ASSERT_TRUE(m.beginSearch(10.,{1,2},0.,1));
+  m.activated(11.);m.motion_failed=true;
+  EXPECT_EQ(m.searches,1u);
+  EXPECT_EQ(m.searchState(12.),DepartureRecoveryMemory::Search::EXHAUSTED);
+  EXPECT_FALSE(m.beginSearch(12.,{1,2},0.,1));
+}
+
+TEST(LocalTaskPlanner, MeasuredSlopeAndWalkCapabilityAreSeparate) {
+  for(double degrees:{0.,20.,24.,25.,28.,30.}) {
+    std::vector<Eigen::Vector3d> support;
+    for(double x=-.4;x<=.4;x+=.1)for(double y=-.4;y<=.4;y+=.1)
+      support.emplace_back(100.+x,-20.+y,-5.+x*std::tan(degrees*std::acos(-1.)/180.));
+    const auto slope=measuredSupportSlope(support);
+    ASSERT_TRUE(slope);EXPECT_NEAR(*slope,degrees*std::acos(-1.)/180.,1e-8);
+    EXPECT_EQ(*slope>25.*std::acos(-1.)/180.+1e-6,degrees>25.);
+  }
+}
+TEST(LocalTaskPlanner, MissingOrCollinearSupportCannotInventSlope) {
+  EXPECT_FALSE(measuredSupportSlope({}));
+  std::vector<Eigen::Vector3d> line;
+  for(int i=0;i<20;++i) line.emplace_back(i*.05,0.,i*.01);
+  EXPECT_FALSE(measuredSupportSlope(line));
 }

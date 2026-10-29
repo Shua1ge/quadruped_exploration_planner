@@ -85,6 +85,7 @@ namespace scan_planner
     double tracking_match_forward_time_{0.80};
     double planning_clearance_margin_{0.10};
     double preferred_clearance_margin_{0.20};
+    double maximum_walk_slope_radians_{25.0*std::acos(-1.0)/180.0};
     double clearance_limited_max_forward_speed_{0.30};
     double min_forward_command_{0.30};
     double min_forward_effective_speed_{0.165};
@@ -171,8 +172,6 @@ namespace scan_planner
     std::atomic<bool> task_restart_current_turn_{false};
     std::atomic<int64_t> task_transition_hold_stamp_{0};
     std::atomic<bool> task_restart_from_rest_used_{false};
-    std::atomic<bool> task_lateral_repair_used_{false}; // Also fenced by physical departure memory.
-    std::atomic<bool> task_lateral_repair_authorized_{false}; // Current bounded family, across all entry points.
     DepartureRecoveryMemory departure_recovery_memory_;
     std::mutex departure_recovery_mutex_;
     TaskTransitionRestGate task_station_rest_gate_;
@@ -225,9 +224,10 @@ namespace scan_planner
     void confirmObservationTaskRetirement(TaskVersion version);
     bool selectObservationTaskTarget(bool report_failure=true, bool preferred_only=false, size_t* geometry_remaining=nullptr);
     void refreshDepartureRecoveryBudget();
+    bool deferDepartureRecoverySearch();
     bool observationStationRestartCertified(const Eigen::Vector3d& position,double yaw) const;
     bool forwardStageRestartCertified(const Eigen::Vector3d& position,double yaw,bool capture_region) const;
-    uint16_t observationStationExitMask(const Eigen::Vector3d& position, double yaw) const;
+    uint16_t observationStationExitMask(const Eigen::Vector3d& position, double yaw, bool task_domain = true) const;
     void observationTaskRejected(const std::string &reason);
     void publishObservationFeedback(uint8_t state, const std::string &reason);
     size_t reference_progress_idx_{0};

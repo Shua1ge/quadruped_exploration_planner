@@ -204,11 +204,12 @@ class ObservationTaskBridge:
             return False
         now = self.get_clock().now().nanoseconds
         limit = int(self.path_request_timeout*1e9)
-        if pending.transition_phase == ObservationFeedback.TRANSITION_WAIT_STOP:
+        if (pending.transition_phase == ObservationFeedback.TRANSITION_WAIT_STOP or
+                pending.transition_reason == "DEPARTURE_RETRY_PENDING"):
             # A certified forward stage is <=1.2 m (~7.3 s at the measured
             # 0.165 m/s response), followed by <=5 s rest confirmation. This
             # finite phase must not be cancelled by the ordinary 5 s ACK wait.
-            stage_wait = pending.transition_reason == 'WAITING_FOR_TURN_STAGE'
+            stage_wait = pending.transition_reason in ('WAITING_FOR_TURN_STAGE', 'DEPARTURE_RETRY_PENDING')
             limit = max(limit, 15000000000 if stage_wait else 6000000000)
         if pending.state == "PREPARING" and now-pending.published_ns >= limit:
             self.cancel_pending_observation_handoff("EXECUTION_READY_TIMEOUT")
@@ -261,8 +262,10 @@ class ObservationTaskBridge:
             return True
         if message.state in (ObservationFeedback.TRANSITION_WAIT_STOP,
                              ObservationFeedback.TRANSITION_RESTARTING):
-            if message.state > pending.transition_phase:
-                pending.transition_phase = message.state
+            if (message.state > pending.transition_phase or
+                    (message.reason == "DEPARTURE_RETRY_PENDING" and
+                     pending.transition_reason != "DEPARTURE_RETRY_PENDING")):
+                pending.transition_phase = max(message.state,pending.transition_phase)
                 pending.transition_reason = message.reason
                 pending.published_ns = self.get_clock().now().nanoseconds
                 self.publish_status('OBSERVATION_HANDOFF_PHASE reason='+message.reason)
@@ -315,6 +318,13 @@ class ObservationTaskBridge:
                 or getattr(self, "departure_recovery_terminal", False)):
             self.task_stale_feedback += 1
             return
+        if (message.state in (ObservationFeedback.TRANSITION_WAIT_STOP,
+                              ObservationFeedback.TRANSITION_RESTARTING) and
+                message.reason=="DEPARTURE_RETRY_PENDING"):
+            if getattr(self,"local_recovery_request",None)!=message.request_id:
+                self.local_recovery_request=message.request_id
+                self.local_recovery_started_ns=self.get_clock().now().nanoseconds
+            return  # Duplicate phase feedback never renews the finite wait.
         if message.state == ObservationFeedback.EXECUTION_READY:
             # A replay of the committed handoff is not station/progress feedback.
             return
@@ -459,29 +469,15 @@ class ObservationTaskBridge:
             any(self.grid.in_bounds(cell) and self.grid.value(cell)==FREE
                 for cell in attempt.blocked_cells))
 
-    def local_departure_candidate_allowed(self, candidate, *, cells=None):
-        attempts=getattr(self,"departure_action_failures",[])
-        if not attempts:
-            return True
-        attempts=[a for a in attempts if not self.departure_attempt_changed(a)]
-        self.departure_action_failures=attempts
-        if not attempts:
-            return True
-        explicit_cells=cells is not None
-        cells=(getattr(candidate,"path",()) if cells is None else cells) or ()
-        sparse=None if explicit_cells else getattr(candidate,"sparse_route",None)
-        if not cells and sparse is not None:
-            yaw=self.departure_polyline_yaw(candidate.goal,sparse.polyline)
-        else:
-            yaw=self.departure_route_yaw(candidate.goal,cells)
-        # Missing direction cannot establish a different action. Failed route
-        # sectors are retained across Goals and clocks. Accepted alternatives
-        # differ by at least 45 degrees, so a stationary state has finite trials.
-        allowed=math.isfinite(yaw) and all(math.isfinite(a.route_yaw) and
-            abs(math.remainder(yaw-a.route_yaw,2*math.pi))>=math.pi/4-1e-9 for a in attempts)
-        if not allowed:
-            self.departure_action_suppressed=True
-        return allowed
+    def local_departure_history_penalty(self, candidate):
+        # A ranking hint only. Motion feasibility and retry budgets belong to Local.
+        self.departure_action_failures=[a for a in getattr(self,"departure_action_failures",[])
+                                       if not self.departure_attempt_changed(a)]
+        yaw=self.departure_route_yaw(candidate.goal,getattr(candidate,"path",()) or ())
+        return .25 if math.isfinite(yaw) and any(math.isfinite(a.route_yaw) and
+            abs(math.remainder(yaw-a.route_yaw,2*math.pi))<math.pi/4
+            for a in getattr(self,"departure_action_failures",[])
+            if not self.departure_attempt_changed(a)) else 0.0
 
     def remember_local_motion_attempt(self, goal, reason, *, cells=None, pose_wide=False):
         """Temporary motion cooldown; expiry allows revalidation, not execution."""
@@ -494,10 +490,13 @@ class ObservationTaskBridge:
                             if self.grid.in_bounds((i, j)) and self.grid.value((i, j)) == OCCUPIED)
         self.local_motion_goal_cooldowns[goal] = LocalMotionAttempt(
             tuple(self.position), reason, blocked, getattr(self,"body_yaw",math.nan),
-            self.get_clock().now().nanoseconds + 5000000000,
+            self.get_clock().now().nanoseconds + 2000000000,
             self.departure_route_yaw(goal, getattr(self,"active_raw_path",()) if cells is None else cells),
             pose_wide or reason=="RECOVERY_START_FOOTPRINT_OCCUPIED")
-        if reason.startswith("LATERAL_RECOVERY_") or pose_wide or reason=="RECOVERY_START_FOOTPRINT_OCCUPIED":
+        # Scheduling/budget/installation failures are not directional geometry.
+        direction_evidence=reason in ("DEPARTURE_UNSAFE", "LATERAL_RECOVERY_REJOIN_FAILED",
+            "LATERAL_RECOVERY_NO_PROGRESS", "LATERAL_RECOVERY_BOUNDARY_CERTIFICATE_REVOKED")
+        if direction_evidence or pose_wide or reason=="RECOVERY_START_FOOTPRINT_OCCUPIED":
             attempt=self.local_motion_goal_cooldowns[goal]
             if attempt.pose_wide:
                 self.local_departure_failure=attempt
@@ -510,28 +509,21 @@ class ObservationTaskBridge:
                 self.departure_action_failures=attempts
 
     def local_motion_retry_allowed(self, attempt):
-        departure_failure=(attempt.pose_wide or attempt.reason in ("DEPARTURE_UNSAFE", "RECOVERY_START_FOOTPRINT_OCCUPIED") or
-                           attempt.reason.startswith("LATERAL_RECOVERY_"))
-        if not departure_failure and self.get_clock().now().nanoseconds >= attempt.retry_after_ns:
-            return True  # Generic scheduling cooldown, not a refill of Local recovery.
-        # Heading jitter and unrelated map updates are not a different
-        # departure, even after the scheduling cooldown has elapsed. Every
-        # retry still needs full Local certification.
-        if math.dist(self.position, attempt.position) >= max(
-                1.0, 2.0*getattr(self, "task_corridor_radius", .8)):
+        if math.dist(self.position,attempt.position)>=max(1.,2.*getattr(self,"task_corridor_radius",.8)):
             return True
-        # A substantial externally measured reorientation is a new departure,
-        # not a new task or a map revision. Local must certify it again.
-        yaw=getattr(self,"body_yaw",math.nan)
-        if (departure_failure and math.isfinite(yaw)
-                and math.isfinite(attempt.departure_yaw)
-                and abs(math.remainder(yaw-attempt.departure_yaw,2*math.pi))>=math.pi/4):
+        physical=(attempt.pose_wide or attempt.reason in ("DEPARTURE_UNSAFE",
+            "RECOVERY_START_FOOTPRINT_OCCUPIED", "DEPARTURE_EPISODE_EXHAUSTED") or
+            attempt.reason in ("LATERAL_RECOVERY_INEFFECTIVE", "LATERAL_RECOVERY_REJOIN_FAILED",
+                               "LATERAL_RECOVERY_NO_PROGRESS"))
+        if physical and self.departure_attempt_changed(attempt):
             return True
-        # Only a departure-obstacle failure may be reconsidered on obstacle
-        # removal. Other causes require a different physical departure.
-        return (departure_failure and bool(attempt.blocked_cells)
-                and any(self.grid.in_bounds(cell) and self.grid.value(cell) == FREE
-                        for cell in attempt.blocked_cells))
+        if attempt.reason in ("DEPARTURE_EPISODE_EXHAUSTED", "LATERAL_RECOVERY_INEFFECTIVE",
+                              "LATERAL_RECOVERY_REJOIN_FAILED", "LATERAL_RECOVERY_NO_PROGRESS") or attempt.pose_wide:
+            # This goal already consumed Local's initial search plus probe.
+            # No timer/region/request refresh purchases another one. Other
+            # goals are still compared; this is not a wall or a region ban.
+            return False
+        return self.get_clock().now().nanoseconds >= attempt.retry_after_ns
 
     def handle_local_motion_exhausted(self, message=None, *, reason=None):
         """Consume typed feedback or a matched legacy status as one motion terminal."""
@@ -566,9 +558,15 @@ class ObservationTaskBridge:
             if self.plan_from_current_position(excluded_goals=excluded):
                 self.publish_status("LOCAL_MOTION_EXHAUSTED_OTHER_TASK_SELECTED")
             else:
-                self.publish_status("LOCAL_DEPARTURE_ACTIONS_EXHAUSTED" if
-                    getattr(self,"departure_action_suppressed",False) else
-                    "LOCAL_MOTION_EXHAUSTED_WAITING_FOR_ALTERNATIVE")
+                self.publish_status("LOCAL_MOTION_EXHAUSTED_WAITING_FOR_ALTERNATIVE")
+
+    def motion_request_timeout(self):
+        if (getattr(self,"local_recovery_request",None) is not None and
+                self.local_recovery_request==getattr(self,"pending_path_request_generation",None)):
+            started=getattr(self,"local_recovery_started_ns",self.pending_path_publish_ns)
+            return max(self.path_request_timeout,
+                (started+15_000_000_000-self.pending_path_publish_ns)/1_000_000_000)
+        return self.path_request_timeout
 
     def local_departure_replan_allowed(self):
         attempt=getattr(self,"local_departure_failure",None)
