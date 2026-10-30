@@ -1,6 +1,6 @@
 # Global 空间记忆观察模式（2026-10-29）
 
-本页记录现有实现。当前 place_id 的严格凸合并仍有非凸空间碎分和观测顺序依赖；后续修改统一按 [无 Vision 的 Global 设计](GLOBAL_NO_VISION_DESIGN_ZH.md) 分阶段验收，不能把本页的稳定配色说明当成空间划分已正确。
+2026-10-30 已分离凸支撑域与空间身份，并补齐净空来源、连接压缩及被压缩域的接入。具体实现、接口字段及表达限制见 [Global 几何语义](GLOBAL_GEOMETRY_SEMANTICS_ZH.md)。[无 Vision 的 Global 设计](GLOBAL_NO_VISION_DESIGN_ZH.md) 中的全链路增量发布与 Explorer 替代仍未完成。
 
 默认继续使用 `shadow`：Global 独立建图和显示，Explorer 不订阅它的 topology delta/snapshot、safe-region snapshot 或转发 failure evidence。Local、消息定义、控制器、恢复、步态与模型均不在本次修改范围内。
 
@@ -21,11 +21,11 @@ cd ~/ros2_ws/scan_planner_dyn_ws
 
 `SparseRouteGraph` 通过已知空间域接入锚点，取代“必须在固定 3m 内找到骨架”的覆盖要求。远距离接入必须由查询方再次检查实际地图；域归属不授权运动。一个空平台可以只有一个节点、没有边，域内可见查询走直接连接而不绕锚点。旧的近节点/边采样接入继续支持缺少域数据时的情况；预算或证据不足不会被当成已知可达。
 
-域的世界格行区间和身份通过现有 `safe_region_snapshot` JSON 的 `spatial_supports` 字段传输，没有修改 ROS 消息或 Local 接口。快照可先于图到达，使用时必须匹配当前节点的锚点；旧 map epoch 的域不能复活。Local 地图重启强制发布完整图快照。
+压缩掉的锚点通过 `edge_attachment` 对应 Edge 折点，单 tile 非凸域可携带原有波前父树见证；接入不新增栅格搜索。域的世界格行区间和身份通过现有 `safe_region_snapshot` JSON 的 `spatial_supports` 字段传输，没有修改 ROS 消息或 Local 接口。快照可先于图到达，使用时必须匹配当前节点的锚点；旧 map epoch 的域不能复活。Local 地图重启强制发布完整图快照。
 
 ## 稳定地面颜色与动态信息边界分开
 
-`/global_representation/graph_markers` 仍是 MarkerArray，RViz 显示名改为 **Global Spatial Memory (Observation)**。新增 `spatial_domains` namespace，表示稳定空间地面填色；`spatial_nodes`、`spatial_edges` 保留锚点与粗连接。颜色绑定独立的 `place_id`，多个路线锚点可以共享同一地面颜色；覆盖范围或新分叉要求增加锚点时不重染旧平台。扩展保留旧身份，真实连通分裂最大重叠的一支继承旧身份，其他部分分配新身份。Frontier 移动、满足、换 ID、换 Goal 不能改变空间颜色。
+`/global_representation/graph_markers` 仍是 MarkerArray，RViz 显示名改为 **Global Spatial Memory (Observation)**。新增 `spatial_domains` namespace，表示稳定空间地面填色；`spatial_nodes`、`spatial_edges` 保留锚点与粗连接。颜色绑定独立的 `place_id`，相同空间可以非凸，多个路线支撑域可以共享同一地面颜色；覆盖范围或新分叉要求增加锚点时不重染旧平台。扩展保留旧身份，真实连通分裂最大重叠的一支继承旧身份，其他部分分配新身份。Frontier 移动、满足、换 ID、换 Goal 不能改变空间颜色。
 
 填色按连续矩形合并，复用未改变的三角形几何；矩形只覆盖实际 FREE 格。它仍是固定高度的 XY 投影，不是世界地面高程，也不是身体可通行认证。没有测量支持的地方不绘制虚构地面。
 

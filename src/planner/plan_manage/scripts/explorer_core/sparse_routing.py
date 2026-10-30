@@ -56,6 +56,7 @@ class EdgeAttachment:
     connector_cost: float
     position: Point2
     sample_index: int = 0
+    connector: Tuple[Point2, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,8 @@ class SparseRouteGraph:
         self._components_dirty = True
         self._support_rows = {}
         self._support_anchors = {}
+        self._support_edge_refs = {}
+        self._support_trees = {}
         self._support_resolution = None
         self._support_map_revision = -1
         self._support_epoch = -1
@@ -126,6 +129,8 @@ class SparseRouteGraph:
         self.source_map_revision = 0
         self._support_rows.clear()
         self._support_anchors.clear()
+        self._support_edge_refs.clear()
+        self._support_trees.clear()
         self._support_resolution = None
         self._support_map_revision = -1
         self._support_epoch = -1
@@ -389,6 +394,7 @@ class SparseRouteGraph:
         epoch = int(payload.get('world_epoch', 0))
         if epoch < self._support_epoch or (epoch == self._support_epoch and revision < self._support_map_revision):
             return False
+        edge_refs, trees = {}, {}
         if not domains:
             rows, anchors = {}, {}
         else:
@@ -401,6 +407,21 @@ class SparseRouteGraph:
                 if node_id < 0 or node_id in anchors:
                     raise ValueError('invalid/duplicate support node')
                 anchors[node_id] = anchor
+                if 'edge_attachment' in item:
+                    ref = item['edge_attachment']
+                    if (len(ref) != 2 or any(int(v) != v or v < 0 for v in ref)):
+                        raise ValueError('invalid support edge attachment')
+                    edge_refs[node_id] = tuple(map(int, ref))
+                if 'connector_tree' in item:
+                    tree = item['connector_tree']
+                    width = int(tree['width']); origin = tuple(tree['origin'])
+                    steps = tree['steps']
+                    if (width < 1 or width != tree['width'] or len(origin) != 2 or
+                            any(int(v) != v for v in origin) or
+                            not isinstance(steps, str) or len(steps) != width*width or
+                            any(c not in '.012345678' for c in steps)):
+                        raise ValueError('invalid support connector tree')
+                    trees[node_id] = tuple(map(int, origin)), width, steps
                 for row in item['rows']:
                     if len(row) != 3 or any(int(v) != v for v in row):
                         raise ValueError('support intervals must use integer world cells')
@@ -410,19 +431,78 @@ class SparseRouteGraph:
                     rows.setdefault(y, []).append((x0, x1, node_id))
         self._support_rows = {y: sorted(v) for y, v in rows.items()}
         self._support_anchors = anchors
+        self._support_edge_refs = edge_refs
+        self._support_trees = trees
         self._support_resolution = resolution
         self._support_map_revision = revision
         self._support_epoch = epoch
         return True
 
-    def support_nodes(self, point):
+    def _support_domains(self, point):
         if not self._support_rows:
             return ()
         x, y = (math.floor(v/self._support_resolution) for v in point)
-        return tuple(node_id for lo, hi, node_id in self._support_rows.get(y, ())
-                     if lo <= x <= hi and node_id in self.nodes and
-                     math.dist(self.nodes[node_id].position,
-                               self._support_anchors[node_id]) < 1e-5)
+        result = []
+        for lo, hi, domain in self._support_rows.get(y, ()):
+            if not lo <= x <= hi:
+                continue
+            anchor = self._support_anchors[domain]
+            if domain in self._support_edge_refs:
+                eid, index = self._support_edge_refs[domain]
+                edge = self.edges.get(eid)
+                if edge and index < len(edge.polyline) and math.dist(edge.polyline[index], anchor) < 1e-5:
+                    result.append(domain)
+            elif domain in self.nodes and math.dist(self.nodes[domain].position, anchor) < 1e-5:
+                result.append(domain)
+        return tuple(result)
+
+    def support_nodes(self, point):
+        nodes = set()
+        for domain in self._support_domains(point):
+            if domain in self._support_edge_refs:
+                edge = self.edges[self._support_edge_refs[domain][0]]
+                nodes.update((edge.source_id, edge.target_id))
+            else:
+                nodes.add(domain)
+        return tuple(sorted(nodes))
+
+    def _support_connector(self, point, domain, allowed):
+        anchor = self._support_anchors[domain]
+        if allowed(point, anchor) and allowed(anchor, point):
+            return (point, anchor)
+        tree = self._support_trees.get(domain)
+        if tree is None:
+            return None
+        (x0, y0), width, steps = tree
+        resolution = self._support_resolution
+        def chain(position):
+            cell = tuple(math.floor(v/resolution) for v in position)
+            result, seen = [], set()
+            while cell not in seen:
+                x, y = cell[0]-x0, cell[1]-y0
+                if not (0 <= x < width and 0 <= y < width):
+                    return None
+                code = steps[y*width+x]
+                if code == '.':
+                    return None
+                seen.add(cell); result.append(cell)
+                if code == '4':
+                    return result
+                step = int(code)
+                cell = cell[0]+step % 3-1, cell[1]+step//3-1
+            return None  # malformed/cyclic witness never triggers a search
+        left, right = chain(point), chain(anchor)
+        if left is None or right is None or left[-1] != right[-1]:
+            return None
+        # Trim their shared tail, so a connector need not detour to the root.
+        while len(left) > 1 and len(right) > 1 and left[-2] == right[-2]:
+            left.pop(); right.pop()
+        cells = left+list(reversed(right[:-1]))
+        path = self._join_points((point,), tuple(
+            ((x+.5)*resolution, (y+.5)*resolution) for x, y in cells), (anchor,))
+        if all(allowed(a, b) and allowed(b, a) for a, b in zip(path, path[1:])):
+            return path
+        return None
 
     def attachment_details(
             self, point: Point2, radius: float, limit: int = 8,
@@ -438,6 +518,31 @@ class SparseRouteGraph:
         edge_options: Dict[int, List[EdgeAttachment]] = {}
         nearby_count = 0
         rejected_count = 0
+        def add_edge(edge_id, sample_index, position, along, distance, connector=None):
+            edge = self.edges[edge_id]
+            connector = connector or (point, position)
+            edge_options.setdefault(edge_id, []).append(EdgeAttachment(
+                edge_id, along, distance, position, sample_index, connector))
+            multiplier = self.edge_cost(edge_id)
+            source_along = along
+            target_along = max(0.0, edge.length - along)
+            source_cost = distance + source_along * multiplier
+            target_cost = distance + target_along * multiplier
+            if source_cost < options.get(edge.source_id, math.inf):
+                options[edge.source_id] = source_cost
+                penalties[edge.source_id] = (
+                    source_along * (multiplier - 1.0))
+                node_paths[edge.source_id] = self._join_points(
+                    connector,
+                    tuple(reversed(edge.polyline[:sample_index + 1])))
+                node_connections[edge.source_id]=((edge_id,edge.target_id,edge.source_id),) if sample_index>0 else ()
+            if target_cost < options.get(edge.target_id, math.inf):
+                options[edge.target_id] = target_cost
+                penalties[edge.target_id] = (
+                    target_along * (multiplier - 1.0))
+                node_paths[edge.target_id] = self._join_points(
+                    connector, edge.polyline[sample_index:])
+                node_connections[edge.target_id]=((edge_id,edge.source_id,edge.target_id),) if sample_index<len(edge.polyline)-1 else ()
         for key in self._nearby_buckets(point, radius):
             for node_id, position in self._node_buckets.get(key, {}).items():
                 distance = math.hypot(position[0] - point[0],
@@ -467,45 +572,33 @@ class SparseRouteGraph:
                 edge = self.edges.get(edge_id)
                 if edge is None:
                     continue
-                edge_options.setdefault(edge_id, []).append(EdgeAttachment(
-                    edge_id, along, distance, position, sample_index))
-                multiplier = self.edge_cost(edge_id)
-                source_along = along
-                target_along = max(0.0, edge.length - along)
-                source_cost = distance + source_along * multiplier
-                target_cost = distance + target_along * multiplier
-                if source_cost < options.get(edge.source_id, math.inf):
-                    options[edge.source_id] = source_cost
-                    penalties[edge.source_id] = (
-                        source_along * (multiplier - 1.0))
-                    node_paths[edge.source_id] = self._join_points(
-                        (point, position),
-                        tuple(reversed(edge.polyline[:sample_index + 1])))
-                    node_connections[edge.source_id]=((edge_id,edge.target_id,edge.source_id),) if sample_index>0 else ()
-                if target_cost < options.get(edge.target_id, math.inf):
-                    options[edge.target_id] = target_cost
-                    penalties[edge.target_id] = (
-                        target_along * (multiplier - 1.0))
-                    node_paths[edge.target_id] = self._join_points(
-                        (point, position), edge.polyline[sample_index:])
-                    node_connections[edge.target_id]=((edge_id,edge.source_id,edge.target_id),) if sample_index<len(edge.polyline)-1 else ()
+                add_edge(edge_id, sample_index, position, along, distance)
         # Spatial support removes the fixed-radius coverage requirement. It
         # does not authorize an unobserved shortcut through a concave domain.
         if connector_allowed is not None:
-            for node_id in self.support_nodes(point):
-                position = self.nodes[node_id].position
+            for domain in self._support_domains(point):
+                position = self._support_anchors[domain]
                 nearby_count += 1
-                if not (allowed(point, position) and allowed(position, point)):
+                connector = self._support_connector(point, domain, allowed)
+                if connector is None:
                     rejected_count += 1
                     continue
-                distance = math.dist(point, position)
-                multiplier = self.nodes[node_id].traversability
+                distance = sum(math.dist(a, b) for a, b in zip(connector, connector[1:]))
+                if domain in self._support_edge_refs:
+                    eid, index = self._support_edge_refs[domain]
+                    edge = self.edges[eid]
+                    # Reuse the along-distance already indexed at edge ingest;
+                    # compression must not make every target rescan the edge.
+                    along = self._sample_buckets[self._bucket(position)][(eid, index)][1]
+                    add_edge(eid, index, position, along, distance, connector)
+                    continue
+                multiplier = self.nodes[domain].traversability
                 cost = distance*multiplier
-                if cost < options.get(node_id, math.inf):
-                    options[node_id] = cost
-                    penalties[node_id] = distance*(multiplier-1.)
-                    node_paths[node_id] = (point, position)
-                    node_connections[node_id] = ()
+                if cost < options.get(domain, math.inf):
+                    options[domain] = cost
+                    penalties[domain] = distance*(multiplier-1.)
+                    node_paths[domain] = connector
+                    node_connections[domain] = ()
         node_options = sorted(
             options.items(), key=lambda item: (item[1], item[0]))[
                 :max(1, int(limit))]
@@ -671,12 +764,16 @@ class SparseRouteGraph:
         results: List[Optional[SparseRouteEstimate]] = []
         reasons: List[Optional[str]] = []
         for target, details in zip(targets, target_details):
-            common_support = set(self.support_nodes(start)) & set(self.support_nodes(target))
+            common_support = set(self._support_domains(start)) & set(self._support_domains(target))
             if (common_support and connector_allowed is not None
                     and connector_allowed(start, target) and connector_allowed(target, start)):
-                node_id = min(common_support)
+                domain = min(common_support)
+                if domain in self._support_edge_refs:
+                    edge = self.edges[self._support_edge_refs[domain][0]]
+                    node_id, price = edge.source_id, edge.traversability
+                else:
+                    node_id, price = domain, self.nodes[domain].traversability
                 distance = math.dist(start, target)
-                price = self.nodes[node_id].traversability
                 results.append(SparseRouteEstimate(distance*price, 0., node_id, node_id,
                     (start, target), self.graph_revision, (), "space_connector",
                     distance*(price-1.)))
@@ -724,9 +821,10 @@ class SparseRouteGraph:
                 total, start_edge, target_edge, terrain_surcharge = direct_choice
                 edge = self.edges[start_edge.edge_id]
                 points = self._join_points(
-                    (start, start_edge.position),
+                    start_edge.connector or (start, start_edge.position),
                     self._same_edge_polyline(start_edge, target_edge),
-                    (target_edge.position, target))
+                    tuple(reversed(target_edge.connector)) if target_edge.connector
+                    else (target_edge.position, target))
                 results.append(SparseRouteEstimate(
                     total, self._turn_cost(points), edge.source_id,
                     edge.target_id, points, self.graph_revision,

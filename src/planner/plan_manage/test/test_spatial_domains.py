@@ -145,7 +145,8 @@ def test_discovering_branch_adds_route_anchors_without_recolouring_old_platform(
     after = floor_identity(engine)
     assert len(engine.routing_view().nodes) > len(node_ids)
     assert all(after[c] == pid for c, pid in before.items())
-    assert any(after[c] not in set(before.values()) for c in after if c not in before)
+    # A narrowing into UNKNOWN adds route coverage, not a measured doorway.
+    assert set(after.values()) == set(before.values())
 
 
 def test_pillar_changes_route_supports_but_does_not_split_connected_floor_identity():

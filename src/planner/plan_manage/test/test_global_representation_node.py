@@ -591,3 +591,36 @@ def test_spatial_support_sync_survives_message_order_and_world_epoch_reset():
     assert mirror.update_supports(payload)  # lower map revision, new epoch
     assert not mirror.update_supports(support)  # delayed old-world support
     assert payload['world_epoch'] == 1
+
+
+def test_compressed_support_and_clearance_provenance_survive_wire_order():
+    import numpy as np
+    from frontier_explorer import FrontierExplorer
+    from explorer_core.sparse_routing import SparseRouteGraph
+    from explorer_core.grid import FREE, UNKNOWN
+    node = make_wavefront_node(); node.wavefront_compact_routes = True
+    node.topology_oracle_enabled = False
+    grid = np.full((40, 60), UNKNOWN, dtype=np.int8)
+    grid[:20, :] = FREE; grid[:, 40:] = FREE
+    node.patch_callback(local_patch(30, grid))
+    payload = json.loads(node.safe_region_pub.messages[-1].data)['spatial_supports']
+    meta = payload['clearance']
+    assert payload['source_map_revision'] == 30 and payload['world_epoch'] == 0
+    assert meta['geometry_revision'] == payload['geometry_revision']
+    assert meta['projection'] == 'local_uninflated_body_space'
+    assert meta['edges'] and payload['domains']
+    absorbed = next(d for d in payload['domains'] if 'edge_attachment' in d)
+    mirror = SparseRouteGraph()
+    assert mirror.update_supports(payload)
+    assert mirror._support_domains(absorbed['anchor']) == ()
+    snapshot = node.snapshot_pub.messages[-1]
+    mirror.apply_delta(snapshot.graph_revision, snapshot.source_map_revision,
+        [FrontierExplorer.sparse_node_from_message(n) for n in snapshot.added_nodes], [], [],
+        [FrontierExplorer.sparse_edge_from_message(e) for e in snapshot.added_edges], [], [])
+    assert absorbed['id'] in mirror._support_domains(absorbed['anchor'])
+    assert absorbed['id'] not in mirror.nodes
+    assert len(mirror.nodes) == 2 and len(mirror.edges) == 1
+    def allowed(a, b):
+        cells = [tuple(int(v//.2) for v in p) for p in (a, b)]
+        return node.wavefront._free_segment(*cells) is not None
+    assert mirror.attachments(absorbed['anchor'], .001, connector_allowed=allowed)

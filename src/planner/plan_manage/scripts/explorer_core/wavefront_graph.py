@@ -8,7 +8,7 @@ successive skeletons. Execution constraints are deliberately not an input.
 """
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import heapq
 import time
@@ -23,6 +23,9 @@ from .spatial_domains import SpatialDomainView
 
 Cell = Tuple[int, int]
 STEPS = ((-1, 0), (0, -1), (0, 1), (1, 0))
+CLEARANCE_OCCUPIED = 1
+CLEARANCE_UNKNOWN = 2
+CLEARANCE_FIELD_LIMIT = 4
 
 
 @dataclass
@@ -32,6 +35,7 @@ class Tile:
     parents: Dict[Cell, Cell]
     distances: Dict[Cell, float]
     clearance: Dict[Cell, float]
+    clearance_sources: Dict[Cell, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -170,14 +174,32 @@ class IncrementalWavefrontGraph:
         size = self.tile_cells
         x0, y0 = key[0]*size, key[1]*size
         # A one-tile halo bounds distance work and provides neighbouring walls.
-        mask = np.zeros((3*size+2, 3*size+2), dtype=bool)
+        shape = (3*size+2, 3*size+2)
+        labels = np.full(shape, CLEARANCE_FIELD_LIMIT, dtype=np.uint8)
         for y in range(y0-size, y0+2*size):
             for x in range(x0-size, x0+2*size):
-                mask[y-y0+size+1, x-x0+size+1] = self.occupancy.get((x, y)) == FREE
-        field = distance_transform_edt(mask) * self.resolution
+                state = self.occupancy.get((x, y), UNKNOWN)
+                labels[y-y0+size+1, x-x0+size+1] = (
+                    0 if state == FREE else CLEARANCE_OCCUPIED
+                    if state == OCCUPIED else CLEARANCE_UNKNOWN)
+        # Separate measured walls, unobserved cells and the artificial halo.
+        # Empty channels are infinite: scipy's all-ones EDT is not evidence.
+        fields = {kind: (distance_transform_edt(labels != kind)*self.resolution
+                        if np.any(labels == kind) else np.full(shape, np.inf))
+                  for kind in (CLEARANCE_OCCUPIED, CLEARANCE_UNKNOWN, CLEARANCE_FIELD_LIMIT)}
+        distance = np.minimum.reduce(tuple(fields.values()))
+        # EDT measures centre-to-centre distances. Subtract a cell circumradius
+        # for a lower bound to the CLOSED non-free cell area. This is a sampled
+        # 2D bound, not body clearance or a continuous swept-volume certificate.
+        field_values = np.maximum(0., distance-self.resolution/math.sqrt(2.))
         free = {(x, y) for y in range(y0, y0+size) for x in range(x0, x0+size)
                 if self.occupancy.get((x, y)) == FREE}
-        clearance = {p: float(field[p[1]-y0+size+1, p[0]-x0+size+1]) for p in free}
+        clearance, sources = {}, {}
+        for p in free:
+            index = (p[1]-y0+size+1, p[0]-x0+size+1)
+            clearance[p] = float(field_values[index])
+            sources[p] = sum(kind for kind, values in fields.items()
+                             if abs(values[index]-distance[index]) < 1e-9)
         components = []
         remaining = set(free)
         while remaining:
@@ -202,7 +224,7 @@ class IncrementalWavefrontGraph:
             if old_id not in claimed and index not in assigned:
                 assigned[index] = old_id
                 claimed.add(old_id)
-        result = Tile({}, {}, {}, {}, clearance)
+        result = Tile({}, {}, {}, {}, clearance, sources)
         created = {}
         for index, cells in enumerate(components):
             node_id = assigned.get(index)
@@ -251,6 +273,13 @@ class IncrementalWavefrontGraph:
                                         if old_cells & cells))
                    for old_id, old_cells in old.items()}
         return result, created, lineage
+
+    def clearance_evidence(self, cell):
+        tile = self.tiles[self.tile_key(cell)]
+        flags = tile.clearance_sources[cell]
+        return dict(radius=tile.clearance[cell], sources=[name for kind, name in (
+            (CLEARANCE_OCCUPIED, 'occupied'), (CLEARANCE_UNKNOWN, 'unknown'),
+            (CLEARANCE_FIELD_LIMIT, 'field_limit')) if flags & kind])
 
     @staticmethod
     def _to_seed(tile, cell):

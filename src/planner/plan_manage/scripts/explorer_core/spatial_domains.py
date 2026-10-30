@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 import heapq
 import math
 
-from .grid import FREE
+from .grid import FREE, OCCUPIED
 from .topology import TopologyNode, TopologyEdge, TopologyGraph, stable_edge_id
 
 
@@ -103,6 +103,9 @@ class SpatialDomainView:
         self.edges = {}
         self.edge_dependencies = {}
         self._pruned_edges = {}
+        self._neck_cache = {}
+        self._support_edges = {}
+        self._connector_trees = {}
         self.revision = 0
         self.floor_revision = 0
         self.metrics = {}
@@ -140,6 +143,9 @@ class SpatialDomainView:
         for key in members:
             node = engine.nodes[key]
             edges = [engine.edges[k] for k in engine.adjacency[key]]
+            if any(self._neck_cache[e.edge_id][1] for e in edges):
+                reasons[key] = 'neck'
+                continue
             if len(edges) <= 1:
                 reasons[key] = 'endpoint' if edges else 'coverage'
                 continue
@@ -152,10 +158,46 @@ class SpatialDomainView:
                 if not engine._free_hull(points):
                     reasons[key] = 'junction'
                     continue
-            if len(edges) == 2 and all(engine.nodes[k].clearance > 2*node.clearance
-                                       for k in neighbours):
-                reasons[key] = 'neck'
         return reasons
+
+    @staticmethod
+    def _measured_neck(engine, edge):
+        """Relative contraction bounded by measured walls on BOTH sides.
+
+        Unknown and the EDT halo cannot establish a physical separator. Test
+        only narrow path samples; a cross-section must close within one tile
+        on either side. This is a geometric partition, not a body-size gate.
+        """
+        def context(node_id):
+            neighbours = [engine.nodes[node_id].clearance]
+            for eid in engine.adjacency[node_id]:
+                other = engine.edges[eid]
+                neighbour = other.target_id if other.source_id == node_id else other.source_id
+                neighbours.append(engine.nodes[neighbour].clearance)
+            return max(neighbours)
+        width_limit = 1.2*min(context(edge.source_id), context(edge.target_id))
+        for a, p, b in zip(edge.cells, edge.cells[1:], edge.cells[2:]):
+            tile = engine.tiles[engine.tile_key(p)]
+            if (tile.clearance[p]*2 >= width_limit or
+                    tile.clearance_sources[p] != 1):
+                continue
+            normal = (0, 1) if abs(b[0]-a[0]) >= abs(b[1]-a[1]) else (1, 0)
+            distances, walls = [], []
+            for sign in (-1, 1):
+                for step in range(1, engine.tile_cells+1):
+                    q = p[0]+sign*step*normal[0], p[1]+sign*step*normal[1]
+                    state = engine.occupancy.get(q)
+                    if state != FREE:
+                        if state == OCCUPIED:
+                            distances.append(step)
+                            walls.append(q)
+                        break
+            if len(distances) == 2 and (sum(distances)-1)*engine.resolution < width_limit:
+                return dict(sample=p, walls=walls,
+                            width=(sum(distances)-1)*engine.resolution,
+                            neighbour_width_reference=width_limit/.6,
+                            contraction_ratio=.6)
+        return None
 
     def update(self, engine, dirty_tiles):
         if not dirty_tiles and self.revision:
@@ -175,10 +217,16 @@ class SpatialDomainView:
                             affected.add(self.owners[n])
         old = {d: self.domains[d] for d in affected}
         floor_before = {d: (v.place_id, v.cells) for d, v in self.domains.items()}
-        split_places = {v.place_id for v in old.values()
-                        if any(engine.occupancy.get(c) != FREE for c in v.cells)}
-        old_place_cells = {pid: frozenset(c for v in self.domains.values()
-                           if v.place_id == pid for c in v.cells) for pid in split_places}
+        for eid in self._neck_cache.keys()-engine.edges.keys():
+            del self._neck_cache[eid]
+        for eid, edge in engine.edges.items():
+            # Width probes and one-hop context stay inside this dependency halo.
+            endpoints = [engine.tile_key(engine.nodes[k].cell) for k in (edge.source_id, edge.target_id)]
+            dependencies = {(x+dx, y+dy) for x, y in endpoints
+                            for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+            cached = self._neck_cache.get(eid)
+            if cached is None or cached[0] != edge or dependencies & dirty_tiles:
+                self._neck_cache[eid] = edge, self._measured_neck(engine, edge)
         reconsider = set()
         for eid, (edge, dependencies, alternative_domains) in list(self._pruned_edges.items()):
             if dependencies & dirty_tiles or alternative_domains & affected:
@@ -193,6 +241,14 @@ class SpatialDomainView:
         if not self.revision:
             members.update(engine.nodes)
         protected = self._protected(engine, members)
+        neck_neighbours = defaultdict(set)
+        for eid, (edge, evidence) in self._neck_cache.items():
+            if evidence:
+                neck_neighbours[edge.source_id].add(edge.target_id)
+                neck_neighbours[edge.target_id].add(edge.source_id)
+        # A measured neck prevents merging ACROSS that interface. It does not
+        # require keeping both adjacent calculation nodes as public landmarks.
+        fixed = {k for k, reason in protected.items() if reason != 'neck'}
         groups, cell_sets, hulls = {}, {}, {}
         next_group = 0
         for domain in old.values():
@@ -228,7 +284,9 @@ class SpatialDomainView:
             _, _, a, b = heapq.heappop(queue)
             if a not in groups or b not in groups or b not in neighbours[a]:
                 continue
-            if (groups[a] | groups[b]) & protected.keys():
+            if (groups[a] | groups[b]) & fixed:
+                continue
+            if any(neck_neighbours[k] & groups[b] for k in groups[a]):
                 continue
             hull = convex_hull(hulls[a]+hulls[b]); merge_checks += 1
             if (max(p[0] for p in hull)-min(p[0] for p in hull))*engine.resolution > self.max_span or \
@@ -317,8 +375,7 @@ class SpatialDomainView:
                     (previous.length, -previous.minimum_clearance, previous.cells):
                 self.edges[candidate.edge_id] = candidate
                 self.edge_dependencies[candidate.edge_id] = frozenset(engine.tile_key(p) for p in path)
-        self._split_places(old_place_cells)
-        self._merge_places()
+        self._assign_places(engine, floor_before, affected)
         self._prune_redundant_edges(engine, changed_domains, reconsider)
         if floor_before != {d: (v.place_id, v.cells) for d, v in self.domains.items()}:
             self.floor_revision += 1
@@ -327,98 +384,162 @@ class SpatialDomainView:
             degrees[edge.source_id] += 1; degrees[edge.target_id] += 1
         nodes = {d: TopologyNode(d, v.anchor, degrees[d],
                  engine.tiles[engine.tile_key(v.anchor)].clearance[v.anchor]) for d, v in self.domains.items()}
+        nodes, route_edges, absorbed = self._compress_connections(nodes)
         published_edges = {}
-        for eid, edge in self.edges.items():
+        self._support_edges = {}
+        for eid, edge in route_edges.items():
+            required = {self.domains[d].anchor for d in absorbed[eid]}
             compact = [edge.cells[0]]
             for previous, current, following in zip(edge.cells, edge.cells[1:], edge.cells[2:]):
                 if ((current[0]-previous[0], current[1]-previous[1]) !=
                         (following[0]-current[0], following[1]-current[1]) or
-                        math.dist(compact[-1], following)*engine.resolution > .5):
+                        math.dist(compact[-1], following)*engine.resolution > .5 or current in required):
                     compact.append(current)
             compact.append(edge.cells[-1])
             published_edges[eid] = TopologyEdge(eid, edge.source_id, edge.target_id,
                 tuple(compact), edge.length, edge.minimum_clearance)
+            positions = {p: i for i, p in enumerate(compact) if p in required}
+            for d in absorbed[eid]:
+                self._support_edges[d] = (eid, positions[self.domains[d].anchor])
         self.revision += 1
-        self.graph = TopologyGraph(nodes, published_edges, set(), self.payload(engine.resolution))
-        self.metrics = dict(spatial_domains=len(nodes), spatial_places=len({v.place_id for v in self.domains.values()}), spatial_rebuilt_domains=len(changed_domains),
+        self._connector_trees = {}
+        for d, domain in self.domains.items():
+            if len(domain.members) != 1 or lattice_count(domain.hull) == len(domain.cells):
+                continue
+            # A single tile component can itself bend around an obstacle.
+            # Reuse its existing parent tree instead of exporting a dense map
+            # or making every future attachment run A*. One byte per tile cell.
+            tile = engine.tiles[engine.tile_key(domain.anchor)]
+            size = engine.tile_cells
+            x0, y0 = (v*size for v in engine.tile_key(domain.anchor))
+            steps = ['.']*(size*size)
+            for x, y in domain.cells:
+                px, py = tile.parents[(x, y)]
+                steps[(y-y0)*size+x-x0] = str((py-y+1)*3+(px-x+1))
+            self._connector_trees[d] = dict(origin=(x0, y0), width=size, steps=''.join(steps))
+        payload = self.payload(engine.resolution)
+        payload['geometry_revision'] = engine.routing_revision
+        payload['measured_necks'] = [dict(evidence, fine_edge=eid,
+            source_domain=self.owners[edge.source_id], target_domain=self.owners[edge.target_id])
+            for eid, (edge, evidence) in sorted(self._neck_cache.items()) if evidence]
+        payload['clearance'] = dict(
+            definition='sampled_2d_nonfree_cell_area_lower_bound',
+            projection='local_uninflated_body_space',
+            cell_error=engine.resolution/math.sqrt(2.),
+            field_halo_tiles=1, geometry_revision=engine.routing_revision,
+            nodes={str(k): engine.clearance_evidence(n.cell) for k, n in nodes.items()},
+            edges={str(k): self._edge_evidence(engine, e) for k, e in route_edges.items()})
+        self.graph = TopologyGraph(nodes, published_edges, set(), payload)
+        self.metrics = dict(spatial_domains=len(self.domains), spatial_route_nodes=len(nodes),
+                            spatial_route_edges=len(published_edges),
+                            spatial_places=len({v.place_id for v in self.domains.values()}), spatial_rebuilt_domains=len(changed_domains),
                             spatial_touched_fine_nodes=len(members), spatial_merge_checks=merge_checks,
-                            spatial_rebuilt_fine_edges=len(fine_edges), spatial_revision=self.revision)
+                            spatial_rebuilt_fine_edges=len(fine_edges), spatial_revision=self.revision,
+                            spatial_compressed_nodes=len(self.domains)-len(nodes),
+                            spatial_measured_neck_edges=sum(bool(v[1]) for v in self._neck_cache.values()))
         return self.graph
 
-    def _merge_places(self):
-        """A coverage/route-anchor boundary is not a new floor region.
+    @staticmethod
+    def _edge_evidence(engine, edge):
+        samples = [p for p in edge.cells if abs(
+            engine.tiles[engine.tile_key(p)].clearance[p]-edge.minimum_clearance) < 1e-9]
+        return dict(radius=edge.minimum_clearance, sample=samples[0],
+                    sources=sorted({s for p in samples for s in engine.clearance_evidence(p)['sources']}),
+                    support_tiles=sorted({engine.tile_key(p) for p in edge.cells}),
+                    clearance_tiles=sorted({(x+dx, y+dy)
+                        for x, y in {engine.tile_key(p) for p in edge.cells}
+                        for dx in (-1, 0, 1) for dy in (-1, 0, 1)}))
 
-        Alias adjacent place IDs only when their complete observed support
-        union is convex and FREE. This reuses domain hulls/counts; it neither
-        creates another map nor floods historical ground from moving seeds.
+    def _assign_places(self, engine, previous, affected):
+        """Partition observed interfaces, separately from convex route supports.
+
+        The graph uses certified FREE boundary crossings. Only a contraction
+        closed by measured walls cuts an interface. Obstacles remain holes;
+        neither a tile boundary nor a non-convex hull creates a new place.
+        Largest surviving overlap inherits the old identity, one component per
+        identity. Reconciliation also handles a new doorway in an old place.
         """
-        members = defaultdict(set)
-        for d, v in self.domains.items():
-            members[v.place_id].add(d)
-        hulls = {pid: convex_hull(p for d in ds for p in self.domains[d].hull)
-                 for pid, ds in members.items()}
-        counts = {pid: sum(len(self.domains[d].cells) for d in ds) for pid, ds in members.items()}
-        adjacency = {pid: set() for pid in members}
-        edges = list(self.edges.values())+[item[0] for item in self._pruned_edges.values()]
-        for edge in edges:
-            a, b = self.domains[edge.source_id].place_id, self.domains[edge.target_id].place_id
-            if a != b:
-                adjacency[a].add(b); adjacency[b].add(a)
-        queue = [(self.place_birth[a], self.place_birth[b], a, b)
-                 for a in members for b in adjacency[a] if a < b]
-        heapq.heapify(queue)
-        while queue:
-            _, _, a, b = heapq.heappop(queue)
-            if a not in members or b not in members or b not in adjacency[a]:
-                continue
-            hull = convex_hull(hulls[a]+hulls[b])
-            if lattice_count(hull) != counts[a]+counts[b]:
-                continue
-            if self.place_birth[b] < self.place_birth[a]:
-                a, b = b, a
-            for d in members[b]:
-                self.domains[d] = replace(self.domains[d], place_id=a)
-            members[a].update(members.pop(b)); hulls[a] = hull; del hulls[b]
-            counts[a] += counts.pop(b)
-            for n in adjacency[b]:
-                adjacency[n].discard(b)
-                if n != a:
-                    adjacency[n].add(a)
-            adjacency[a] = (adjacency[a] | adjacency.pop(b))-{a, b}
-            for n in adjacency[a]:
-                heapq.heappush(queue, (self.place_birth[a], self.place_birth[n], a, n))
-
-    def _split_places(self, old_place_cells):
-        """Geometry splits a place; extra route anchors never recolour it.
-
-        A single place may need several convex support domains/anchors. Only
-        loss of actual FREE connectivity divides its display identity. The
-        largest surviving overlap keeps the old hue.
-        """
-        if not old_place_cells:
-            return
         adjacency = defaultdict(set)
-        edges = list(self.edges.values())+[item[0] for item in self._pruned_edges.values()]
-        for edge in edges:
-            adjacency[edge.source_id].add(edge.target_id)
-            adjacency[edge.target_id].add(edge.source_id)
-        for pid, old_cells in old_place_cells.items():
-            remaining = {d for d, v in self.domains.items() if v.place_id == pid}
-            components = []
-            while remaining:
-                first = min(remaining); remaining.remove(first)
-                members, queue = {first}, [first]
-                while queue:
-                    current = queue.pop()
-                    for nxt in adjacency[current] & remaining:
-                        remaining.remove(nxt); members.add(nxt); queue.append(nxt)
-                components.append(members)
-            components.sort(key=lambda group: (-sum(len(self.domains[d].cells & old_cells)
-                                                     for d in group), min(group)))
-            for component in components[1:]:
-                new_id = self._new_place_id(min(component))
-                for d in component:
-                    self.domains[d] = replace(self.domains[d], place_id=new_id)
+        for eid, edge in engine.edges.items():
+            a, b = self.owners[edge.source_id], self.owners[edge.target_id]
+            if a != b and not self._neck_cache[eid][1]:
+                adjacency[a].add(b); adjacency[b].add(a)
+        remaining, components = set(self.domains), []
+        while remaining:
+            first = min(remaining); remaining.remove(first)
+            group, queue = {first}, [first]
+            while queue:
+                for nxt in adjacency[queue.pop()] & remaining:
+                    remaining.remove(nxt); group.add(nxt); queue.append(nxt)
+            components.append(group)
+        # Existing exact support sets are reused, not rasterized a second time.
+        matches = []
+        for index, group in enumerate(components):
+            votes = defaultdict(int)
+            for d in group:
+                cells = self.domains[d].cells
+                if d in previous and cells is previous[d][1]:
+                    votes[previous[d][0]] += len(cells)
+                    continue
+                for old in affected:
+                    pid, old_cells = previous[old]
+                    votes[pid] += len(cells & old_cells)
+            matches.extend((-overlap, self.place_birth[pid], pid, index)
+                           for pid, overlap in votes.items() if overlap)
+        assigned, claimed = {}, set()
+        for _, _, pid, index in sorted(matches):
+            if index not in assigned and pid not in claimed:
+                assigned[index] = pid; claimed.add(pid)
+        for index, group in enumerate(components):
+            pid = assigned.get(index)
+            if pid is None:
+                pid = min((self.domains[d].place_id for d in group if
+                           self.domains[d].place_id not in claimed),
+                          key=lambda k: self.place_birth[k], default=None)
+                if pid is None:
+                    pid = self._new_place_id(min(group))
+                claimed.add(pid)
+            for d in group:
+                if self.domains[d].place_id != pid:
+                    self.domains[d] = replace(self.domains[d], place_id=pid)
+
+    def _compress_connections(self, nodes):
+        """Move degree-two geometry into edges without losing support access.
+
+        Keep a third anchor when removing it would collapse a real loop into
+        parallel endpoint-pair IDs. Each removed domain attaches to an exact
+        vertex of the resulting edge; query clients need no dense rescue.
+        """
+        nodes, edges = dict(nodes), dict(self.edges)
+        absorbed = {eid: set() for eid in edges}
+        adjacency = defaultdict(set)
+        for eid, e in edges.items():
+            adjacency[e.source_id].add(eid); adjacency[e.target_id].add(eid)
+        queue = list(nodes); heapq.heapify(queue)
+        while queue:
+            node = heapq.heappop(queue)
+            if node not in nodes or len(adjacency[node]) != 2:
+                continue
+            first, second = (edges[k] for k in sorted(adjacency[node]))
+            a = first.target_id if first.source_id == node else first.source_id
+            b = second.target_id if second.source_id == node else second.source_id
+            eid = stable_edge_id(a, b)
+            if a == b or eid in edges:
+                continue
+            left = first.cells if first.target_id == node else tuple(reversed(first.cells))
+            right = second.cells if second.source_id == node else tuple(reversed(second.cells))
+            edges[eid] = TopologyEdge(eid, a, b, left+right[1:],
+                first.length+second.length, min(first.minimum_clearance, second.minimum_clearance))
+            absorbed[eid] = absorbed.pop(first.edge_id) | absorbed.pop(second.edge_id) | {node}
+            for edge in (first, second):
+                del edges[edge.edge_id]
+                adjacency[edge.source_id].remove(edge.edge_id)
+                adjacency[edge.target_id].remove(edge.edge_id)
+            del nodes[node]
+            adjacency[a].add(eid); adjacency[b].add(eid)
+            heapq.heappush(queue, a); heapq.heappush(queue, b)
+        nodes = {k: replace(n, degree=len(adjacency[k])) for k, n in nodes.items()}
+        return nodes, edges, absorbed
 
     def _prune_redundant_edges(self, engine, changed, reconsider):
         """Keep real alternatives, remove local free-space shortcut cliques."""
@@ -495,7 +616,9 @@ class SpatialDomainView:
     def payload(self, resolution):
         return {'resolution': resolution, 'spatial_revision': self.revision, 'domains': [
             {'id': d, 'place_id': v.place_id, 'anchor': [(v.anchor[0]+.5)*resolution, (v.anchor[1]+.5)*resolution],
-             'rows': v.rows, 'reason': v.reason}
+             'rows': v.rows, 'reason': v.reason,
+             **({'connector_tree': self._connector_trees[d]} if d in self._connector_trees else {}),
+             **({'edge_attachment': self._support_edges[d]} if d in self._support_edges else {})}
             for d, v in sorted(self.domains.items())]}
 
 
