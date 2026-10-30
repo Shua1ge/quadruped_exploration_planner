@@ -75,6 +75,7 @@ from explorer_core.portal_connectivity import SafeRegionConnectivity
 from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import BranchCommitment, ResidualCommitmentGate
 from explorer_core.region_overlay import build_region_overlay, region_rgb
+from explorer_core.region_visit_planner import RegionVisitPlanner
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
 )
@@ -130,7 +131,7 @@ class FrontierCandidate:
     route_source: str = "dense"
 
 
-class FrontierExplorer(ObservationTaskBridge, Node):
+class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
     @property
     def grid(self) -> ExplorationGrid:
         coordinator = getattr(self, "_planning_coordinator", None)
@@ -389,6 +390,21 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             self.declare_parameter("selection_strategy", "hierarchical").value).lower()
         if self.selection_strategy not in ("greedy", "hierarchical"):
             raise ValueError("selection_strategy must be 'greedy' or 'hierarchical'")
+        self.region_visit_window_enabled = bool(self.declare_parameter(
+            "region_visit_window_enabled", True).value)
+        self.region_visit_frontiers = int(self.declare_parameter(
+            "region_visit_frontiers", 4).value)
+        self.region_visit_stations = int(self.declare_parameter(
+            "region_visit_stations", 2).value)
+        self.region_visit_route_expansions = int(self.declare_parameter(
+            "region_visit_route_expansions", 4096).value)
+        if not (1 <= self.region_visit_frontiers <= 8 and
+                1 <= self.region_visit_stations <= 3 and
+                1 <= self.region_visit_route_expansions <= 20000):
+            raise ValueError("Region visit budgets must remain bounded")
+        self.region_visit_deferred = False
+        self.last_visit_window = []
+        self.last_visit_stats = {}
         self.region_size = float(self.declare_parameter("region_size", 8.0).value)
         self.region_match_distance = float(
             self.declare_parameter("region_match_distance", 6.0).value)
@@ -860,7 +876,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             f"observation_prepare={self.observation_prepare_ratio:.2f}, "
             f"observation_done={self.observation_done_ratio:.2f}, "
             f"sparse_routing={self.sparse_routing_enabled} "
-            f"global_usage_mode={self.global_usage_mode}")
+            f"global_usage_mode={self.global_usage_mode} "
+            f"region_visit_window={self.bounded_visits_enabled()}")
 
     def locomotion_state_callback(self, msg: LocomotionState):
         self.locomotion_actuation_ready = msg.actuation_ready
@@ -1978,7 +1995,11 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         previous_scope = getattr(self, "active_commitment_scope", None)
         candidate_scope = (candidate.commitment_scope
                            or ("region", candidate.region_id))
-        if hasattr(self, "branch_option_serial"):
+        if self.bounded_visits_enabled():
+            candidate_scope = self.visit_window().commit(candidate.region_id)
+            candidate.commitment_scope = candidate_scope
+            self.branch_commitment = None
+        elif hasattr(self, "branch_option_serial"):
             intent = getattr(self, "branch_commitment", None)
             same_branch = (intent is not None and (
                 candidate_scope == previous_scope or intent.contains(
@@ -3398,6 +3419,9 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 getattr(self, 'branch_commitment', None) is None),
             map_preprocess_prefix_ms=preprocess_ms)
         if best is None:
+            if getattr(self, 'region_visit_deferred', False):
+                self.publish_status("REGION_VISIT_SEARCH_PENDING")
+                return False
             if any(a.reason=="DEPARTURE_EPISODE_EXHAUSTED" and
                    not self.local_motion_retry_allowed(a)
                    for a in getattr(self,"local_motion_goal_cooldowns",{}).values()):
@@ -3514,6 +3538,24 @@ class FrontierExplorer(ObservationTaskBridge, Node):
         self.map_preprocess_calls += 1
         self.planning_events += 1
         self.latest_region_count = len(regions)
+        if self.bounded_visits_enabled():
+            result = self.choose_window_visit(
+                start, regions, blocked_edges, excluded_goals,
+                allow_region_release=allow_region_release,
+                allow_cross_region_preparation=allow_cross_region_preparation,
+                required_scope=required_scope)
+            self.last_global_plan_ms = map_preprocess_prefix_ms + (
+                time.perf_counter()-selection_started)*1000.
+            self.cumulative_planning_ms += self.last_global_plan_ms
+            self.get_logger().info(
+                f"[GLOBAL_PLAN_BASELINE] revision={self.map_update_count} "
+                f"task_id={getattr(self.active_observation, 'task_id', 0)} "
+                f"regions={len(regions)} candidates={self.last_visit_stats.get('candidates',0)} "
+                f"total_ms={self.last_global_plan_ms:.1f} "
+                f"region_partition_ms={self.last_region_partition_ms:.1f} "
+                f"expanded_grid_cells={self.last_expanded_grid_cells} "
+                f"planner=bounded_region_visits window={self.last_visit_window}")
+            return result
         candidates = self.build_frontier_candidates(
             start, regions, inflated, blocked_edges, excluded_goals)
         self.attach_safe_region_commitment_scopes(candidates, inflated)
@@ -3759,7 +3801,9 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                                   regions: Sequence[FrontierRegion],
                                   inflated: Set[Cell],
                                   blocked_edges: Set[DirectedEdge],
-                                  excluded_goals: Sequence[Point2] = ()) -> List[FrontierCandidate]:
+                                  excluded_goals: Sequence[Point2] = (), *,
+                                  frontier_limit=None, station_limit=None,
+                                  route_provider=None, preview_regions=()) -> List[FrontierCandidate]:
         inflated = set()  # caller inflation is not a publication veto
         rejected = dict.fromkeys(self.last_candidate_rejections, 0)
         self.last_candidate_rejections = rejected
@@ -3768,7 +3812,24 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             getattr(self, "global_repair_search_limit", 4)*getattr(self, "global_repair_max_expansions", 400))
         proposals = []
         for region in regions:
-            for cluster in region.clusters:
+            clusters = region.clusters
+            sampled = None
+            if frontier_limit is not None:
+                window = self.visit_window()
+                choices = [candidate_cells(cluster) for cluster in clusters]
+                flat = [f for i in range(max((len(c) for c in choices), default=0))
+                        for c in choices if i < len(c) for f in [c[i]]]
+                retained = list(window.prefix if window.prefix_region == region.region_id else ())
+                task = getattr(self, "active_observation", None)
+                if isinstance(task, ObservationTask) and task.region_id == region.region_id:
+                    retained.insert(0, task.frontier_cell)
+                valid = set().union(*(set(c) for c in clusters))
+                retained = [f for f in retained if f in valid]
+                cursor = window.sample_cursor.get(region.region_id, 0)
+                rotated = flat[cursor % len(flat):]+flat[:cursor % len(flat)] if flat else []
+                sampled = list(dict.fromkeys(retained+rotated))[:frontier_limit]
+                window.sample_cursor[region.region_id] = cursor+frontier_limit
+            for cluster in clusters:
                 used_viewpoints: Set[Cell] = set()
                 task = getattr(self, "active_observation", None)
                 frontiers = list(candidate_cells(cluster))
@@ -3780,6 +3841,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                         and (task.frontier_cell in cluster
                              or task.frontier_cluster_cells.intersection(cluster))):
                     frontiers = list(dict.fromkeys([task.frontier_cell] + frontiers))
+                if sampled is not None:
+                    frontiers = [f for f in sampled if f in cluster]
                 for frontier in frontiers:
                     viewpoints = safe_viewpoint_cells(
                         self.grid, frontier, inflated, self.viewpoint_standoff,
@@ -3821,6 +3884,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                                              "reason": reason})
                             continue
                         terminals.append(viewpoint)
+                    if station_limit is not None:
+                        terminals = terminals[:station_limit]
                     for viewpoint in terminals:
                         if viewpoint in used_viewpoints:
                             continue
@@ -3862,39 +3927,55 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                             self.terminal_clearance(viewpoint, inflated),
                             set(cluster)))
 
-        proposal_cells = list(dict.fromkeys(proposal[2] for proposal in proposals))
-        sparse_started = time.perf_counter()
-        sparse_estimates, sparse_miss_reasons = self.sparse_route_estimates(
-            start, proposal_cells, inflated, blocked_edges)
-        sparse_elapsed = (time.perf_counter() - sparse_started) * 1000.0
-        self.last_sparse_candidate_ms += sparse_elapsed
-        estimate_by_cell = dict(zip(proposal_cells, sparse_estimates))
-        sparse_hits = sum(estimate is not None for estimate in sparse_estimates)
-        fallback_cells = {cell for cell, estimate in estimate_by_cell.items()
-                          if estimate is None}
-        self.sparse_candidate_queries += len(proposal_cells)
-        self.sparse_candidate_hits += sparse_hits
-        self.sparse_candidate_fallbacks += len(fallback_cells)
-        self.last_sparse_candidate_hits += sparse_hits
-        self.last_sparse_candidate_fallbacks += len(fallback_cells)
-        self.ensure_sparse_miss_counters()
-        self.accumulate_sparse_miss_reasons(
-            sparse_miss_reasons, self.sparse_candidate_miss_reasons,
-            self.last_sparse_candidate_miss_reasons)
+        visit_paths = {}
+        if route_provider is not None:
+            estimate_by_cell = {}
+            for proposal in proposals:
+                rid, _, cell = proposal[:3]
+                if rid in preview_regions:
+                    continue
+                if cell in visit_paths:
+                    continue
+                result = route_provider.query(start, cell)
+                visit_paths[cell] = result
+                if result.status == RouteSearchStatus.INCOMPLETE:
+                    self._visit_pending_regions.add(rid)
+                    if result.reason == 'SEARCH_CACHE_CAPACITY':
+                        self._visit_capacity_regions.add(rid)
+        else:
+            proposal_cells = list(dict.fromkeys(proposal[2] for proposal in proposals))
+            sparse_started = time.perf_counter()
+            sparse_estimates, sparse_miss_reasons = self.sparse_route_estimates(
+                start, proposal_cells, inflated, blocked_edges)
+            sparse_elapsed = (time.perf_counter() - sparse_started) * 1000.0
+            self.last_sparse_candidate_ms += sparse_elapsed
+            estimate_by_cell = dict(zip(proposal_cells, sparse_estimates))
+            sparse_hits = sum(estimate is not None for estimate in sparse_estimates)
+            fallback_cells = {cell for cell, estimate in estimate_by_cell.items()
+                              if estimate is None}
+            self.sparse_candidate_queries += len(proposal_cells)
+            self.sparse_candidate_hits += sparse_hits
+            self.sparse_candidate_fallbacks += len(fallback_cells)
+            self.last_sparse_candidate_hits += sparse_hits
+            self.last_sparse_candidate_fallbacks += len(fallback_cells)
+            self.ensure_sparse_miss_counters()
+            self.accumulate_sparse_miss_reasons(
+                sparse_miss_reasons, self.sparse_candidate_miss_reasons,
+                self.last_sparse_candidate_miss_reasons)
 
-        tree = ShortestPathTree(start, {}, {}, 0)
-        if fallback_cells:
-            # Sparse coverage is deliberately non-authoritative.  Missing graph
-            # attachments retain the original dense behaviour for completeness.
-            tree_started = time.perf_counter()
-            tree = build_shortest_path_tree(
-                self.grid, start, inflated, blocked_edges, fallback_cells)
-            self.last_candidate_tree_ms += (
-                time.perf_counter() - tree_started) * 1000.0
-            self.candidate_tree_searches += 1
-            self.last_candidate_tree_searches += 1
-            self.expanded_grid_cells += tree.expanded_cells
-            self.last_expanded_grid_cells += tree.expanded_cells
+            tree = ShortestPathTree(start, {}, {}, 0)
+            if fallback_cells:
+                # Sparse coverage is deliberately non-authoritative.  Missing graph
+                # attachments retain the original dense behaviour for completeness.
+                tree_started = time.perf_counter()
+                tree = build_shortest_path_tree(
+                    self.grid, start, inflated, blocked_edges, fallback_cells)
+                self.last_candidate_tree_ms += (
+                    time.perf_counter() - tree_started) * 1000.0
+                self.candidate_tree_searches += 1
+                self.last_candidate_tree_searches += 1
+                self.expanded_grid_cells += tree.expanded_cells
+                self.last_expanded_grid_cells += tree.expanded_cells
         records = []
         task = getattr(self, "active_observation", None)
         recorded_tasks = set()
@@ -3902,7 +3983,27 @@ class FrontierExplorer(ObservationTaskBridge, Node):
              unknown_gain, cluster_size, target_cells, terminal_cells,
              terminal_clearance, frontier_cluster_cells) in proposals:
             estimate = estimate_by_cell.get(viewpoint)
-            if estimate is None:
+            if route_provider is not None and region_id in preview_regions:
+                # These are only bounded lookahead options. No claim of robot
+                # reachability until one is promoted and its route is checked.
+                path = []
+                path_length = math.dist(start, viewpoint)*self.grid.resolution
+                turn_cost = 0.
+            elif route_provider is not None:
+                result = visit_paths[viewpoint]
+                if result.status == RouteSearchStatus.INCOMPLETE:
+                    outcomes.append({"region": region_id, "viewpoint": viewpoint,
+                                     "frontier": frontier, "reason": "search_pending"})
+                    continue
+                if result.status != RouteSearchStatus.FOUND:
+                    rejected["astar_unreachable"] += 1
+                    outcomes.append({"region": region_id, "viewpoint": viewpoint,
+                                     "frontier": frontier, "reason": "astar_unreachable"})
+                    continue
+                path = result.path
+                path_length = path_length_cells(path, self.grid.resolution)
+                turn_cost = path_turn_cost(path)
+            elif estimate is None:
                 path = tree.path_to(viewpoint)
                 if not path:
                     rejected["astar_unreachable"] += 1
@@ -3922,7 +4023,7 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 turn_cost = estimate.turn_cost
             # One frontier remains one ranked objective, with its safest
             # usable terminal first. Dense fallback has already checked siblings.
-            if (region_id, frontier) in recorded_tasks:
+            if station_limit is None and (region_id, frontier) in recorded_tasks:
                 continue
             recorded_tasks.add((region_id, frontier))
             records.append(FrontierCandidate(
@@ -3933,16 +4034,20 @@ class FrontierExplorer(ObservationTaskBridge, Node):
                 frontier_cluster_cells=frontier_cluster_cells,
                 commitment_scope=commitment_scope,
                 excluded_goals=tuple(excluded_goals),
+                route_source=('visit_preview' if region_id in preview_regions else
+                              'visit_bounded' if route_provider is not None else 'dense'),
                 observation_progress=(
                     task.progress if isinstance(task, ObservationTask)
                     and task.region_id == region_id
                     and task.frontier_cell == frontier else 0.0)))
-            rejected["accepted"] += 1
+            if region_id not in preview_regions:
+                rejected["accepted"] += 1
         self.get_logger().info(
             f"[FRONTIER_CANDIDATE_SUMMARY] {rejected}",
             throttle_duration_sec=2.0)
         self.last_candidate_outcomes = outcomes[-400:]
-        self.publish_region_overlay(regions, records)
+        if route_provider is None:
+            self.publish_region_overlay(regions, records)
         return records
 
     def region_color_map(self, regions):
@@ -4530,6 +4635,8 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             "strategy": self.selection_strategy,
             "active_region": self.active_region_id,
             "sequence": self.region_sequence,
+            "visit_window": getattr(self, "last_visit_window", []),
+            "visit_stats": getattr(self, "last_visit_stats", {}),
         }, separators=(",", ":"))
         self.region_sequence_pub.publish(msg)
         self.get_logger().info(f"Region sequence: {self.region_sequence}")
@@ -4781,6 +4888,9 @@ class FrontierExplorer(ObservationTaskBridge, Node):
             "regions": self.latest_region_count,
             "total_distance_m": self.total_distance,
             "revisit_distance_m": self.revisit_distance,
+            "region_visit_window_enabled": self.bounded_visits_enabled(),
+            "region_visit_window": getattr(self, "last_visit_window", []),
+            "region_visit_stats": getattr(self, "last_visit_stats", {}),
             "region_switches": self.region_switches,
             "intra_scope_region_switches": self.intra_scope_region_switches,
             "local_repair_exhausted_count": self.local_repair_exhausted_count,

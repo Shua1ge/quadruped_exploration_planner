@@ -24,6 +24,7 @@ REASON_COLORS = {
     "blacklisted": (0.55, 0.20, 0.85),
     "cooldown": (0.65, 0.35, 0.95),
     "excluded": (0.45, 0.45, 0.45),
+    "search_pending": (1.0, 0.75, 0.1),
 }
 ACTIVE_COLOR = (1.00, 0.85, 0.10)
 ACCEPTED_COLOR = (0.10, 0.90, 0.20)

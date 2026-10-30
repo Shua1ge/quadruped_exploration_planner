@@ -128,6 +128,7 @@ def generate_launch_description():
         DeclareLaunchArgument("auto_start", default_value="true"),
         DeclareLaunchArgument("task_mode", default_value="false"),
         DeclareLaunchArgument("sparse_routing_enabled", default_value="true"),
+        DeclareLaunchArgument("region_visit_window_enabled", default_value="true"),
         DeclareLaunchArgument("global_usage_mode", default_value="shadow",
                               choices=["off", "shadow", "route_cost"]),
         DeclareLaunchArgument("task_geometry_autonomy", default_value="true"),
@@ -285,6 +286,8 @@ def generate_launch_description():
                 "planning_map_publish_period": 0.25,
                 "goal_timeout": 120.0,
                 "path_request_timeout": 5.0,
+                "region_visit_window_enabled": ParameterValue(
+                    LaunchConfiguration("region_visit_window_enabled"), value_type=bool),
                 "region_size": 8.0,
                 "region_max_path_ratio": 1.5,
                 "region_max_detour_ratio": 1.75,

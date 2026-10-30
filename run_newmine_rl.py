@@ -84,6 +84,8 @@ def main():
     parser.add_argument("--sparse-routing", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="legacy sparse-route switch; used only with --global-mode route_cost")
+    parser.add_argument("--region-visit-window", action=argparse.BooleanOptionalAction,
+                        default=True, help="bounded 1+2 Region visiting in shadow/off mode")
     parser.add_argument("--actual-route", type=Path, default=None,
                         help="actual odometry CSV; default: metrics name + _actual_route.csv")
     parser.add_argument("--record-route", action=argparse.BooleanOptionalAction,
@@ -137,6 +139,7 @@ def main():
         f"task_mode:={'true' if args.task_mode else 'false'}",
         f"global_usage_mode:={args.global_mode}",
         f"sparse_routing_enabled:={'true' if args.sparse_routing else 'false'}",
+        f"region_visit_window_enabled:={'true' if args.region_visit_window else 'false'}",
         "locomotion_mode:=rl_effort",
         "locomotion_policy:=go2_rl_lab",
         f"policy_model_path:={args.policy_model}",
