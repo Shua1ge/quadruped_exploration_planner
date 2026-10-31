@@ -21,6 +21,41 @@ class RegionVisitPlanner:
             self._visit_routes = BoundedVisitRoutes()
         return self._region_visits
 
+    def visit_candidate_available(self, candidate):
+        ref = getattr(candidate, 'visit_demand_ref', None)
+        return ref is None or not ref.retired
+
+    def retire_visit_demand(self, task):
+        window = getattr(self, '_region_visits', None)
+        if window is not None and task is not None and window.retire(task):
+            getattr(self, 'last_visit_stats', {}).update(
+                installed_demand_prefix=list(window.demand_prefix))
+            self.log_visit_plan('SATISFIED', task)
+
+    def log_visit_plan(self, state, task, request_id=0, trajectory_id=0):
+        plan = getattr(task, 'visit_plan', None)
+        if plan is None:
+            return
+        window = self.visit_window()
+        self.get_logger().info(
+            f"[REGION_VISIT_PLAN] state={state} plan={plan.plan_id} "
+            f"task={task.task_id} version={task.task_version} request={request_id} "
+            f"trajectory={trajectory_id} "
+            f"region={task.region_id} demand={task.visit_demand_id} "
+            f"priced={plan.demand_ids} remaining={window.demand_prefix}")
+
+    def install_visit_plan(self, task, request_id, trajectory_id):
+        plan = getattr(task, 'visit_plan', None)
+        if plan is None:
+            return
+        self.retire_visit_demand(task)
+        key = (task.task_id, task.task_version, request_id)
+        if self.visit_window().install(plan, key):
+            getattr(self, 'last_visit_stats', {}).update(
+                installed_plan_id=plan.plan_id,
+                installed_demand_prefix=list(self.visit_window().demand_prefix))
+            self.log_visit_plan('INSTALLED', task, request_id, trajectory_id)
+
     def choose_window_visit(self, start, regions, blocked_edges, excluded_goals,
                             *, allow_region_release, allow_cross_region_preparation,
                             required_scope):
@@ -131,15 +166,17 @@ class RegionVisitPlanner:
         lookahead = [by_region[rid] for rid in after[:2]]
         choice = choose_joint_visit(current, lookahead, routes,
             body_yaw=getattr(self, 'body_yaw', None), retained_prefix=prefix,
-            retained_demands=demand_prefix)
+            retained_demands=demand_prefix,
+            retained_stations=window.retained_stations(chosen_region),
+            cost_model=getattr(self, 'region_visit_cost_model', None),
+            resolution=self.grid.resolution)
         if choice is None:
             self.last_visit_stats = dict(window=self.last_visit_window,
                 candidates=len(records), deferred=False, reason='NO_REMAINING_VISIBLE_TARGETS')
             self._log_visit(began)
             return None
         candidate = choice.candidate
-        window.prefix, window.prefix_region = choice.prefix, chosen_region
-        window.demand_prefix = choice.demand_prefix
+        candidate.visit_plan = window.draft(choice, chosen_region)
         candidate.commitment_scope = window.scope(chosen_region)
         candidate.option_target_cells = set().union(*(c.observation_cells for c in current))
         self.last_selection_reason = 'bounded_joint_visit'
@@ -149,9 +186,22 @@ class RegionVisitPlanner:
             frontier_objectives=len({(c.region_id,c.frontier_cell) for c in records}),
             prefix=[list(p) for p in choice.prefix], score=choice.score,
             demand_prefix=list(choice.demand_prefix),
+            plan_id=candidate.visit_plan.plan_id, plan_state='DRAFT',
+            installed_plan_id=(window.installed_plan.plan_id if window.installed_plan else None),
+            installed_demand_prefix=list(window.demand_prefix),
+            station_prefix=[list(p) for p in choice.station_prefix],
             selected_demand=candidate.visit_demand_id,
             selected_visible_cells=len(candidate.visit_remaining_cells),
             selected_target_cells=len(candidate.observation_cells),
+            predicted_gain=choice.predicted_gain,
+            estimated_time_s=choice.estimated_time_s,
+            travel_time_s=choice.travel_time_s,
+            turn_time_s=choice.turn_time_s,
+            stop_turn_time_s=choice.stop_turn_time_s,
+            continuation_time_s=choice.continuation_time_s,
+            preview_regions_priced=choice.preview_regions_priced,
+            preview_unavailable=choice.preview_unavailable,
+            reordered=choice.reordered,
             expansions=routes.budget.used, cache_hits=routes.cache_hits,
             estimated_transitions=routes.estimated_transitions,
             preview_estimated=choice.continuation_estimated, deferred=False)

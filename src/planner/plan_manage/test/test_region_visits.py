@@ -72,10 +72,13 @@ def test_expected_gain_is_marginal_and_same_frontier_is_not_visited_twice():
     assert len(result.prefix)==len(set(result.prefix))==2
 
 
-def test_retained_visit_prefix_does_not_churn_on_a_higher_one_step_gain():
-    a=option(1,(2,0));b=option(1,(1,0),targets={(i,100) for i in range(1000)})
+def test_retained_visit_prefix_tolerates_small_score_changes_but_is_not_a_veto():
+    a=option(1,(2,0));b=option(1,(2,1),length=1.95)
     result=choose_joint_visit([a,b],[],EuclideanRoutes(),retained_prefix=(a.frontier_cell,),depth=1)
     assert result.candidate is a
+    b.observation_cells={(i,100) for i in range(1000)}
+    improved=choose_joint_visit([a,b],[],EuclideanRoutes(),retained_prefix=(a.frontier_cell,),depth=1)
+    assert improved.candidate is b and improved.reordered
     # If evidence removes that option, the remaining valid candidate is used.
     assert choose_joint_visit([b],[],EuclideanRoutes(),retained_prefix=(a.frontier_cell,)).candidate is b
 
@@ -251,7 +254,7 @@ def test_reward_estimation_does_not_mutate_the_frozen_observation_targets():
     a=option(1,(1,0),targets={(9,9),(9,10)})
     a.visit_remaining_cells={(9,10)}
     result=choose_joint_visit([a],[],EuclideanRoutes(),depth=1)
-    assert result.score==pytest.approx(1/(1+a.path_length))
+    assert result.score==pytest.approx(1/(1+a.path_length/.5))
     assert a.observation_cells=={(9,9),(9,10)}
 
 

@@ -76,7 +76,7 @@ from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import BranchCommitment, ResidualCommitmentGate
 from explorer_core.region_overlay import build_region_overlay, region_rgb
 from explorer_core.region_visit_planner import RegionVisitPlanner
-from explorer_core.region_visits import same_visit_demand, station_alternatives
+from explorer_core.region_visits import same_visit_demand, station_alternatives, VisitCostModel
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
 )
@@ -132,6 +132,8 @@ class FrontierCandidate:
     route_source: str = "dense"
     visit_demand_id: Optional[int] = None
     visit_visible_cells: Optional[Set[Cell]] = None
+    visit_demand_ref: object = None
+    visit_plan: object = None
 
 
 class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
@@ -405,6 +407,19 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 1 <= self.region_visit_stations <= 3 and
                 1 <= self.region_visit_route_expansions <= 20000):
             raise ValueError("Region visit budgets must remain bounded")
+        # Preference estimates only: Local/Controller retain all motion limits,
+        # rest gates and certification. These do not authorize a stop or turn.
+        self.region_visit_cost_model = VisitCostModel(
+            linear_speed=float(self.declare_parameter(
+                "region_visit_nominal_speed", .5).value),
+            yaw_rate=float(self.declare_parameter(
+                "region_visit_nominal_yaw_rate", .8).value),
+            stop_turn_angle=float(self.declare_parameter(
+                "region_visit_stop_turn_angle", .8).value),
+            stop_restart_time=float(self.declare_parameter(
+                "region_visit_stop_restart_time", 1.).value),
+            reorder_ratio=float(self.declare_parameter(
+                "region_visit_reorder_ratio", 1.15).value))
         self.region_visit_deferred = False
         self.last_visit_window = []
         self.last_visit_stats = {}
@@ -1793,6 +1808,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         (self.last_observation_completion_reason,
          self.last_observation_completion_progress) = (
             observation_completion_record(task))
+        self.retire_visit_demand(task)
 
     def prepare_next_observation(self, force: bool = False) -> bool:
         """Select the next information objective without publishing its path."""
@@ -1860,6 +1876,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         """Reuse the safe suffix of a prepared route from the current pose."""
         candidate = self.prepared_candidate
         if self.position is None or candidate is None:
+            return False
+        if not self.visit_candidate_available(candidate):
+            self.prepared_candidate = None
             return False
         candidate_scope = (candidate.commitment_scope
                            or ("region", candidate.region_id))
@@ -1962,7 +1981,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             excluded_goals=candidate.excluded_goals,
             observation_progress=candidate.observation_progress,
             visit_demand_id=candidate.visit_demand_id,
-            visit_visible_cells=set(hypotheses))
+            visit_visible_cells=set(hypotheses),
+            visit_demand_ref=candidate.visit_demand_ref,
+            visit_plan=candidate.visit_plan)
         refreshed.route_source = route_source
         if not self.directional_candidate_allowed(refreshed, candidate_scope):
             self.prepared_candidate = None
@@ -2071,6 +2092,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
     def stage_observation_handoff(self, path, candidate):
         if getattr(self,"pending_observation_handoff",None) is not None:
             return False
+        if not self.visit_candidate_available(candidate):
+            return False
         predecessor = self.active_observation
         if (candidate.visit_demand_id is not None and
                 same_visit_demand(predecessor, candidate) and predecessor.information_satisfied):
@@ -2079,7 +2102,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             set(candidate.observation_cells),frontier_cell=candidate.frontier_cell,
             frontier_cluster_cells=set(candidate.frontier_cluster_cells),
             terminal_cells=candidate.terminal_cells or (candidate.cell,),
-            visit_demand_id=candidate.visit_demand_id)
+            visit_demand_id=candidate.visit_demand_id,
+            visit_demand_ref=candidate.visit_demand_ref, visit_plan=candidate.visit_plan)
         if (candidate.visit_demand_id is not None and
                 same_visit_demand(predecessor, candidate) and
                 predecessor.require_sensor_evidence):
@@ -2113,6 +2137,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             self.completion_handoff_in_progress = False
         self.active_path_request_generation = pending.request_id
         self.active_path_trajectory_id = feedback.trajectory_id
+        self.install_visit_plan(pending.task, pending.request_id, feedback.trajectory_id)
         self.record_route_source_activation(pending.task, pending.request_id)
         self.pending_path_publish_ns = 0
         self.pending_path_request_generation = None
@@ -2638,6 +2663,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 completed_task.satisfied_map_revision = self.map_content_revision
                 completed_task.satisfied_sensor_revision = self.grid.sensor_revision
                 completed_task.lifecycle = "SATISFIED"
+            self.retire_visit_demand(completed_task)
 
         switched = self.activate_or_prepare_next_observation(
             allow_commitment_transfer=True)
@@ -3791,7 +3817,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             visit_demand_id=candidate.visit_demand_id,
             visit_visible_cells=(observation_hypothesis_cells(
                 self.grid, selected_cell, observation_cells, self.observation_radius)
-                if candidate.visit_demand_id is not None else None))
+                if candidate.visit_demand_id is not None else None),
+            visit_demand_ref=candidate.visit_demand_ref,
+            visit_plan=candidate.visit_plan)
 
     def terminal_rejection_reason(
             self, cell: Cell, inflated: Set[Cell],
@@ -4089,7 +4117,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                     and task.region_id == region_id
                     and (task.frontier_cell == frontier or (
                         demand_id is not None and task.visit_demand_id == demand_id)) else 0.0),
-                visit_demand_id=demand_id, visit_visible_cells=visible_cells))
+                visit_demand_id=demand_id, visit_visible_cells=visible_cells,
+                visit_demand_ref=(window.sampled_demands.get((region_id, frontier))
+                                  if route_provider is not None else None)))
             if region_id not in preview_regions:
                 rejected["accepted"] += 1
         self.get_logger().info(
@@ -4781,6 +4811,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         changes since publication belong to Local safety, not a second ACK veto.
         """
         previous = self.active_observation
+        if acknowledged_task is None and not self.visit_candidate_available(candidate):
+            return False
         if (acknowledged_task is None and candidate.visit_demand_id is not None and
                 same_visit_demand(previous, candidate) and previous.information_satisfied):
             return False
@@ -4790,9 +4822,23 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                                not previous.information_satisfied))
         if acknowledged_task is not None:
             task = acknowledged_task
+            if (same_visit_demand(previous, task)
+                    and previous.information_satisfied):
+                # A supplemental station may already be installed when the
+                # predecessor's measurements finish. Accept its motion ACK,
+                # carrying the completed information rather than reopening it.
+                for name in ('information_satisfied', 'satisfied_map_revision',
+                             'satisfied_sensor_revision', 'observed_cells',
+                             'sensor_observed_cells', 'progress', 'completion_streak',
+                             'frontier_missing_streak', 'completion_reason',
+                             'boundary_closure_supported'):
+                    setattr(task, name, getattr(previous, name))
+                task.lifecycle = 'SATISFIED'
         elif same_objective:
             task = replace(previous, goal=candidate.goal,
-                           terminal_cells=candidate.terminal_cells or (candidate.cell,))
+                           terminal_cells=candidate.terminal_cells or (candidate.cell,),
+                           visit_plan=candidate.visit_plan,
+                           visit_demand_ref=candidate.visit_demand_ref)
         else:
             task = ObservationTask(
                 region_id=candidate.region_id, goal=candidate.goal,
@@ -4800,7 +4846,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 frontier_cell=candidate.frontier_cell,
                 frontier_cluster_cells=set(candidate.frontier_cluster_cells),
                 terminal_cells=candidate.terminal_cells or (candidate.cell,),
-                visit_demand_id=candidate.visit_demand_id)
+                visit_demand_id=candidate.visit_demand_id,
+                visit_demand_ref=candidate.visit_demand_ref, visit_plan=candidate.visit_plan)
         if acknowledged_task is None:
             task.route_estimate = candidate.sparse_route
             task.route_source = candidate.route_source

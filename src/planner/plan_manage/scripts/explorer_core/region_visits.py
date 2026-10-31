@@ -15,7 +15,7 @@ from .grid import FREE, UNKNOWN, bresenham
 from .frontier_regions import observation_hypothesis_cells
 from .path_planning import (
     ExpansionBudget, KnownFreeSearch, RouteSearchResult, RouteSearchStatus,
-    adjacent_grid_path_is_valid, path_length_cells, path_turn_cost,
+    adjacent_grid_path_is_valid, path_length_cells,
 )
 
 
@@ -30,6 +30,22 @@ class VisitDemand:
     region_id: int
     frontier: tuple
     targets: frozenset
+    retired: bool = False  # cache invalidation from the real task's completion
+
+
+@dataclass(frozen=True)
+class VisitPlan:
+    """The priced current-Region prefix carried by one publication candidate.
+
+    Future Region legs remain estimates. This snapshot grants no motion rights.
+    Demand references live only as long as the bounded cache/tasks/candidates.
+    """
+    plan_id: int
+    region_id: int
+    demand_ids: tuple
+    frontiers: tuple
+    stations: tuple
+    demands: tuple
 
 
 def same_visit_demand(a, b):
@@ -77,6 +93,55 @@ class RegionVisitWindow:
         self.demand_serial = 0
         self.demand_prefix = ()
         self.sampled_demands = {}
+        self.plan_serial = 0
+        self.installed_plan = None
+        self.installed_request = None
+
+    def draft(self, choice, rid):
+        self.plan_serial += 1
+        pool = self.demands.get(rid, {})
+        return VisitPlan(self.plan_serial, rid, choice.demand_prefix,
+                         choice.prefix, choice.station_prefix,
+                         tuple(pool[k] for k in choice.demand_prefix if k in pool))
+
+    def install(self, plan, request):
+        """Called only after the bridge matches an actual installation ACK."""
+        if plan is None or request == self.installed_request:
+            return False
+        self.installed_plan, self.installed_request = plan, request
+        self.prefix_region = plan.region_id
+        live = {d.demand_id for d in plan.demands if not d.retired}
+        self.demand_prefix = tuple(k for k in plan.demand_ids if k in live)
+        self.prefix = tuple(f for k, f in zip(plan.demand_ids, plan.frontiers) if k in live)
+        return True
+
+    def retire(self, task):
+        """Release scheduling references after measured completion, not arrival."""
+        if not task.information_satisfied:
+            return False
+        identity = getattr(task, 'visit_demand_id', None)
+        if identity is None:
+            return False
+        pool = self.demands.get(task.region_id, {})
+        ref = getattr(task, 'visit_demand_ref', None) or pool.get(identity)
+        changed = ref is not None and not ref.retired
+        if ref is not None:
+            ref.retired = True
+        pool.pop(identity, None)
+        self.sampled_demands = {key: d for key, d in self.sampled_demands.items()
+                                if d.demand_id != identity}
+        if self.prefix_region == task.region_id:
+            self.prefix = tuple(f for k, f in zip(self.demand_prefix, self.prefix)
+                                if k != identity)
+            self.demand_prefix = tuple(k for k in self.demand_prefix if k != identity)
+        return changed
+
+    def retained_stations(self, rid):
+        plan = self.installed_plan
+        if plan is None or plan.region_id != rid:
+            return ()
+        return tuple((k, station) for k, station in zip(plan.demand_ids, plan.stations)
+                     if k in self.demand_prefix)
 
     def reconcile(self, regions, start, revision):
         by_id = {r.region_id: r for r in regions}
@@ -122,11 +187,14 @@ class RegionVisitWindow:
         if active_id is not None and not task.information_satisfied:
             # Reuse the existing task's frozen domain and measurement baseline;
             # selection never edits them or manufactures task completion.
-            pool[active_id] = VisitDemand(active_id, rid, task.frontier_cell,
-                                         frozenset(task.target_cells))
+            ref = getattr(task, 'visit_demand_ref', None) or pool.get(active_id)
+            if ref is None:
+                ref = VisitDemand(active_id, rid, task.frontier_cell, frozenset(task.target_cells))
+            if not ref.retired:
+                pool[active_id] = ref
             self.demand_serial = max(self.demand_serial, active_id)
         elif active_id is not None:
-            pool.pop(active_id, None)
+            self.retire(task)
         order = list(dict.fromkeys(
             ([active_id] if active_id in pool else [])
             + list(self.demand_prefix if self.prefix_region == rid else ())
@@ -136,7 +204,7 @@ class RegionVisitWindow:
         kept = OrderedDict()
         for identity in order:
             demand = pool.get(identity)
-            if demand is None:
+            if demand is None or demand.retired:
                 continue
             remaining = sorted(c for c in demand.targets if grid.value(c) == UNKNOWN)
             if not remaining:
@@ -189,9 +257,7 @@ class RegionVisitWindow:
         if rid in self.order:
             self.order.remove(rid)
             self.order.append(rid)
-        if self.prefix_region == rid:
-            self.prefix = ()
-            self.demand_prefix = ()
+        # A failed preparation is not evidence that an installed prefix ended.
 
     def scope(self, rid):
         if rid == self.committed_region and self.committed_scope is not None:
@@ -367,16 +433,67 @@ class JointVisitChoice:
     score: float
     continuation_estimated: bool = False
     demand_prefix: tuple = ()
+    estimated_time_s: float = 0.
+    travel_time_s: float = 0.
+    turn_time_s: float = 0.
+    stop_turn_time_s: float = 0.
+    continuation_time_s: float = 0.
+    preview_regions_priced: int = 0
+    preview_unavailable: bool = False
+    reordered: bool = False
+    predicted_gain: int = 0
+    station_prefix: tuple = ()
 
 
-def _heading(points, at_end=False):
-    pairs = list(zip(points[:-1], points[1:]))
-    if at_end:
-        pairs.reverse()
-    for a, b in pairs:
-        if a != b:
-            return math.atan2(b[1]-a[1], b[0]-a[0])
-    return None
+@dataclass(frozen=True)
+class VisitCostModel:
+    """Ranking estimates in seconds; never motion limits or certificates."""
+    linear_speed: float = .5
+    yaw_rate: float = .8
+    stop_turn_angle: float = .8
+    stop_restart_time: float = 1.
+    reorder_ratio: float = 1.15
+
+    def __post_init__(self):
+        values = (self.linear_speed, self.yaw_rate, self.stop_turn_angle,
+                  self.stop_restart_time, self.reorder_ratio)
+        if (not all(math.isfinite(v) for v in values)
+                or min(values[:3]) <= 0 or self.stop_turn_angle > math.pi
+                or self.stop_restart_time < 0 or self.reorder_ratio < 1):
+            raise ValueError('Invalid Region visit ranking estimates')
+
+    def seconds(self, distance, turn, stops):
+        return distance/self.linear_speed + turn/self.yaw_rate + stops*self.stop_restart_time
+
+
+def _motion_shape(points, resolution):
+    """Metre-scale cost geometry, not a replacement executable route.
+
+    Consecutive grid steps on a diagonal alternate by 45 degrees. Resampling
+    the witnessed polyline at 1 m avoids pricing each raster step as a body
+    turn. Always retain the original route for validation and publication.
+    """
+    if points is None or len(points) < 2:
+        return None, None, ()
+    p = np.asarray(points, dtype=float)*resolution
+    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
+    if arc[-1] <= 1e-9:
+        return None, None, ()
+    samples = np.arange(0., arc[-1], 1.)
+    # Fold a short remainder into the last metre-scale chord rather than
+    # introducing a tiny final segment with a quantized heading.
+    if len(samples) > 1 and arc[-1]-samples[-1] < .5:
+        samples = samples[:-1]
+    samples = np.r_[samples, arc[-1]]
+    q = np.c_[np.interp(samples, arc, p[:,0]), np.interp(samples, arc, p[:,1])]
+    d = np.diff(q, axis=0)
+    d = d[np.linalg.norm(d, axis=1) > 1e-9]
+    if not len(d):
+        return None, None, ()
+    heading = np.arctan2(d[:,1], d[:,0])
+    bends = tuple(abs(math.remainder(float(b-a), 2*math.pi))
+                  for a,b in zip(heading[:-1], heading[1:]))
+    return float(heading[0]), float(heading[-1]), bends
 
 
 def _angle(a, b):
@@ -384,7 +501,8 @@ def _angle(a, b):
 
 
 def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
-                      depth=3, beam_width=8, retained_prefix=(), retained_demands=()):
+                      depth=3, beam_width=8, retained_prefix=(), retained_demands=(),
+                      retained_stations=(), cost_model=None, resolution=1.):
     """Short joint Frontier/station visit, then a two-Region exit preview.
 
     The current Region owns all executable choices. Future legs are estimates;
@@ -395,15 +513,21 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
     """
     if not current:
         return None
+    model = cost_model or VisitCostModel()
     transitions = {}
     def leg(a, b):
         key = (a.cell, b.cell)
         if key not in transitions:
-            transitions[key] = routes.transition(*key)
+            distance, path = routes.transition(*key)
+            if path:
+                entry, arrival, bends = _motion_shape(path, resolution)
+            else:
+                entry = arrival = math.atan2(b.cell[1]-a.cell[1], b.cell[0]-a.cell[0])
+                bends = ()
+            transitions[key] = (distance, entry, arrival, bends, path is None)
         return transitions[key]
 
-    # A retained next objective remains the next objective while it has a valid
-    # station. Recalculate its station/route; do not freeze stale geometry.
+    # Retain the information identity, not an unconditional execution order.
     def demand(c):
         return getattr(c, 'visit_remaining_cells', c.observation_cells)
     current = [c for c in current if demand(c)]
@@ -411,81 +535,113 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
         return None
     keys = {visit_demand_key(c) for c in current}
     retained = tuple(k for k in (retained_demands or retained_prefix) if k in keys)
-    first = [c for c in current if not retained or visit_demand_key(c) == retained[0]]
+    available = {(visit_demand_key(c), c.cell) for c in current}
+    stations = {k: s for k, s in retained_stations if (k, s) in available}
+    def follows_retained(prefix):
+        count = min(len(prefix), len(retained))
+        return (bool(retained)
+                and tuple(visit_demand_key(c) for c in prefix[:count]) == retained[:count]
+                and all(c.cell == stations.get(visit_demand_key(c), c.cell)
+                        for c in prefix[:count]))
 
-    # prefix, expected remaining cells, length, turn, final heading
+    def state_time(state):
+        return model.seconds(state[2], state[3], state[4])
+
+    def partial_rank(state):
+        return (-len(state[1])/(1.+state_time(state)),
+                tuple((c.frontier_cell,c.cell) for c in state[0]))
+
+    # prefix, expected remaining cells, length, turn, large turns, final heading
     beam = []
-    for c in first:
-        heading = _heading(c.path)
+    for c in current:
+        heading, arrival, bends = _motion_shape(c.path, resolution)
+        initial_turn = _angle(body_yaw, heading)
         beam.append(((c,), set(demand(c)), c.path_length,
-                     c.turn_cost+_angle(body_yaw, heading), _heading(c.path, True)))
+                     sum(bends)+initial_turn,
+                     sum(b > model.stop_turn_angle for b in bends)
+                     + int(initial_turn > model.stop_turn_angle), arrival))
     complete = list(beam)
     for _ in range(1, min(depth, len(keys))):
         expanded = []
-        for prefix, seen, length, turn, heading in beam:
+        for prefix, seen, length, turn, stops, heading in beam:
             used = {visit_demand_key(c) for c in prefix}
-            next_retained = next((k for k in retained if k not in used), None)
             for c in current:
-                if (visit_demand_key(c) in used or not demand(c)-seen or
-                        (next_retained is not None and visit_demand_key(c) != next_retained)):
+                if visit_demand_key(c) in used or not demand(c)-seen:
                     continue
-                distance, path = leg(prefix[-1], c)
+                distance, entry, arrival, bends, _ = leg(prefix[-1], c)
                 if not math.isfinite(distance):
                     continue
-                arrival = _heading(path, True) if path else math.atan2(
-                    c.cell[1]-prefix[-1].cell[1], c.cell[0]-prefix[-1].cell[0])
-                entry = _heading(path) if path else arrival
+                entry_turn = _angle(heading, entry)
                 expanded.append((prefix+(c,), seen | demand(c),
-                    length+distance, turn+_angle(heading, entry)+(path_turn_cost(path) if path else 0.), arrival))
-        expanded.sort(key=lambda s: (-len(s[1])/(1+s[2]+.25*s[3]),
-                                     tuple((c.frontier_cell,c.cell) for c in s[0])))
+                    length+distance, turn+entry_turn+sum(bends),
+                    stops+int(entry_turn > model.stop_turn_angle)
+                    + sum(b > model.stop_turn_angle for b in bends), arrival))
+        expanded.sort(key=partial_rank)
         beam = expanded[:beam_width]
+        # One incumbent slot inside the SAME beam budget allows a fair final
+        # hysteresis comparison even if a small gain increase prunes it early.
+        incumbent = next((s for s in expanded if follows_retained(s[0])), None)
+        if incumbent is not None and not any(s is incumbent for s in beam):
+            beam[-1:] = [incumbent]
         complete.extend(beam)
         if not beam:
             break
 
-    best = None
     # When another independently useful demand exists, compare the access to
     # the first station AND its next visit. A one-station reward ratio would
     # otherwise defeat joint selection by winning before that leg is priced.
     joint = [state for state in complete if len(state[0]) > 1]
     if joint:
         complete = joint
-    for prefix, seen, length, turn, heading in complete:
+    evaluations = []
+    pools = [pool for pool in lookahead[:2] if pool]
+    for state in complete:
+        prefix, seen, length, turn, stops, heading = state
         # Visit B then C in coarse order, with only their bounded stations.
         tails = [(prefix[-1], 0., heading, False)]
-        for pool in lookahead[:2]:
-            if not pool:
-                continue
+        levels = [tails]
+        for pool in pools:
             next_tails = []
             for previous, cost, tail_heading, estimated in tails:
                 for option in pool:
-                    distance, path = leg(previous, option)
+                    distance, entry, exit_heading, bends, provisional = leg(previous, option)
                     if not math.isfinite(distance):
                         continue
-                    entry = _heading(path) if path else math.atan2(
-                        option.cell[1]-previous.cell[1], option.cell[0]-previous.cell[0])
-                    exit_heading = _heading(path, True) if path else entry
-                    next_tails.append((option, cost+distance+.25*_angle(tail_heading,entry),
-                                       exit_heading, estimated or path is None))
+                    angle = _angle(tail_heading, entry)
+                    next_tails.append((option, cost+model.seconds(distance, angle+sum(bends),
+                        int(angle > model.stop_turn_angle)+sum(b > model.stop_turn_angle for b in bends)),
+                        exit_heading, estimated or provisional))
             tails = sorted(next_tails, key=lambda s:(s[1],s[0].cell))[:beam_width]
             if not tails:
                 break
-        if not tails:
-            continue
-        tail = min(tails, key=lambda s:(s[1],s[0].cell))
-        score = len(seen)/(1+length+tail[1]+.25*turn)
-        key = (score, -length, tuple((-c.cell[0],-c.cell[1]) for c in prefix))
-        if best is None or key > best[0]:
-            best = (key, JointVisitChoice(prefix[0], tuple(c.frontier_cell for c in prefix),score,tail[3],
-                                         tuple(visit_demand_key(c) for c in prefix)))
-    # Uncertain/blocked preview cannot veto an independently valid current leg.
-    if best is None:
-        c = max(first, key=lambda c:(len(demand(c))/(1+c.path_length+.25*c.turn_cost),
-                                     -c.path_length,-c.cell[0],-c.cell[1]))
-        return JointVisitChoice(c,(c.frontier_cell,),0.,True,(visit_demand_key(c),))
+            levels.append(tails)
+        evaluations.append((state, levels))
+    # All current prefixes are ranked against the SAME available horizon.
+    # An unavailable future must neither erase a valid joint visit nor give
+    # that prefix a free tail compared with others priced through B/C.
+    priced = min(len(levels)-1 for _,levels in evaluations)
+    unavailable = priced < len(lookahead[:2])
+    ranked = []
+    for state, levels in evaluations:
+        prefix, seen, length, turn, stops, _ = state
+        tail = min(levels[priced], key=lambda s:(s[1],s[0].cell))
+        total = state_time(state)+tail[1]
+        score = len(seen)/(1.+total)
+        key = (score, -total, tuple((-c.cell[0],-c.cell[1]) for c in prefix))
+        choice = JointVisitChoice(prefix[0], tuple(c.frontier_cell for c in prefix),score,
+            tail[3] or unavailable, tuple(visit_demand_key(c) for c in prefix),
+            estimated_time_s=total, travel_time_s=length/model.linear_speed,
+            turn_time_s=turn/model.yaw_rate, stop_turn_time_s=stops*model.stop_restart_time,
+            continuation_time_s=tail[1], preview_regions_priced=priced,
+            preview_unavailable=unavailable, predicted_gain=len(seen),
+            station_prefix=tuple(c.cell for c in prefix))
+        ranked.append((key, choice, follows_retained(prefix)))
+    best = max(ranked, key=lambda item:item[0])
+    incumbents = [item for item in ranked if item[2]]
+    if incumbents:
+        incumbent = max(incumbents, key=lambda item:item[0])
+        if best[0][0] <= incumbent[0][0]*model.reorder_ratio:
+            best = incumbent
     result = best[1]
-    result.demand_prefix = tuple(dict.fromkeys(
-        result.demand_prefix+tuple(k for k in retained
-                                  if k not in result.demand_prefix)))[:depth]
+    result.reordered = bool(retained) and not best[2]
     return result

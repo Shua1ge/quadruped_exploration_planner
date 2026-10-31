@@ -159,6 +159,8 @@ class ObservationTaskBridge:
                 message.gate_min_progress = (0.0 if preparing else self.commitment_direction_progress)-tolerance
         self.observation_task_pub.publish(message)
         self.task_requests_published += 1
+        if getattr(task, 'visit_plan', None) is not None:
+            self.log_visit_plan('PUBLISHED', task, request_id)
         if not preparing:
             self.pending_observation_station = None
             self.blocked_execution_context = None
@@ -168,6 +170,8 @@ class ObservationTaskBridge:
         if pending is None or pending.state == "CANCELLING":
             return
         pending.state = "CANCELLING"
+        if getattr(pending.task, 'visit_plan', None) is not None:
+            self.log_visit_plan('CANCELLING:'+reason, pending.task, pending.request_id)
         pending.cancel_publish_ns = self.get_clock().now().nanoseconds
         pending.cancel_started_ns = pending.cancel_publish_ns
         if getattr(self, "task_geometry_autonomy", False):
@@ -308,6 +312,18 @@ class ObservationTaskBridge:
         if self.pending_observation_feedback(message):
             return
         task = self.active_observation
+        if message.state == ObservationFeedback.EXECUTION_READY:
+            # Installation is independent of information completion. Match the
+            # exact ordinary request, just as the pending handoff does above.
+            if (task is None or (message.task_id, message.task_version) !=
+                    (task.task_id, task.task_version)
+                    or message.request_id != self.active_path_request_generation
+                    or message.trajectory_id <= 0 or not message.candidate_id
+                    or getattr(self, 'departure_recovery_terminal', False)):
+                self.task_stale_feedback += 1
+            elif getattr(task, 'visit_plan', None) is not None:
+                self.install_visit_plan(task, message.request_id, message.trajectory_id)
+            return
         if task is not None and (task.information_satisfied or task.motion_released) and \
                 (message.task_id,message.task_version)==(task.task_id,task.task_version):
             # G1 arrival/stall is no longer a reason to reopen its information

@@ -55,6 +55,8 @@ class ObservationTask:
     boundary_closure_supported: bool = False
     # Explorer selection cache identity; never a second completion ledger.
     visit_demand_id: Optional[int] = None
+    visit_demand_ref: object = None
+    visit_plan: object = None
 
 
 def evaluate_observation(
