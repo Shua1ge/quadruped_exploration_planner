@@ -53,8 +53,11 @@ def bind_task_identity(task, task_id, grid):
         raise ValueError("task_id must be a positive monotonic generation")
     task.task_id = int(task_id)
     task.task_version = 1
+    inherited_demand = (getattr(task, 'visit_demand_id', None) is not None
+                        and task.require_sensor_evidence)
     task.require_sensor_evidence = True
-    task.initial_sensor_revision = grid.sensor_revision
+    if not inherited_demand:
+        task.initial_sensor_revision = grid.sensor_revision
     task.last_evaluated_sensor_revision = grid.sensor_revision
     task.last_closure_sensor_revision = grid.sensor_revision
     return task

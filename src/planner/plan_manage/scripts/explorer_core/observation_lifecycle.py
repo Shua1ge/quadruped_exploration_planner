@@ -53,6 +53,8 @@ class ObservationTask:
     last_evaluated_sensor_revision: int = 0
     last_closure_sensor_revision: int = 0
     boundary_closure_supported: bool = False
+    # Explorer selection cache identity; never a second completion ledger.
+    visit_demand_id: Optional[int] = None
 
 
 def evaluate_observation(

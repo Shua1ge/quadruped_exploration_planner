@@ -76,6 +76,7 @@ from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import BranchCommitment, ResidualCommitmentGate
 from explorer_core.region_overlay import build_region_overlay, region_rgb
 from explorer_core.region_visit_planner import RegionVisitPlanner
+from explorer_core.region_visits import same_visit_demand, station_alternatives
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
 )
@@ -129,6 +130,8 @@ class FrontierCandidate:
     excluded_goals: Tuple[Point2, ...] = ()
     observation_progress: float = 0.0
     route_source: str = "dense"
+    visit_demand_id: Optional[int] = None
+    visit_visible_cells: Optional[Set[Cell]] = None
 
 
 class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
@@ -1896,9 +1899,10 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             return False
         self._repair_expansion_budget = ExpansionBudget(
             getattr(self, "global_repair_max_expansions", 400))
-        target_cells = observation_target_cells(
-            self.grid, candidate.frontier_cell, self.observation_radius,
-            candidate.cell)
+        target_cells = (set(candidate.observation_cells)
+            if candidate.visit_demand_id is not None else observation_target_cells(
+                self.grid, candidate.frontier_cell, self.observation_radius,
+                candidate.cell))
         hypotheses = observation_hypothesis_cells(
             self.grid, candidate.cell, target_cells, self.observation_radius)
         if (not hypotheses
@@ -1945,7 +1949,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         refreshed = FrontierCandidate(
             candidate.region_id, candidate.cell, candidate.frontier_cell,
             candidate.goal, path,
-            path_length_cells(path, self.grid.resolution), len(target_cells),
+            path_length_cells(path, self.grid.resolution), len(hypotheses),
             candidate.cluster_size, path_turn_cost(path), target_cells,
             sparse_route=None, # Spliced/dense route must not claim the old graph transitions.
             terminal_cells=candidate.terminal_cells,
@@ -1956,7 +1960,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             commitment_scope=candidate.commitment_scope,
             option_target_cells=set(candidate.option_target_cells),
             excluded_goals=candidate.excluded_goals,
-            observation_progress=candidate.observation_progress)
+            observation_progress=candidate.observation_progress,
+            visit_demand_id=candidate.visit_demand_id,
+            visit_visible_cells=set(hypotheses))
         refreshed.route_source = route_source
         if not self.directional_candidate_allowed(refreshed, candidate_scope):
             self.prepared_candidate = None
@@ -2066,10 +2072,19 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         if getattr(self,"pending_observation_handoff",None) is not None:
             return False
         predecessor = self.active_observation
+        if (candidate.visit_demand_id is not None and
+                same_visit_demand(predecessor, candidate) and predecessor.information_satisfied):
+            return False
         task = ObservationTask(candidate.region_id,candidate.goal,
             set(candidate.observation_cells),frontier_cell=candidate.frontier_cell,
             frontier_cluster_cells=set(candidate.frontier_cluster_cells),
-            terminal_cells=candidate.terminal_cells or (candidate.cell,))
+            terminal_cells=candidate.terminal_cells or (candidate.cell,),
+            visit_demand_id=candidate.visit_demand_id)
+        if (candidate.visit_demand_id is not None and
+                same_visit_demand(predecessor, candidate) and
+                predecessor.require_sensor_evidence):
+            task.require_sensor_evidence = True
+            task.initial_sensor_revision = predecessor.initial_sensor_revision
         if not getattr(self,"handoff_execution_retired",False):
             task.predecessor_task_id = predecessor.task_id
             task.predecessor_task_version = predecessor.task_version
@@ -3682,8 +3697,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         path = None
         task = getattr(self, "active_observation", None)
         same_task = (isinstance(task, ObservationTask)
-                     and task.region_id == candidate.region_id
-                     and task.frontier_cell == candidate.frontier_cell)
+                     and same_visit_demand(task, candidate))
         observation_cells = (set(task.target_cells) if same_task
                              else candidate.observation_cells)
         terminals = tuple(dict.fromkeys((candidate.cell,) + candidate.terminal_cells))
@@ -3730,7 +3744,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                     for target in targets)
                 if visible_remaining == 0:
                     continue
-            elif cell != candidate.cell:
+            elif cell != candidate.cell and candidate.visit_demand_id is None:
                 targets = observation_target_cells(
                     self.grid, candidate.frontier_cell, self.observation_radius, cell)
                 if len(targets) < self.min_expected_observation_cells:
@@ -3773,7 +3787,11 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             excluded_goals=candidate.excluded_goals,
             observation_progress=candidate.observation_progress,
             route_source=(selected_sparse_route.route_source if selected_sparse_route is not None
-                          else "dense_rescue" if candidate.sparse_route is not None else "dense"))
+                          else "dense_rescue" if candidate.sparse_route is not None else "dense"),
+            visit_demand_id=candidate.visit_demand_id,
+            visit_visible_cells=(observation_hypothesis_cells(
+                self.grid, selected_cell, observation_cells, self.observation_radius)
+                if candidate.visit_demand_id is not None else None))
 
     def terminal_rejection_reason(
             self, cell: Cell, inflated: Set[Cell],
@@ -3811,6 +3829,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         self._repair_expansion_budget = ExpansionBudget(
             getattr(self, "global_repair_search_limit", 4)*getattr(self, "global_repair_max_expansions", 400))
         proposals = []
+        station_visibility = {}
         for region in regions:
             clusters = region.clusters
             sampled = None
@@ -3819,16 +3838,10 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 choices = [candidate_cells(cluster) for cluster in clusters]
                 flat = [f for i in range(max((len(c) for c in choices), default=0))
                         for c in choices if i < len(c) for f in [c[i]]]
-                retained = list(window.prefix if window.prefix_region == region.region_id else ())
                 task = getattr(self, "active_observation", None)
-                if isinstance(task, ObservationTask) and task.region_id == region.region_id:
-                    retained.insert(0, task.frontier_cell)
-                valid = set().union(*(set(c) for c in clusters))
-                retained = [f for f in retained if f in valid]
-                cursor = window.sample_cursor.get(region.region_id, 0)
-                rotated = flat[cursor % len(flat):]+flat[:cursor % len(flat)] if flat else []
-                sampled = list(dict.fromkeys(retained+rotated))[:frontier_limit]
-                window.sample_cursor[region.region_id] = cursor+frontier_limit
+                sampled = window.sample_demands(
+                    region, flat, self.grid, frontier_limit,
+                    self.observation_radius, task)
             for cluster in clusters:
                 used_viewpoints: Set[Cell] = set()
                 task = getattr(self, "active_observation", None)
@@ -3844,6 +3857,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 if sampled is not None:
                     frontiers = [f for f in sampled if f in cluster]
                 for frontier in frontiers:
+                    demand = (window.sampled_demands.get((region.region_id, frontier))
+                              if route_provider is not None else None)
                     viewpoints = safe_viewpoint_cells(
                         self.grid, frontier, inflated, self.viewpoint_standoff,
                         limit=self.terminal_candidate_limit,
@@ -3853,8 +3868,11 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                         footprint_radius=0.0,
                         footprint_offset=0.0)
                     same_task = (isinstance(task, ObservationTask)
-                                 and task.frontier_cell == frontier
-                                 and task.region_id == region.region_id)
+                                 and task.region_id == region.region_id
+                                 and not task.information_satisfied
+                                 and (task.frontier_cell == frontier or (
+                                     demand is not None and
+                                     task.visit_demand_id == demand.demand_id)))
                     if same_task:
                         # Previously safe terminals are frozen task alternatives,
                         # not trusted geometry: recheck LOS, pose and route below.
@@ -3885,19 +3903,32 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                             continue
                         terminals.append(viewpoint)
                     if station_limit is not None:
-                        terminals = terminals[:station_limit]
+                        terminals = station_alternatives(terminals, station_limit)
                     for viewpoint in terminals:
                         if viewpoint in used_viewpoints:
                             continue
                         used_viewpoints.add(viewpoint)
                         target_cells = (set(task.target_cells) if same_task else
+                                        set(demand.targets) if demand is not None else
                                         observation_target_cells(
                                             self.grid, frontier,
                                             self.observation_radius, viewpoint))
-                        unknown_gain = sum(self.grid.value(cell) == UNKNOWN
-                                           for cell in target_cells)
+                        if route_provider is not None:
+                            visible = ({cell for cell in target_cells
+                                        if math.dist(viewpoint, cell)*self.grid.resolution
+                                        <= self.observation_radius}
+                                if demand is None and not same_task else
+                                observation_hypothesis_cells(
+                                    self.grid, viewpoint, target_cells, self.observation_radius))
+                            station_visibility[(region.region_id, frontier, viewpoint)] = visible
+                            unknown_gain = len(visible)
+                            if demand is None and not same_task:
+                                target_cells = visible
+                        else:
+                            unknown_gain = sum(self.grid.value(cell) == UNKNOWN
+                                               for cell in target_cells)
                         if same_task:
-                            visible_remaining = sum(
+                            visible_remaining = unknown_gain if route_provider is not None else sum(
                                 self.grid.value(cell) == UNKNOWN and
                                 not any(self.grid.value(ray) == OCCUPIED
                                         for ray in bresenham(viewpoint, cell)[1:-1])
@@ -3928,7 +3959,23 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                             set(cluster)))
 
         visit_paths = {}
+        station_demands = {}
         if route_provider is not None:
+            # One fixed information domain for the alternative stations of a
+            # demand. Visibility is a prediction per station, never completion.
+            grouped_targets = {}
+            for proposal in proposals:
+                rid, _, cell, frontier = proposal[:4]
+                grouped_targets.setdefault((rid, frontier), set()).update(proposal[7])
+            fixed_proposals = []
+            for proposal in proposals:
+                rid, _, cell, frontier = proposal[:4]
+                demand = window.freeze_demand(rid, frontier, grouped_targets[(rid, frontier)])
+                visible = station_visibility[(rid, frontier, cell)]
+                station_demands[(rid, frontier, cell)] = (demand.demand_id, visible)
+                fixed_proposals.append(proposal[:5]+(len(visible),)+proposal[6:7]
+                                       +(set(demand.targets),)+proposal[8:])
+            proposals = fixed_proposals
             estimate_by_cell = {}
             for proposal in proposals:
                 rid, _, cell = proposal[:3]
@@ -3982,6 +4029,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         for (region_id, commitment_scope, viewpoint, frontier, goal_xy,
              unknown_gain, cluster_size, target_cells, terminal_cells,
              terminal_clearance, frontier_cluster_cells) in proposals:
+            demand_id, visible_cells = station_demands.get((region_id, frontier, viewpoint), (None, None))
             estimate = estimate_by_cell.get(viewpoint)
             if route_provider is not None and region_id in preview_regions:
                 # These are only bounded lookahead options. No claim of robot
@@ -4039,7 +4087,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 observation_progress=(
                     task.progress if isinstance(task, ObservationTask)
                     and task.region_id == region_id
-                    and task.frontier_cell == frontier else 0.0)))
+                    and (task.frontier_cell == frontier or (
+                        demand_id is not None and task.visit_demand_id == demand_id)) else 0.0),
+                visit_demand_id=demand_id, visit_visible_cells=visible_cells))
             if region_id not in preview_regions:
                 rejected["accepted"] += 1
         self.get_logger().info(
@@ -4731,9 +4781,13 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         changes since publication belong to Local safety, not a second ACK veto.
         """
         previous = self.active_observation
+        if (acknowledged_task is None and candidate.visit_demand_id is not None and
+                same_visit_demand(previous, candidate) and previous.information_satisfied):
+            return False
         same_objective = (isinstance(previous, ObservationTask)
-                          and previous.region_id == candidate.region_id
-                          and previous.frontier_cell == candidate.frontier_cell)
+                          and same_visit_demand(previous, candidate)
+                          and (candidate.visit_demand_id is None or
+                               not previous.information_satisfied))
         if acknowledged_task is not None:
             task = acknowledged_task
         elif same_objective:
@@ -4745,7 +4799,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 target_cells=set(candidate.observation_cells),
                 frontier_cell=candidate.frontier_cell,
                 frontier_cluster_cells=set(candidate.frontier_cluster_cells),
-                terminal_cells=candidate.terminal_cells or (candidate.cell,))
+                terminal_cells=candidate.terminal_cells or (candidate.cell,),
+                visit_demand_id=candidate.visit_demand_id)
         if acknowledged_task is None:
             task.route_estimate = candidate.sparse_route
             task.route_source = candidate.route_source

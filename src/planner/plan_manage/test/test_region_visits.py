@@ -139,6 +139,7 @@ def test_preview_estimate_is_explicit_and_cannot_create_an_executable_path():
 def test_same_frontier_retains_station_alternatives_in_production_builder(monkeypatch):
     from test_frontier_explorer import candidate_test_explorer, MODULE
     explorer=candidate_test_explorer();explorer._visit_pending_regions=set()
+    explorer.observation_radius=4.
     grid=explorer.grid;grid.data[2,9]=MODULE.UNKNOWN
     monkeypatch.setattr(MODULE,'candidate_cells',lambda cluster:[(8,2)])
     monkeypatch.setattr(MODULE,'safe_viewpoint_cells',lambda *a,**kw:[(6,2),(6,3),(6,4)])
@@ -147,7 +148,7 @@ def test_same_frontier_retains_station_alternatives_in_production_builder(monkey
     r=MODULE.FrontierRegion(3,[[(8,2)]],(8,2),{(8,2)})
     records=explorer.build_frontier_candidates((1,2),[r],set(),set(),
         frontier_limit=4,station_limit=2,route_provider=routes)
-    assert {c.cell for c in records}=={(6,2),(6,3)}
+    assert {c.cell for c in records}=={(6,2),(6,4)}
     assert all(c.path for c in records)
 
 
@@ -166,6 +167,7 @@ def test_production_scheduler_only_refines_three_of_many_regions():
         return [MODULE.FrontierCandidate(r.region_id,(6,2),(8,2),(6.5,2.5),
             [(1,2),(2,2),(3,2),(4,2),(5,2),(6,2)],5.,10,5,0.,{(9,2)}) for r in rs]
     explorer.build_frontier_candidates=build
+    explorer.grid.data[2,9]=MODULE.UNKNOWN
     assert explorer.choose_window_visit((1,2),regions,set(),(),allow_region_release=True,
         allow_cross_region_preparation=False,required_scope=None) is not None
     assert len(seen)==3 and len(explorer.region_sequence)==60

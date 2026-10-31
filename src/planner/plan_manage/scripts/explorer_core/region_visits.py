@@ -11,11 +11,53 @@ import time
 import numpy as np
 from scipy.ndimage import binary_propagation
 
-from .grid import FREE, bresenham
+from .grid import FREE, UNKNOWN, bresenham
+from .frontier_regions import observation_hypothesis_cells
 from .path_planning import (
     ExpansionBudget, KnownFreeSearch, RouteSearchResult, RouteSearchStatus,
     adjacent_grid_path_is_valid, path_length_cells, path_turn_cost,
 )
+
+
+@dataclass
+class VisitDemand:
+    """Bounded selection reference, not another task/completion ledger.
+
+    Targets freeze when the alternatives are first compared. A later boundary
+    can supply another view of these targets, without claiming Frontier lineage.
+    """
+    demand_id: int
+    region_id: int
+    frontier: tuple
+    targets: frozenset
+
+
+def same_visit_demand(a, b):
+    if a is None or b is None or a.region_id != b.region_id:
+        return False
+    left = getattr(a, 'visit_demand_id', None)
+    right = getattr(b, 'visit_demand_id', None)
+    if left is not None or right is not None:
+        return left is not None and left == right
+    return a.frontier_cell == b.frontier_cell
+
+
+def visit_demand_key(candidate):
+    identity = getattr(candidate, 'visit_demand_id', None)
+    return candidate.frontier_cell if identity is None else identity
+
+
+def station_alternatives(cells, limit):
+    """Keep the safest first choice and spatially distinct bounded siblings."""
+    cells = list(dict.fromkeys(cells))
+    if not cells or limit <= 0:
+        return []
+    selected = [cells.pop(0)]
+    while cells and len(selected) < limit:
+        cell = max(cells, key=lambda c: min(math.dist(c, old) for old in selected))
+        selected.append(cell)
+        cells.remove(cell)
+    return selected
 
 
 class RegionVisitWindow:
@@ -31,11 +73,17 @@ class RegionVisitWindow:
         self.prefix = ()
         self.prefix_region = None
         self.sample_cursor = {}
+        self.demands = {}
+        self.demand_serial = 0
+        self.demand_prefix = ()
+        self.sampled_demands = {}
 
     def reconcile(self, regions, start, revision):
         by_id = {r.region_id: r for r in regions}
         self.order = [rid for rid in self.order if rid in by_id]
         self.sample_cursor = {rid: cursor for rid,cursor in self.sample_cursor.items() if rid in by_id}
+        self.demands = {rid: pool for rid, pool in self.demands.items() if rid in by_id}
+        self.sampled_demands = {}
         self.deferred = {rid: rev for rid, rev in self.deferred.items()
                          if rid in by_id and rev == revision}
         for rid in sorted(set(by_id)-set(self.order)):
@@ -61,6 +109,80 @@ class RegionVisitWindow:
         ready = [rid for rid in self.order if rid not in self.deferred]
         return [by_id[rid] for rid in ready[:self.width]]
 
+    def sample_demands(self, region, choices, grid, limit, radius, task=None):
+        """Keep a small demand batch; obtain views from this Region only.
+
+        Reprojection tests visibility of fixed target facts, not overlap/IoU
+        between moving Frontier shapes. The actual stations are checked later.
+        """
+        rid = region.region_id
+        valid = set().union(*(set(c) for c in region.clusters))
+        pool = self.demands.setdefault(rid, OrderedDict())
+        active_id = getattr(task, 'visit_demand_id', None) if task is not None and task.region_id == rid else None
+        if active_id is not None and not task.information_satisfied:
+            # Reuse the existing task's frozen domain and measurement baseline;
+            # selection never edits them or manufactures task completion.
+            pool[active_id] = VisitDemand(active_id, rid, task.frontier_cell,
+                                         frozenset(task.target_cells))
+            self.demand_serial = max(self.demand_serial, active_id)
+        elif active_id is not None:
+            pool.pop(active_id, None)
+        order = list(dict.fromkeys(
+            ([active_id] if active_id in pool else [])
+            + list(self.demand_prefix if self.prefix_region == rid else ())
+            + list(pool)))
+        chosen = []
+        used = set()
+        kept = OrderedDict()
+        for identity in order:
+            demand = pool.get(identity)
+            if demand is None:
+                continue
+            remaining = sorted(c for c in demand.targets if grid.value(c) == UNKNOWN)
+            if not remaining:
+                continue
+            frontier = demand.frontier if demand.frontier in valid else None
+            if frontier is None:
+                # At most eight target representatives and eight candidate
+                # boundaries. This does not enumerate stand-off poses globally.
+                stride = max(1, math.ceil(len(remaining)/8))
+                representatives = set(remaining[::stride][:8])
+                nearby = sorted(choices, key=lambda f: (
+                    min(math.dist(f, c) for c in representatives), f))[:8]
+                frontier = next((f for f in nearby if f not in used and
+                    observation_hypothesis_cells(grid, f, representatives, radius)), None)
+            if frontier is None or frontier in used:
+                continue
+            demand.frontier = frontier
+            chosen.append(frontier)
+            used.add(frontier)
+            kept[identity] = demand
+            self.sampled_demands[(rid, frontier)] = demand
+            if len(chosen) == limit:
+                break
+        cursor = self.sample_cursor.get(rid, 0)
+        rotated = choices[cursor % len(choices):]+choices[:cursor % len(choices)] if choices else []
+        for frontier in rotated:
+            if len(chosen) >= limit:
+                break
+            if frontier not in used:
+                chosen.append(frontier)
+                used.add(frontier)
+        self.sample_cursor[rid] = cursor+max(0, len(chosen)-len(kept))
+        # Unselected demand records are disposable scheduling caches. Their
+        # unknown cells remain in the map and receive no completion/blacklist.
+        self.demands[rid] = kept
+        return chosen
+
+    def freeze_demand(self, rid, frontier, targets):
+        demand = self.sampled_demands.get((rid, frontier))
+        if demand is None:
+            self.demand_serial += 1
+            demand = VisitDemand(self.demand_serial, rid, frontier, frozenset(targets))
+            self.sampled_demands[(rid, frontier)] = demand
+            self.demands.setdefault(rid, OrderedDict())[demand.demand_id] = demand
+        return demand
+
     def defer(self, rid, revision):
         """No usable station this revision; retain residual work, no blacklist."""
         self.deferred[rid] = revision
@@ -69,6 +191,7 @@ class RegionVisitWindow:
             self.order.append(rid)
         if self.prefix_region == rid:
             self.prefix = ()
+            self.demand_prefix = ()
 
     def scope(self, rid):
         if rid == self.committed_region and self.committed_scope is not None:
@@ -243,6 +366,7 @@ class JointVisitChoice:
     prefix: tuple
     score: float
     continuation_estimated: bool = False
+    demand_prefix: tuple = ()
 
 
 def _heading(points, at_end=False):
@@ -260,7 +384,7 @@ def _angle(a, b):
 
 
 def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
-                      depth=3, beam_width=8, retained_prefix=()):
+                      depth=3, beam_width=8, retained_prefix=(), retained_demands=()):
     """Short joint Frontier/station visit, then a two-Region exit preview.
 
     The current Region owns all executable choices. Future legs are estimates;
@@ -280,11 +404,14 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
 
     # A retained next objective remains the next objective while it has a valid
     # station. Recalculate its station/route; do not freeze stale geometry.
-    retained = next((frontier for frontier in retained_prefix
-                     if any(c.frontier_cell == frontier for c in current)), None)
-    first = [c for c in current if retained is None or c.frontier_cell == retained]
     def demand(c):
         return getattr(c, 'visit_remaining_cells', c.observation_cells)
+    current = [c for c in current if demand(c)]
+    if not current:
+        return None
+    keys = {visit_demand_key(c) for c in current}
+    retained = tuple(k for k in (retained_demands or retained_prefix) if k in keys)
+    first = [c for c in current if not retained or visit_demand_key(c) == retained[0]]
 
     # prefix, expected remaining cells, length, turn, final heading
     beam = []
@@ -293,12 +420,14 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
         beam.append(((c,), set(demand(c)), c.path_length,
                      c.turn_cost+_angle(body_yaw, heading), _heading(c.path, True)))
     complete = list(beam)
-    for _ in range(1, min(depth, len({c.frontier_cell for c in current}))):
+    for _ in range(1, min(depth, len(keys))):
         expanded = []
         for prefix, seen, length, turn, heading in beam:
-            used = {c.frontier_cell for c in prefix}
+            used = {visit_demand_key(c) for c in prefix}
+            next_retained = next((k for k in retained if k not in used), None)
             for c in current:
-                if c.frontier_cell in used:
+                if (visit_demand_key(c) in used or not demand(c)-seen or
+                        (next_retained is not None and visit_demand_key(c) != next_retained)):
                     continue
                 distance, path = leg(prefix[-1], c)
                 if not math.isfinite(distance):
@@ -316,6 +445,12 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
             break
 
     best = None
+    # When another independently useful demand exists, compare the access to
+    # the first station AND its next visit. A one-station reward ratio would
+    # otherwise defeat joint selection by winning before that leg is priced.
+    joint = [state for state in complete if len(state[0]) > 1]
+    if joint:
+        complete = joint
     for prefix, seen, length, turn, heading in complete:
         # Visit B then C in coarse order, with only their bounded stations.
         tails = [(prefix[-1], 0., heading, False)]
@@ -342,10 +477,15 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
         score = len(seen)/(1+length+tail[1]+.25*turn)
         key = (score, -length, tuple((-c.cell[0],-c.cell[1]) for c in prefix))
         if best is None or key > best[0]:
-            best = (key, JointVisitChoice(prefix[0], tuple(c.frontier_cell for c in prefix),score,tail[3]))
+            best = (key, JointVisitChoice(prefix[0], tuple(c.frontier_cell for c in prefix),score,tail[3],
+                                         tuple(visit_demand_key(c) for c in prefix)))
     # Uncertain/blocked preview cannot veto an independently valid current leg.
     if best is None:
         c = max(first, key=lambda c:(len(demand(c))/(1+c.path_length+.25*c.turn_cost),
                                      -c.path_length,-c.cell[0],-c.cell[1]))
-        return JointVisitChoice(c,(c.frontier_cell,),0.,True)
-    return best[1]
+        return JointVisitChoice(c,(c.frontier_cell,),0.,True,(visit_demand_key(c),))
+    result = best[1]
+    result.demand_prefix = tuple(dict.fromkeys(
+        result.demand_prefix+tuple(k for k in retained
+                                  if k not in result.demand_prefix)))[:depth]
+    return result

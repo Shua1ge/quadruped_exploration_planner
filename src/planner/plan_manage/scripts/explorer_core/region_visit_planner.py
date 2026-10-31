@@ -4,7 +4,8 @@ import time
 
 from .grid import UNKNOWN
 from .path_planning import RouteSearchStatus, path_length_cells, path_turn_cost
-from .region_visits import BoundedVisitRoutes, RegionVisitWindow, choose_joint_visit
+from .region_visits import (BoundedVisitRoutes, RegionVisitWindow, choose_joint_visit,
+                           same_visit_demand, visit_demand_key)
 
 
 class RegionVisitPlanner:
@@ -31,6 +32,8 @@ class RegionVisitPlanner:
                                 if r.region_id == window.committed_region
                                 and required_scope == window.committed_scope]
         self.last_visit_window = [r.region_id for r in selected_regions]
+        window.demands = {rid: pool for rid, pool in window.demands.items()
+                          if rid in self.last_visit_window}
         self.region_visit_deferred = False
         self._visit_pending_regions = set()
         self._visit_capacity_regions = set()
@@ -52,7 +55,9 @@ class RegionVisitPlanner:
         self.publish_region_overlay(regions, [c for c in records if c.path])
         for c in records:
             # Separate remaining-reward estimate from the frozen task ledger.
-            c.visit_remaining_cells = {cell for cell in c.observation_cells
+            predicted = (c.visit_visible_cells if c.visit_visible_cells is not None
+                         else c.observation_cells)
+            c.visit_remaining_cells = {cell for cell in predicted
                                       if self.grid.value(cell) == UNKNOWN}
         by_region = {r.region_id: [c for c in records if c.region_id == r.region_id]
                      for r in selected_regions}
@@ -112,20 +117,29 @@ class RegionVisitPlanner:
 
         self.region_visit_deferred = False
         prefix = window.prefix if window.prefix_region == chosen_region else ()
+        demand_prefix = window.demand_prefix if window.prefix_region == chosen_region else ()
         if (task is not None and excluded_goals and task.region_id == chosen_region):
             # Prepare the next objective, not a different pose of the same
             # still-executing objective, when an independent sibling exists.
-            siblings = [c for c in current if c.frontier_cell != task.frontier_cell]
+            siblings = [c for c in current if not same_visit_demand(c, task)]
             if siblings:
                 current = siblings
                 prefix = tuple(f for f in prefix if f != task.frontier_cell)
+                demand_prefix = tuple(k for k in demand_prefix if k != visit_demand_key(task))
         remaining_ids = [r.region_id for r in selected_regions]
         after = remaining_ids[remaining_ids.index(chosen_region)+1:]
         lookahead = [by_region[rid] for rid in after[:2]]
         choice = choose_joint_visit(current, lookahead, routes,
-            body_yaw=getattr(self, 'body_yaw', None), retained_prefix=prefix)
+            body_yaw=getattr(self, 'body_yaw', None), retained_prefix=prefix,
+            retained_demands=demand_prefix)
+        if choice is None:
+            self.last_visit_stats = dict(window=self.last_visit_window,
+                candidates=len(records), deferred=False, reason='NO_REMAINING_VISIBLE_TARGETS')
+            self._log_visit(began)
+            return None
         candidate = choice.candidate
         window.prefix, window.prefix_region = choice.prefix, chosen_region
+        window.demand_prefix = choice.demand_prefix
         candidate.commitment_scope = window.scope(chosen_region)
         candidate.option_target_cells = set().union(*(c.observation_cells for c in current))
         self.last_selection_reason = 'bounded_joint_visit'
@@ -134,6 +148,10 @@ class RegionVisitPlanner:
             preview_candidates=sum(not c.path for c in records),
             frontier_objectives=len({(c.region_id,c.frontier_cell) for c in records}),
             prefix=[list(p) for p in choice.prefix], score=choice.score,
+            demand_prefix=list(choice.demand_prefix),
+            selected_demand=candidate.visit_demand_id,
+            selected_visible_cells=len(candidate.visit_remaining_cells),
+            selected_target_cells=len(candidate.observation_cells),
             expansions=routes.budget.used, cache_hits=routes.cache_hits,
             estimated_transitions=routes.estimated_transitions,
             preview_estimated=choice.continuation_estimated, deferred=False)
