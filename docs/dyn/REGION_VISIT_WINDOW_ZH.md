@@ -79,3 +79,17 @@ Region 访问的 scope 在任务成功发布或准确安装 ACK 后提交；同�
 临时副本中曾尝试扩大测试范围，但该副本没有复制 maps/config/launch 等集成资源，也未启用 launch_testing fixtures，整套尝试未通过，不能作为全套回归结果；验证结论仅限上述针对性测试。没有运行本轮修改后的 Gazebo 闭环长测。
 
 Region 的空间划分和 PersistentRegionTracker 尚沿用原实现。这一步不能证明旧 Region 0→12、62→90 的身份变化已被修复，也没有补齐逐格 measured-FREE 的来源记录。下一轮闭环长测应分别比较同 Region 内的路线反向、跨 Region 访问顺序、计算等待和真实执行等待；不能仅以减少 scope 释放日志宣布所有问题消失。
+
+## 2026-11-01：未来站位与决策来源补齐
+
+已安装前缀的未来站位也会进入本轮重验：检查终端规则、到当前边界的raw FREE连接和固定目标域的可见收益。有效时占用原有两个站位候选名额之一，另一名额保留新站位；无效则正常换站。每项需求不因与另一需求共享一个站位而在可见性检查前被抹掉。窗口仍为1+2 Region、每Region最多4需求、每需求2站位、共享4096展开；仅为少量旧站位增加有界几何/可见性重验，不增加路线查询候选上限。
+
+每次选择的REGION_VISIT_DECISION记录缓存释放与候选缺失原因：NO_UNKNOWN_TARGETS、BOUNDARY_REPROJECTION_UNAVAILABLE、BOUNDARY_ALREADY_USED、DEMAND_SAMPLE_LIMIT、REGION_ABSENT、OUTSIDE_VISIT_WINDOW；站位有STATION_RETAINED/STATION_REJECTED和具体原因，未产生候选时有NO_CANDIDATE_THIS_DECISION。缓存释放不是任务完成，也不是不可达黑名单。事件只保留当前决策，最多64条，超出计入overflow，不增加长期历史。
+
+comparison包含输入旧顺序、仍有候选的旧需求、缺失需求/旧站位、最优方案与有效旧方案的gain/time/score、比值和原1.15阈值。区分没有可比较旧方案与旧方案因收益/时间被替换。没有增加年龄惩罚或强制执行失效站位。这里的未来收益比较仍是有界预测，不保证每一项最终安装；发布和Local拒绝需要与REGION_VISIT_PLAN关联核对。
+
+Local B的执行边界另见[有界移动接续契约](LOCAL_CONTINUOUS_HANDOFF_B_ZH.md)。该文档尚未改动Local执行行为。
+
+本次346项针对性Python回归通过，新增11项，覆盖旧未来站位保留/占据/遮挡/收益不足/临时排除、共享站位不同需求、缓存释放分类、事件容量和换序来源。三个已录静态快照各测3次，首次选择中位数由161.2/203.1/263.2 ms变为164.2/203.8/242.9 ms；将首次计划标记为已安装后再选择，中位数由122.0/157.0/206.5 ms变为120.0/172.2/212.5 ms。后两张图中，多保留一个需求候选使总候选22→23，仍低于24，展开数均维持2688/3830/4096。复用阶段存在额外重验成本，不能声称零开销；这些离线快照不证明闭环路线或停顿已改善。
+
+连接等待的入口替换、预算所有权与录包地图验收见[连接计算持续推进](EXPLORER_CONNECTION_CONTINUATION_ZH.md)。

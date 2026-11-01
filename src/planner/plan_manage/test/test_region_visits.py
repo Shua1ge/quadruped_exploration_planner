@@ -136,7 +136,7 @@ def test_preview_estimate_is_explicit_and_cannot_create_an_executable_path():
     routes=BoundedVisitRoutes();routes.begin(grid,set(),1)
     distance,path=routes.transition((1,1),(28,1))
     assert math.isfinite(distance) and path is None
-    assert routes.estimated_transitions==1 and routes.budget.used==1
+    assert routes.estimated_transitions==1 and routes.budget.used==0
 
 
 def test_same_frontier_retains_station_alternatives_in_production_builder(monkeypatch):

@@ -1816,7 +1816,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         if self.position is None or self.active_goal is None or task is None:
             return False
         if (not force
-                and self.last_preparation_attempt_update == self.map_update_count):
+                and self.last_preparation_attempt_update == self.map_update_count
+                and getattr(self, '_pending_visit', None) is None):
             return self.prepared_candidate is not None
         self.last_preparation_attempt_update = self.map_update_count
 
@@ -1827,19 +1828,28 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         if self.grid.value(start) != FREE:
             self.publish_status("START_NOT_KNOWN_FREE")
             return False
-        frontiers = self.grid.frontier_cells(inflated)
-        clusters = cluster_frontiers(frontiers, self.min_frontier_size)
-        filtered_frontiers = clustered_frontier_cells(clusters)
-        self.latest_frontier_count = len(filtered_frontiers)
-        preprocess_ms = (
-            time.perf_counter() - preprocess_started) * 1000.0
-        self.publish_frontiers(filtered_frontiers)
-        candidate = self.choose_frontier(
-            start, clusters, inflated, blocked_edges,
-            excluded_goals=(self.active_goal,*self.current_handoff_exclusions()), allow_region_release=False,
-            allow_cross_region_preparation=True,
-            update_region_prediction=not force,
-            map_preprocess_prefix_ms=preprocess_ms)
+        resumed, resumed_candidate = self.resume_visit_connection(
+            start, blocked_edges, (self.active_goal,*self.current_handoff_exclusions()),
+            allow_region_release=False, allow_cross_region_preparation=True, required_scope=None)
+        if resumed:
+            candidate = resumed_candidate
+            if candidate is None:
+                self.publish_status("REGION_VISIT_SEARCH_PENDING")
+                return False
+        else:
+            frontiers = self.grid.frontier_cells(inflated)
+            clusters = cluster_frontiers(frontiers, self.min_frontier_size)
+            filtered_frontiers = clustered_frontier_cells(clusters)
+            self.latest_frontier_count = len(filtered_frontiers)
+            preprocess_ms = (
+                time.perf_counter() - preprocess_started) * 1000.0
+            self.publish_frontiers(filtered_frontiers)
+            candidate = self.choose_frontier(
+                start, clusters, inflated, blocked_edges,
+                excluded_goals=(self.active_goal,*self.current_handoff_exclusions()), allow_region_release=False,
+                allow_cross_region_preparation=True,
+                update_region_prediction=not force,
+                map_preprocess_prefix_ms=preprocess_ms)
         if candidate is None:
             self.publish_status("NEXT_OBSERVATION_NOT_YET_AVAILABLE")
             return False
@@ -2610,13 +2620,17 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         if self.active_goal is None:
             self.replacement_pending = False
             return False
-        if self.last_handoff_attempt_update == self.map_update_count:
+        if (self.last_handoff_attempt_update == self.map_update_count
+                and getattr(self, '_pending_visit', None) is None):
             return False
         self.last_handoff_attempt_update = self.map_update_count
         previous_goal = self.active_goal
 
         switched = self.activate_or_prepare_next_observation(
             allow_commitment_transfer=True)
+        if not switched and getattr(self, '_pending_visit', None) is not None:
+            self.publish_status("REGION_VISIT_SEARCH_PENDING")
+            return False  # continuation owns this decision; no full fallback
         if not switched:
             released = self.release_commitment_for_idle_handoff()
             if released:
@@ -2651,7 +2665,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             return True
         if self.active_goal is None:
             return False
-        if self.last_handoff_attempt_update == self.map_update_count:
+        if (self.last_handoff_attempt_update == self.map_update_count
+                and getattr(self, '_pending_visit', None) is None):
             return False
         self.last_handoff_attempt_update = self.map_update_count
         previous_goal = self.active_goal
@@ -2667,6 +2682,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
 
         switched = self.activate_or_prepare_next_observation(
             allow_commitment_transfer=True)
+        if not switched and getattr(self, '_pending_visit', None) is not None:
+            self.publish_status("REGION_VISIT_SEARCH_PENDING")
+            return False  # continuation owns this decision; no full fallback
         if not switched and self.coarse_repair_pending():
             self.publish_status("WAITING_FOR_COARSE_ROUTE_REPAIR")
             return False
@@ -3440,25 +3458,33 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 "coarse_connection=unconfirmed",
                 throttle_duration_sec=2.0)
             return False
-        frontiers = self.grid.frontier_cells(inflated)
-        clusters = cluster_frontiers(frontiers, self.min_frontier_size)
-        filtered_frontiers = clustered_frontier_cells(clusters)
-        self.latest_frontier_count = len(filtered_frontiers)
-        preprocess_ms = (
-            time.perf_counter() - preprocess_started) * 1000.0
-        self.publish_frontiers(filtered_frontiers)
-        best = self.choose_frontier(
-            start, clusters, inflated, blocked_edges,
-            excluded_goals=excluded_goals,
-            required_scope=required_scope,
+        resumed, best = self.resume_visit_connection(
+            start, blocked_edges, excluded_goals, required_scope=required_scope,
             allow_region_release=allow_region_release,
-            # Completion permits selecting a standby outside the old scope;
-            # activate_candidate still stages it and waits for Local readiness.
-            allow_cross_region_preparation=(
-                getattr(self, 'task_mode', False) and
+            allow_cross_region_preparation=(getattr(self, 'task_mode', False) and
                 getattr(self, 'completion_handoff_in_progress', False) and
-                getattr(self, 'branch_commitment', None) is None),
-            map_preprocess_prefix_ms=preprocess_ms)
+                getattr(self, 'branch_commitment', None) is None))
+        filtered_frontiers = set()
+        if not resumed:
+            frontiers = self.grid.frontier_cells(inflated)
+            clusters = cluster_frontiers(frontiers, self.min_frontier_size)
+            filtered_frontiers = clustered_frontier_cells(clusters)
+            self.latest_frontier_count = len(filtered_frontiers)
+            preprocess_ms = (
+                time.perf_counter() - preprocess_started) * 1000.0
+            self.publish_frontiers(filtered_frontiers)
+            best = self.choose_frontier(
+                start, clusters, inflated, blocked_edges,
+                excluded_goals=excluded_goals,
+                required_scope=required_scope,
+                allow_region_release=allow_region_release,
+                # Completion permits selecting a standby outside the old scope;
+                # activate_candidate still stages it and waits for Local readiness.
+                allow_cross_region_preparation=(
+                    getattr(self, 'task_mode', False) and
+                    getattr(self, 'completion_handoff_in_progress', False) and
+                    getattr(self, 'branch_commitment', None) is None),
+                map_preprocess_prefix_ms=preprocess_ms)
         if best is None:
             if getattr(self, 'region_visit_deferred', False):
                 self.publish_status("REGION_VISIT_SEARCH_PENDING")
@@ -3870,8 +3896,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 sampled = window.sample_demands(
                     region, flat, self.grid, frontier_limit,
                     self.observation_radius, task)
+                planned_stations = dict(window.retained_stations(region.region_id))
             for cluster in clusters:
-                used_viewpoints: Set[Cell] = set()
+                used_viewpoints = set()
                 task = getattr(self, "active_observation", None)
                 frontiers = list(candidate_cells(cluster))
                 # Sampling may change as a boundary shrinks. Keep the frozen
@@ -3908,6 +3935,29 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                                     if segment_known_free(
                                         self.grid, cell, frontier, inflated)]
                         viewpoints = list(dict.fromkeys(viewpoints + retained))
+                    retained_station = (planned_stations.get(demand.demand_id)
+                        if route_provider is not None and demand is not None else None)
+                    if retained_station is not None:
+                        # Keep a previous future station inside the SAME station
+                        # budget, after rechecking raw geometry and visibility.
+                        retained_reason = self.terminal_rejection_reason(
+                            retained_station, inflated, excluded_goals)
+                        if retained_reason is None and not segment_known_free(
+                                self.grid, retained_station, frontier, inflated):
+                            retained_reason = 'FRONTIER_CONNECTION_CHANGED'
+                        retained_visible = (observation_hypothesis_cells(
+                            self.grid, retained_station, set(demand.targets), self.observation_radius)
+                            if retained_reason is None else set())
+                        if retained_reason is None and len(retained_visible) < self.min_expected_observation_cells:
+                            retained_reason = 'INSUFFICIENT_VISIBLE_TARGETS'
+                        window.note('STATION_REJECTED' if retained_reason else 'STATION_RETAINED',
+                            region.region_id, demand.demand_id, station=retained_station,
+                            reason=retained_reason or 'REVALIDATED_RAW_FREE_AND_VISIBILITY')
+                        if retained_reason is None:
+                            viewpoints = list(dict.fromkeys([retained_station]+viewpoints))
+                            station_visibility[(region.region_id, frontier, retained_station)] = retained_visible
+                        else:
+                            retained_station = None
                     if not viewpoints:
                         rejected["no_safe_viewpoint"] += 1
                         outcomes.append({"region": region.region_id,
@@ -3931,18 +3981,26 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                             continue
                         terminals.append(viewpoint)
                     if station_limit is not None:
-                        terminals = station_alternatives(terminals, station_limit)
+                        if retained_station is not None and retained_station in terminals and station_limit > 0:
+                            terminals = [retained_station]+station_alternatives(
+                                [v for v in terminals if v != retained_station], station_limit-1)
+                        else:
+                            terminals = station_alternatives(terminals, station_limit)
                     for viewpoint in terminals:
-                        if viewpoint in used_viewpoints:
+                        viewpoint_key = ((demand.demand_id if demand else frontier, viewpoint)
+                                         if route_provider is not None else viewpoint)
+                        if viewpoint_key in used_viewpoints:
                             continue
-                        used_viewpoints.add(viewpoint)
+                        used_viewpoints.add(viewpoint_key)
                         target_cells = (set(task.target_cells) if same_task else
                                         set(demand.targets) if demand is not None else
                                         observation_target_cells(
                                             self.grid, frontier,
                                             self.observation_radius, viewpoint))
                         if route_provider is not None:
-                            visible = ({cell for cell in target_cells
+                            visible = station_visibility.get((region.region_id, frontier, viewpoint))
+                            if visible is None:
+                                visible = ({cell for cell in target_cells
                                         if math.dist(viewpoint, cell)*self.grid.resolution
                                         <= self.observation_radius}
                                 if demand is None and not same_task else
@@ -4005,6 +4063,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                                        +(set(demand.targets),)+proposal[8:])
             proposals = fixed_proposals
             estimate_by_cell = {}
+            route_provider.retain_goals({p[2] for p in proposals if p[0] not in preview_regions})
             for proposal in proposals:
                 rid, _, cell = proposal[:3]
                 if rid in preview_regions:
@@ -4070,14 +4129,14 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 if result.status == RouteSearchStatus.INCOMPLETE:
                     outcomes.append({"region": region_id, "viewpoint": viewpoint,
                                      "frontier": frontier, "reason": "search_pending"})
-                    continue
-                if result.status != RouteSearchStatus.FOUND:
+                if result.status not in (RouteSearchStatus.FOUND, RouteSearchStatus.INCOMPLETE):
                     rejected["astar_unreachable"] += 1
                     outcomes.append({"region": region_id, "viewpoint": viewpoint,
                                      "frontier": frontier, "reason": "astar_unreachable"})
                     continue
-                path = result.path
-                path_length = path_length_cells(path, self.grid.resolution)
+                path = result.path or []
+                path_length = (path_length_cells(path, self.grid.resolution) if path else
+                               math.dist(start, viewpoint)*self.grid.resolution)
                 turn_cost = path_turn_cost(path)
             elif estimate is None:
                 path = tree.path_to(viewpoint)
@@ -4111,7 +4170,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 commitment_scope=commitment_scope,
                 excluded_goals=tuple(excluded_goals),
                 route_source=('visit_preview' if region_id in preview_regions else
-                              'visit_bounded' if route_provider is not None else 'dense'),
+                              ('visit_bounded' if path else 'visit_pending') if route_provider is not None else 'dense'),
                 observation_progress=(
                     task.progress if isinstance(task, ObservationTask)
                     and task.region_id == region_id
@@ -4125,6 +4184,14 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         self.get_logger().info(
             f"[FRONTIER_CANDIDATE_SUMMARY] {rejected}",
             throttle_duration_sec=2.0)
+        if route_provider is not None:
+            represented = {c.visit_demand_id for c in records}
+            for (rid, frontier), demand in window.sampled_demands.items():
+                if demand.demand_id not in represented:
+                    reasons = sorted({o['reason'] for o in outcomes
+                                      if o.get('region') == rid and o.get('frontier') == frontier})
+                    window.note('NO_CANDIDATE_THIS_DECISION', rid, demand.demand_id,
+                                reasons=reasons or ['NO_STATION_PROPOSAL'])
         self.last_candidate_outcomes = outcomes[-400:]
         if route_provider is None:
             self.publish_region_overlay(regions, records)

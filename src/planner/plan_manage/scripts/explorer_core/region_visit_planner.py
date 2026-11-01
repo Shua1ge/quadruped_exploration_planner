@@ -2,7 +2,9 @@
 import math
 import time
 
-from .grid import UNKNOWN
+from .grid import UNKNOWN, FREE
+from .frontier_regions import observation_hypothesis_cells
+from .path_planning import segment_known_free
 from .path_planning import RouteSearchStatus, path_length_cells, path_turn_cost
 from .region_visits import (BoundedVisitRoutes, RegionVisitWindow, choose_joint_visit,
                            same_visit_demand, visit_demand_key)
@@ -56,6 +58,76 @@ class RegionVisitPlanner:
                 installed_demand_prefix=list(self.visit_window().demand_prefix))
             self.log_visit_plan('INSTALLED', task, request_id, trajectory_id)
 
+    def _visit_context(self, excluded, scope, release, preparation):
+        task = getattr(self, 'active_observation', None)
+        return (tuple(excluded), scope, release, preparation,
+                getattr(task, 'task_id', 0), getattr(task, 'task_version', 0),
+                getattr(task, 'information_satisfied', False), getattr(task, 'motion_released', False),
+                getattr(self, 'route_constraint_revision', 0), getattr(self, 'locomotion_epoch', 0),
+                (self.grid.width, self.grid.height, self.grid.resolution,
+                 self.grid.origin_x, self.grid.origin_y))
+
+    def resume_visit_connection(self, start, blocked_edges, excluded_goals, *,
+                                required_scope, allow_region_release, allow_cross_region_preparation):
+        batch = getattr(self, '_pending_visit', None)
+        if not self.bounded_visits_enabled() or batch is None:
+            return False, None
+        context, anchor, regions, records = batch
+        key = self._visit_context(excluded_goals, required_scope,
+                                  allow_region_release, allow_cross_region_preparation)
+        if context != key or math.dist(start, anchor)*self.grid.resolution > 1.:
+            self._pending_visit = None
+            self._visit_routes.searches.clear()
+            return False, None
+        began = time.perf_counter()
+        window = self.visit_window()
+        window.events = []; window.event_overflow = 0
+        live = []
+        for c in records:
+            if (not self.visit_candidate_available(c) or self.grid.value(c.cell) != FREE
+                    or self.terminal_rejection_reason(c.cell, set(), excluded_goals) is not None
+                    or not segment_known_free(self.grid, c.cell, c.frontier_cell, set())):
+                continue
+            visible = observation_hypothesis_cells(self.grid,c.cell,c.observation_cells,self.observation_radius)
+            if not visible:
+                continue
+            c.visit_visible_cells = visible
+            live.append(c)
+        if not live:
+            self._pending_visit = None
+            self._visit_routes.searches.clear()
+            return False, None
+        self._visit_pending_regions = set(); self._visit_capacity_regions = set()
+        routes = self._visit_routes
+        routes.begin(self.grid, blocked_edges, self.region_visit_route_expansions,
+                     revision=self.map_content_revision)
+        routes.retain_goals({c.cell for c in live})
+        for c in live:
+            if c.region_id != regions[0].region_id:
+                continue
+            result = routes.query(start,c.cell)
+            c.path = result.path or []
+            if result.status == RouteSearchStatus.FOUND:
+                c.path_length = path_length_cells(c.path,self.grid.resolution)
+                c.turn_cost = path_turn_cost(c.path); c.route_source = 'visit_bounded'
+            elif result.status == RouteSearchStatus.INCOMPLETE:
+                self._visit_pending_regions.add(c.region_id)
+                if result.reason == 'SEARCH_CACHE_CAPACITY':self._visit_capacity_regions.add(c.region_id)
+        self.region_visit_deferred = False
+        candidate = self._select_visit_records(began,start,regions,live,excluded_goals,
+            required_scope=required_scope,allow_region_release=allow_region_release,
+            allow_cross_region_preparation=allow_cross_region_preparation)
+        self.last_visit_stats['entry'] = 'CONNECTION_RESUME'
+        self.last_region_partition_ms = 0.
+        self.last_map_preprocess_ms = 0.
+        self.last_global_plan_ms = (time.perf_counter()-began)*1000
+        self.cumulative_planning_ms = getattr(self, 'cumulative_planning_ms', 0.)+self.last_global_plan_ms
+        self.get_logger().info(f"[REGION_CONNECTION_RESUME] elapsed_ms={self.last_global_plan_ms:.1f} "
+            f"expansions={routes.budget.used} candidate={candidate is not None}")
+        if candidate is None and not self.region_visit_deferred:
+            return False, None  # actual route/visibility loss wakes a new decision
+        return True, candidate
+
     def choose_window_visit(self, start, regions, blocked_edges, excluded_goals,
                             *, allow_region_release, allow_cross_region_preparation,
                             required_scope):
@@ -67,8 +139,7 @@ class RegionVisitPlanner:
                                 if r.region_id == window.committed_region
                                 and required_scope == window.committed_scope]
         self.last_visit_window = [r.region_id for r in selected_regions]
-        window.demands = {rid: pool for rid, pool in window.demands.items()
-                          if rid in self.last_visit_window}
+        window.retain_regions(self.last_visit_window, 'OUTSIDE_VISIT_WINDOW')
         self.region_visit_deferred = False
         self._visit_pending_regions = set()
         self._visit_capacity_regions = set()
@@ -76,6 +147,7 @@ class RegionVisitPlanner:
             self.region_visit_deferred = bool(window.deferred)
             self.last_visit_stats = {'window': [], 'deferred': self.region_visit_deferred,
                 'reason': 'WAITING_FOR_RELATED_INPUT_OR_CAPACITY' if window.deferred else 'NO_CURRENT_WORK'}
+            self._record_visit_evidence()
             self.publish_region_overlay(regions, [])
             return None
         routes = self._visit_routes
@@ -88,6 +160,14 @@ class RegionVisitPlanner:
             route_provider=routes,
             preview_regions={r.region_id for r in selected_regions[1:]})
         self.publish_region_overlay(regions, [c for c in records if c.path])
+        return self._select_visit_records(began, start, selected_regions, records,
+            excluded_goals, allow_region_release=allow_region_release,
+            allow_cross_region_preparation=allow_cross_region_preparation, required_scope=required_scope)
+
+    def _select_visit_records(self, began, start, selected_regions, records, excluded_goals,
+                              *, allow_region_release, allow_cross_region_preparation, required_scope):
+        window, routes = self.visit_window(), self._visit_routes
+        self._pending_visit = None
         for c in records:
             # Separate remaining-reward estimate from the frozen task ledger.
             predicted = (c.visit_visible_cells if c.visit_visible_cells is not None
@@ -102,6 +182,8 @@ class RegionVisitPlanner:
         for r in selected_regions:
             rid = r.region_id
             options = by_region[rid]
+            if rid == selected_regions[0].region_id:
+                options = [c for c in options if c.path]
             if rid in self._visit_pending_regions:
                 # Valid siblings are usable, but no sibling means pending work,
                 # not permission to silently skip a Region whose search is busy.
@@ -147,6 +229,16 @@ class RegionVisitPlanner:
                 candidates=len(records), preview_candidates=sum(not c.path for c in records), expansions=routes.budget.used,
                 deferred=self.region_visit_deferred, reason='SEARCH_INCOMPLETE' if
                 self.region_visit_deferred else 'NO_USABLE_STATION')
+            if self.region_visit_deferred and records and not self._visit_capacity_regions:
+                owner = next(iter(routes.searches.values()), None)
+                offset = next((i for i,r in enumerate(selected_regions)
+                    if owner is not None and any(c.region_id == r.region_id and c.cell == owner.goal
+                                                 for c in records)), 0)
+                waiting_regions = selected_regions[offset:]
+                waiting_ids = {r.region_id for r in waiting_regions}
+                self._pending_visit = (self._visit_context(excluded_goals, required_scope,
+                    allow_region_release, allow_cross_region_preparation), start, waiting_regions,
+                    [c for c in records if c.region_id in waiting_ids])
             self._log_visit(began)
             return None
 
@@ -190,6 +282,7 @@ class RegionVisitPlanner:
             installed_plan_id=(window.installed_plan.plan_id if window.installed_plan else None),
             installed_demand_prefix=list(window.demand_prefix),
             station_prefix=[list(p) for p in choice.station_prefix],
+            comparison=choice.comparison,
             selected_demand=candidate.visit_demand_id,
             selected_visible_cells=len(candidate.visit_remaining_cells),
             selected_target_cells=len(candidate.observation_cells),
@@ -219,6 +312,9 @@ class RegionVisitPlanner:
         if self.region_sequence != self._region_visits.order:
             self.region_sequence = list(self._region_visits.order)
             self.publish_region_sequence()
+        owner = next(iter(self._visit_routes.searches.values()), None)
+        self.last_visit_stats['connection_owner'] = (None if owner is None else
+            dict(start=owner.start, goal=owner.goal, expanded=len(owner.closed)))
         self.last_visit_stats['capacity_yields'] = len(self._visit_routes.capacity_yields)
         self.last_visit_stats['reachability_ms'] = self._visit_routes.reachability_ms
         self.last_visit_stats['reachability_bytes'] = (0 if self._visit_routes.reachable is None
@@ -226,5 +322,18 @@ class RegionVisitPlanner:
         self.last_visit_stats['elapsed_ms'] = (time.perf_counter()-began)*1000
         # Do not keep the full planning snapshot alive between callbacks.
         self._visit_routes.grid = None
+        self._record_visit_evidence()
         self.get_logger().info(
             f"[REGION_VISIT_WINDOW] {self.last_visit_stats}", throttle_duration_sec=2.)
+
+    def _record_visit_evidence(self):
+        self.last_visit_stats['demand_events'] = list(self._region_visits.events)
+        self.last_visit_stats['demand_event_overflow'] = self._region_visits.event_overflow
+        # Once per decision: throttling this record can hide a whole release
+        # or replacement before the next metrics sample. No per-tick history.
+        self.get_logger().info(
+            f"[REGION_VISIT_DECISION] revision={self.map_content_revision} "
+            f"plan={self.last_visit_stats.get('plan_id')} "
+            f"comparison={self.last_visit_stats.get('comparison')} "
+            f"events={self._region_visits.events} "
+            f"overflow={self._region_visits.event_overflow}")

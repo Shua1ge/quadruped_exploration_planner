@@ -512,3 +512,111 @@ def test_production_selection_keeps_installed_prefix_while_drafting_a_new_one():
     assert w.installed_plan is installed and w.installed_request==(10,1,10)
     assert e.last_visit_stats['plan_state']=='DRAFT'
     assert e.last_visit_stats['installed_plan_id']==installed.plan_id
+
+
+def future_station_fixture(monkeypatch):
+    e=candidate_test_explorer();e._visit_pending_regions=set()
+    e.observation_radius=4.
+    e.grid.data[2,9]=UNKNOWN
+    w=e.visit_window();d=w.freeze_demand(3,(8,2),{(9,2)})
+    plan=w.draft(NS(demand_prefix=(d.demand_id,),prefix=(d.frontier,),station_prefix=((6,4),)),3)
+    w.install(plan,(1,1,1))
+    monkeypatch.setattr(MODULE,'candidate_cells',lambda cluster:[(8,2)])
+    monkeypatch.setattr(MODULE,'safe_viewpoint_cells',lambda *a,**kw:[(6,2),(6,3)])
+    region=MODULE.FrontierRegion(3,[[(8,2)]],(8,2),{(8,2)})
+    routes=BoundedVisitRoutes();routes.begin(e.grid,set(),100)
+    return e,w,d,region,routes
+
+
+def test_future_station_outside_new_enumeration_is_revalidated_inside_same_budget(monkeypatch):
+    e,w,d,r,routes=future_station_fixture(monkeypatch)
+    cs=e.build_frontier_candidates((1,2),[r],set(),set(),frontier_limit=4,station_limit=2,route_provider=routes)
+    assert len(cs)==2 and (6,4) in {c.cell for c in cs}
+    assert all(c.visit_demand_id==d.demand_id for c in cs)
+    assert next(x for x in w.events if x['action']=='STATION_RETAINED')['station']==(6,4)
+
+
+@pytest.mark.parametrize('failure',['occupied','occluded','insufficient_gain','excluded'])
+def test_invalid_future_station_falls_back_with_a_reason_and_no_extra_candidate(monkeypatch,failure):
+    e,w,d,r,routes=future_station_fixture(monkeypatch)
+    excluded=()
+    if failure=='occupied':e.grid.data[4,6]=OCCUPIED
+    elif failure=='occluded':e.grid.data[3,7]=OCCUPIED
+    elif failure=='insufficient_gain':
+        real=MODULE.observation_hypothesis_cells
+        monkeypatch.setattr(MODULE,'observation_hypothesis_cells',
+            lambda g,v,t,r:set() if v==(6,4) else real(g,v,t,r))
+    else:excluded=(e.grid.cell_to_world((6,4)),)
+    cs=e.build_frontier_candidates((1,2),[r],set(),set(),excluded,frontier_limit=4,station_limit=2,route_provider=routes)
+    assert (6,4) not in {c.cell for c in cs} and len(cs)<=2
+    assert any(x['action']=='STATION_REJECTED' and x['reason'] for x in w.events)
+    assert d.targets==frozenset({(9,2)}) and not d.retired
+
+
+def test_sample_release_distinguishes_no_unknown_targets_capacity_and_reprojection():
+    g=grid();w=RegionVisitWindow()
+    a=w.freeze_demand(1,(8,2),{(10,2)});b=w.freeze_demand(1,(8,3),{(10,3)})
+    g.data[2,10]=g.data[3,10]=UNKNOWN
+    w.sample_demands(boundary(1,(8,2),(8,3)),[(8,2),(8,3)],g,1,3)
+    assert any(x['demand']==b.demand_id and x['reason']=='DEMAND_SAMPLE_LIMIT' for x in w.events)
+    assert not b.retired and g.value((10,3))==UNKNOWN
+    g.data[2,10]=FREE;w.events=[]
+    w.sample_demands(boundary(1,(8,2)),[(8,2)],g,1,3)
+    assert any(x['demand']==a.demand_id and x['reason']=='NO_UNKNOWN_TARGETS' for x in w.events)
+    d=w.freeze_demand(1,(10,3),{(10,3)});g.data[:,9]=OCCUPIED;w.events=[]
+    w.sample_demands(boundary(1,(7,3)),[(7,3)],g,4,4)
+    assert any(x['demand']==d.demand_id and x['reason']=='BOUNDARY_REPROJECTION_UNAVAILABLE' for x in w.events)
+
+
+def test_region_and_window_releases_are_audited_without_completing_demands():
+    w=RegionVisitWindow();a=w.freeze_demand(1,(8,2),{(10,2)})
+    b=w.freeze_demand(2,(8,3),{(10,3)})
+    w.reconcile([boundary(1,(8,2))],(0,0),1)
+    assert any(x['demand']==b.demand_id and x['reason']=='REGION_ABSENT' for x in w.events)
+    w.retain_regions([], 'OUTSIDE_VISIT_WINDOW')
+    assert any(x['demand']==a.demand_id and x['reason']=='OUTSIDE_VISIT_WINDOW' for x in w.events)
+    assert not a.retired and not b.retired
+
+
+def test_decision_evidence_has_a_fixed_capacity_and_resets_each_cycle():
+    w=RegionVisitWindow()
+    for i in range(100):w.note('TEST',1,i)
+    assert len(w.events)==64 and w.event_overflow==36
+    w.reconcile([], (0,0), 1)
+    assert not w.events and not w.event_overflow
+
+
+def test_ranking_reports_incumbent_reward_time_and_missing_station_separately():
+    a=option(1,(2,0));a.visit_demand_id=1
+    c=choose_joint_visit([a],[],EuclideanRoutes(),retained_demands=(1,),retained_stations=((1,(3,0)),))
+    assert c.comparison['missing_stations']==[(1,(3,0))]
+    assert c.comparison['incumbent_score']==c.score
+    assert c.comparison['incumbent_gain']==c.predicted_gain
+    assert c.comparison['score_ratio']==1.
+    c=choose_joint_visit([a],[],EuclideanRoutes(),retained_demands=(7,))
+    assert c.comparison['missing_demands']==[7]
+    assert c.comparison['reason']=='RETAINED_CANDIDATES_UNAVAILABLE'
+
+
+def test_shared_station_keeps_distinct_demand_evidence_inside_per_demand_budget(monkeypatch):
+    e=candidate_test_explorer();e._visit_pending_regions=set();e.observation_radius=4.
+    e.grid.data[2,9]=e.grid.data[3,9]=UNKNOWN
+    w=e.visit_window()
+    a=w.freeze_demand(3,(8,2),{(9,2)});b=w.freeze_demand(3,(8,3),{(9,3)})
+    monkeypatch.setattr(MODULE,'candidate_cells',lambda cluster:[(8,2),(8,3)])
+    monkeypatch.setattr(MODULE,'safe_viewpoint_cells',lambda *a,**kw:[(6,2)])
+    region=MODULE.FrontierRegion(3,[[(8,2),(8,3)]],(8,2),{(8,2),(8,3)})
+    routes=BoundedVisitRoutes();routes.begin(e.grid,set(),100)
+    cs=e.build_frontier_candidates((1,2),[region],set(),set(),frontier_limit=4,station_limit=2,route_provider=routes)
+    assert {c.visit_demand_id for c in cs}=={a.demand_id,b.demand_id}
+    assert len(cs)==2 and all(c.cell==(6,2) for c in cs)
+
+
+def test_no_candidate_evidence_reports_station_failure_without_retiring_demand(monkeypatch):
+    e,w,d,r,routes=future_station_fixture(monkeypatch)
+    e.grid.data[4,6]=OCCUPIED
+    monkeypatch.setattr(MODULE,'safe_viewpoint_cells',lambda *a,**kw:[])
+    cs=e.build_frontier_candidates((1,2),[r],set(),set(),frontier_limit=4,station_limit=2,route_provider=routes)
+    assert not cs and not d.retired
+    item=next(x for x in w.events if x['action']=='NO_CANDIDATE_THIS_DECISION')
+    assert item['demand']==d.demand_id and item['reasons']==['no_safe_viewpoint']

@@ -96,6 +96,22 @@ class RegionVisitWindow:
         self.plan_serial = 0
         self.installed_plan = None
         self.installed_request = None
+        self.events = []
+        self.event_overflow = 0
+
+    def note(self, action, rid, identity=None, **facts):
+        # One decision's evidence, not a permanent failure/completion ledger.
+        if len(self.events) < 64:
+            self.events.append(dict(action=action, region=rid, demand=identity, **facts))
+        else:
+            self.event_overflow += 1
+
+    def retain_regions(self, region_ids, reason):
+        for rid, pool in self.demands.items():
+            if rid not in region_ids:
+                for identity in pool:
+                    self.note('CACHE_RELEASED', rid, identity, reason=reason)
+        self.demands = {rid: pool for rid, pool in self.demands.items() if rid in region_ids}
 
     def draft(self, choice, rid):
         self.plan_serial += 1
@@ -144,10 +160,12 @@ class RegionVisitWindow:
                      if k in self.demand_prefix)
 
     def reconcile(self, regions, start, revision):
+        self.events = []
+        self.event_overflow = 0
         by_id = {r.region_id: r for r in regions}
         self.order = [rid for rid in self.order if rid in by_id]
         self.sample_cursor = {rid: cursor for rid,cursor in self.sample_cursor.items() if rid in by_id}
-        self.demands = {rid: pool for rid, pool in self.demands.items() if rid in by_id}
+        self.retain_regions(by_id, 'REGION_ABSENT')
         self.sampled_demands = {}
         self.deferred = {rid: rev for rid, rev in self.deferred.items()
                          if rid in by_id and rev == revision}
@@ -183,6 +201,12 @@ class RegionVisitWindow:
         rid = region.region_id
         valid = set().union(*(set(c) for c in region.clusters))
         pool = self.demands.setdefault(rid, OrderedDict())
+        # Installed work outlives its disposable sampling cache. Reattach only
+        # this bounded prefix, not every historical demand or a second ledger.
+        if self.installed_plan is not None and self.installed_plan.region_id == rid:
+            for ref in self.installed_plan.demands:
+                if not ref.retired and ref.demand_id in self.demand_prefix:
+                    pool.setdefault(ref.demand_id, ref)
         active_id = getattr(task, 'visit_demand_id', None) if task is not None and task.region_id == rid else None
         if active_id is not None and not task.information_satisfied:
             # Reuse the existing task's frozen domain and measurement baseline;
@@ -208,6 +232,11 @@ class RegionVisitWindow:
                 continue
             remaining = sorted(c for c in demand.targets if grid.value(c) == UNKNOWN)
             if not remaining:
+                self.note('CACHE_RELEASED', rid, identity, reason='NO_UNKNOWN_TARGETS')
+                continue
+            if len(chosen) >= limit:
+                self.note('CACHE_RELEASED', rid, identity, reason='DEMAND_SAMPLE_LIMIT',
+                          remaining=len(remaining))
                 continue
             frontier = demand.frontier if demand.frontier in valid else None
             if frontier is None:
@@ -220,14 +249,18 @@ class RegionVisitWindow:
                 frontier = next((f for f in nearby if f not in used and
                     observation_hypothesis_cells(grid, f, representatives, radius)), None)
             if frontier is None or frontier in used:
+                self.note('CACHE_RELEASED', rid, identity,
+                          reason=('BOUNDARY_REPROJECTION_UNAVAILABLE' if frontier is None
+                                  else 'BOUNDARY_ALREADY_USED'), remaining=len(remaining))
                 continue
+            if frontier != demand.frontier:
+                self.note('BOUNDARY_REPROJECTED', rid, identity,
+                          previous=demand.frontier, current=frontier)
             demand.frontier = frontier
             chosen.append(frontier)
             used.add(frontier)
             kept[identity] = demand
             self.sampled_demands[(rid, frontier)] = demand
-            if len(chosen) == limit:
-                break
         cursor = self.sample_cursor.get(rid, 0)
         rotated = choices[cursor % len(choices):]+choices[:cursor % len(choices)] if choices else []
         for frontier in rotated:
@@ -310,7 +343,7 @@ class BoundedVisitRoutes:
         self.cache_hits = 0
         self.estimated_transitions = 0
 
-    def query(self, start, goal, quota=512):
+    def query(self, start, goal, quota=None, *, preview=False):
         grid, forbidden = self.grid, self.blocked
         key = (start, goal)
         path = self.paths.get(key)
@@ -337,17 +370,27 @@ class BoundedVisitRoutes:
             return RouteSearchResult(RouteSearchStatus.FOUND, direct)
         if grid.value(start) != FREE or grid.value(goal) != FREE:
             return RouteSearchResult(RouteSearchStatus.NO_ROUTE, reason='ENDPOINT_NOT_KNOWN_FREE')
+        if preview:
+            return RouteSearchResult(RouteSearchStatus.INCOMPLETE, reason='PREVIEW_ESTIMATE_ONLY')
+        # One unfinished connection owns the bounded search working set.
+        # Other candidates can use cheap/cache witnesses, but cannot evict it.
+        if self.searches and not any(k[1] == goal for k in self.searches):
+            self.pending.add(goal)
+            return RouteSearchResult(RouteSearchStatus.INCOMPLETE, reason='CONNECTION_OWNER_BUSY')
+        if self.budget.remaining <= 0:
+            self.pending.add(goal)
+            return RouteSearchResult(RouteSearchStatus.INCOMPLETE, reason='EXPANSION_BUDGET')
         # A one-byte reachability index prevents an unreachable endpoint from
         # exhausting/restarting a Python search over an entire large map. It
         # contains no occupancy/terrain authority. Four-connectivity has the
         # same components as 8-connectivity without diagonal corner cutting.
-        if self.reachable is None:
+        if self.reachable is None and not self.searches:
             began = time.perf_counter()
             seed = np.zeros(grid.data.shape, dtype=bool)
             seed[start[1],start[0]] = True
             self.reachable = binary_propagation(seed, mask=grid.data == FREE)
             self.reachability_ms += (time.perf_counter()-began)*1000.
-        if bool(self.reachable[start[1],start[0]]) != bool(self.reachable[goal[1],goal[0]]):
+        if self.reachable is not None and bool(self.reachable[start[1],start[0]]) != bool(self.reachable[goal[1],goal[0]]):
             return RouteSearchResult(RouteSearchStatus.NO_ROUTE, reason='RAW_COMPONENT_DISCONNECTED')
         search_key = key
         search = self.searches.get(key)
@@ -362,10 +405,14 @@ class BoundedVisitRoutes:
                     break
         if search is None or not search.current(grid, forbidden):
             search_key = key
+            self.searches.clear()  # old start/evidence cannot own a second search
             search = KnownFreeSearch(start, goal)
             self.searches[search_key] = search
         self.searches.move_to_end(search_key)
-        local = ExpansionBudget(min(max(0, quota), self.budget.remaining))
+        # Current terminal connections may use the remaining decision budget.
+        # Preview transitions retain their small quota and cannot displace one.
+        local = ExpansionBudget(self.budget.remaining if quota is None else
+                                min(max(0, quota), self.budget.remaining))
         result = search.advance(grid, forbidden, local)
         self.budget.used += local.used
         if result.status == RouteSearchStatus.FOUND:
@@ -387,6 +434,12 @@ class BoundedVisitRoutes:
             result.reason = 'SEARCH_CACHE_CAPACITY'
             self.capacity_yields.add(goal)
         return result
+
+    def retain_goals(self, goals):
+        """Release an owner only when its problem is no longer requested."""
+        for key in list(self.searches):
+            if key[1] not in goals:
+                self.searches.pop(key)
 
     def _join(self, start, path):
         if not adjacent_grid_path_is_valid(self.grid,path,set(),self.blocked):
@@ -415,7 +468,7 @@ class BoundedVisitRoutes:
     def transition(self, a, b):
         if a == b:
             return 0., None
-        result = self.query(a, b, quota=96)
+        result = self.query(a, b, preview=True)
         if result.status == RouteSearchStatus.FOUND:
             return path_length_cells(result.path, self.grid.resolution), result.path
         if result.status == RouteSearchStatus.NO_ROUTE:
@@ -443,6 +496,7 @@ class JointVisitChoice:
     reordered: bool = False
     predicted_gain: int = 0
     station_prefix: tuple = ()
+    comparison: object = None
 
 
 @dataclass(frozen=True)
@@ -534,7 +588,8 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
     if not current:
         return None
     keys = {visit_demand_key(c) for c in current}
-    retained = tuple(k for k in (retained_demands or retained_prefix) if k in keys)
+    requested = tuple(retained_demands or retained_prefix)
+    retained = tuple(k for k in requested if k in keys)
     available = {(visit_demand_key(c), c.cell) for c in current}
     stations = {k: s for k, s in retained_stations if (k, s) in available}
     def follows_retained(prefix):
@@ -644,4 +699,20 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
             best = incumbent
     result = best[1]
     result.reordered = bool(retained) and not best[2]
+    incumbent = max(incumbents, key=lambda item:item[0])[1] if incumbents else None
+    result.comparison = dict(
+        retained=list(requested), available=list(retained),
+        missing_demands=[k for k in requested if k not in keys],
+        missing_stations=[(k,s) for k,s in retained_stations if (k,s) not in available],
+        reason=('NO_RETAINED_PREFIX' if not requested else
+                'RETAINED_CANDIDATES_UNAVAILABLE' if not retained else
+                'RETAINED_ORDER_UNAVAILABLE' if incumbent is None else
+                'GAIN_TIME_IMPROVEMENT' if result.reordered else 'RETAINED_WITHIN_HYSTERESIS'),
+        threshold=model.reorder_ratio,
+        winner_gain=result.predicted_gain, winner_time_s=result.estimated_time_s,
+        winner_score=result.score,
+        incumbent_gain=incumbent.predicted_gain if incumbent else None,
+        incumbent_time_s=incumbent.estimated_time_s if incumbent else None,
+        incumbent_score=incumbent.score if incumbent else None,
+        score_ratio=(result.score/incumbent.score if incumbent and incumbent.score>0 else None))
     return result
