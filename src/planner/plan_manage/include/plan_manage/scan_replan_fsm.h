@@ -208,6 +208,8 @@ namespace scan_planner
     std::vector<Eigen::Vector2d> task_rejected_stations_;
     std::vector<Eigen::Vector2d> task_visited_stations_;
     std::vector<Eigen::Vector3d> task_approach_;
+    TaskApproachContext task_approach_context_;
+    double task_approach_margin_{0.0};
     std::vector<DirectedRoutePortal> task_route_portals_;
     size_t task_route_cursor_{0};
     Eigen::Vector2d task_route_last_position_{Eigen::Vector2d::Zero()};
@@ -272,6 +274,7 @@ namespace scan_planner
       rclcpp::Time start_time;
       double duration{0.0};
       double controller_execution_time{0.0};
+      std::chrono::steady_clock::time_point feedback_received{};
       double handoff_matched_time{0.0};
       double handoff_target_yaw{std::numeric_limits<double>::quiet_NaN()};
       double handoff_turn_position_allowance{kHandoffPositionAllowance};
@@ -427,9 +430,23 @@ namespace scan_planner
         double seed_sample_interval = 0.0,
         const PredictedCollisionInterval *seed_interval = nullptr,
         double seed_base_time = 0.0,
-        bool fixed_body_yaw_repair = true); // front-end and back-end method
+        bool fixed_body_yaw_repair = true, const UniformBspline* retained_prefix = nullptr, double retained_source_time = 0.0); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
+    bool keepOrdinaryPredecessor(const LocalTrajData &previous, const char *reason);
+    bool activeAlignmentOwnsMotion();
+    enum class CandidateOutcome { NOT_READY, FAILED, ENTRY_MISMATCH, SUBMITTED };
+    CandidateOutcome candidate_outcome_{CandidateOutcome::NOT_READY};
+    struct TaskPreparationTiming {
+      double target_ms{0.0}, selector_ms{0.0}, clearance_ms{0.0};
+      double visibility_ms{0.0}, visibility_lock_wait_ms{0.0}, raycast_ms{0.0};
+      double seed_sample_ms{0.0};
+      size_t rays{0}, terminal_checks{0}, terminal_cache_hits{0}, dominated{0};
+      size_t visibility_cache_hits{0}, nonprogress_endpoints{0};
+      bool reused{false}, cross_task{false};
+    } task_preparation_timing_;
+    double planning_entry_yaw_{std::numeric_limits<double>::quiet_NaN()};
+    double last_rolling_prepare_wall_s_{0.25};
     bool tryStructuredLocalRepair();
     bool tryBoundaryEscape(std::string& rejection);
     TaskTransitionRestGate boundary_departure_rest_gate_;

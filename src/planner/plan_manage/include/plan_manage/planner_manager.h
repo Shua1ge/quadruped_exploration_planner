@@ -1,6 +1,7 @@
 #ifndef _PLANNER_MANAGER_H_
 #define _PLANNER_MANAGER_H_
 
+#include <functional>
 #include <stdlib.h>
 #include <limits>
 
@@ -39,7 +40,10 @@ namespace scan_planner
                        double end_acc_y = 0.0,
                        double end_acc_z = 0.0,
                        double seed_sample_interval = 0.0,
-                       double preferred_clearance_margin = 0.0);
+                       double preferred_clearance_margin = 0.0,
+                       double suffix_progress = std::numeric_limits<double>::quiet_NaN(),
+                       const UniformBspline* retained_prefix = nullptr,
+                       const std::function<double(const Eigen::Vector2d&,Eigen::Vector2d*)>& corridor_cost = {});
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
@@ -71,7 +75,7 @@ namespace scan_planner
     void reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt,
                         double &time_inc);
 
-    bool refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points);
+    bool refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points, bool preserve_start=false);
 
     // !SECTION stable
 

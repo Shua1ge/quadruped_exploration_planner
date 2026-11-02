@@ -1,3 +1,4 @@
+import pytest
 import pathlib
 import sys
 from collections import deque
@@ -716,7 +717,8 @@ def test_time_and_task_change_do_not_reopen_unchanged_departure_failure():
     assert value.local_motion_retry_allowed(attempt)
 
 
-def test_turn_stage_successor_wait_is_finite_and_duplicate_does_not_extend_it():
+@pytest.mark.parametrize('reason',('WAITING_FOR_TURN_STAGE','WAITING_FOR_ACTIVE_ALIGNMENT'))
+def test_turn_stage_successor_wait_is_finite_and_duplicate_does_not_extend_it(reason):
     from explorer_core.observation_task_bridge import PendingObservationHandoff
     value=bridge();value.path_request_timeout=5.;value.publish_status=lambda _:None
     task=SimpleNamespace(task_id=101,task_version=1,goal=(3.,2.))
@@ -729,7 +731,7 @@ def test_turn_stage_successor_wait_is_finite_and_duplicate_does_not_extend_it():
         cancelled.append(reason);pending.state='CANCELLING';pending.cancel_started_ns=now.nanoseconds
     value.cancel_pending_observation_handoff=cancel
     message=ObservationFeedback(task_id=101,task_version=1,request_id=99,
-        state=ObservationFeedback.TRANSITION_WAIT_STOP,reason='WAITING_FOR_TURN_STAGE')
+        state=ObservationFeedback.TRANSITION_WAIT_STOP,reason=reason)
     assert value.pending_observation_feedback(message)
     now.nanoseconds+=8_000_000_000
     assert value.continue_pending_observation_handoff()

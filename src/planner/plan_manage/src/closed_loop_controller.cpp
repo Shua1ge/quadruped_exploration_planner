@@ -397,6 +397,7 @@ private:
     double start_error = 0.0;
     double matched_error = 0.0;
     double matched_yaw_error = 0.0;
+    bool inherits_running_prefix=false;
     const double turn_position_allowance=msg->handoff_turn_position_allowance==0.
         ? kHandoffPositionAllowance : msg->handoff_turn_position_allowance;
     const double alignment_tolerance=msg->handoff_alignment_tolerance==0.
@@ -485,6 +486,46 @@ private:
       matched_yaw_error = std::abs(normalizeAngle(candidateDesiredYaw(
           candidate, candidate_duration, matched_time, candidate_fixed_yaw,
           candidate_body_yaw, msg->use_measured_progress) - odom_yaw_));
+      if(msg->retained_prefix_duration>0.) {
+        // An existing tracking residual is not a new command jump. This
+        // exception needs an exact, live predecessor and a C2-identical prefix;
+        // arbitrary rolling candidates retain the measured-velocity gate.
+        const double source=msg->retained_predecessor_time;
+        bool same=receive_traj_ && traj_.size()==3 && !soft_hold_ &&
+            !simulation_collision_latched_ && !motion_stalled_ && !terminal_capture_latched_ &&
+            !handoff_alignment_pending_ && !handoff_alignment_deviated_ && !uncertified_turn_latched_ &&
+            active_execution_mode_==scan_planner_msgs::msg::Bspline::MODE_NORMAL &&
+            msg->execution_mode==scan_planner_msgs::msg::Bspline::MODE_NORMAL &&
+            !candidate_fixed_yaw && active_measured_progress_ && msg->use_measured_progress &&
+            active_request_id_==msg->retained_predecessor_request_id &&
+            traj_id_==msg->retained_predecessor_trajectory_id &&
+            std::isfinite(source) && source>=0. && std::isfinite(msg->retained_prefix_duration) &&
+            source+msg->retained_prefix_duration<=traj_duration_+1e-8 &&
+            matched_time<msg->retained_prefix_duration &&
+            std::abs(candidate_max_vx-active_max_vx_)<1e-9 &&
+            std::abs(candidate_max_vy-active_max_vy_)<1e-9 &&
+            std::abs(candidate_max_vyaw-active_max_vyaw_)<1e-9;
+        const double overlap=std::min(.10,std::max(0.,msg->retained_prefix_duration-matched_time));
+        for(int i=0;i<=3 && same;++i) {
+          const double t=matched_time+overlap*i/3.;
+          for(int derivative=0;derivative<3;++derivative) {
+            const double tolerance=derivative==0 ? 1e-6 : (derivative==1 ? 1e-5 : 1e-4);
+            if((candidate[derivative].evaluateDeBoorT(t)-traj_[derivative].evaluateDeBoorT(source+t)).norm()>tolerance)
+              same=false;
+          }
+        }
+        if(same && (candidate[1].evaluateDeBoorT(matched_time).head<2>()-
+              traj_[1].evaluateDeBoorT(exec_time_).head<2>()).norm()>handoff_max_deceleration_*handoff_reaction_time_)
+          same=false;
+        if(!same) {
+          publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+              "HANDOFF_COMMON_PREFIX_PROOF_CHANGED",matched_time,matched_error,matched_yaw_error);
+          return;
+        }
+        inherits_running_prefix=true;
+        RCLCPP_INFO(get_logger(),"[HANDOFF_COMMON_PREFIX_VERIFIED] predecessor=%lld successor=%lld matched=%.3f verified_span=%.3f; command continuity verified, existing measured tracking residual retained",
+            static_cast<long long>(traj_id_),static_cast<long long>(msg->traj_id),matched_time,overlap);
+      }
       if (msg->rolling_task_handoff) {
         if(handoff_alignment_pending_) {
           publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
@@ -502,8 +543,8 @@ private:
         const double velocity_limit = handoff_max_deceleration_ * handoff_reaction_time_;
         const bool heading_jump = matched_yaw_error >
             std::min(max_handoff_yaw_error_,heading_release_threshold_);
-        if (heading_jump ||
-            (candidate_velocity.head<2>()-odom_world_velocity).norm() > velocity_limit) {
+        if (!inherits_running_prefix && (heading_jump ||
+            (candidate_velocity.head<2>()-odom_world_velocity).norm() > velocity_limit)) {
           publishTrajectoryAck(*msg, scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
               heading_jump ? "HANDOFF_ROLLING_HEADING_ERROR" : "HANDOFF_ROLLING_VELOCITY_ERROR",
               matched_time,matched_error,matched_yaw_error);
@@ -591,7 +632,7 @@ private:
     terminal_best_error_ = std::numeric_limits<double>::infinity();
     terminal_last_progress_time_ = now();
     resetHeadingFreezeState();
-    handoff_alignment_pending_=handoffNeedsHeadingAlignment(msg->handoff_certified,
+    handoff_alignment_pending_=!inherits_running_prefix && handoffNeedsHeadingAlignment(msg->handoff_certified,
         candidate_fixed_yaw,unfinished_alignment,odom_vel_.head<2>().norm(),
         matched_yaw_error,heading_release_threshold_);
     const auto install_time=now();

@@ -375,3 +375,26 @@ TEST(TerrainMotionPolicy, SameMeasuredTerrainDifferentExplicitCapabilities) {
   EXPECT_EQ(ordinary.assess(fact),plan_env::TerrainVerdict::OVERHEAD);
   ordinary.maximum_drop=-1.;EXPECT_THROW(ordinary.validate(),std::invalid_argument);
 }
+
+TEST(ObservationSnapshot, RawVisibilityDoesNotUseInflationOrLiveMapLocks) {
+  GridMap::InflatedOccupancySnapshot s;
+  s.voxel_num={4,4,4};s.bound_min={0,0,0};s.bound_max={3,3,3};s.resolution_inv=1.;
+  s.buffer.assign(64,1);s.raw_occupied_bits.assign(8,0);
+  auto ray=[&](){return plan_env::observationRayMayReach({.5,.5,.5},{3.5,.5,.5},1.,
+      [&](const Eigen::Vector3d& p){return s.getRawOccupancy(p);});};
+  EXPECT_EQ(s.getCylinderOccupancy({2.5,.5,.5}),1);
+  EXPECT_EQ(s.getRawOccupancy({2.5,.5,.5}),0);EXPECT_TRUE(ray());
+  const int address=2*16;
+  s.raw_occupied_bits[address/8]|=1u<<(address%8);
+  EXPECT_EQ(s.getRawOccupancy({2.5,.5,.5}),1);EXPECT_FALSE(ray());
+  EXPECT_EQ(s.getRawOccupancy({4.5,.5,.5}),-1);
+}
+TEST(ObservationSnapshot, RawEvidencePreservesNegativeRingCoordinatesAndUnavailableBounds) {
+  GridMap::InflatedOccupancySnapshot s;
+  s.voxel_num={4,4,4};s.bound_min={-4,-4,-4};s.bound_max={-1,-1,-1};s.resolution_inv=1.;
+  EXPECT_EQ(s.getRawOccupancy({-.5,-.5,-.5}),-1);
+  s.raw_occupied_bits.assign(8,0);s.raw_occupied_bits[7]=128;
+  EXPECT_EQ(s.getRawOccupancy({-.5,-.5,-.5}),1);
+  EXPECT_EQ(s.getRawOccupancy({-1.5,-.5,-.5}),0);
+  EXPECT_EQ(s.getRawOccupancy({.5,-.5,-.5}),-1);
+}

@@ -79,8 +79,8 @@ def main():
                         help="start the Ignition GUI (not headless)")
     parser.add_argument("--show-rviz", action="store_true")
     parser.add_argument("--task-mode", action="store_true", default=True)
-    parser.add_argument("--global-mode", choices=("off", "shadow", "route_cost"),
-                        default="shadow", help="Global usage: default observes only")
+    parser.add_argument("--global-mode", choices=("off", "shadow", "route_cost", "memory"),
+                        default="memory", help="Global usage: bounded route memory by default; shadow runs the full graph")
     parser.add_argument("--sparse-routing", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="legacy sparse-route switch; used only with --global-mode route_cost")

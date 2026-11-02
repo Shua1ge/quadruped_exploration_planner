@@ -54,6 +54,11 @@ class TestTaskRuntime(unittest.TestCase):
                 # time rather than assumed to coincide with body zero.
                 "-p","obstacle_min_z:=-0.25","-p","obstacle_max_z:=0.25"]),)
         for executable,extra in processes:
+            if (executable == "closed_loop_controller" and self._testMethodName ==
+                    "test_stopped_handoff_finishes_small_rotation_before_translation"):
+                # This scenario asserts the production align-then-connect
+                # contract, with the optional moving-alignment exception off.
+                extra += ["-p", "handoff_moving_alignment_tolerance:=0.0"]
             if (executable == "scan_planner_node" and
                     self._testMethodName == "test_cancel_confirmation_timeout_is_explicit_and_recoverable"):
                 extra += ["-p", "fsm.task_cancel_timeout:=0.5"]
@@ -67,7 +72,10 @@ class TestTaskRuntime(unittest.TestCase):
                         "test_rolling_rejection_waits_for_confirmed_rest_before_retry",
                         "test_failed_recovery_rejoin_rejection_is_terminal",
                         "test_failed_recovery_rejoin_ack_timeout_does_not_restart_escape",
-                        "test_installation_rejection_retries_same_station_without_blacklist")):
+                        "test_installation_rejection_retries_same_station_without_blacklist",
+                        "test_cross_task_rejection_keeps_acknowledged_predecessor",
+                        "test_same_successor_retry_reuses_own_route_before_install",
+                        "test_moving_successor_retains_exact_common_prefix")):
                 extra += ["-r", "planning/bspline:=controller_spline_proxy"]
             if executable=="scan_planner_node" and self._testMethodName=="test_original_laser_no_return_updates_local_patch":
                 extra += ["-p","grid_map.use_laser_scan:=true","-p","grid_map.need_extrinsic:=false"]
@@ -122,6 +130,12 @@ class TestTaskRuntime(unittest.TestCase):
         cls.executor.shutdown()
         cls.node.destroy_node()
         rclpy.shutdown(context=cls.context)
+        artifact=os.environ.get('SCAN_TEST_ARTIFACT_DIR')
+        if artifact:
+            directory=pathlib.Path(artifact);directory.mkdir(parents=True,exist_ok=True)
+            for index,log in enumerate(cls.logs):
+                (directory/f'{self._testMethodName}-{index}.log').write_text(
+                    os.pread(log.fileno(),os.fstat(log.fileno()).st_size,0).decode())
         for log in cls.logs: log.close()
 
     def spin_until(self,predicate,timeout=5):
@@ -2081,6 +2095,205 @@ rclpy.spin(e)
         self.spin_until(lambda:'[LOCAL_TERRAIN_LIMIT]' in self.read_child_log(0),timeout=8)
         self.assertIn('reason=GROUND_SLOPE_LIMIT',self.read_child_log(0))
         self.assertFalse(any(f.task_id==8994 and f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+
+
+    def test_successor_waits_for_installed_alignment_without_stopping_it(self):
+        # Isolated ROS fixture with mock odometry; no Gazebo or hardware.
+        self.pose_yaw=.5
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and bool(self.patches),timeout=8)
+        first=self.task(9010);self.auto_ack_request=first.request_id
+        commands=[]
+        self.node.create_subscription(ExecutionCommand,"planning/execution_command",commands.append,20)
+        self.task_pub.publish(first)
+        self.spin_until(lambda:any('PATH_TRAJECTORY_READY' in s and
+            f'request_id={first.request_id}' in s for s in self.statuses),timeout=10)
+        self.spin_until(lambda:any(s.task_id==9010 and
+            s.state==ExecutionState.STATE_HEADING_FROZEN for s in self.states))
+        until=time.monotonic()+.2
+        self.spin_until(lambda:time.monotonic()>=until)
+        successor=self.task(9011)
+        successor.predecessor_task_id=first.task_id;successor.predecessor_task_version=1
+        self.task_pub.publish(successor)
+        self.spin_until(lambda:any(f.request_id==successor.request_id and
+            f.reason=='WAITING_FOR_ACTIVE_ALIGNMENT' for f in self.feedback))
+        mark=len(commands);until=time.monotonic()+.5
+        self.spin_until(lambda:time.monotonic()>=until)
+        self.assertFalse(any(s.task_id==9011 for s in self.splines))
+        self.assertFalse(any(c.command==ExecutionCommand.COMMAND_HOLD for c in commands[mark:]))
+        # A fresh RUNNING report after real alignment releases the queued task.
+        self.pose_yaw=0.;self.auto_ack_request=successor.request_id
+        self.spin_until(lambda:any(s.task_id==9011 for s in self.splines),timeout=10)
+
+
+    def test_cross_task_rejection_keeps_acknowledged_predecessor(self):
+        # Proxy B away from Controller so its real RUNNING state remains A.
+        # Injecting an exact candidate rejection must not itself HOLD A.
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and bool(self.patches),timeout=8)
+        proxy=self.node.create_publisher(Bspline,"controller_spline_proxy",20)
+        self.spin_until(lambda:proxy.get_subscription_count()>0)
+        commands=[]
+        self.node.create_subscription(ExecutionCommand,"planning/execution_command",commands.append,20)
+        first=self.task(9020);self.auto_ack_request=first.request_id
+        self.task_pub.publish(first)
+        self.spin_until(lambda:any(s.task_id==9020 for s in self.splines),timeout=10)
+        original=next(s for s in self.splines if s.task_id==9020)
+        proxy.publish(original)
+        self.spin_until(lambda:any('PATH_TRAJECTORY_READY' in s and
+            f'request_id={first.request_id}' in s for s in self.statuses))
+        self.spin_until(lambda:any(s.task_id==9020 and s.state==ExecutionState.STATE_RUNNING for s in self.states))
+        successor=self.task(9021)
+        successor.predecessor_task_id=first.task_id;successor.predecessor_task_version=1
+        self.task_pub.publish(successor)
+        self.spin_until(lambda:any(s.task_id==9021 for s in self.splines),timeout=10)
+        candidate=next(s for s in self.splines if s.task_id==9021)
+        rejection=TrajectoryAck()
+        rejection.stamp=self.node.get_clock().now().to_msg()
+        rejection.task_id=candidate.task_id;rejection.task_version=candidate.task_version
+        rejection.request_id=candidate.request_id;rejection.trajectory_id=candidate.traj_id
+        rejection.candidate_id=candidate.candidate_id
+        rejection.status=TrajectoryAck.STATUS_REJECTED
+        rejection.reason='HANDOFF_ROLLING_HEADING_ERROR'
+        mark=len(commands);self.ack_pub.publish(rejection)
+        self.spin_until(lambda:'source=HANDOFF_ROLLING_HEADING_ERROR' in self.read_child_log(0) or
+            'reason=HANDOFF_ROLLING_HEADING_ERROR' in self.read_child_log(0))
+        log=self.read_child_log(0)
+        self.assertIn('[ROLLING_PREDECESSOR_RETAINED]',log)
+        until=time.monotonic()+.2
+        self.spin_until(lambda:time.monotonic()>=until)
+        self.assertEqual(self.states[-1].task_id,first.task_id)
+        self.assertEqual(self.states[-1].state,ExecutionState.STATE_RUNNING)
+        self.assertFalse(any(c.command==ExecutionCommand.COMMAND_HOLD for c in commands[mark:]))
+        self.assertFalse(any(f.request_id==successor.request_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+
+    def test_same_successor_retry_reuses_own_route_before_install(self):
+        # Proxy B away from Controller so its real RUNNING state remains A.
+        # Injecting an exact candidate rejection must not itself HOLD A.
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and bool(self.patches),timeout=8)
+        proxy=self.node.create_publisher(Bspline,"controller_spline_proxy",20)
+        self.spin_until(lambda:proxy.get_subscription_count()>0)
+        commands=[]
+        self.node.create_subscription(ExecutionCommand,"planning/execution_command",commands.append,20)
+        self.pose_vx=.20;self.advance_pose=True
+        first=self.task(9020);first.local_geometry_autonomy=True
+        first.goal=Point(x=3.,y=0.,z=0.)
+        first.coarse_route=[Point(x=0.,y=0.,z=0.),first.goal]
+        self.auto_ack_request=first.request_id
+        self.task_pub.publish(first)
+        self.spin_until(lambda:any(s.task_id==9020 for s in self.splines),timeout=10)
+        original=next(s for s in self.splines if s.task_id==9020)
+        proxy.publish(original)
+        self.spin_until(lambda:any('PATH_TRAJECTORY_READY' in s and
+            f'request_id={first.request_id}' in s for s in self.statuses))
+        self.spin_until(lambda:any(s.task_id==9020 and s.state==ExecutionState.STATE_RUNNING for s in self.states))
+        successor=self.task(9021);successor.local_geometry_autonomy=True
+        successor.goal=Point(x=2.8,y=.1,z=0.)
+        successor.coarse_route=[Point(x=self.pose_x,y=0.,z=0.),successor.goal]
+        successor.predecessor_task_id=first.task_id;successor.predecessor_task_version=1
+        self.task_pub.publish(successor)
+        self.spin_until(lambda:any(s.task_id==9021 for s in self.splines),timeout=10)
+        candidate=next(s for s in self.splines if s.task_id==9021)
+        rejection=TrajectoryAck()
+        rejection.stamp=self.node.get_clock().now().to_msg()
+        rejection.task_id=candidate.task_id;rejection.task_version=candidate.task_version
+        rejection.request_id=candidate.request_id;rejection.trajectory_id=candidate.traj_id
+        rejection.candidate_id=candidate.candidate_id
+        rejection.status=TrajectoryAck.STATUS_REJECTED
+        rejection.reason='HANDOFF_COMMON_PREFIX_PROOF_CHANGED'
+        mark=len(commands);self.ack_pub.publish(rejection)
+        self.spin_until(lambda:'source=HANDOFF_COMMON_PREFIX_PROOF_CHANGED' in self.read_child_log(0) or
+            'reason=HANDOFF_COMMON_PREFIX_PROOF_CHANGED' in self.read_child_log(0))
+        log=self.read_child_log(0)
+        self.assertIn('[ROLLING_PREDECESSOR_RETAINED]',log)
+        self.spin_until(lambda:any('[TASK_APPROACH_REUSED]' in line and
+            f'request={successor.request_id} ' in line and 'cross_task=1' in line
+            for line in self.read_child_log(0).splitlines()),timeout=6)
+        self.assertIn('[LOCAL_PREPARATION_TIMING]',self.read_child_log(0))
+        self.assertEqual(self.states[-1].task_id,first.task_id)
+        self.assertEqual(self.states[-1].state,ExecutionState.STATE_RUNNING)
+        self.assertFalse(any(c.command==ExecutionCommand.COMMAND_HOLD for c in commands[mark:]))
+        self.assertFalse(any(f.request_id==successor.request_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+
+    def test_moving_successor_retains_exact_common_prefix(self):
+        # Proxy B away from Controller so its real RUNNING state remains A.
+        # Injecting an exact candidate rejection must not itself HOLD A.
+        self.spin_until(lambda:self.task_pub.get_subscription_count()>0 and bool(self.patches),timeout=8)
+        proxy=self.node.create_publisher(Bspline,"controller_spline_proxy",20)
+        self.spin_until(lambda:proxy.get_subscription_count()>0)
+        commands=[]
+        self.node.create_subscription(ExecutionCommand,"planning/execution_command",commands.append,20)
+        self.pose_vx=.20;self.advance_commands=True
+        first=self.task(9020);first.local_geometry_autonomy=True
+        first.goal=Point(x=3.,y=0.,z=0.)
+        first.coarse_route=[Point(x=0.,y=0.,z=0.),first.goal]
+        self.auto_ack_request=first.request_id
+        self.task_pub.publish(first)
+        self.spin_until(lambda:any(s.task_id==9020 for s in self.splines),timeout=10)
+        original=next(s for s in self.splines if s.task_id==9020)
+        proxy.publish(original)
+        self.spin_until(lambda:any('PATH_TRAJECTORY_READY' in s and
+            f'request_id={first.request_id}' in s for s in self.statuses))
+        self.spin_until(lambda:any(s.task_id==9020 and s.state==ExecutionState.STATE_RUNNING for s in self.states))
+        self.spin_until(lambda:self.pose_vx>.10 and self.pose_x>.12,timeout=6)
+        successor=self.task(9021);successor.local_geometry_autonomy=True
+        successor.goal=Point(x=2.8,y=.1,z=0.)
+        successor.coarse_route=[Point(x=self.pose_x,y=0.,z=0.),successor.goal]
+        successor.predecessor_task_id=first.task_id;successor.predecessor_task_version=1
+        handoff_mark=len(commands)
+        self.task_pub.publish(successor)
+        self.spin_until(lambda:any(s.task_id==9021 for s in self.splines),timeout=10)
+        candidate=next(s for s in self.splines if s.task_id==9021)
+        import re
+        lines=[line for line in self.read_child_log(0).splitlines()
+            if '[ROLLING_COMMON_PREFIX]' in line and f'request={successor.request_id} ' in line]
+        self.assertTrue(lines,self.read_child_log(0)[-16000:])
+        local_log=self.read_child_log(0)
+        self.assertIn('[TASK_JOIN_PROBE]',local_log)
+        self.assertIn('[TASK_ENTRY_GUIDE]',local_log)
+        self.assertIn('result=READY',local_log)
+        line=lines[0]
+        source=float(re.search(r'source_t=([0-9.]+)',line)[1])
+        end=float(re.search(r'join_t=([0-9.]+)',line)[1]);common=end-source
+        self.assertGreater(common,.14)
+        def evaluate(msg,time):
+            u=list(msg.knots);p=msg.order;n=len(msg.pos_pts)-1;t=time+u[p]
+            span=n if t>=u[n+1] else next(k for k in range(p,n+1) if u[k]<=t<u[k+1])
+            d=[[q.x,q.y,q.z] for q in msg.pos_pts[span-p:span+1]]
+            for level in range(1,p+1):
+                for j in range(p,level-1,-1):
+                    z=j+span-p;alpha=(t-u[z])/(u[z+p-level+1]-u[z])
+                    d[j]=[(1-alpha)*d[j-1][axis]+alpha*d[j][axis] for axis in range(3)]
+            return d[p]
+        for fraction in [0.,.2,.5,.8,1.]:
+            a=evaluate(original,source+common*fraction);b=evaluate(candidate,common*fraction)
+            self.assertLess(math.sqrt(sum((x-y)**2 for x,y in zip(a,b))),1e-6)
+        self.assertGreater(candidate.knots[-candidate.order-1]-candidate.knots[candidate.order]-common,.35)
+        self.assertFalse(any(f.request_id==successor.request_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+        # Continuous map fusion is part of this fixture; all visibility reads
+        # must use the same published raw snapshot, with no per-ray map lock.
+        prep=[x for x in self.read_child_log(0).splitlines() if '[LOCAL_PREPARATION_TIMING]' in x]
+        self.assertTrue(prep)
+        self.assertTrue(all(float(re.search(r'visibility_lock_wait_ms=([0-9.]+)',x)[1])==0. for x in prep))
+        forged=copy.deepcopy(candidate)
+        forged.retained_predecessor_trajectory_id+=100
+        self.auto_ack_request=successor.request_id
+        # Same reliable publisher preserves order; do not deliberately age the
+        # valid 2-cm installation certificate while testing the forged proof.
+        proxy.publish(forged)
+        proxy.publish(candidate)
+        self.spin_until(lambda:any(ack.request_id==successor.request_id and ack.trajectory_id==candidate.traj_id and ack.status==TrajectoryAck.STATUS_ACTIVATED for ack in self.acks))
+        installed=next(ack for ack in self.acks if ack.request_id==successor.request_id and ack.trajectory_id==candidate.traj_id and ack.status==TrajectoryAck.STATUS_ACTIVATED)
+        self.assertEqual(installed.status,TrajectoryAck.STATUS_ACTIVATED,installed.reason)
+        self.assertTrue(any(ack.request_id==successor.request_id and
+            ack.reason=='HANDOFF_COMMON_PREFIX_PROOF_CHANGED' and ack.status==TrajectoryAck.STATUS_REJECTED
+            for ack in self.acks))
+        self.spin_until(lambda:any(f.request_id==successor.request_id and
+            f.state==ObservationFeedback.EXECUTION_READY for f in self.feedback))
+        self.assertEqual(self.states[-1].task_id,successor.task_id)
+        self.assertEqual(self.states[-1].state,ExecutionState.STATE_RUNNING)
+        self.assertFalse(any(c.command==ExecutionCommand.COMMAND_HOLD for c in commands[handoff_mark:]))
 
 
 if __name__=="__main__": unittest.main()

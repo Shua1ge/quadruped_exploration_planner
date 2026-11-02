@@ -4,6 +4,7 @@
 #include <Eigen/Eigen>
 #include <algorithm>
 #include <iostream>
+#include <optional>
 
 using namespace std;
 
@@ -40,6 +41,11 @@ namespace scan_planner
 
     // get / set basic bspline info
 
+    // Exact restriction and C2 concatenation; no resampling/re-fitting of a
+    // retained execution prefix. Returned curves use a local zero time origin.
+    std::optional<UniformBspline> segment(double begin, double end) const;
+    static std::optional<UniformBspline> joinC2(const UniformBspline& prefix,
+                                               const UniformBspline& suffix);
     void setKnot(const Eigen::VectorXd &knot);
     Eigen::VectorXd getKnot();
     Eigen::MatrixXd getControlPoint();

@@ -1170,6 +1170,20 @@ inline void advancePlanarBrakingState(
       std::cos(state->yaw + average_yaw_rate * dt));
 }
 
+inline bool rollingExecutionEvidenceFresh(bool same_version, bool running,
+    double feedback_age, double map_age, double max_map_age)
+{
+  return same_version && running && std::isfinite(feedback_age) &&
+      feedback_age >= 0.0 && feedback_age <= .25 && std::isfinite(map_age) &&
+      map_age >= 0.0 && map_age <= max_map_age;
+}
+
+inline bool reusableSuffixProgress(double progress, double duration)
+{
+  return std::isfinite(progress) && std::isfinite(duration) &&
+      progress >= 0.0 && duration > 0.0 && progress < duration;
+}
+
 inline bool shouldKeepExecutingAfterRollingReplanFailure(
     bool reference_path_active, bool reference_path_update_pending,
     bool safety_stop_active, bool execution_frozen,

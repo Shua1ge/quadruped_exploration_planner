@@ -1,0 +1,19 @@
+# 信息任务中途完成后的运动交接
+
+本批在前两批 Local 修改上，使用现有 execution_snapshot 和 rolling_predecessor 身份关系，区分“新任务正在规划”与“Controller仍执行旧任务”。不修改速度参数或Controller安装认证。
+
+跨任务候选不能接入时，普通生成函数返回候选失败，不再仅因处于rolling_task_handoff就立即HANDOFF_PREDICTED_UNSAFE。是否保留前任，由同一个继续执行入口判断。前任必须是Controller已确认的执行版本，并与当前任务或明确predecessor任务/版本匹配；反馈、地图、跟踪、足迹、制动距离及剩余量条件维持原有保守检查。新规划request不再要求等于仍在执行的前任request；未关联的旧任务不能获得继续执行权限。
+
+新任务进入时，前任身份优先取实际执行快照，保留尚未切换的最早执行所有者。只有Controller激活新候选后，原有ACK链才清理/退役前任。前任反馈持续更新实际进度、RUNNING/转向/停稳状态和反馈新鲜度，不把前任的完成、失败或观测结果记到新任务。
+
+正在正常转向的已安装轨迹继续拥有动作。收到带predecessor的新目标时，Local先排队并反馈WAITING_FOR_ACTIVE_ALIGNMENT；保留当前任务上下文，转向结束后再消费队列。若新任务已经进入准备而候选被拒绝，当前健康转向也可保留。安全停止、转向卡死、过期反馈等不会获得健康转向保留；明确取消继续按既有退役流程执行。
+
+等待不会跳过pending ACK超时/状态对账。Explorer将WAITING_FOR_ACTIVE_ALIGNMENT接入既有有限阶段等待（最多15秒，重复阶段消息不延期），避免普通5秒ACK等待提前取消转向中的交接。EXECUTION_READY仍只能来自实际安装ACK，排队反馈不是成功。
+
+候选函数的线程地图快照增加退出清理：提前失败也释放旧规划视图，后续继续执行检查不会继承一份遗漏清理的候选地图快照。
+
+新增日志TASK_HANDOFF_WAIT_ALIGNMENT表示后继排队。ROLLING_PREDECESSOR_RETAINED可出现reason=ALIGNMENT_OWNER；原有旧段保留/拒绝日志仍记录判断结果。不能把日志条数当成实际停车次数。
+
+验证：生产节点构建成功；C++回归102+59例通过；Explorer bridge 48例通过（包含等待有限且重复消息不延期）；独立ROS domain229模拟里程计运行3例通过：转向时后继排队且不额外HOLD、跨任务拒绝后前任仍报告RUNNING、无效证书仍拒绝。未启动Gazebo或向现场域发送运动命令；尚无新一轮Go2停顿率/平均速度结论。
+
+下一轮完整重启，使用独立的新RUN_DIR保存runtime、actual_route、metrics及本轮版本补丁，避免覆盖。先跑10–20分钟，对比同窗口停顿/100m、跨任务接入失败后的旧段保留、TASK_TRANSITION_REQUIRES_STOP、转向期间后继排队时长以及所有候选准备P95。方向真正改变、旧段余量不足或真实风险仍可能需要停车。本批未处理Explorer总目标超时及长期连接搜索循环。

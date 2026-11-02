@@ -406,6 +406,7 @@ def test_duplicate_scan_is_dropped_before_pose_query_or_fusion():
 
 def fusion_test_explorer():
     explorer = object.__new__(MODULE.FrontierExplorer)
+    explorer.work_metrics = MODULE.WorkMetrics(enabled=False)
     explorer.cloud_frame_id = "lidar"
     explorer.last_map_update_ns = explorer.last_integrated_cloud_stamp_ns = 0
     explorer._pending_fusion_cloud = None
@@ -423,7 +424,7 @@ def fusion_test_explorer():
 
 
 def scan(stamp):
-    return SimpleNamespace(stamp=stamp, header=SimpleNamespace(frame_id="lidar"))
+    return SimpleNamespace(stamp=stamp, width=1, height=1, header=SimpleNamespace(frame_id="lidar"))
 
 
 def test_spatial_timer_samples_latest_scan_without_replayed_evidence():

@@ -182,11 +182,17 @@ bool plan_env::observationRayMayReach(
 }
 
 bool GridMap::observationRayMayReach(
-    const Eigen::Vector3d& start, const Eigen::Vector3d& end)
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    plan_env::ObservationRayTiming* timing)
 {
-  std::shared_lock<std::shared_mutex> lock(map_mutex_);
-  return plan_env::observationRayMayReach(start, end, mp_.resolution_,
-      [this](const Eigen::Vector3d& point) { return getOccupancy(point); });
+  if(timing) *timing={};
+  const auto began=timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const auto snapshot=currentThreadOccupancySnapshot() ? currentThreadOccupancySnapshot() : captureInflatedOccupancySnapshot();
+  const bool result=snapshot && plan_env::observationRayMayReach(start,end,
+      1./snapshot->resolution_inv,[&](const Eigen::Vector3d& p){return snapshot->getRawOccupancy(p);});
+  if(timing) timing->query_ms=std::chrono::duration<double,std::milli>(
+      std::chrono::steady_clock::now()-began).count();
+  return result;
 }
 
 thread_local const GridMap* GridMap::tls_snapshot_owner_ = nullptr;
@@ -194,6 +200,16 @@ thread_local GridMap::InflatedOccupancySnapshotPtr GridMap::tls_snapshot_ = null
 thread_local const GridMap* GridMap::tls_clearance_owner_ = nullptr;
 thread_local double GridMap::tls_planning_clearance_margin_ = 0.0;
 thread_local std::vector<Eigen::Vector2d> GridMap::tls_clearance_offsets_;
+
+int GridMap::InflatedOccupancySnapshot::getRawOccupancy(const Eigen::Vector3d& point) const {
+  if(!point.allFinite() || resolution_inv<=0 || raw_occupied_bits.empty()) return -1;
+  Eigen::Vector3i id=(point*resolution_inv).array().floor().cast<int>();
+  if((id.array()<bound_min.array()).any() || (id.array()>bound_max.array()).any()) return -1;
+  Eigen::Vector3i local;
+  for(int d=0;d<3;++d) {if(voxel_num[d]<=0) return -1;local[d]=id[d]%voxel_num[d];if(local[d]<0)local[d]+=voxel_num[d];}
+  const size_t address=local.x()*voxel_num.y()*voxel_num.z()+local.y()*voxel_num.z()+local.z();
+  return address/8<raw_occupied_bits.size() ? ((raw_occupied_bits[address/8]>>(address%8))&1) : -1;
+}
 
 int GridMap::InflatedOccupancySnapshot::getCylinderOccupancy(const Eigen::Vector3d& point) const
 {
@@ -328,12 +344,17 @@ GridMap::buildInflatedOccupancySnapshotLocked() const
 {
   auto snapshot = std::make_shared<InflatedOccupancySnapshot>();
   snapshot->buffer = md_.occupancy_buffer_inflate_;
+  snapshot->raw_occupied_bits.assign((md_.occupancy_buffer_.size()+7)/8,0);
+  for(size_t i=0;i<md_.occupancy_buffer_.size();++i)
+    if(md_.occupancy_buffer_[i]>mp_.min_occupancy_log_)
+      snapshot->raw_occupied_bits[i/8] |= uint8_t(1u<<(i%8));
   snapshot->voxel_num = mp_.map_voxel_num_;
   snapshot->bound_min = mp_.map_bound_min_idx_;
   snapshot->bound_max = mp_.map_bound_max_idx_;
   snapshot->resolution_inv = mp_.resolution_inv_;
   snapshot->body_offset = mp_.double_cylinder_offset_;
   snapshot->revision = map_revision_.load();
+  snapshot->published_steady_ns = plan_env::steady_ns_now();
   snapshot->body_radius=mp_.double_cylinder_radius_;
   snapshot->sources=md_.occupancy_sources_;
   snapshot->terrain_facts=md_.terrain_facts_;
@@ -475,6 +496,11 @@ void GridMap::initMap(
   load_parameter(node_, "grid_map.frame_id", mp_.frame_id_, string("world"));
   load_parameter(node_, "grid_map.sliding_map_frame_id", mp_.sliding_map_frame_id_, string("sliding_map"));
   load_parameter(node_, "grid_map.ground_height", mp_.ground_height_, 0.0);
+  bool metrics_enable = false;
+  std::string metrics_file;
+  load_parameter(node_, "grid_map.metrics_enable", metrics_enable, false);
+  load_parameter(node_, "grid_map.metrics_file", metrics_file, std::string(""));
+  fusion_metrics_ = std::make_unique<plan_env::FusionMetrics>(metrics_enable, metrics_file);
   load_parameter(node_, "grid_map.local_patch_enabled", local_patch_enabled_, true);
   load_parameter(node_, "grid_map.local_patch_period", local_patch_period_, 0.25);
   load_parameter(node_, "grid_map.local_patch_resolution", local_patch_resolution_, 0.2);
@@ -1572,47 +1598,65 @@ void GridMap::updateVisualizationSnapshotLocked(InflatedOccupancySnapshotPtr sna
 void GridMap::updateOccupancyCallback()
 {
   const auto callback_started = std::chrono::steady_clock::now();
+  const bool metrics_on = fusion_metrics_ && fusion_metrics_->enabled();
+  plan_env::FusionRecord rec;
+  int64_t cpu_entry = 0;
+  int64_t runnable_entry = plan_env::FusionRecord::kUnavailable;
+  if (metrics_on)
+  {
+    rec.start_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        callback_started.time_since_epoch()).count();
+    rec.tid = plan_env::current_tid();
+    cpu_entry = plan_env::thread_cpu_ns_now();
+  }
+  const auto lock_requested = std::chrono::steady_clock::now();
   std::unique_lock<std::shared_mutex> lock(map_mutex_);
   const auto lock_acquired = std::chrono::steady_clock::now();
   if (!md_.occ_need_update_)
   {
+    if (metrics_on)
+    {
+      const auto early_exit = std::chrono::steady_clock::now();
+      rec.cls = 0;
+      rec.wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          early_exit - callback_started).count();
+      rec.callback_total_ns = rec.wall_ns;
+      rec.prelock_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          lock_requested - callback_started).count();
+      rec.lock_wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          lock_acquired - lock_requested).count();
+      rec.cpu_ns = plan_env::thread_cpu_ns_now() - cpu_entry;
+      rec.map_revision = map_revision_.load();
+      fusion_metrics_->record(rec);
+    }
     return;
   }
-
-  /* update occupancy */
-  // ros::Time t1, t2, t3, t4;
-  // t1 = ros::Time::now();
+  if (metrics_on)
+    runnable_entry = plan_env::schedstat_runnable_ns();
 
   if (!md_.use_cloud_update_)
     projectDepthImage();
-  // t2 = ros::Time::now();
   const int projected_points = md_.proj_points_cnt;
+  if (metrics_on)
+    rec.points = projected_points;
+  const auto raycast_started = std::chrono::steady_clock::now();
+  const int64_t cpu_raycast_start = metrics_on ? plan_env::thread_cpu_ns_now() : 0;
   raycastProcess();
+  const int64_t cpu_raycast_end = metrics_on ? plan_env::thread_cpu_ns_now() : 0;
+  const auto raycast_finished = std::chrono::steady_clock::now();
   map_revision_.fetch_add(1);
   last_map_update_ns_.store(node_->now().nanoseconds());
   const auto fusion_finished = std::chrono::steady_clock::now();
   auto snapshot = buildInflatedOccupancySnapshotLocked();
+  const auto snapshot_built = std::chrono::steady_clock::now();
   std::atomic_store(&latest_inflated_snapshot_, snapshot);
+  const auto snapshot_published = std::chrono::steady_clock::now();
   updateVisualizationSnapshotLocked(snapshot);
   const auto snapshot_finished = std::chrono::steady_clock::now();
-  // t3 = ros::Time::now();
-
-  // t4 = ros::Time::now();
-
-  // cout << setprecision(7);
-  // cout << "t2=" << (t2-t1).toSec() << " t3=" << (t3-t2).toSec() << " t4=" << (t4-t3).toSec() << endl;;
-
-  // md_.fuse_time_ += (t2 - t1).toSec();
-  // md_.max_fuse_time_ = max(md_.max_fuse_time_, (t2 - t1).toSec());
-
-  // if (mp_.show_occ_time_)
-  //   ROS_WARN("Fusion: cur t = %lf, avg t = %lf, max t = %lf", (t2 - t1).toSec(),
-  //            md_.fuse_time_ / md_.update_num_, md_.max_fuse_time_);
 
   md_.occ_need_update_ = false;
   md_.use_cloud_update_ = false;
   lock.unlock();
-
 
   const double lock_wait_ms = std::chrono::duration<double, std::milli>(
       lock_acquired - callback_started).count();
@@ -1625,6 +1669,40 @@ void GridMap::updateOccupancyCallback()
       "[MAP_FUSION_TIMING] lock_wait=%.1fms raycast=%.1fms snapshot=%.1fms points=%d revision=%lu",
       lock_wait_ms, fusion_ms, snapshot_ms, projected_points,
       static_cast<unsigned long>(snapshot->revision));
+
+  if (metrics_on)
+  {
+    const auto ns = [](const auto &a, const auto &b) {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+    };
+    const int64_t cpu_exit = plan_env::thread_cpu_ns_now();
+    const int64_t runnable_exit = plan_env::schedstat_runnable_ns();
+    rec.cls = projected_points > 0 ? 2 : 1;
+    rec.wall_ns = ns(callback_started, snapshot_finished);
+    rec.callback_total_ns = rec.wall_ns;
+    rec.cpu_ns = cpu_exit - cpu_entry;
+    if (runnable_entry != plan_env::FusionRecord::kUnavailable &&
+        runnable_exit != plan_env::FusionRecord::kUnavailable &&
+        runnable_exit >= runnable_entry)
+    {
+      rec.runnable_ns = runnable_exit - runnable_entry;
+      rec.residual_ns = rec.wall_ns - rec.cpu_ns - rec.runnable_ns;
+    }
+    rec.prelock_ns = ns(callback_started, lock_requested);
+    rec.lock_wait_ns = ns(lock_requested, lock_acquired);
+    rec.raycast_ns = ns(raycast_started, raycast_finished);
+    rec.fusion_other_ns = ns(lock_acquired, raycast_started) +
+                          ns(raycast_finished, fusion_finished);
+    rec.snapshot_build_ns = ns(fusion_finished, snapshot_built);
+    rec.snapshot_publish_ns = ns(snapshot_built, snapshot_published);
+    rec.visualization_ns = ns(snapshot_published, snapshot_finished);
+    rec.raycast_cpu_ns = cpu_raycast_end - cpu_raycast_start;
+    rec.fusion_other_cpu_ns = rec.cpu_ns - rec.raycast_cpu_ns;
+    rec.sensor_stamp_ns = last_ray_cloud_stamp_ns_;
+    rec.map_revision = map_revision_.load();
+    rec.snapshot_revision = snapshot->revision;
+    fusion_metrics_->record(rec);
+  }
 }
 
 namespace {
@@ -2271,6 +2349,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
   md_.proj_points_cnt = static_cast<int>(projected_points.size());
   md_.use_cloud_update_ = true;
   md_.occ_need_update_ = true;
+  last_ray_cloud_stamp_ns_ = cloud_stamp_ns;
 
   const auto committed = std::chrono::steady_clock::now();
   lock.unlock();

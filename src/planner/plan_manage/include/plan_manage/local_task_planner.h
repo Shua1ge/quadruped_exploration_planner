@@ -548,10 +548,173 @@ inline bool taskDomainContains(const LocalTaskDomain& domain,
   return false;
 }
 
+
+// Positive distance outside the SAME task domain used by final validation.
+// Interior points have zero cost; no occupancy or unknown-space edits.
+inline double taskDomainViolation(const LocalTaskDomain& d,const Eigen::Vector2d& p,
+                                  Eigen::Vector2d* gradient=nullptr) {
+  double best=std::numeric_limits<double>::infinity(); Eigen::Vector2d g=Eigen::Vector2d::Zero();
+  const auto consider=[&](const Eigen::Vector2d& delta,double radius) {
+    const double norm=delta.norm(),v=norm-radius;
+    if(v<best) {best=v;g=norm>1e-9 ? Eigen::Vector2d(delta/norm) : Eigen::Vector2d::Zero();}
+  };
+  consider(p-d.observation_center,d.observation_radius);
+  for(size_t i=1;i<d.route.size();++i) {
+    const Eigen::Vector2d a=d.route[i-1],delta=d.route[i]-a;
+    const double t=delta.squaredNorm()>1e-12 ? std::clamp((p-a).dot(delta)/delta.squaredNorm(),0.,1.) : 0.;
+    consider(p-a-t*delta,d.corridor_radius);
+  }
+  if(d.has_directional_gate && d.gate_direction.norm()>1e-9) {
+    const Eigen::Vector2d n=d.gate_direction.normalized();
+    const double v=d.gate_min_progress-(p-d.gate_origin).dot(n);
+    if(v>best) {best=v;g=-n;}
+  }
+  if(gradient) *gradient=best>0 ? g : Eigen::Vector2d::Zero();
+  return std::max(0.,best);
+}
+
+struct TaskEntryCurve {
+  Eigen::Vector2d coefficients[6];
+  double duration{0.}, join_distance{0.};
+  Eigen::Vector2d value(double t,int derivative=0) const {
+    const double u=std::clamp(t/duration,0.,1.); Eigen::Vector2d out=Eigen::Vector2d::Zero();
+    for(int i=5;i>=derivative;--i) {
+      double factor=1.;for(int j=0;j<derivative;++j) factor*=i-j;
+      out=out*u+factor*coefficients[i];
+    }
+    return out/std::pow(duration,derivative);
+  }
+};
+
+inline Eigen::Vector2d taskPointAtArc(const std::vector<Eigen::Vector2d>& path,double arc,
+                                     Eigen::Vector2d* tangent=nullptr) {
+  for(size_t i=1;i<path.size();++i) {
+    const Eigen::Vector2d delta=path[i]-path[i-1]; const double length=delta.norm();
+    if(length<1e-9) continue;
+    if(arc<=length || i+1==path.size()) {
+      if(tangent)*tangent=delta/length;
+      return path[i-1]+std::clamp(arc/length,0.,1.)*delta;
+    }
+    arc-=length;
+  }
+  if(tangent)*tangent=Eigen::Vector2d::Zero();
+  return path.empty() ? Eigen::Vector2d::Zero() : path.back();
+}
+
+// At most 3 anchors x 2 durations x 25 probes. Complete footprint, sweep and
+// spline certification still happens downstream. No extra selector/A* pass.
+inline std::optional<TaskEntryCurve> taskEntryConnection(
+    const std::vector<Eigen::Vector2d>& path,const Eigen::Vector2d& velocity,
+    const Eigen::Vector2d& acceleration,const Eigen::Vector2d& end_velocity,
+    double max_velocity,double max_acceleration,
+    const std::function<bool(const Eigen::Vector2d&,double)>& allowed) {
+  if(path.size()<2 || !velocity.allFinite() || !acceleration.allFinite() ||
+      max_velocity<=0 || max_acceleration<=0) return std::nullopt;
+  double length=0.;for(size_t i=1;i<path.size();++i)length+=(path[i]-path[i-1]).norm();
+  if(length<.1)return std::nullopt;
+  const double horizon=std::clamp(.4+velocity.squaredNorm()/max_acceleration,.5,2.);
+  for(double requested:{horizon,1.5*horizon,2.*horizon}) {
+    const double distance=std::min(length,requested);
+    Eigen::Vector2d direction;const Eigen::Vector2d finish=taskPointAtArc(path,distance,&direction);
+    const Eigen::Vector2d finish_velocity=distance>=length-1e-6 ? end_velocity :
+        Eigen::Vector2d(direction*std::min(max_velocity,std::max(.2,velocity.norm())));
+    const double nominal=std::max({.4,2.*distance/std::max(.2,velocity.norm()+finish_velocity.norm()),
+        1.5*(finish_velocity-velocity).norm()/max_acceleration});
+    for(double scale:{1.,1.5}) {
+      TaskEntryCurve c;c.duration=nominal*scale;c.join_distance=distance;
+      if(c.duration>6.)continue;
+      const Eigen::Vector2d delta=finish-path.front(),v0=velocity*c.duration,
+          v1=finish_velocity*c.duration,a0=acceleration*c.duration*c.duration;
+      c.coefficients[0]=path.front();c.coefficients[1]=v0;c.coefficients[2]=.5*a0;
+      c.coefficients[3]=10.*delta-6.*v0-4.*v1-1.5*a0;
+      c.coefficients[4]=-15.*delta+8.*v0+7.*v1+1.5*a0;
+      c.coefficients[5]=6.*delta-3.*v0-3.*v1-.5*a0;
+      bool valid=true;
+      for(int i=0;i<=24 && valid;++i) {
+        const double t=c.duration*i/24.;const Eigen::Vector2d v=c.value(t,1);
+        valid=v.cwiseAbs().maxCoeff()<=max_velocity+1e-3 &&
+            c.value(t,2).cwiseAbs().maxCoeff()<=max_acceleration+1e-3 &&
+            allowed(c.value(t),v.norm()>.01 ? std::atan2(v.y(),v.x()) : 0.);
+      }
+      if(valid)return c;
+    }
+  }
+  return std::nullopt;
+}
+
 // Bounded connected search, not arbitrary lateral displacement. edge_safe
 // must validate the complete edge (footprint + clearance + turning), including
 // unknown/map boundaries. A returned approach is NOT an executable trajectory:
 // spline, dynamics, braking sweep and Controller ACK are still mandatory.
+// Geometry-only reuse: trim the consumed prefix and join a short distance
+// ahead. The caller must certify every resulting edge, bend and endpoint.
+inline std::vector<Eigen::Vector2d> trimTaskApproach(
+    const std::vector<Eigen::Vector2d>& path, const Eigen::Vector2d& start,
+    double max_deviation=.25, double join_ahead=.25) {
+  if(path.size()<2 || path.size()>128 || !start.allFinite() ||
+      !std::isfinite(max_deviation) || max_deviation<0. ||
+      !std::isfinite(join_ahead) || join_ahead<0.) return {};
+  double best=std::numeric_limits<double>::infinity(), ratio=0.; size_t segment=0;
+  for(size_t i=1;i<path.size();++i) {
+    if(!path[i-1].allFinite() || !path[i].allFinite()) return {};
+    const Eigen::Vector2d d=path[i]-path[i-1];
+    const double u=d.squaredNorm()>1e-12 ? std::clamp((start-path[i-1]).dot(d)/d.squaredNorm(),0.,1.) : 0.;
+    const double distance=(start-path[i-1]-u*d).norm();
+    if(distance<best) { best=distance;segment=i;ratio=u; }
+  }
+  if(best>max_deviation) return {};
+  Eigen::Vector2d join=path[segment-1]+ratio*(path[segment]-path[segment-1]);
+  double left=join_ahead;
+  while(segment<path.size()) {
+    const double length=(path[segment]-join).norm();
+    if(length>left && length>1e-9) {join+=left/length*(path[segment]-join);break;}
+    left-=length;join=path[segment++];
+  }
+  std::vector<Eigen::Vector2d> result{start};
+  if((join-start).norm()>1e-6) result.push_back(join);
+  for(size_t i=segment;i<path.size();++i)
+    if((path[i]-result.back()).norm()>1e-6) result.push_back(path[i]);
+  return result.size()>1 ? result : std::vector<Eigen::Vector2d>{};
+}
+
+inline bool validateTaskApproach(const std::vector<Eigen::Vector2d>& path,
+    double initial_yaw,
+    const std::function<bool(const Eigen::Vector2d&,const Eigen::Vector2d&)>& edge_safe,
+    const std::function<bool(const Eigen::Vector2d&,double,double)>& turn_safe) {
+  if(path.size()<2 || !std::isfinite(initial_yaw) || !edge_safe || !turn_safe) return false;
+  double yaw=initial_yaw;
+  for(size_t i=1;i<path.size();++i) {
+    const auto delta=path[i]-path[i-1];
+    if(!path[i-1].allFinite() || !path[i].allFinite() || delta.norm()<1e-6) return false;
+    const double next=std::atan2(delta.y(),delta.x());
+    if(!edge_safe(path[i-1],path[i]) || !turn_safe(path[i-1],yaw,next)) return false;
+    yaw=next;
+  }
+  return true;
+}
+
+// The endpoint must advance the mission route. Intermediate edges may still
+// retreat around an obstacle before reconnecting at this endpoint.
+inline bool taskEndpointAdvances(const std::vector<Eigen::Vector2d>& route,
+    const Eigen::Vector2d& start,const Eigen::Vector2d& goal,double requested_progress) {
+  if(route.size()<2 || !start.allFinite() || !goal.allFinite() ||
+      !std::isfinite(requested_progress) || requested_progress<=0.) return false;
+  const double progress=taskRouteProgress(route,start),end=taskRouteProgress(route,route.back());
+  const double needed=std::min(requested_progress,std::max(0.,end-progress));
+  return needed>.05 && taskRouteProgress(route,goal)+1e-6>=progress+needed;
+}
+
+struct TaskApproachContext {
+  uint64_t task{0}, version{0}, request{0};
+  size_t cursor{0};
+  bool matches(const TaskApproachContext& other) const {
+    return task && version && request && task==other.task && version==other.version &&
+        request==other.request && cursor==other.cursor;
+  }
+};
+
+struct TaskSearchStats { size_t dominated_before_geometry{0}; };
+
 inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const LocalTaskDomain& domain, const Eigen::Vector2d& start,
     const Eigen::Vector2d& preferred,
@@ -565,8 +728,9 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const Eigen::Vector2d* fixed_goal = nullptr,
     const std::function<bool(const Eigen::Vector2d&,double,double)>& turn_safe = {},
     const std::function<bool(const Eigen::Vector2d&,double,bool)>& terminal_safe = {},
-    size_t* expansion_count = nullptr) {
+    size_t* expansion_count = nullptr, TaskSearchStats* stats = nullptr) {
   if(expansion_count) *expansion_count=0;
+  if(stats) *stats={};
   std::vector<LocalTaskCandidate> result;
   if (!start.allFinite() || !preferred.allFinite() || !edge_safe || !visible ||
       !std::isfinite(step) || step <= 0.0 || !std::isfinite(window) ||
@@ -600,11 +764,14 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
     const double arrival=(goal-p).norm()>1e-6 ? std::atan2(goal.y()-p.y(),goal.x()-p.x()) : incoming;
     const bool connects = !fixed_goal || ((p-goal).norm() <= 1.5*step && edge_safe(p,goal) &&
         (!turn_safe || turn_safe(p,incoming,arrival)));
-    const bool station=taskNeedsDwell(domain,goal,visible(goal));
     const double extra = fixed_goal && connects && edge_cost ? edge_cost(p,goal) : 0.0;
     if (index > 0 && connects && std::isfinite(extra) && extra>=0 &&
-        (!goal_allowed || goal_allowed(goal)) &&
-        (!terminal_safe || terminal_safe(goal,arrival,station))) {
+        (!goal_allowed || goal_allowed(goal))) {
+      // Visibility only affects dwell semantics inside the capture disk.
+      // In particular, a fixed goal with no connecting edge needs no ray query.
+      const bool station=(goal-domain.observation_center).norm()<=
+          std::min(0.8,domain.observation_radius) && visible(goal);
+      if(!terminal_safe || terminal_safe(goal,arrival,station)) {
       LocalTaskCandidate candidate;
       candidate.goal = goal;
       candidate.observation_station = station;
@@ -621,24 +788,32 @@ inline std::vector<LocalTaskCandidate> selectLocalTaskCandidates(
         return a.cost < b.cost;
       });
       if (result.size() > max_candidates) result.pop_back();
+      }
     }
     for (int heading=0;heading<8;++heading) {
       const auto& move=moves[heading];
       const int x=current.x+move[0], y=current.y+move[1];
       const Eigen::Vector2d next=start+basis*Eigen::Vector2d(step*x,step*y);
-      if ((next-start).norm() > window || !taskDomainContains(domain,next) ||
-          !edge_safe(p,next)) continue;
       const double yaw=basis_yaw+std::atan2(move[1],move[0]);
       const double previous_yaw=current.heading<8 ?
           basis_yaw+std::atan2(moves[current.heading][1],moves[current.heading][0]) : initial_yaw;
       const double turn=std::isfinite(previous_yaw) ?
           std::abs(std::remainder(yaw-previous_yaw,2*std::acos(-1.0))) : 0.0;
+      // Nonnegative edge extras cannot improve this lower bound. Preserve
+      // queue/candidate ordering, but skip geometry for already dominated states.
+      const double lower=current.cost+(next-p).norm()+0.35*turn;
+      const auto key=std::make_tuple(x,y,heading);
+      const auto old=best.find(key);
+      if(old!=best.end() && old->second<=lower+1e-9) {
+        if(stats) ++stats->dominated_before_geometry;
+        continue;
+      }
+      if ((next-start).norm() > window || !taskDomainContains(domain,next) ||
+          !edge_safe(p,next)) continue;
       if(turn_safe && !turn_safe(p,previous_yaw,yaw)) continue;
       const double extra=edge_cost ? edge_cost(p,next) : 0.0;
       if(!std::isfinite(extra) || extra<0) continue;
-      const double cost=current.cost+(next-p).norm()+0.35*turn+extra;
-      const auto key=std::make_tuple(x,y,heading);
-      const auto old=best.find(key);
+      const double cost=lower+extra;
       if(old!=best.end() && old->second<=cost+1e-9) continue;
       best[key]=cost;
       nodes.push_back({x,y,heading,index,current.distance+(next-p).norm(),cost});

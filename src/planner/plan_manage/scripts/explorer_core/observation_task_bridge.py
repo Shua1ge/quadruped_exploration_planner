@@ -213,7 +213,7 @@ class ObservationTaskBridge:
             # A certified forward stage is <=1.2 m (~7.3 s at the measured
             # 0.165 m/s response), followed by <=5 s rest confirmation. This
             # finite phase must not be cancelled by the ordinary 5 s ACK wait.
-            stage_wait = pending.transition_reason in ('WAITING_FOR_TURN_STAGE', 'DEPARTURE_RETRY_PENDING')
+            stage_wait = pending.transition_reason in ('WAITING_FOR_TURN_STAGE', 'WAITING_FOR_ACTIVE_ALIGNMENT', 'DEPARTURE_RETRY_PENDING')
             limit = max(limit, 15000000000 if stage_wait else 6000000000)
         if pending.state == "PREPARING" and now-pending.published_ns >= limit:
             self.cancel_pending_observation_handoff("EXECUTION_READY_TIMEOUT")

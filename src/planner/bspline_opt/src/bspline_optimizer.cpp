@@ -1222,7 +1222,22 @@ namespace scan_planner
       }
     }
     addPreferredClearanceCost(grad_3D,f_combine);
+    addTaskCorridorCost(grad_3D,f_combine);
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
+  }
+
+  void BsplineOptimizer::addTaskCorridorCost(Eigen::MatrixXd& gradient,double& total) {
+    if(!corridor_cost_)return;
+    // Sample the curve itself, not only its control polygon. Final validation
+    // remains authoritative. Three samples/span; only the new tail is optimized.
+    for(int i=0;i+3<cps_.size;++i)for(double u:{0.,.5,1.}) {
+      const double b[4]={std::pow(1-u,3)/6.,(3*u*u*u-6*u*u+4)/6.,
+          (-3*u*u*u+3*u*u+3*u+1)/6.,u*u*u/6.};
+      Eigen::Vector2d p=Eigen::Vector2d::Zero();for(int j=0;j<4;++j)p+=b[j]*cps_.points.col(i+j).head<2>();
+      Eigen::Vector2d g;const double d=corridor_cost_(p,&g);
+      total+=40.*d*d;
+      for(int j=0;j<4;++j)gradient.col(i+j).head<2>()+=80.*d*b[j]*g;
+    }
   }
 
   void BsplineOptimizer::addPreferredClearanceCost(Eigen::MatrixXd& gradient,double& total) {
@@ -1278,6 +1293,7 @@ namespace scan_planner
                               lambda3_ * g_feasibility;
     grad_3D.row(2).setZero();
     addPreferredClearanceCost(grad_3D,f_combine);
+    addTaskCorridorCost(grad_3D,f_combine);
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 

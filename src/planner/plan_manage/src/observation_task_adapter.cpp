@@ -269,7 +269,8 @@ void SCANReplanFSM::observationTaskCallback(
   deferred_task_ = msg;
   const bool recovery_owns=have_target_ && (structured_local_repair_active_.load() ||
       stopped_local_repair_pending_.load() || stopped_local_repair_active_.load());
-  if(recovery_owns || (task_turn_stage_active_.load() && msg->predecessor_task_id)) {
+  const bool alignment_owns=msg->predecessor_task_id && activeAlignmentOwnsMotion();
+  if(recovery_owns || alignment_owns || (task_turn_stage_active_.load() && msg->predecessor_task_id)) {
     // This is the queued successor's phase, not the active stage's identity.
     // It grants no motion or information completion. Explorer must allow
     // the finite straight leg and confirmed stopping before its ready ACK.
@@ -278,7 +279,8 @@ void SCANReplanFSM::observationTaskCallback(
     feedback.task_id=msg->task_id;feedback.task_version=msg->task_version;
     feedback.request_id=msg->request_id;
     feedback.state=scan_planner_msgs::msg::ObservationFeedback::TRANSITION_WAIT_STOP;
-    feedback.reason=recovery_owns ? "DEPARTURE_RETRY_PENDING" : "WAITING_FOR_TURN_STAGE";
+    feedback.reason=recovery_owns ? "DEPARTURE_RETRY_PENDING" :
+        alignment_owns ? "WAITING_FOR_ACTIVE_ALIGNMENT" : "WAITING_FOR_TURN_STAGE";
     task_feedback_pub_->publish(feedback);
   }
   if (!recovery_owns && current.first != 0 && incoming != current && !msg->predecessor_task_id)
@@ -339,6 +341,12 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
   // approach. Explicit cancellation still fences execution immediately.
   if (deferred_task_ && have_target_ && (structured_local_repair_active_.load() ||
       stopped_local_repair_pending_.load() || stopped_local_repair_active_.load())) return false;
+  if(deferred_task_ && deferred_task_->predecessor_task_id && activeAlignmentOwnsMotion()) {
+    RCLCPP_INFO_THROTTLE(node_->get_logger(),*node_->get_clock(),1000,
+        "[TASK_HANDOFF_WAIT_ALIGNMENT] queued_request=%llu; acknowledged turn retains ownership",
+        static_cast<unsigned long long>(deferred_task_->request_id));
+    return false;
+  }
   if (deferred_task_ && !task_turn_stage_active_.load()) {
     // Do not consume the finite candidate budget before the first accepted
     // sensor update. Keep the request queued while startup safety is holding.
@@ -355,8 +363,10 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
       // Several information tasks may finish before any successor ACK.
       // Keep ownership of the actual oldest execution until the swap.
       if (!rolling_predecessor_id_.load()) {
-        rolling_predecessor_id_.store(msg->predecessor_task_id);
-        rolling_predecessor_version_.store(msg->predecessor_task_version);
+        std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        const bool actual=execution_snapshot_.valid && execution_snapshot_.task_id && execution_snapshot_.task_version;
+        rolling_predecessor_id_.store(actual ? execution_snapshot_.task_id : msg->predecessor_task_id);
+        rolling_predecessor_version_.store(actual ? execution_snapshot_.task_version : msg->predecessor_task_version);
       }
       rolling_task_handoff_.store(true);
     }
@@ -580,6 +590,7 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
 }
 
 bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool preferred_only, size_t* geometry_remaining) {
+    const double entry_yaw=std::isfinite(planning_entry_yaw_) ? planning_entry_yaw_ : getOdomYaw();
     const bool autonomy=observation_task_ && observation_task_->local_geometry_autonomy;
     // Observation purpose survives curve revisions. A transit point extends
     // before capture rather than being rebuilt until its reference runs out.
@@ -597,19 +608,21 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
       return true;
     const bool had_retained_goal=retain_goal;
     const Eigen::Vector2d previous_goal = task_station_.head<2>();
-    task_goal_available_ = false;
-    task_transit_speed_limited_=false;
-    task_approach_.clear();
-  if (!observation_task_ || reference_path_.size()<2) return false;
+  if (!observation_task_ || reference_path_.size()<2) {
+    task_goal_available_=false;task_approach_.clear();return false;
+  }
   auto map=planner_manager_->grid_map_;
   const auto sample=projectReferencePathLookahead(reference_path_,start_pt_,
       reference_progress_idx_,reference_progress_ratio_, std::max(0.5,reference_path_lookahead_));
   const bool in_observation = (start_pt_.head<2>()-Eigen::Vector2d(observation_task_->goal.x,
       observation_task_->goal.y)).norm() <= observation_task_->observation_radius;
-  if (!sample.valid && !in_observation) return false;
+  if (!sample.valid && !in_observation) {
+    task_goal_available_=false;task_approach_.clear();return false;
+  }
   reference_progress_idx_=sample.progress_segment; reference_progress_ratio_=sample.progress_ratio;
   LocalTaskDomain domain=observationTaskDomain();
-  const auto clearance=autonomy ? map->capturePlanarClearance(start_pt_.z()) : nullptr;
+  // Build the preference field only if bounded route reuse cannot continue.
+  decltype(map->capturePlanarClearance(start_pt_.z())) clearance;
   const auto snapshot=map->captureInflatedOccupancySnapshot();
   // Refit the approach with the retained objective as first preference.
   // Compare wider arrivals before hard-margin alternatives; a new map/odom
@@ -654,7 +667,7 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
   // Ordinary rolling search retains its existing measured-motion contract.
   if(!preferred_only && !task_turn_stage_used_ && !structured_local_repair_active_.load() &&
       start_vel_.head<2>().norm()<=.05 && toward.norm()>.4) {
-    const auto departure=taskPlanDeparture(start_pt_.head<2>(),getOdomYaw(),stage_target,
+    const auto departure=taskPlanDeparture(start_pt_.head<2>(),entry_yaw,stage_target,
                                          stopped_distance,departure_safe,turn_stage_safe);
     if(departure && departure->kind==TaskDepartureKind::FORWARD_STAGE) {
       task_departure_plan_=departure;
@@ -670,14 +683,13 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
       const auto y=static_cast<uint32_t>(static_cast<int64_t>(std::floor(stage.y()/.2)));
       task_candidate_id_.store((uint64_t(x)<<32)|y);
       RCLCPP_INFO(node_->get_logger(),"[TASK_FORWARD_TURN_STAGE] request=%llu stage=(%.3f,%.3f) yaw=%.3f retained_target=(%.3f,%.3f); straight incoming motion and future turn/braking certified",
-          static_cast<unsigned long long>(active_reference_request_id_.load()),stage.x(),stage.y(),getOdomYaw(),preferred.x(),preferred.y());
+          static_cast<unsigned long long>(active_reference_request_id_.load()),stage.x(),stage.y(),entry_yaw,preferred.x(),preferred.y());
       return true;
     }
   }
   double search_margin=preferred_clearance_margin_;
-  const bool narrow_start=footprintOccupiedWithMargin(map,start_pt_,getOdomYaw(),preferred_clearance_margin_);
-  const double initial_clearance=clearance && snapshot ?
-      clearance->footprintDistance(start_pt_.head<2>(),getOdomYaw(),snapshot->body_offset) : 0.;
+  const bool narrow_start=footprintOccupiedWithMargin(map,start_pt_,entry_yaw,preferred_clearance_margin_);
+  double initial_clearance=0.;
   const auto point_safe=[&](const Eigen::Vector2d& p,double yaw) {
     if(!taskDomainContains(domain,p)) return false;
     const bool escape_prefix=search_margin>planning_clearance_margin_ && narrow_start &&
@@ -696,7 +708,7 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
     return taskDomainContains(domain,p) && !footprintOccupiedWithMargin(
         map,{p.x(),p.y(),start_pt_.z()},yaw,search_margin);
   };
-  const auto terminal_safe=[&](const Eigen::Vector2d& p,double yaw,bool station) {
+  const auto terminal_check=[&](const Eigen::Vector2d& p,double yaw,bool station) {
     const Eigen::Vector2d return_direction=domain.route.empty() ? Eigen::Vector2d::Zero() :
         Eigen::Vector2d(domain.route.front()-p);
     const double return_yaw=return_direction.norm()>.20 ?
@@ -705,6 +717,21 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
     return taskTransitTerminalSpeed(p,yaw,planner_manager_->pp_.max_vel_,min_forward_command_,
         command_stop_latency_+predictive_replan_reaction_time_,guaranteed_braking_deceleration_,terminal_point_safe)>0. ||
         taskTerminalRestartCertified(p,yaw,stopped_distance,terminal_point_safe,return_yaw);
+  };
+  // All terminal motion checks in this call use the caller's immutable
+  // occupancy snapshot. Never retain this cache across attempts/revisions.
+  std::map<std::tuple<double,double,double,bool,double>,bool> terminal_evidence;
+  const auto terminal_safe=[&](const Eigen::Vector2d& p,double yaw,bool station) {
+    ++task_preparation_timing_.terminal_checks;
+    const auto key=std::make_tuple(p.x(),p.y(),yaw,station,search_margin);
+    const auto old=terminal_evidence.find(key);
+    if(old!=terminal_evidence.end()) {
+      ++task_preparation_timing_.terminal_cache_hits;
+      return old->second;
+    }
+    const bool safe=terminal_check(p,yaw,station);
+    terminal_evidence.emplace(key,safe);
+    return safe;
   };
   bool certified_departure_available=false;
   size_t departure_checks=0, departure_certificates=0;
@@ -720,13 +747,13 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
       const double stop_distance=min_forward_command_*
           (command_stop_latency_+predictive_replan_reaction_time_)+
           min_forward_command_*min_forward_command_/(2*guaranteed_braking_deceleration_);
-      if (!taskDepartureCertified(start_pt_.head<2>(),getOdomYaw(),yaw,stop_distance,
+      if (!taskDepartureCertified(start_pt_.head<2>(),entry_yaw,yaw,stop_distance,
           point_safe)) return false;
       certified_departure_available=true;
       ++departure_certificates;
     }
     if ((a-start_pt_.head<2>()).norm()<0.05 &&
-        !taskRollingDirectionAllowed(b-a,getOdomYaw(),start_vel_.head<2>().norm())) return false;
+        !taskRollingDirectionAllowed(b-a,entry_yaw,start_vel_.head<2>().norm())) return false;
     const int samples=std::max(1,static_cast<int>(std::ceil((b-a).norm()/0.05)));
     double progress=autonomy ? 0.0 : taskRouteProgress(domain.route,a);
     for(int i=0;i<=samples;++i) {
@@ -746,10 +773,22 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
       // Observation hypothesis, not a footprint-clear motion segment.
       // Unknown space can contain information; known obstacles occlude it.
       // Motion goal/edge/departure certification above remains strict.
-      return map->observationRayMayReach(
-          {p.x(),p.y(),start_pt_.z()}, {endpoint.x(),endpoint.y(),start_pt_.z()});
+      plan_env::ObservationRayTiming timing;
+      const bool result=map->observationRayMayReach(
+          {p.x(),p.y(),start_pt_.z()}, {endpoint.x(),endpoint.y(),start_pt_.z()}, &timing);
+      ++task_preparation_timing_.rays;
+      task_preparation_timing_.visibility_lock_wait_ms+=timing.lock_wait_ms;
+      task_preparation_timing_.raycast_ms+=timing.query_ms;
+      return result;
   };
-  auto visible=[&](const Eigen::Vector2d& p) {
+  auto visible_uncached=[&](const Eigen::Vector2d& p) {
+    const auto began=std::chrono::steady_clock::now();
+    struct VisibilityTiming {
+      double& total;
+      std::chrono::steady_clock::time_point began;
+      ~VisibilityTiming() {total+=std::chrono::duration<double,std::milli>(
+          std::chrono::steady_clock::now()-began).count();}
+    } visibility_timing{task_preparation_timing_.visibility_ms,began};
     for(const auto& rejected:task_rejected_stations_) if ((p-rejected).norm()<0.35) return false;
     if(!autonomy) for(const auto& visited:task_visited_stations_) if ((p-visited).norm()<0.35) return false;
     for(const auto& target:observation_task_->target_cells) {
@@ -761,6 +800,18 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
     }
     return false;
   };
+  // Raw visibility now shares the caller's immutable planning snapshot.
+  std::map<std::pair<double,double>,bool> visibility_evidence;
+  const auto visible=[&](const Eigen::Vector2d& p) {
+    const auto key=std::make_pair(p.x(),p.y());const auto it=visibility_evidence.find(key);
+    if(it!=visibility_evidence.end()) {++task_preparation_timing_.visibility_cache_hits;return it->second;}
+    const bool value=visible_uncached(p);visibility_evidence.emplace(key,value);return value;
+  };
+  const double endpoint_speed=std::max(.3,start_vel_.head<2>().norm());
+  const double endpoint_progress=std::max(.4,endpoint_speed*(command_stop_latency_+
+      predictive_replan_reaction_time_+rolling_replan_retry_period_+
+      std::max(.10,1.25*last_rolling_prepare_wall_s_))+
+      endpoint_speed*endpoint_speed/(2.*guaranteed_braking_deceleration_)+planning_clearance_margin_);
   const auto goal_allowed=[&](const Eigen::Vector2d& p) {
     if ((p-start_pt_.head<2>()).norm()<(autonomy && retain_goal ? 0.20 : 0.4)) return false;
     if (!autonomy && !task_visited_stations_.empty() && domain.route.size()>1) {
@@ -770,8 +821,112 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
     }
     for(const auto& rejected:task_rejected_stations_) if((p-rejected).norm()<0.35) return false;
     if(!autonomy) for(const auto& visited:task_visited_stations_) if((p-visited).norm()<0.35) return false;
+    const bool capture=(retain_goal && task_station_target_ && (p-previous_goal).norm()<.05) ||
+        ((p-domain.observation_center).norm()<=std::min(.8,domain.observation_radius) && visible(p));
+    if(autonomy && !capture && !taskEndpointAdvances(domain.route,start_pt_.head<2>(),p,endpoint_progress)) {
+      ++task_preparation_timing_.nonprogress_endpoints;return false;
+    }
     return (p-domain.observation_center).norm()>domain.observation_radius || visible(p);
   };
+  // Same-request geometry reuse uses the SAME edge/turn/visibility/terminal
+  // predicates as search. Only the source of candidate geometry changes.
+  const auto reuse_began=std::chrono::steady_clock::now();
+  const bool have_approach=task_goal_available_ && task_approach_.size()>1;
+  const bool cross_task=rolling_task_handoff_.load();
+  task_preparation_timing_.cross_task=cross_task;
+  bool execution_allows_reuse=!cross_task;
+  if(cross_task) {
+    std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+    const double age=std::chrono::duration<double>(
+        std::chrono::steady_clock::now()-execution_snapshot_.feedback_received).count();
+    execution_allows_reuse=execution_snapshot_.valid &&
+        rolling_predecessor_id_.load()!=task_id_.load() &&
+        execution_snapshot_.task_id==rolling_predecessor_id_.load() &&
+        execution_snapshot_.task_version==rolling_predecessor_version_.load() &&
+        execution_snapshot_.controller_state==scan_planner_msgs::msg::ExecutionState::STATE_RUNNING &&
+        std::isfinite(age) && age>=0. && age<=.25;
+  }
+  const TaskApproachContext current_context{task_id_.load(),task_version_.load(),
+      active_reference_request_id_.load(),task_route_cursor_};
+  const bool reuse_context=have_approach && execution_allows_reuse &&
+      task_approach_context_.matches(current_context) &&
+      (task_approach_.back()-task_station_).head<2>().norm()<1e-6 &&
+      replan_fail_count_==0 && start_vel_.head<2>().norm()>.05 &&
+      task_departure_plan_ && task_departure_plan_->kind==TaskDepartureKind::DIRECT &&
+      !task_retirement_pending_.load() && !task_turn_stage_active_ &&
+      !structured_local_repair_active_.load() && !stopped_local_repair_active_.load() &&
+      !tracking_recovery_active_ && !safety_stop_active_.load() && !predictive_replan_requested_.load() &&
+      !go2_execution_frozen_.load() && !task_restart_from_rest_requested_.load();
+  if(reuse_context) {
+    std::vector<Eigen::Vector2d> old;
+    for(const auto& p:task_approach_) old.push_back(p.head<2>());
+    auto route=trimTaskApproach(old,start_pt_.head<2>());
+    bool extended=false;
+    const char *failure=route.empty() ? "NO_NEARBY_SUFFIX" : "PATH_REVALIDATION";
+    if(!route.empty() && !retain_goal && !task_station_target_ && sample.valid) {
+      const Eigen::Vector2d target=preferred;
+      const Eigen::Vector2d tangent=route.back()-route[route.size()-2];
+      if((target-route.back()).dot(tangent)>0. && (target-route.back()).norm()>.20 &&
+          (target-start_pt_.head<2>()).norm()<=std::max(.5,reference_path_lookahead_)+.5) {
+        route.push_back(target);extended=true;
+      } else {route.clear();failure="NO_FORWARD_EXTENSION";}
+    }
+    search_margin=std::max(planning_clearance_margin_,task_approach_margin_);
+    size_t checked=0;
+    const auto bounded_edge=[&](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
+      checked+=1+size_t(std::ceil((b-a).norm()/.05));
+      return checked<=256 && edge_safe(a,b);
+    };
+    // Preferred-margin escape requires the preference field and therefore
+    // retains the full selector. Ordinary hard-margin reuse has no escape.
+    if(!(narrow_start && search_margin>planning_clearance_margin_) &&
+        !route.empty() && (retain_goal || extended) &&
+        validateTaskApproach(route,entry_yaw,bounded_edge,turn_safe)) {
+      const auto& goal=route.back();
+      const Eigen::Vector2d delta=goal-route[route.size()-2];
+      const double yaw=std::atan2(delta.y(),delta.x());
+      // Information updates can turn a transit endpoint into a capture stop;
+      // an existing capture keeps its rest contract.
+      const bool station=(retain_goal && task_station_target_) || taskNeedsDwell(domain,goal,visible(goal));
+      failure="TERMINAL_REVALIDATION";
+      if(goal_allowed(goal) && terminal_safe(goal,yaw,station)) {
+        task_approach_.clear();
+        for(const auto& p:route) task_approach_.push_back({p.x(),p.y(),start_pt_.z()});
+        task_station_=task_approach_.back();local_target_pt_=task_station_;
+        task_station_target_=station;task_station_arrival_yaw_=yaw;
+        local_target_vel_.setZero();
+        const double speed=station ? 0. : taskTransitTerminalSpeed(goal,yaw,planner_manager_->pp_.max_vel_,
+            min_forward_command_,command_stop_latency_+predictive_replan_reaction_time_,
+            guaranteed_braking_deceleration_,terminal_point_safe);
+        if(speed>0.) local_target_vel_.head<2>()=delta.normalized()*speed;
+        task_transit_speed_limited_=speed>0. && speed+1e-6<planner_manager_->pp_.max_vel_;
+        task_departure_plan_=TaskDeparturePlan{TaskDepartureKind::DIRECT,goal,goal,entry_yaw};
+        const auto x=static_cast<uint32_t>(static_cast<int64_t>(std::floor(goal.x()/.2)));
+        const auto y=static_cast<uint32_t>(static_cast<int64_t>(std::floor(goal.y()/.2)));
+        task_candidate_id_.store((uint64_t(x)<<32)|y);
+        task_preparation_timing_.reused=true;
+        RCLCPP_INFO(node_->get_logger(),"[TASK_APPROACH_REUSED] request=%llu mode=%s points=%zu checked=%zu elapsed_ms=%.2f cross_task=%d",
+            static_cast<unsigned long long>(active_reference_request_id_.load()),extended ? "EXTENDED" : "TRIMMED",
+            route.size(),checked,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-reuse_began).count(),int(cross_task));
+        return true;
+      }
+    }
+    RCLCPP_INFO(node_->get_logger(),"[TASK_APPROACH_REBUILD] request=%llu reason=%s checked=%zu",
+        static_cast<unsigned long long>(active_reference_request_id_.load()),failure,checked);
+  } else if(have_approach) {
+    RCLCPP_INFO(node_->get_logger(),"[TASK_APPROACH_REBUILD] request=%llu reason=CONTEXT_OR_MODE failures=%d speed=%.3f tracking_repair=%d predictive=%d frozen=%d",
+        static_cast<unsigned long long>(active_reference_request_id_.load()),replan_fail_count_,
+        start_vel_.head<2>().norm(),int(tracking_recovery_active_),int(predictive_replan_requested_.load()),
+        int(go2_execution_frozen_.load()));
+  }
+  task_goal_available_=false;task_transit_speed_limited_=false;task_approach_.clear();
+  search_margin=preferred_clearance_margin_;
+  const auto clearance_started=std::chrono::steady_clock::now();
+  clearance=autonomy ? map->capturePlanarClearance(start_pt_.z()) : nullptr;
+  task_preparation_timing_.clearance_ms+=std::chrono::duration<double,std::milli>(
+      std::chrono::steady_clock::now()-clearance_started).count();
+  initial_clearance=clearance && snapshot ?
+      clearance->footprintDistance(start_pt_.head<2>(),entry_yaw,snapshot->body_offset) : 0.;
   const auto cost=[&](const Eigen::Vector2d& a,const Eigen::Vector2d& b) {
     const double yaw=std::atan2(b.y()-a.y(),b.x()-a.x());
     if(autonomy && clearance && snapshot) {
@@ -796,11 +951,15 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
   size_t remaining=geometry_remaining ? *geometry_remaining : 1024;
   size_t wide_expanded=0,hard_expanded=0;
   const auto search=[&](bool fixed,size_t limit) {
-    size_t used=0;
+    size_t used=0; TaskSearchStats stats;
+    const auto began=std::chrono::steady_clock::now();
     auto result=selectLocalTaskCandidates(domain,start_pt_.head<2>(),preferred,
         edge_safe,visible,.2,std::min(4.,std::max(1.,reference_path_lookahead_)),
-        std::min(limit,remaining),8,goal_allowed,getOdomYaw(),cost,
-        fixed ? &previous_goal : nullptr,turn_safe,terminal_safe,&used);
+        std::min(limit,remaining),8,goal_allowed,entry_yaw,cost,
+        fixed ? &previous_goal : nullptr,turn_safe,terminal_safe,&used,&stats);
+    task_preparation_timing_.selector_ms+=std::chrono::duration<double,std::milli>(
+        std::chrono::steady_clock::now()-began).count();
+    task_preparation_timing_.dominated+=stats.dominated_before_geometry;
     remaining-=std::min(remaining,used);
     if(geometry_remaining) *geometry_remaining=remaining;
     if(search_margin>planning_clearance_margin_) wide_expanded+=used;else hard_expanded+=used;
@@ -814,10 +973,14 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
       terminal_safe(previous_goal,task_station_arrival_yaw_,task_station_target_);
   search_margin=preferred_clearance_margin_;
   const bool retained_admissible=autonomy && had_retained_goal && retained_terminal_safe &&
-      taskDomainContains(domain,previous_goal) &&
+      goal_allowed(previous_goal) && taskDomainContains(domain,previous_goal) &&
       !footprintOccupiedWithMargin(map,{previous_goal.x(),previous_goal.y(),start_pt_.z()},
           task_station_arrival_yaw_,planning_clearance_margin_) &&
       ((previous_goal-domain.observation_center).norm()>domain.observation_radius || visible(previous_goal));
+  if(autonomy && retain_goal && !retained_admissible) {
+    retain_goal=false;
+    preferred=sample.valid ? Eigen::Vector2d(sample.target.head<2>()) : domain.observation_center;
+  }
   if(autonomy && retain_goal) candidates=search(true,256);
   if(candidates.empty() && !retained_admissible) {
     retain_goal=false;
@@ -838,7 +1001,7 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
       hard_expanded,remaining,search_margin,candidates.size());
   RCLCPP_INFO(node_->get_logger(),
       "[TASK_DEPARTURE_SEARCH] request=%llu heading=%.3f checked=%zu certified=%zu excluded=%zu candidates=%zu retained_goal=%d",
-      static_cast<unsigned long long>(active_reference_request_id_.load()),getOdomYaw(),
+      static_cast<unsigned long long>(active_reference_request_id_.load()),entry_yaw,
       departure_checks,departure_certificates,task_rejected_departures_.size(),candidates.size(),retain_goal);
   if(candidates.empty()) {
     if(retained_admissible) {
@@ -850,7 +1013,7 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
     }
     if(!report_failure) return false;
     if (!certified_departure_available ||
-        footprintOccupiedWithMargin(map,start_pt_,getOdomYaw(),planning_clearance_margin_))
+        footprintOccupiedWithMargin(map,start_pt_,entry_yaw,planning_clearance_margin_))
       observationTaskRejected("DEPARTURE_UNSAFE");
     else
       // An empty motion/visibility search does not prove the remote viewpoint
@@ -877,7 +1040,7 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
   const Eigen::Vector2d delta=simple_approach.back()-simple_approach[simple_approach.size()-2];
   task_station_arrival_yaw_=std::atan2(delta.y(),delta.x());
   task_departure_plan_=TaskDeparturePlan{TaskDepartureKind::DIRECT,selected.goal,
-      selected.goal,getOdomYaw()};
+      selected.goal,entry_yaw};
   local_target_vel_.setZero();
   if(!task_station_target_ && delta.norm()>1e-6) {
     const double yaw=std::atan2(delta.y(),delta.x());
@@ -890,6 +1053,21 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
     if(speed>0.) local_target_vel_.head<2>()=delta.normalized()*speed;
     task_transit_speed_limited_=speed>0. && speed+1e-6<planner_manager_->pp_.max_vel_;
   }
+  const double rejoin_progress=taskRouteProgress(domain.route,selected.goal);
+  double peak=taskRouteProgress(domain.route,start_pt_.head<2>()),regression=0.;
+  for(const auto& p:selected.approach) {
+    const double progress=taskRouteProgress(domain.route,p);regression=std::max(regression,peak-progress);peak=std::max(peak,progress);
+  }
+  if(autonomy && regression>.10) {
+    const double yaw=std::atan2(selected.goal.y()-start_pt_.y(),selected.goal.x()-start_pt_.x());
+    const bool direct=edge_safe(start_pt_.head<2>(),selected.goal) && turn_safe(start_pt_.head<2>(),entry_yaw,yaw);
+    const char* reason=selected.observation_station ? "STATION_CAPTURE" :
+        (direct ? "CLEARANCE_PREFERENCE" : "DIRECT_CONNECTION_UNCERTIFIED");
+    RCLCPP_INFO(node_->get_logger(),"[LOCAL_APPROACH_DETOUR] request=%llu retreat=%.3fm rejoin=(%.3f,%.3f) route_progress=%.3fm reason=%s; intermediate retreat has an explicit rejoin",
+        static_cast<unsigned long long>(active_reference_request_id_.load()),regression,selected.goal.x(),selected.goal.y(),rejoin_progress,reason);
+  }
+  task_approach_context_=current_context;
+  task_approach_margin_=search_margin;
   task_goal_available_=true;
   return true;
 }

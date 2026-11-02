@@ -633,3 +633,129 @@ TEST(LocalTaskPlanner, MissingOrCollinearSupportCannotInventSlope) {
   for(int i=0;i<20;++i) line.emplace_back(i*.05,0.,i*.01);
   EXPECT_FALSE(measuredSupportSlope(line));
 }
+
+TEST(LocalTaskApproachReuse, TrimsConsumedPrefixAndKeepsEndpoint) {
+  const std::vector<Eigen::Vector2d> path{{0,0},{2,0},{4,0}};
+  const auto route=trimTaskApproach(path,{1,0});
+  ASSERT_EQ(route.size(),4u);
+  EXPECT_NEAR(route[0].x(),1.,1e-9);
+  EXPECT_NEAR(route[1].x(),1.25,1e-9);
+  EXPECT_NEAR(route.back().x(),4.,1e-9);
+  for(const auto& p:route) EXPECT_GE(p.x(),1.);
+}
+TEST(LocalTaskApproachReuse, OffRouteAndInvalidGeometryRequireSearch) {
+  EXPECT_TRUE(trimTaskApproach({{0,0},{2,0}},{1,.26}).empty());
+  EXPECT_TRUE(trimTaskApproach({{0,0}},{0,0}).empty());
+  EXPECT_TRUE(trimTaskApproach({{0,0},{2,0}},{2,0}).empty());
+  EXPECT_TRUE(trimTaskApproach({{0,0},{NAN,0}},{0,0}).empty());
+  EXPECT_TRUE(trimTaskApproach({{0,0},{2,0}},{1,0},-.1).empty());
+}
+TEST(LocalTaskApproachReuse, RechecksNewStartConnectorAndEveryTurn) {
+  auto route=trimTaskApproach({{0,0},{2,0},{2,2}},{1,0});
+  ASSERT_FALSE(route.empty());
+  const auto edge=[](const auto&,const auto&){return true;};
+  const auto turn=[](const auto&,double,double){return true;};
+  EXPECT_TRUE(validateTaskApproach(route,0.,edge,turn));
+  EXPECT_FALSE(validateTaskApproach(route,0.,[](const auto& a,const auto&){return a.x()>1.1;},turn));
+  EXPECT_FALSE(validateTaskApproach(route,0.,edge,[](const auto&,double a,double b){return std::abs(a-b)<.1;}));
+  // A newly blocked later edge must revoke reuse even when the entry is free.
+  EXPECT_FALSE(validateTaskApproach(route,0.,[](const auto&,const auto& b){return b.y()<1.;},turn));
+}
+TEST(LocalTaskApproachReuse, ExtensionIsOnlyGeometryUntilItPassesChecks) {
+  auto route=trimTaskApproach({{0,0},{2,0}},{1.5,0});
+  route.push_back({4,0});
+  const auto turn=[](const auto&,double,double){return true;};
+  EXPECT_TRUE(validateTaskApproach(route,0.,[](const auto&,const auto& b){return b.x()<=4.;},turn));
+  EXPECT_FALSE(validateTaskApproach(route,0.,[](const auto&,const auto& b){return b.x()<3.;},turn));
+}
+
+TEST(LocalTaskSearchPreparation, DisconnectedFixedGoalDoesNotQueryObservationEvidence) {
+  LocalTaskDomain d;d.route={{0,0},{4,0}};d.corridor_radius=2.;d.observation_center={4,0};
+  size_t visible_calls=0,terminal_calls=0,pops=0;TaskSearchStats stats;
+  const Eigen::Vector2d goal(4,0);
+  const auto paths=selectLocalTaskCandidates(d,{0,0},goal,
+      [](const auto&,const auto&){return true;},
+      [&](const auto&){++visible_calls;return true;},.2,4.,8,8,{},0.,{},&goal,{},
+      [&](const auto&,double,bool){++terminal_calls;return true;},&pops,&stats);
+  EXPECT_TRUE(paths.empty());EXPECT_EQ(pops,8u);
+  EXPECT_EQ(visible_calls,0u);EXPECT_EQ(terminal_calls,0u);
+}
+TEST(LocalTaskSearchPreparation, TransitOutsideCaptureDiskNeedsNoDwellRay) {
+  LocalTaskDomain d;d.route={{0,0},{4,0}};d.corridor_radius=2.;d.observation_center={8,0};
+  size_t rays=0;TaskSearchStats stats;
+  const auto paths=selectLocalTaskCandidates(d,{0,0},{1,0},
+      [](const auto&,const auto&){return true;},
+      [&](const auto&){++rays;return true;},.2,2.,64,8,{},0.,{},nullptr,{},
+      [](const auto&,double,bool stop){return !stop;},nullptr,&stats);
+  ASSERT_FALSE(paths.empty());EXPECT_EQ(rays,0u);
+  EXPECT_GT(stats.dominated_before_geometry,0u);
+  for(const auto& p:paths) EXPECT_FALSE(p.observation_station);
+}
+TEST(LocalTaskSearchPreparation, CaptureDiskStillRequiresObservedVisibility) {
+  LocalTaskDomain d;d.route={{0,0},{2,0}};d.corridor_radius=2.;d.observation_center={1,0};
+  size_t rays=0;
+  const auto paths=selectLocalTaskCandidates(d,{0,0},{1,0},
+      [](const auto&,const auto&){return true;},
+      [&](const auto&){++rays;return true;},.2,2.,64,8,{},0.,{},nullptr,{},
+      [](const auto&,double,bool stop){return stop;});
+  ASSERT_FALSE(paths.empty());EXPECT_GT(rays,0u);
+  for(const auto& p:paths) EXPECT_TRUE(p.observation_station);
+}
+TEST(LocalTaskApproachReuse, OwnershipCannotCrossRequestTaskVersionOrPortal) {
+  const TaskApproachContext prepared{100,2,300,4};
+  EXPECT_TRUE(prepared.matches({100,2,300,4}));
+  EXPECT_FALSE(prepared.matches({101,2,300,4}));
+  EXPECT_FALSE(prepared.matches({100,3,300,4}));
+  EXPECT_FALSE(prepared.matches({100,2,301,4}));
+  EXPECT_FALSE(prepared.matches({100,2,300,5}));
+  EXPECT_FALSE(TaskApproachContext{}.matches({}));
+}
+
+TEST(LocalTaskEndpoint, RejoinMustAdvanceButDetourEdgesMayRetreat) {
+  const std::vector<Eigen::Vector2d> route{{3.5,-4.3},{3.5,-5.1},{3.3,-5.7},{3.3,-6.3}};
+  EXPECT_FALSE(taskEndpointAdvances(route,{3.44,-5.01},{3.85,-5.17},.9));
+  EXPECT_FALSE(taskEndpointAdvances(route,{3.22,-5.17},{3.66,-5.06},.9));
+  EXPECT_TRUE(taskEndpointAdvances(route,{3.44,-5.01},{3.3,-6.2},.9));
+  // No restriction on intermediate route progress: a temporary retreat can
+  // still reach a forward rejoin around a real obstacle.
+  const std::vector<Eigen::Vector2d> detour{{3.44,-5.01},{4.,-4.8},{4.,-6.2},{3.3,-6.2}};
+  EXPECT_TRUE(validateTaskApproach(detour,-1.57,[](const auto&,const auto&){return true;},
+      [](const auto&,double,double){return true;}));
+  EXPECT_TRUE(taskEndpointAdvances(route,detour.front(),detour.back(),.9));
+}
+TEST(LocalTaskEndpoint, NewTaskDirectionUsesItsOwnRouteAndRejectsEmptyEvidence) {
+  const std::vector<Eigen::Vector2d> reverse{{4,0},{2,0},{0,0}};
+  EXPECT_TRUE(taskEndpointAdvances(reverse,{3,0},{1.5,0},1.));
+  EXPECT_FALSE(taskEndpointAdvances(reverse,{3,0},{3.5,0},.4));
+  EXPECT_FALSE(taskEndpointAdvances({}, {0,0},{1,0},.4));
+  EXPECT_FALSE(taskEndpointAdvances(reverse,{3,0},{1.5,0},0.));
+}
+
+
+TEST(LocalTaskPlanner, EntryCurveRetainsFullVelocityAndAcceleration) {
+  std::vector<Eigen::Vector2d> path{{0,0},{3,0},{5,0}};
+  const Eigen::Vector2d velocity(.35,.08),acceleration(.01,-.01);
+  auto c=taskEntryConnection(path,velocity,acceleration,{.3,0},.75,.5,
+      [](const auto& p,double){return p.x()>=-1e-6 && std::abs(p.y())<.5;});
+  ASSERT_TRUE(c);EXPECT_LT((c->value(0)-path.front()).norm(),1e-9);
+  EXPECT_LT((c->value(0,1)-velocity).norm(),1e-9);
+  EXPECT_LT((c->value(0,2)-acceleration).norm(),1e-9);
+  EXPECT_NEAR(c->value(c->duration).y(),0.,1e-8);
+  EXPECT_NEAR(c->value(c->duration,1).y(),0.,1e-8);
+  EXPECT_LT(c->value(c->duration,2).norm(),1e-8);
+}
+
+TEST(LocalTaskPlanner, EntryCurveCannotInventSpaceForSidewaysVelocity) {
+  EXPECT_FALSE(taskEntryConnection({{0,0},{3,0}}, {0,.7},{0,0},{.3,0},.75,.5,
+      [](const auto& p,double){return std::abs(p.y())<.01;}));
+}
+
+TEST(LocalTaskPlanner, DomainCostMatchesCorridorAndDirectionalGate) {
+  LocalTaskDomain d;d.route={{0,0},{3,0}};d.corridor_radius=.3;
+  d.observation_center={3,0};d.observation_radius=.5;
+  Eigen::Vector2d g;
+  EXPECT_DOUBLE_EQ(taskDomainViolation(d,{1,.2},&g),0.);
+  EXPECT_NEAR(taskDomainViolation(d,{1,.5},&g),.2,1e-9);EXPECT_NEAR(g.y(),1.,1e-9);
+  d.has_directional_gate=true;d.gate_origin={0,0};d.gate_direction={1,0};d.gate_min_progress=.1;
+  EXPECT_NEAR(taskDomainViolation(d,{0,0},&g),.1,1e-9);EXPECT_NEAR(g.x(),-1.,1e-9);
+}

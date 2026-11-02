@@ -20,7 +20,7 @@ class RegionVisitPlanner:
     def visit_window(self):
         if not hasattr(self, '_region_visits'):
             self._region_visits = RegionVisitWindow()
-            self._visit_routes = BoundedVisitRoutes()
+            self._visit_routes = BoundedVisitRoutes(memory=getattr(self,'global_usage_mode','shadow')=='memory')
         return self._region_visits
 
     def visit_candidate_available(self, candidate):
@@ -99,6 +99,10 @@ class RegionVisitPlanner:
             return False, None
         self._visit_pending_regions = set(); self._visit_capacity_regions = set()
         routes = self._visit_routes
+        if hasattr(routes.paths,'record_motion'):
+            samples=getattr(self,'_route_motion_samples',None)
+            for _ in range(min(128,len(samples) if samples else 0)):
+                routes.paths.record_motion(samples.popleft())
         routes.begin(self.grid, blocked_edges, self.region_visit_route_expansions,
                      revision=self.map_content_revision)
         routes.retain_goals({c.cell for c in live})
@@ -133,7 +137,11 @@ class RegionVisitPlanner:
                             required_scope):
         began = time.perf_counter()
         window = self.visit_window()
+        _wm = getattr(self, "work_metrics", None)
+        _m_reconcile = _wm.mark() if _wm else None
         selected_regions = window.reconcile(regions, start, self.map_content_revision)
+        if _wm:
+            _wm.record_since("region_reconcile", _m_reconcile, count=len(regions))
         if required_scope is not None:
             selected_regions = [r for r in selected_regions
                                 if r.region_id == window.committed_region
@@ -151,6 +159,12 @@ class RegionVisitPlanner:
             self.publish_region_overlay(regions, [])
             return None
         routes = self._visit_routes
+        if hasattr(routes.paths,'record_motion'):
+            samples=getattr(self,'_route_motion_samples',None)
+            for _ in range(min(128,len(samples) if samples else 0)):
+                routes.paths.record_motion(samples.popleft())
+        _m_candidates = _wm.mark() if _wm else None
+        _q0 = getattr(routes, "queries", 0)
         routes.begin(self.grid, blocked_edges, self.region_visit_route_expansions,
                      revision=self.map_content_revision)
         records = self.build_frontier_candidates(
@@ -159,10 +173,18 @@ class RegionVisitPlanner:
             station_limit=self.region_visit_stations,
             route_provider=routes,
             preview_regions={r.region_id for r in selected_regions[1:]})
+        if _wm:
+            _wm.record_since("candidates_route", _m_candidates,
+                             count=len(records),
+                             input_size=getattr(routes, "queries", 0) - _q0)
         self.publish_region_overlay(regions, [c for c in records if c.path])
-        return self._select_visit_records(began, start, selected_regions, records,
+        _m_select = _wm.mark() if _wm else None
+        result = self._select_visit_records(began, start, selected_regions, records,
             excluded_goals, allow_region_release=allow_region_release,
             allow_cross_region_preparation=allow_cross_region_preparation, required_scope=required_scope)
+        if _wm:
+            _wm.record_since("select", _m_select)
+        return result
 
     def _select_visit_records(self, began, start, selected_regions, records, excluded_goals,
                               *, allow_region_release, allow_cross_region_preparation, required_scope):
@@ -316,6 +338,10 @@ class RegionVisitPlanner:
         self.last_visit_stats['connection_owner'] = (None if owner is None else
             dict(start=owner.start, goal=owner.goal, expanded=len(owner.closed)))
         self.last_visit_stats['capacity_yields'] = len(self._visit_routes.capacity_yields)
+        if hasattr(self._visit_routes.paths,'stats'):
+            self.last_visit_stats['route_memory']=self._visit_routes.paths.stats()
+            self.get_logger().info(f"[GLOBAL_ROUTE_MEMORY] {self.last_visit_stats['route_memory']} "
+                f"expansions={self._visit_routes.budget.used}",throttle_duration_sec=2.)
         self.last_visit_stats['reachability_ms'] = self._visit_routes.reachability_ms
         self.last_visit_stats['reachability_bytes'] = (0 if self._visit_routes.reachable is None
                                                        else self._visit_routes.reachable.nbytes)

@@ -130,7 +130,7 @@ def generate_launch_description():
         DeclareLaunchArgument("sparse_routing_enabled", default_value="true"),
         DeclareLaunchArgument("region_visit_window_enabled", default_value="true"),
         DeclareLaunchArgument("global_usage_mode", default_value="shadow",
-                              choices=["off", "shadow", "route_cost"]),
+                              choices=["off", "shadow", "route_cost", "memory"]),
         DeclareLaunchArgument("task_geometry_autonomy", default_value="true"),
         DeclareLaunchArgument("selection_strategy", default_value="hierarchical"),
         DeclareLaunchArgument("locomotion_mode", default_value="planning_kinematic"),
@@ -343,7 +343,7 @@ def generate_launch_description():
             name="global_representation",
             output="screen",
             condition=IfCondition(PythonExpression([
-                "'", LaunchConfiguration("global_usage_mode"), "' != 'off'"])),
+                "'", LaunchConfiguration("global_usage_mode"), "' not in ['off', 'memory']"])),
             parameters=[{
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
                 "spatial_engine": "wavefront",

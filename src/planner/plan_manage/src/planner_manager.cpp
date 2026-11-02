@@ -107,7 +107,8 @@ namespace scan_planner
                                         double end_acc_x, double end_acc_y,
                                         double end_acc_z,
                                         double seed_sample_interval,
-                                        double preferred_clearance_margin)
+                                        double preferred_clearance_margin, double suffix_progress, const UniformBspline* retained_prefix,
+                                        const std::function<double(const Eigen::Vector2d&,Eigen::Vector2d*)>& corridor_cost)
   {
 
     grid_map_->usePlanningClearanceMarginForCurrentThread(
@@ -153,6 +154,7 @@ namespace scan_planner
       return false;
     }
 
+    bspline_optimizer_rebound_->setTaskCorridor(corridor_cost);
     auto t_start = std::chrono::steady_clock::now();
     double t_init = 0.0, t_opt = 0.0, t_refine = 0.0;
 
@@ -259,7 +261,10 @@ namespace scan_planner
       {
 
         double t;
-        double t_cur = (node_->now() - local_data_.start_time_).seconds();
+        // The caller owns execution progress; never infer spatial gait progress
+        // from elapsed wall/simulation time inside the generator.
+        if (!reusableSuffixProgress(suffix_progress, local_data_.duration_)) return false;
+        double t_cur = suffix_progress;
 
         vector<double> pseudo_arc_length;
         vector<Eigen::Vector3d> segment_point;
@@ -364,6 +369,13 @@ namespace scan_planner
 
     Eigen::MatrixXd ctrl_pts;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+    if(retained_prefix) {
+      // These three uniform cubic controls are fixed by the optimizer. Enforce
+      // the prospective join's exact position/velocity/acceleration, not an LS fit.
+      ctrl_pts.col(0)=start_pt-start_vel*ts+start_acc*ts*ts/3.;
+      ctrl_pts.col(1)=start_pt-start_acc*ts*ts/6.;
+      ctrl_pts.col(2)=start_pt+start_vel*ts+start_acc*ts*ts/3.;
+    }
 
     vector<vector<Eigen::Vector3d>> a_star_paths;
     a_star_paths = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
@@ -408,7 +420,7 @@ namespace scan_planner
       cout << "Need to reallocate time." << endl;
 
       Eigen::MatrixXd optimal_control_points;
-      flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
+      flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points, retained_prefix!=nullptr);
       if (flag_step_2_success)
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
@@ -422,6 +434,14 @@ namespace scan_planner
 
     t_refine = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
+    if(retained_prefix) {
+      const auto joined=UniformBspline::joinC2(*retained_prefix,pos);
+      if(!joined || !checkDynamicFeasibility(*joined)) {
+        RCLCPP_WARN(node_->get_logger(),"[ROLLING_PREFIX_JOIN_REJECTED] C2 join or dynamics failed; active execution unchanged");
+        return false;
+      }
+      pos=*joined;
+    }
     // save planned results
     updateTrajInfo(pos, node_->now());
 
@@ -592,14 +612,20 @@ namespace scan_planner
     return true;
   }
 
-  bool SCANPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points)
+  bool SCANPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points, bool preserve_start)
   {
     double t_inc;
 
     Eigen::MatrixXd ctrl_pts; // = traj.getControlPoint()
 
     // std::cout << "ratio: " << ratio << std::endl;
+    const Eigen::Vector3d original_start=traj.evaluateDeBoorT(0.);
     reparamBspline(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
+    if(preserve_start) {
+      ctrl_pts.col(0)=original_start-start_end_derivative[0]*ts+start_end_derivative[2]*ts*ts/3.;
+      ctrl_pts.col(1)=original_start-start_end_derivative[2]*ts*ts/6.;
+      ctrl_pts.col(2)=original_start+start_end_derivative[0]*ts+start_end_derivative[2]*ts*ts/3.;
+    }
 
     traj = UniformBspline(ctrl_pts, 3, ts);
 

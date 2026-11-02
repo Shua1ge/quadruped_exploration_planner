@@ -6,6 +6,12 @@ uint64 task_version
 uint64 candidate_id
 # First cross-task candidate must connect motion, not merely position.
 bool rolling_task_handoff
+# Optional exact common-prefix proof; zero duration uses ordinary entry checks.
+# Controller independently compares this range with its active predecessor.
+uint64 retained_predecessor_request_id
+int64 retained_predecessor_trajectory_id
+float64 retained_predecessor_time
+float64 retained_prefix_duration
 # Local certifies this exact initial match and align-then-connect motion.
 # Controller must not independently choose a different trajectory prefix.
 # Moving task candidates require the certificate; stationary HOLD is exempt.

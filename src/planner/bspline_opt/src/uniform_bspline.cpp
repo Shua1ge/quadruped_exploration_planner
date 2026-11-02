@@ -372,4 +372,91 @@ namespace scan_planner
     mean_a = mean_acc;
     max_a = max_acc;
   }
+
+  namespace {
+  bool insertExactKnot(Eigen::MatrixXd& points,std::vector<double>& knots,int degree,double t) {
+    const int n=points.cols()-1;
+    const int multiplicity=std::count(knots.begin(),knots.end(),t);
+    if(multiplicity>=degree+1) return true;
+    const int k=std::upper_bound(knots.begin(),knots.end(),t)-knots.begin()-1;
+    if(k<degree || k>n+1) return false;
+    Eigen::MatrixXd next(points.rows(),n+2);
+    for(int i=0;i<=k-degree;++i) next.col(i)=points.col(i);
+    for(int i=k-multiplicity;i<=n;++i) next.col(i+1)=points.col(i);
+    for(int i=k-degree+1;i<=k-multiplicity;++i) {
+      const double denominator=knots[i+degree]-knots[i];
+      if(denominator<=0 || i<=0 || i>n) return false;
+      const double a=(t-knots[i])/denominator;
+      next.col(i)=a*points.col(i)+(1-a)*points.col(i-1);
+    }
+    knots.insert(knots.begin()+k+1,t);points=std::move(next);
+    return points.allFinite();
+  }
+  // Invert one Boehm insertion. C2-compatible cubic joins allow the two
+  // redundant interior knots to be removed without changing either segment.
+  bool removeExactKnot(Eigen::MatrixXd& q,std::vector<double>& knots,int degree,double t) {
+    const auto at=std::upper_bound(knots.begin(),knots.end(),t);
+    if(at==knots.begin() || *(at-1)!=t) return false;
+    auto u=knots;u.erase(u.begin()+(at-knots.begin()-1));
+    const int k=std::upper_bound(u.begin(),u.end(),t)-u.begin()-1;
+    const int count=std::count(u.begin(),u.end(),t),n=q.cols()-2;
+    const int right=k-count;
+    if(k-degree<0 || right<0 || right>n) return false;
+    Eigen::MatrixXd p(q.rows(),n+1);
+    for(int i=0;i<=k-degree;++i) p.col(i)=q.col(i);
+    for(int i=right;i<=n;++i) p.col(i)=q.col(i+1);
+    for(int i=k-degree+1;i<=right;++i) {
+      const double den=u[i+degree]-u[i],a=den>0 ? (t-u[i])/den : 0.;
+      if(a<=1e-12) return false;
+      const Eigen::VectorXd recovered=(q.col(i)-(1-a)*p.col(i-1))/a;
+      if(i==right) {if((p.col(i)-recovered).norm()>1e-6) return false;}
+      else p.col(i)=recovered;
+    }
+    q=std::move(p);knots=std::move(u);return q.allFinite();
+  }
+  }
+
+  std::optional<UniformBspline> UniformBspline::segment(double begin,double end) const {
+    if(p_<1 || control_points_.cols()<=p_ || !control_points_.allFinite() ||
+       !u_.allFinite() || !std::isfinite(begin) || !std::isfinite(end) ||
+       begin<0 || end<=begin+1e-8 || end>u_(m_-p_)-u_(p_)+1e-9) return {};
+    const double a=begin+u_(p_),z=std::min(end+u_(p_),u_(m_-p_));
+    auto points=control_points_;std::vector<double> knots(u_.data(),u_.data()+u_.size());
+    for(double t:{a,z}) while(std::count(knots.begin(),knots.end(),t)<p_+1)
+      if(!insertExactKnot(points,knots,p_,t)) return {};
+    const int first=std::lower_bound(knots.begin(),knots.end(),a)-knots.begin();
+    const int last=std::upper_bound(knots.begin(),knots.end(),z)-knots.begin();
+    const int count=last-first-p_-1;
+    if(count<=p_ || first+count>points.cols()) return {};
+    UniformBspline result(points.middleCols(first,count),p_,interval_);
+    Eigen::VectorXd u(last-first);
+    for(int i=0;i<u.size();++i) u(i)=knots[first+i]-a;
+    result.setKnot(u);return result;
+  }
+
+  std::optional<UniformBspline> UniformBspline::joinC2(
+      const UniformBspline& prefix,const UniformBspline& suffix) {
+    if(prefix.p_!=3 || suffix.p_!=3 || prefix.control_points_.rows()!=suffix.control_points_.rows()) return {};
+    auto left=prefix.segment(0.,prefix.u_(prefix.m_-prefix.p_)-prefix.u_(prefix.p_));
+    auto right=suffix.segment(0.,suffix.u_(suffix.m_-suffix.p_)-suffix.u_(suffix.p_));
+    if(!left || !right) return {};
+    const double duration=left->getTimeSum();
+    auto lv=left->getDerivative(),rv=right->getDerivative();
+    auto la=lv.getDerivative(),ra=rv.getDerivative();
+    if((left->evaluateDeBoorT(duration)-right->evaluateDeBoorT(0)).norm()>1e-7 ||
+       (lv.evaluateDeBoorT(duration)-rv.evaluateDeBoorT(0)).norm()>1e-6 ||
+       (la.evaluateDeBoorT(duration)-ra.evaluateDeBoorT(0)).norm()>1e-5) return {};
+    const auto& a=left->control_points_;const auto& b=right->control_points_;
+    Eigen::MatrixXd points(a.rows(),a.cols()+b.cols()-1);
+    points.leftCols(a.cols())=a;points.rightCols(b.cols()-1)=b.rightCols(b.cols()-1);
+    std::vector<double> knots;
+    for(int i=0;i<left->u_.size()-1;++i) knots.push_back(left->u_(i));
+    for(int i=4;i<right->u_.size();++i) knots.push_back(duration+right->u_(i));
+    if(!removeExactKnot(points,knots,3,duration) || !removeExactKnot(points,knots,3,duration)) return {};
+    UniformBspline result(points,3,prefix.interval_);
+    result.setKnot(Eigen::Map<Eigen::VectorXd>(knots.data(),knots.size()));
+    auto v=result.getDerivative();auto acc=v.getDerivative();
+    if(!v.getControlPoint().allFinite() || !acc.getControlPoint().allFinite()) return {};
+    return result;
+  }
 } // namespace scan_planner

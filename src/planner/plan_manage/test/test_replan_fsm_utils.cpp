@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <plan_manage/replan_fsm_utils.h>
+#include <plan_manage/task_protocol.h>
 
 TEST(HandoffCertificate, RejectsMissingMalformedAndStaleState) {
   using namespace scan_planner;
@@ -1270,4 +1271,51 @@ TEST(PlanningTravelMatchWindow, CoversActualTravelAtDifferentSpeedsAndTiming)
   EXPECT_NEAR(nearestTimeInWindow(0,end,6.,slow,.02,{.4,0}),4.,.021);
   EXPECT_NEAR(nearestTimeInWindow(0,.77,6.,slow,.05,{.077,0}),.77,1e-9);
   EXPECT_LE(planningTravelMatchEnd(.8,1.,10.,slow),1.);
+}
+
+TEST(RollingExecutionEvidence, RequiresFreshMatchingRunningPredecessor) {
+  using scan_planner::rollingExecutionEvidenceFresh;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_TRUE(rollingExecutionEvidenceFresh(true,true,.1,.1,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(false,true,.1,.1,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(true,false,.1,.1,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(true,true,.251,.1,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(true,true,.1,.251,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(true,true,nan,.1,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(true,true,.1,nan,.25));
+  EXPECT_FALSE(rollingExecutionEvidenceFresh(true,true,-.1,.1,.25));
+}
+TEST(RollingSuffixProgress, MissingAndExhaustedProgressCannotSeedReuse) {
+  using scan_planner::reusableSuffixProgress;
+  EXPECT_TRUE(reusableSuffixProgress(3.,10.));
+  EXPECT_TRUE(reusableSuffixProgress(0.,10.));
+  EXPECT_FALSE(reusableSuffixProgress(10.,10.));
+  EXPECT_FALSE(reusableSuffixProgress(-1.,10.));
+  EXPECT_FALSE(reusableSuffixProgress(0.,0.));
+  EXPECT_FALSE(reusableSuffixProgress(std::numeric_limits<double>::quiet_NaN(),10.));
+}
+
+TEST(TaskExecutionLineage, NewInformationTaskDoesNotEraseActualPredecessor) {
+  using namespace scan_planner;
+  const TaskVersion a{10,1},b{20,1};
+  EXPECT_TRUE(planningOwnsExecution(a,100,a,100,{0,0},false));
+  EXPECT_TRUE(planningOwnsExecution(a,100,b,200,a,true));
+  EXPECT_FALSE(planningOwnsExecution(a,100,b,200,{10,2},true));
+  EXPECT_FALSE(planningOwnsExecution(a,100,b,200,{0,0},true));
+  EXPECT_FALSE(planningOwnsExecution(a,100,b,200,a,false));
+  EXPECT_FALSE(planningOwnsExecution({0,0},0,b,200,{0,0},true));
+  EXPECT_FALSE(planningOwnsExecution(a,99,a,100,{0,0},false));
+  // After activation of B, A no longer owns a continuation grant.
+  EXPECT_TRUE(planningOwnsExecution(b,200,b,200,{0,0},false));
+  EXPECT_FALSE(planningOwnsExecution(a,100,b,200,{0,0},false));
+}
+TEST(InstalledAlignment, NewPlanningMayWaitButSafetyAndStallStillWin) {
+  using namespace scan_planner;
+  EXPECT_TRUE(installedAlignmentMayFinish(true,true,false,false,true,true));
+  EXPECT_FALSE(installedAlignmentMayFinish(false,true,false,false,true,true));
+  EXPECT_FALSE(installedAlignmentMayFinish(true,false,false,false,true,true));
+  EXPECT_FALSE(installedAlignmentMayFinish(true,true,true,false,true,true));
+  EXPECT_FALSE(installedAlignmentMayFinish(true,true,false,true,true,true));
+  EXPECT_FALSE(installedAlignmentMayFinish(true,true,false,false,false,true));
+  EXPECT_FALSE(installedAlignmentMayFinish(true,true,false,false,true,false));
 }

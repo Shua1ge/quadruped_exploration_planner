@@ -21,6 +21,7 @@
 #include <map>
 #include <mutex>
 #include <plan_env/planar_clearance_field.h>
+#include <plan_env/fusion_metrics.h>
 #include <shared_mutex>
 #include <set>
 #include <rmw/qos_profiles.h>
@@ -98,6 +99,9 @@ bool lowReturnOutsideBodyBand(const Eigen::Vector3d& point,
 bool highReturnOutsideBodyBand(const Eigen::Vector3d& point,
     const Eigen::Vector3d& body_position, bool separate_high_returns,
     double above_body);
+struct ObservationRayTiming {
+  double lock_wait_ms{0.0}, query_ms{0.0};
+};
 struct LaserRangeEvidence { bool valid{false}; bool hit{false}; double length{0.}; };
 LaserRangeEvidence laserRangeEvidence(double measured, double minimum,
     double maximum, double no_return_range);
@@ -302,7 +306,8 @@ public:
   inline void setOccupied(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
-  bool observationRayMayReach(const Eigen::Vector3d& start, const Eigen::Vector3d& end);
+  bool observationRayMayReach(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+      plan_env::ObservationRayTiming* timing = nullptr);
   inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
 
   inline void boundIndex(Eigen::Vector3i& id);
@@ -313,12 +318,17 @@ public:
 
   struct InflatedOccupancySnapshot {
     std::vector<char> buffer;
+    // Raw occupied bits share this snapshot's bounds/ring layout/revision.
+    // Unknown/free remain optical hypotheses; inflation is never used here.
+    std::vector<uint8_t> raw_occupied_bits;
+    int getRawOccupancy(const Eigen::Vector3d& point) const;
     Eigen::Vector3i voxel_num{Eigen::Vector3i::Zero()};
     Eigen::Vector3i bound_min{Eigen::Vector3i::Zero()};
     Eigen::Vector3i bound_max{Eigen::Vector3i::Zero()};
     double resolution_inv{1.0};
     double body_offset{0.0};
     uint64_t revision{0};
+    int64_t published_steady_ns{0};
     double body_radius{0.};
     Eigen::Vector3i inflation_min{Eigen::Vector3i::Zero()}, inflation_max{Eigen::Vector3i::Zero()};
     std::set<plan_env::SourceKey> inflation_offsets;
@@ -341,6 +351,9 @@ public:
                rclcpp::CallbackGroup::SharedPtr update_callback_group = nullptr,
                rclcpp::CallbackGroup::SharedPtr visualization_callback_group = nullptr);
   InflatedOccupancySnapshotPtr captureInflatedOccupancySnapshot() const;
+  InflatedOccupancySnapshotPtr currentThreadOccupancySnapshot() const {
+    return tls_snapshot_owner_==this ? tls_snapshot_ : nullptr;
+  }
   std::shared_ptr<const scan_planner::PlanarClearanceField> capturePlanarClearance(double z) const;
   void useInflatedOccupancySnapshotForCurrentThread(
       InflatedOccupancySnapshotPtr snapshot) const;
@@ -374,6 +387,7 @@ private:
   MappingData md_;
   mutable std::shared_mutex map_mutex_;
   std::atomic<uint64_t> map_revision_{0};
+  std::unique_ptr<plan_env::FusionMetrics> fusion_metrics_;
   std::atomic<int64_t> last_map_update_ns_{0};
   std::atomic<bool> perception_pose_valid_{false};
   std::atomic<int64_t> locomotion_state_stamp_ns_{0};
@@ -408,6 +422,7 @@ private:
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& img);
   void scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan);
   int64_t last_laser_stamp_ns_{0}, last_laser_clock_ns_{0};
+  int64_t last_ray_cloud_stamp_ns_{0};
   void locomotionStateCallback(
       const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr& msg);
   bool locomotionReady() const;

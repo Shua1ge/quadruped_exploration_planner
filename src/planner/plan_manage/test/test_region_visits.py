@@ -297,3 +297,44 @@ def test_moving_start_reuses_inflight_search_and_certifies_a_new_connector():
         if result.status==RouteSearchStatus.FOUND:break
     assert result.status==RouteSearchStatus.FOUND
     assert result.path[0]==(2,1) and result.path[-1]==(28,1)
+
+
+def test_memory_reuses_detour_for_a_new_goal_without_search():
+    from explorer_core.route_memory import RouteMemory
+    g=ExplorationGrid(12,12,1,0,0);g.data[:]=FREE
+    g.data[0:8,5]=OCCUPIED
+    r=BoundedVisitRoutes(memory=True);r.begin(g,set(),4096,revision=1)
+    result=r.query((1,1),(9,1));assert result.status==RouteSearchStatus.FOUND
+    assert r.budget.used>0
+    r.begin(g,set(),0,revision=2)
+    result=r.query((1,2),(9,2))
+    assert result.status==RouteSearchStatus.FOUND and r.budget.used==0
+    assert r.paths.hits>0
+
+
+def test_memory_never_reuses_blocked_or_forbidden_history():
+    from explorer_core.route_memory import RouteMemory
+    g=ExplorationGrid(12,12,1,0,0);g.data[:]=FREE
+    m=RouteMemory();path=[(x,5) for x in range(1,10)]
+    m[(path[0],path[-1])]=path
+    assert m.connect(g,(1,5),(9,5),set())
+    assert not m.connect(g,(1,5),(9,5),{((5,5),(6,5))})
+    g.data[5,5]=OCCUPIED
+    assert not m.connect(g,(1,5),(9,5),set())
+
+
+def test_memory_bounds_geometry_and_removes_evicted_spatial_samples():
+    from explorer_core.route_memory import RouteMemory
+    m=RouteMemory(max_entries=2,max_cells=10)
+    for y in range(5):m[((0,y),(4,y))]=[(x,y) for x in range(5)]
+    assert len(m)==2 and m.stats()['cells']==10
+    assert all(k in m for samples in m.buckets.values() for k,i in samples)
+    m.clear();assert not m and not m.buckets
+
+
+def test_memory_measured_motion_ignores_teleport():
+    from explorer_core.route_memory import RouteMemory
+    m=RouteMemory()
+    for x in range(12):m.record_motion((x,1))
+    assert m.motion_records==1
+    m.record_motion((100,100));assert m.motion==[(100,100)]

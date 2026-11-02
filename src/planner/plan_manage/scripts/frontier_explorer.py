@@ -76,6 +76,7 @@ from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import BranchCommitment, ResidualCommitmentGate
 from explorer_core.region_overlay import build_region_overlay, region_rgb
 from explorer_core.region_visit_planner import RegionVisitPlanner
+from explorer_core.work_metrics import WorkMetrics
 from explorer_core.region_visits import same_visit_demand, station_alternatives, VisitCostModel
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
@@ -454,6 +455,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             raise ValueError("region_stagnation_revisions must be positive")
         self.metrics_period = float(self.declare_parameter("metrics_period", 2.0).value)
         self.metrics_file = str(self.declare_parameter("metrics_file", "").value)
+        self.work_metrics = WorkMetrics(
+            bool(self.declare_parameter("work_metrics_enable", False).value),
+            str(self.declare_parameter("work_metrics_file", "").value))
         self.observation_preplanning_enabled = bool(
             self.declare_parameter("observation_preplanning_enabled", True).value)
         self.task_mode = bool(self.declare_parameter("task_mode", False).value)
@@ -509,8 +513,8 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             self.declare_parameter("region_max_detour_ratio", 1.75).value)
         self.global_usage_mode = str(self.declare_parameter(
             "global_usage_mode", "shadow").value)
-        if self.global_usage_mode not in ("off", "shadow", "route_cost"):
-            raise ValueError("global_usage_mode must be off, shadow or route_cost")
+        if self.global_usage_mode not in ("off", "shadow", "route_cost", "memory"):
+            raise ValueError("global_usage_mode must be off, shadow, route_cost or memory")
         sparse_requested = bool(self.declare_parameter("sparse_routing_enabled", True).value)
         self.sparse_routing_enabled = self.global_usage_mode == "route_cost" and sparse_requested
         self.sparse_attachment_radius = float(
@@ -1366,6 +1370,10 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 self.visited_motion_cells.add(cell)
         self.last_metric_position = new_position
         self.position = new_position
+        if getattr(self,'global_usage_mode','shadow')=='memory':
+            from collections import deque
+            if not hasattr(self,'_route_motion_samples'):self._route_motion_samples=deque(maxlen=128)
+            self._route_motion_samples.append(self.grid.world_to_cell(*new_position))
         self.body_z = msg.pose.pose.position.z
         orientation = msg.pose.pose.orientation
         self.body_yaw = math.atan2(
@@ -1592,7 +1600,13 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         msg = self._pending_fusion_cloud
         self._pending_fusion_cloud = None
         if msg is not None:
-            self.integrate_cloud(msg)
+            tx = self.work_metrics.begin_transaction(
+                "explorer_fusion", count=1,
+                input_size=int(msg.width) * int(msg.height))
+            try:
+                self.integrate_cloud(msg)
+            finally:
+                self.work_metrics.end_transaction(tx)
         now = time.monotonic()
         if now - getattr(self, "_fusion_stats_wall", 0.0) >= 2.0:
             self._fusion_stats_wall = now
@@ -1725,6 +1739,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 # the exact-XY evidence. A no-return is never an obstacle, and
                 # known leg-height terrain cannot be reintroduced by a second
                 # body-band projection. All geometry uses the capture pose.
+                _m_project = self.work_metrics.mark()
                 projection = project_spatial_rays(
                     array, return_types, sensor_position, sensor_rotation,
                     z_reference+self.obstacle_min_z, z_reference+self.obstacle_max_z,
@@ -1751,8 +1766,14 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                                 for p in projection.world[projection.support]}
                 obstacle_cells = {self._live_grid.world_to_cell(*p[:2])
                                   for p in projection.world[projection.obstacle]}
+                self.work_metrics.record_since(
+                    "project", _m_project, count=1, input_size=len(array))
+                _m_terrain = self.work_metrics.mark()
                 self.record_terrain(projection.world[projection.terrain],
                                     projection.heights[projection.terrain])
+                self.work_metrics.record_since(
+                    "terrain", _m_terrain,
+                    count=int(np.count_nonzero(projection.terrain)))
             except ValueError as error:
                 self.get_logger().warning(f"Dropping invalid 3-D rays: {error}",
                                           throttle_duration_sec=2.)
@@ -1768,6 +1789,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                                     np.any(clearing_ranges>=.35)):
             self.fusion_stats()["no_planar"] += 1
             return # no planar evidence: do not manufacture an observation revision
+        _m_integrate = self.work_metrics.mark()
         with self._grid_lock:
             previous_grid = self._live_grid.data.copy()
             self._live_grid.integrate_ranges(
@@ -1785,7 +1807,10 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             self.fusion_stats()["integrated"] += 1
             if not np.any(changed_mask):
                 self.fusion_stats()["no_grid_change"] += 1
+        self.work_metrics.record_since("integrate", _m_integrate)
+        _m_publish = self.work_metrics.mark()
         self.publish_maps()
+        self.work_metrics.record_since("publish", _m_publish)
 
     def evaluate_active_observation(self) -> Optional[ObservationTask]:
         """Update information from new task-relevant sensor evidence."""
@@ -3606,11 +3631,15 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         self.planning_events += 1
         self.latest_region_count = len(regions)
         if self.bounded_visits_enabled():
+            _plan_tx = self.work_metrics.begin_transaction(
+                "explorer_plan", count=len(regions),
+                input_size=len(blocked_edges))
             result = self.choose_window_visit(
                 start, regions, blocked_edges, excluded_goals,
                 allow_region_release=allow_region_release,
                 allow_cross_region_preparation=allow_cross_region_preparation,
                 required_scope=required_scope)
+            self.work_metrics.end_transaction(_plan_tx)
             self.last_global_plan_ms = map_preprocess_prefix_ms + (
                 time.perf_counter()-selection_started)*1000.
             self.cumulative_planning_ms += self.last_global_plan_ms

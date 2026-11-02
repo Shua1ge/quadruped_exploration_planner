@@ -1,6 +1,7 @@
 #ifndef _BSPLINE_OPTIMIZER_H_
 #define _BSPLINE_OPTIMIZER_H_
 
+#include <functional>
 #include <Eigen/Eigen>
 #include <path_searching/dyn_a_star.h>
 #include <bspline_opt/uniform_bspline.h>
@@ -67,6 +68,7 @@ namespace scan_planner
     void setCollisionYawOverride(bool enabled, double yaw = 0.0);
 
     // optional inputs
+    void setTaskCorridor(std::function<double(const Eigen::Vector2d&,Eigen::Vector2d*)> cost) { corridor_cost_=std::move(cost); }
     void setGuidePath(const vector<Eigen::Vector3d> &guide_pt) { guide_pts_ = guide_pt; }
     void setPreferredClearance(std::shared_ptr<const PlanarClearanceField> field,
                                double margin, double body_offset) {
@@ -89,6 +91,8 @@ namespace scan_planner
     inline int getOrder(void) { return order_; }
 
   private:
+    std::function<double(const Eigen::Vector2d&,Eigen::Vector2d*)> corridor_cost_;
+    void addTaskCorridorCost(Eigen::MatrixXd& gradient,double& total);
     void addPreferredClearanceCost(Eigen::MatrixXd& gradient,double& cost);
     GridMap::Ptr grid_map_;
 

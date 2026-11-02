@@ -311,9 +311,13 @@ class RegionVisitWindow:
 
 class BoundedVisitRoutes:
     """Reuse raw FREE witnesses/searches in a bounded cache, with one budget."""
-    def __init__(self, max_entries=48, max_retained_expansions=20000):
+    def __init__(self, max_entries=48, max_retained_expansions=20000, memory=False):
         self.searches = OrderedDict()
-        self.paths = OrderedDict()
+        if memory:
+            from .route_memory import RouteMemory
+            self.paths = RouteMemory(max_entries)
+        else:
+            self.paths = OrderedDict()
         self.max_entries = max_entries
         self.max_retained_expansions = max_retained_expansions
         self.geometry = None
@@ -321,6 +325,7 @@ class BoundedVisitRoutes:
         self.pending = set()
         self.capacity_yields = set()
         self.cache_hits = 0
+        self.queries = 0
         self.estimated_transitions = 0
         self.reachable = None
         self.reachability_key = None
@@ -344,6 +349,7 @@ class BoundedVisitRoutes:
         self.estimated_transitions = 0
 
     def query(self, start, goal, quota=None, *, preview=False):
+        self.queries += 1
         grid, forbidden = self.grid, self.blocked
         key = (start, goal)
         path = self.paths.get(key)
@@ -368,6 +374,12 @@ class BoundedVisitRoutes:
             self.paths[key] = direct
             self._trim()
             return RouteSearchResult(RouteSearchStatus.FOUND, direct)
+        if hasattr(self.paths,'connect'):
+            remembered=self.paths.connect(grid,start,goal,forbidden)
+            if remembered:
+                self.paths[key]=remembered
+                self.cache_hits+=1
+                return RouteSearchResult(RouteSearchStatus.FOUND,remembered,reason='HISTORY_CONNECTION')
         if grid.value(start) != FREE or grid.value(goal) != FREE:
             return RouteSearchResult(RouteSearchStatus.NO_ROUTE, reason='ENDPOINT_NOT_KNOWN_FREE')
         if preview:
