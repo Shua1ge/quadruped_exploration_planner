@@ -76,7 +76,7 @@ from explorer_core.replan_control import ReplanContext, ReplanGate, retry_epoch
 from explorer_core.region_commitment import BranchCommitment, ResidualCommitmentGate
 from explorer_core.region_overlay import build_region_overlay, region_rgb
 from explorer_core.region_visit_planner import RegionVisitPlanner
-from explorer_core.work_metrics import WorkMetrics
+from explorer_core.work_metrics import WorkMetrics, timed
 from explorer_core.region_visits import same_visit_demand, station_alternatives, VisitCostModel
 from explorer_core.sparse_routing import (
     SparseEdge, SparseNode, SparseRouteEstimate, SparseRouteGraph,
@@ -1657,6 +1657,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             else:
                 self.defer_cloud_for_pose(msg)
             return
+        _m_decode = self.work_metrics.mark()
         identified_scan = isinstance(msg, LaserScan)
         if identified_scan and (not msg.ranges or msg.time_increment != 0.):
             # Gazebo GPU rays share one capture pose. Sequential scanners need
@@ -1706,6 +1707,9 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
                 throttle_duration_sec=2.0)
             return
         sensor_rotation = body_rotation
+        self.work_metrics.record_since(
+            "decode", _m_decode,
+            input_size=int(getattr(msg, "width", 0)) * int(getattr(msg, "height", 0)))
         sensor_position = np.array(
             [scan_x, scan_y, scan_z], dtype=np.float64)
         if self.need_extrinsic:
@@ -2575,6 +2579,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             cached = self.branch_domain_cache = (key,intent.domain(grid))
         return cached[1]
 
+    @timed("explorer_branch")
     def evaluate_branch_commitment(self):
         """Assess the option before request/ACK/preparation early returns.
 
@@ -3274,6 +3279,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         return region_id in self.region_failure_cooldowns
 
     @with_planning_grid_snapshot
+    @timed("explorer_cycle")
     def exploration_timer(self):
         now_ns = self.get_clock().now().nanoseconds
         dt = max(0.0, (now_ns - self.last_task_clock_ns) * 1e-9)
@@ -4238,6 +4244,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
         return {int(region.region_id): region_rgb(int(region.region_id))
                 for region in regions}
 
+    @timed("explorer_overlay")
     def publish_region_overlay(self, regions, accepted):
         """Publish the current region/candidate decision for RViz only."""
         now = time.monotonic()
@@ -5037,6 +5044,7 @@ class FrontierExplorer(RegionVisitPlanner, ObservationTaskBridge, Node):
             throttle_duration_sec=2.0)
 
     @with_planning_grid_snapshot
+    @timed("explorer_metrics")
     def metrics_timer(self):
         known_cells = int(np.count_nonzero(self.grid.data != UNKNOWN))
         total_cells = int(self.grid.data.size)

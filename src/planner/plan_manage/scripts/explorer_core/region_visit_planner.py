@@ -275,12 +275,36 @@ class RegionVisitPlanner:
                 current = siblings
                 prefix = tuple(f for f in prefix if f != task.frontier_cell)
                 demand_prefix = tuple(k for k in demand_prefix if k != visit_demand_key(task))
+        # Preserve a committed demand while its existing connection is still
+        # computing. Valid siblings do not turn INCOMPLETE into infeasibility.
+        if demand_prefix and not any(visit_demand_key(c)==demand_prefix[0] for c in current):
+            waiting = [c for c in records if c.region_id==chosen_region and
+                       visit_demand_key(c)==demand_prefix[0]]
+            incomplete = False
+            for c in waiting[:3]:
+                query = routes.query(start,c.cell)
+                if query.status == RouteSearchStatus.FOUND:
+                    c.path=query.path;c.path_length=path_length_cells(c.path,self.grid.resolution)
+                    c.turn_cost=path_turn_cost(c.path);current.append(c)
+                elif query.status == RouteSearchStatus.INCOMPLETE:
+                    if query.reason == 'SEARCH_CACHE_CAPACITY':
+                        self._visit_capacity_regions.add(chosen_region)
+                    else:
+                        incomplete=True
+            if incomplete and not any(visit_demand_key(c)==demand_prefix[0] for c in current):
+                self.region_visit_deferred=True
+                self._pending_visit=(self._visit_context(excluded_goals,required_scope,
+                    allow_region_release,allow_cross_region_preparation),start,selected_regions,records)
+                self.last_visit_stats=dict(window=self.last_visit_window,deferred=True,
+                    reason='RETAINED_CONNECTION_PENDING',retained_demand=demand_prefix[0])
+                self._log_visit(began)
+                return None
         remaining_ids = [r.region_id for r in selected_regions]
         after = remaining_ids[remaining_ids.index(chosen_region)+1:]
         lookahead = [by_region[rid] for rid in after[:2]]
         choice = choose_joint_visit(current, lookahead, routes,
             body_yaw=getattr(self, 'body_yaw', None), retained_prefix=prefix,
-            retained_demands=demand_prefix,
+            retained_demands=demand_prefix, committed_order=bool(demand_prefix),
             retained_stations=window.retained_stations(chosen_region),
             cost_model=getattr(self, 'region_visit_cost_model', None),
             resolution=self.grid.resolution)

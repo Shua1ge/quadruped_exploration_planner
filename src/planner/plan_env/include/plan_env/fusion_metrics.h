@@ -38,6 +38,9 @@ struct FusionRecord
   int64_t callback_total_ns{0};
   int points{0};
   int64_t raycast_cpu_ns{0};
+  int64_t raycast_sliding_ns{0};
+  int64_t raycast_terrain_ns{0};
+  int64_t raycast_loop_ns{0};
   int64_t fusion_other_cpu_ns{0};
   int64_t sensor_stamp_ns{0};
   uint64_t map_revision{0};
@@ -90,7 +93,7 @@ public:
       out_ << "start_steady_ns,cls,tid,wall_ms,cpu_ms,runnable_ms,residual_ms,"
               "prelock_ms,lock_wait_ms,raycast_process_ms,fusion_other_ms,"
               "snapshot_build_ms,snapshot_publish_ms,visualization_ms,"
-              "callback_total_ms,points,raycast_cpu_ms,fusion_other_cpu_ms,sensor_stamp_ns,map_revision,snapshot_revision\n";
+              "callback_total_ms,points,raycast_cpu_ms,raycast_sliding_ms,raycast_terrain_maint_ms,raycast_point_loop_ms,fusion_other_cpu_ms,sensor_stamp_ns,map_revision,snapshot_revision\n";
       out_.flush();
     }
   }
@@ -108,7 +111,9 @@ public:
          << ns_to_ms(r.raycast_ns) << ',' << ns_to_ms(r.fusion_other_ns) << ','
          << ns_to_ms(r.snapshot_build_ns) << ',' << ns_to_ms(r.snapshot_publish_ns) << ','
          << ns_to_ms(r.visualization_ns) << ',' << ns_to_ms(r.callback_total_ns) << ','
-         << r.points << ',' << ns_to_ms(r.raycast_cpu_ns) << ',' << ns_to_ms(r.fusion_other_cpu_ns) << ','
+         << r.points << ',' << ns_to_ms(r.raycast_cpu_ns) << ',' << ns_to_ms(r.raycast_sliding_ns) << ','
+         << ns_to_ms(r.raycast_terrain_ns) << ',' << ns_to_ms(r.raycast_loop_ns) << ','
+         << ns_to_ms(r.fusion_other_cpu_ns) << ','
          << r.sensor_stamp_ns << ',' << r.map_revision << ',' << r.snapshot_revision << '\n';
     if (++count_ % 100 == 0) out_.flush();
   }

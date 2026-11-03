@@ -1,6 +1,7 @@
 #ifndef SCAN_PLANNER_REPLAN_FSM_UTILS_H_
 #define SCAN_PLANNER_REPLAN_FSM_UTILS_H_
 
+#include <plan_manage/rolling_execution_contract.h>
 #include <Eigen/Eigen>
 #include <algorithm>
 #include <cmath>
@@ -1505,6 +1506,32 @@ inline bool safetyResultMatchesExecution(
          checked_trajectory == executing_trajectory;
 }
 
+} // namespace scan_planner
+
+
+namespace scan_planner {
+struct OrdinaryTrackingCommand {double vx{0},vy{0},wz{0};};
+inline OrdinaryTrackingCommand ordinaryTrackingCommand(const Eigen::Vector2d& target,
+    const Eigen::Vector2d& velocity,const Eigen::Vector2d& actual,double yaw,double target_yaw,
+    const RollingExecutionContract& c,double kp_pos,double kp_yaw,double endpoint_distance) {
+  Eigen::Vector2d correction=kp_pos*(target-actual);
+  if(correction.norm()>c.correction && correction.norm()>0)correction*=c.correction/correction.norm();
+  Eigen::Vector2d world=velocity+correction;const double bound=std::max(c.vx,c.vy);
+  if(world.norm()>bound && world.norm()>0)world*=bound/world.norm();
+  OrdinaryTrackingCommand out;
+  if(c.command_floor>0) {out.vx=c.command_floor;out.vy=0;}
+  else {
+    out.vx=std::clamp(std::cos(yaw)*world.x()+std::sin(yaw)*world.y(),-c.vx,c.vx);
+    out.vy=std::clamp(-std::sin(yaw)*world.x()+std::cos(yaw)*world.y(),-c.vy,c.vy);
+  }
+  out.wz=std::clamp(kp_yaw*normalizePlanarAngle(target_yaw-yaw),-c.wz,c.wz);
+  if(c.terminal_speed>0) {
+    const double limit=terminalApproachSpeed(c.vx,c.terminal_speed,endpoint_distance,c.deceleration,c.latency);
+    const double speed=std::hypot(out.vx,out.vy);
+    if(speed>limit && speed>0){out.vx*=limit/speed;out.vy*=limit/speed;}
+  }
+  return out;
+}
 } // namespace scan_planner
 
 #endif // SCAN_PLANNER_REPLAN_FSM_UTILS_H_

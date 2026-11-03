@@ -1139,16 +1139,24 @@ bool GridMap::isInsideSelfFilter(const Eigen::Vector3d& point) const
 
 void GridMap::raycastProcess()
 {
+  last_raycast_sliding_ns_ = 0;
+  last_raycast_terrain_ns_ = 0;
+  last_raycast_loop_ns_ = 0;
   // if (md_.proj_points_.size() == 0)
   if (md_.proj_points_cnt == 0)
     return;
 
+  const auto t_slide0 = std::chrono::steady_clock::now();
   updateSlidingMap(md_.ray_pos_);
+  const auto t_slide1 = std::chrono::steady_clock::now();
+  last_raycast_sliding_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      t_slide1 - t_slide0).count();
 
   md_.raycast_num_ += 1;
   md_.terrain_scan_ += 1;
   // Retain physical XYZ for support, slopes, depressions and overhead returns.
   // Sliding drops facts outside the window; lack of a return never says FREE.
+  const auto t_terrain0 = std::chrono::steady_clock::now();
   for(auto it=md_.terrain_facts_.begin();it!=md_.terrain_facts_.end();) {
     if(it->first[0]<mp_.map_bound_min_idx_.x() || it->first[0]>mp_.map_bound_max_idx_.x() ||
         it->first[1]<mp_.map_bound_min_idx_.y() || it->first[1]>mp_.map_bound_max_idx_.y())
@@ -1191,10 +1199,14 @@ void GridMap::raycastProcess()
   double max_y = mp_.map_min_boundary_(1);
   double max_z = mp_.map_min_boundary_(2);
 
+  const auto t_terrain1 = std::chrono::steady_clock::now();
+  last_raycast_terrain_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      t_terrain1 - t_terrain0).count();
   RayCaster raycaster;
   Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
   Eigen::Vector3d ray_pt, pt_w;
 
+  const auto t_loop0 = std::chrono::steady_clock::now();
   for (int i = 0; i < md_.proj_points_cnt; ++i)
   {
     pt_w = md_.proj_points_[i];
@@ -1361,6 +1373,9 @@ void GridMap::raycastProcess()
         break;
     }
   }
+  const auto t_loop1 = std::chrono::steady_clock::now();
+  last_raycast_loop_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      t_loop1 - t_loop0).count();
 
   // Bounded symmetric evidence. A hazard frame adds one hit, a support frame
   // subtracts one, up to the confirmation bound either way. A projection needs
@@ -1697,6 +1712,9 @@ void GridMap::updateOccupancyCallback()
     rec.snapshot_publish_ns = ns(snapshot_built, snapshot_published);
     rec.visualization_ns = ns(snapshot_published, snapshot_finished);
     rec.raycast_cpu_ns = cpu_raycast_end - cpu_raycast_start;
+    rec.raycast_sliding_ns = last_raycast_sliding_ns_;
+    rec.raycast_terrain_ns = last_raycast_terrain_ns_;
+    rec.raycast_loop_ns = last_raycast_loop_ns_;
     rec.fusion_other_cpu_ns = rec.cpu_ns - rec.raycast_cpu_ns;
     rec.sensor_stamp_ns = last_ray_cloud_stamp_ns_;
     rec.map_revision = map_revision_.load();

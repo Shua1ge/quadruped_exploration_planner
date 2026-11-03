@@ -759,3 +759,72 @@ TEST(LocalTaskPlanner, DomainCostMatchesCorridorAndDirectionalGate) {
   d.has_directional_gate=true;d.gate_origin={0,0};d.gate_direction={1,0};d.gate_min_progress=.1;
   EXPECT_NEAR(taskDomainViolation(d,{0,0},&g),.1,1e-9);EXPECT_NEAR(g.x(),-1.,1e-9);
 }
+
+
+TEST(LocalTaskPlanner, FutureEntryCoversStraightGentleBendAndRejectsUncertifiedReversal) {
+  const auto open=[](const Eigen::Vector2d&,double){return true;};
+  EXPECT_TRUE(taskEntryConnection({{0,0},{2,0},{4,0}}, {.3,0},{0,0},{.3,0},.75,.5,open));
+  EXPECT_TRUE(taskEntryConnection({{0,0},{2,.3},{4,.6}}, {.3,.03},{0,0},{.3,.045},.75,.5,open));
+  // No free space ahead: an initial +X velocity cannot be reversed without
+  // leaving this measured-free corridor, even if the target lies behind.
+  EXPECT_FALSE(taskEntryConnection({{0,0},{-2,0},{-4,0}}, {.3,0},{0,0},{-.3,0},.75,.5,
+      [](const Eigen::Vector2d& p,double){return p.x()<=1e-8 && std::abs(p.y())<.1;}));
+}
+
+TEST(LocalTaskRoute, WindowIsBoundedAndDoesNotRequireAnExistingCloseSuffix) {
+  const std::vector<Eigen::Vector2d> route{{0,0},{4,0},{8,0}};
+  EXPECT_TRUE(taskRouteWindow(route,{0,1.2},.8,3.).empty());
+  const auto bridge=taskRouteWindow(route,{0,1.2},2.,3.);
+  ASSERT_GT(bridge.size(),1u);double length=0.;
+  for(size_t i=1;i<bridge.size();++i)length+=(bridge[i]-bridge[i-1]).norm();
+  EXPECT_NEAR(length,3.,1e-8);
+  EXPECT_TRUE(taskRouteWindow(route,{0,2.1},2.,3.).empty());
+  LocalTaskDomain domain;domain.route=route;domain.corridor_radius=.8;domain.observation_radius=0.;
+  EXPECT_FALSE(taskDomainContains(domain,{0,1.2}));
+  domain.connection={{0,1.2},{1,0}};
+  EXPECT_TRUE(taskDomainContains(domain,{0,1.2}));
+  EXPECT_FALSE(taskDomainContains(domain,{2,2}));
+}
+
+TEST(LocalTaskRoute, BridgeRequiresDynamicAndMeasuredSpaceCertification) {
+  const auto route=taskRouteWindow({{0,0},{4,0},{8,0}},{0,1.2},2.,3.);
+  ASSERT_FALSE(route.empty());
+  EXPECT_TRUE(taskEntryConnection(route,{.3,0},{0,0},{.3,0},.75,.5,
+      [](const Eigen::Vector2d&,double){return true;}));
+  EXPECT_FALSE(taskEntryConnection(route,{.3,0},{0,0},{.3,0},.75,.5,
+      [](const Eigen::Vector2d& p,double){return p.y()>.9;}));
+}
+
+
+TEST(CrossTaskJoin, SeparatesEarlyMiddleLateAndNeverUsesPastOrDuplicates) {
+  const auto exits=crossTaskJoinBoundaries(1.,5.,[](double t){return Eigen::Vector2d(t,0);});
+  ASSERT_EQ(exits.size(),3u);EXPECT_DOUBLE_EQ(exits[0].time,1.);
+  EXPECT_GE(exits[1].extra_arc,.5);EXPECT_GE(exits[2].extra_arc,1.25);
+  EXPECT_LT(exits[1].time,exits[2].time);EXPECT_LE(exits.back().time,5.);
+  EXPECT_TRUE(crossTaskJoinBoundaries(5.,1.,[](double t){return Eigen::Vector2d(t,0);}).empty());
+  const auto short_curve=crossTaskJoinBoundaries(1.,1.2,[](double t){return Eigen::Vector2d(t,0);});
+  EXPECT_EQ(short_curve.size(),1u);
+}
+
+TEST(CrossTaskJoin, MiddleConnectionCanSucceedWhenEarlyFootprintCannot) {
+  LocalTaskDomain d;d.route={{0,0},{4,0}};
+  const auto exits=crossTaskJoinBoundaries(0.,3.,[](double t){return Eigen::Vector2d(t,0);});
+  ASSERT_EQ(exits.size(),3u);
+  auto early=taskEntryConnection({{0,0},{3,0}},{.3,0},{0,0},{.3,0},.75,.5,
+      [](const auto& p,double){return p.x()>.2;});
+  EXPECT_FALSE(early);
+  const auto p=Eigen::Vector2d(exits[1].time,0);
+  auto middle=taskEntryConnection({p,{3,0}},{.3,0},{0,0},{.3,0},.75,.5,
+      [](const auto& q,double){return q.x()>.2;});
+  EXPECT_TRUE(middle);
+}
+
+TEST(CrossTaskJoin, DiagnosticsDoNotChangeOrdinaryEntryResult) {
+  const std::vector<Eigen::Vector2d> path{{0,0},{3,0}};
+  const auto safe=[](const Eigen::Vector2d&,double){return true;};TaskEntryProbeStats stats;
+  const auto a=taskEntryConnection(path,{.3,0},{0,0},{.3,0},.75,.5,safe);
+  const auto b=taskEntryConnection(path,{.3,0},{0,0},{.3,0},.75,.5,safe,&stats);
+  ASSERT_TRUE(a);ASSERT_TRUE(b);EXPECT_DOUBLE_EQ(a->duration,b->duration);
+  for(int i=0;i<6;++i)EXPECT_LT((a->coefficients[i]-b->coefficients[i]).norm(),1e-12);
+  EXPECT_GT(stats.samples,0u);
+}

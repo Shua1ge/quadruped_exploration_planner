@@ -338,3 +338,14 @@ def test_memory_measured_motion_ignores_teleport():
     for x in range(12):m.record_motion((x,1))
     assert m.motion_records==1
     m.record_motion((100,100));assert m.motion==[(100,100)]
+
+
+def test_committed_order_survives_gain_reranking_but_missing_evidence_can_release():
+    a=option(1,(2,0));b=option(1,(2,1))
+    b.observation_cells={(i,100) for i in range(1000)}
+    kept=choose_joint_visit([a,b],[],EuclideanRoutes(),retained_prefix=(a.frontier_cell,),
+        depth=1,committed_order=True)
+    assert kept.candidate is a and not kept.reordered
+    released=choose_joint_visit([b],[],EuclideanRoutes(),retained_prefix=(a.frontier_cell,),
+        depth=1,committed_order=True)
+    assert released.candidate is b

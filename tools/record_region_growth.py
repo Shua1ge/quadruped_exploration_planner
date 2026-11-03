@@ -29,6 +29,11 @@ TOPICS = (
     ('/planning/observation_feedback', 'scan_planner_msgs/msg/ObservationFeedback', False),
     ('/planning/status', 'std_msgs/msg/String', False),
     ('/planning/trajectory_ack', 'scan_planner_msgs/msg/TrajectoryAck', False),
+    ('/planning/cmd_vel_raw', 'geometry_msgs/msg/Twist', False),
+    ('/quad_0/cmd_vel', 'geometry_msgs/msg/Twist', False),
+    ('/planning/handoff_metrics', 'std_msgs/msg/String', False),
+    ('/planning/execution_state', 'scan_planner_msgs/msg/ExecutionState', False),
+    ('/planning/bspline', 'scan_planner_msgs/msg/Bspline', False),
     ('/planning/local_execution_event', 'std_msgs/msg/String', False),
     ('/quad_0/body_pose', 'nav_msgs/msg/Odometry', False),
     ('/clock', 'rosgraph_msgs/msg/Clock', False),
@@ -158,6 +163,23 @@ class RegionRecording:
         if topic == '/quad_0/body_pose':
             p,v=message.pose.pose.position,message.twist.twist.linear
             return dict(position=[p.x,p.y,p.z],velocity=[v.x,v.y,v.z])
+        if topic == '/planning/execution_state':
+            return {name:getattr(message,name) for name in
+                ('request_id','task_id','task_version','trajectory_id','state',
+                 'execution_time','duration','terminal_error','reason')}
+        if topic == '/planning/trajectory_ack':
+            return {name:getattr(message,name) for name in
+                ('request_id','task_id','task_version','trajectory_id','status',
+                 'reason','matched_time','position_error','yaw_error') if hasattr(message,name)}
+        if topic == '/planning/bspline':
+            return {name:getattr(message,name) for name in
+                ('request_id','task_id','task_version','traj_id','execution_mode',
+                 'use_measured_progress','max_forward_speed','max_lateral_speed','max_yaw_rate',
+                 'max_tracking_correction','min_forward_command','min_forward_effective_speed',
+                 'retained_predecessor_request_id','retained_predecessor_trajectory_id',
+                 'retained_predecessor_time','retained_prefix_duration','rolling_task_handoff')}
+        if topic in ('/planning/cmd_vel_raw','/quad_0/cmd_vel'):
+            return dict(vx=message.linear.x,vy=message.linear.y,wz=message.angular.z)
         if topic == '/explorer/frontiers':
             return dict(points=len(message.points),ns=message.ns,id=message.id,action=message.action)
         if topic == '/explorer/goal':
@@ -218,8 +240,10 @@ def main(argv=None):
         session = RegionRecording(args.output, os.environ.get('ROS_DOMAIN_ID','0'),args.odom_rate)
         node = Node('region_growth_readonly_recorder')
         for topic,msg_type,transient in TOPICS:
-            qos = QoSProfile(depth=100 if topic == '/map_updates' else 20,
-                reliability=ReliabilityPolicy.RELIABLE if transient else ReliabilityPolicy.BEST_EFFORT,
+            qos = QoSProfile(depth=100 if topic in ('/map_updates','/planning/handoff_metrics') else 20,
+                reliability=ReliabilityPolicy.RELIABLE if transient or topic in (
+                    '/planning/handoff_metrics','/planning/trajectory_ack','/planning/execution_state',
+                    '/planning/bspline') else ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL if transient else DurabilityPolicy.VOLATILE)
             node.create_subscription(get_message(msg_type), topic,
                 lambda message, topic=topic: session.append(topic,message),qos)

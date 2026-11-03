@@ -108,7 +108,8 @@ namespace scan_planner
                                         double end_acc_z,
                                         double seed_sample_interval,
                                         double preferred_clearance_margin, double suffix_progress, const UniformBspline* retained_prefix,
-                                        const std::function<double(const Eigen::Vector2d&,Eigen::Vector2d*)>& corridor_cost)
+                                        const std::function<double(const Eigen::Vector2d&,Eigen::Vector2d*)>& corridor_cost,
+                                        double tail_reference_speed_limit)
   {
 
     grid_map_->usePlanningClearanceMarginForCurrentThread(
@@ -434,6 +435,22 @@ namespace scan_planner
 
     t_refine = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
+    if(tail_reference_speed_limit>0.) {
+      const auto speed_bound=[](UniformBspline& curve) {
+        const auto controls=curve.getDerivative().getControlPoint();double bound=0.;
+        for(int i=0;i<controls.cols();++i)bound=std::max(bound,controls.col(i).head<2>().norm());
+        return bound;
+      };
+      const double ratio=speed_bound(pos)/tail_reference_speed_limit;
+      if(ratio>1.+1e-4) {
+        Eigen::MatrixXd controls;
+        if(!refineTrajAlgo(pos,start_end_derivatives,ratio*1.02,ts,controls,true))return false;
+        pos=UniformBspline(controls,3,ts);
+      }
+      if(speed_bound(pos)>tail_reference_speed_limit+1e-4 || !checkDynamicFeasibility(pos)) {
+        RCLCPP_INFO(node_->get_logger(),"[ROLLING_TAIL_PROFILE_REJECTED] reference speed exceeds installed contract; prefix unchanged");return false;
+      }
+    }
     if(retained_prefix) {
       const auto joined=UniformBspline::joinC2(*retained_prefix,pos);
       if(!joined || !checkDynamicFeasibility(*joined)) {
@@ -442,6 +459,7 @@ namespace scan_planner
       }
       pos=*joined;
     }
+    t_refine = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     // save planned results
     updateTrajInfo(pos, node_->now());
 

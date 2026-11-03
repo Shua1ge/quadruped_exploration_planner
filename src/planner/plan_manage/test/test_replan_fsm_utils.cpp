@@ -1319,3 +1319,35 @@ TEST(InstalledAlignment, NewPlanningMayWaitButSafetyAndStallStillWin) {
   EXPECT_FALSE(installedAlignmentMayFinish(true,true,false,false,false,true));
   EXPECT_FALSE(installedAlignmentMayFinish(true,true,false,false,true,false));
 }
+
+TEST(RollingExecutionContract, InheritsOnlyCompatibleOrdinaryExecution) {
+  using namespace scan_planner;
+  RollingExecutionContract normal;normal.known=true;normal.measured=true;
+  normal=normal.resolved(.75,.35,1.);
+  auto limited=normal;limited.mode=1;limited.vx=.3;limited.vy=.08;
+  limited.wz=.5;limited.command_floor=.3;limited.effective_speed=.165;
+  EXPECT_EQ(rollingContractMismatch(normal,normal),nullptr);
+  EXPECT_EQ(rollingContractMismatch(limited,limited),nullptr);
+  EXPECT_STREQ(rollingContractMismatch(limited,normal),"MODE");
+  auto altered=limited;altered.effective_speed=.2;
+  EXPECT_STREQ(rollingContractMismatch(limited,altered),"LIMITS_OR_GAIT");
+  altered=limited;altered.fixed_yaw=true;
+  EXPECT_STREQ(rollingContractMismatch(limited,altered),"NOT_ORDINARY");
+  altered=limited;altered.command_floor=0.;EXPECT_FALSE(altered.ordinary());
+  altered=normal;altered.known=false;EXPECT_FALSE(altered.ordinary());
+  altered=limited;altered.correction=std::numeric_limits<double>::quiet_NaN();EXPECT_FALSE(altered.ordinary());
+}
+
+TEST(RollingExecutionContract, TrackingMatchesLegacyWorldAndBodyCommands) {
+  using namespace scan_planner;
+  RollingExecutionContract c;c.known=true;c.measured=true;c=c.resolved(.75,.35,1.);
+  // Unsaturated feedforward + position correction, then world -> body frame.
+  auto out=ordinaryTrackingCommand({.1,.05},{.2,.1},{0.,0.},M_PI/2,M_PI/2+.1,c,1.5,1.5,5.);
+  EXPECT_NEAR(out.vx,.175,1e-12);EXPECT_NEAR(out.vy,-.35,1e-12);EXPECT_NEAR(out.wz,.15,1e-12);
+  c.mode=1;c.vx=.3;c.vy=.08;c.wz=.5;c.command_floor=.3;c.effective_speed=.165;
+  out=ordinaryTrackingCommand({.5,.5},{.1,.1},{0.,0.},0.,.5,c,1.5,1.5,5.);
+  EXPECT_DOUBLE_EQ(out.vx,.3);EXPECT_DOUBLE_EQ(out.vy,0.);EXPECT_DOUBLE_EQ(out.wz,.5);
+  c.terminal_speed=.1;c.deceleration=.32;c.latency=.3;
+  out=ordinaryTrackingCommand({0.,0.},{.1,0.},{0.,0.},0.,0.,c,1.5,1.5,0.);
+  EXPECT_NEAR(out.vx,.1,1e-12); // contract scalars alone cannot prove live command continuity
+}

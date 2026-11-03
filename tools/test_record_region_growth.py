@@ -149,3 +149,18 @@ class BagIntegrationTests(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
+
+class LocalMetricRecordingTests(unittest.TestCase):
+    def test_local_topics_include_exact_ack_execution_and_handoff(self):
+        topics={t for t,_,_ in TOPICS}
+        self.assertTrue({'/planning/handoff_metrics','/planning/execution_state','/planning/bspline'}<=topics)
+        with tempfile.TemporaryDirectory() as tmp:
+            r=RegionRecording(Path(tmp)/'capture',232,sink_factory=FakeSink)
+            r.append('/planning/handoff_metrics',NS(data='{"attempt_id":3,"event":"ACK","install_total_wall_ms":123.4}'))
+            r.append('/planning/execution_state',NS(request_id=9,task_id=2,task_version=1,trajectory_id=3,state=1,
+                execution_time=.2,duration=5.,terminal_error=2.,reason='RUNNING'))
+            r.close()
+            rows=[json.loads(x) for x in (Path(tmp)/'capture/events.jsonl').read_text().splitlines()]
+            self.assertEqual(rows[0]['payload']['install_total_wall_ms'],123.4)
+            self.assertEqual(rows[1]['payload']['reason'],'RUNNING')

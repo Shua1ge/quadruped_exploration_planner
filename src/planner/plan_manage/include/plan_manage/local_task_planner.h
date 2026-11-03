@@ -51,6 +51,7 @@ inline std::optional<double> measuredSupportSlope(
 struct LocalTaskDomain {
   std::vector<Eigen::Vector2d> route;
   std::vector<Eigen::Vector2d> terminals;
+  std::vector<Eigen::Vector2d> connection; // attempt-local, measured-space certified bridge
   Eigen::Vector2d observation_center = Eigen::Vector2d::Zero();
   double corridor_radius = 1.0;
   double observation_radius = 2.0;
@@ -539,6 +540,8 @@ inline bool taskDomainContains(const LocalTaskDomain& domain,
        !std::isfinite(domain.gate_min_progress) || domain.gate_direction.norm()<1e-6 ||
        (p-domain.gate_origin).dot(domain.gate_direction.normalized()) < domain.gate_min_progress))
     return false;
+  for(size_t i=1;i<domain.connection.size();++i)
+    if(taskSegmentDistance(p,domain.connection[i-1],domain.connection[i])<=.25)return true;
   if ((p-domain.observation_center).norm() <= domain.observation_radius)
     return true;
   for (size_t i = 1; i < domain.route.size(); ++i)
@@ -601,13 +604,36 @@ inline Eigen::Vector2d taskPointAtArc(const std::vector<Eigen::Vector2d>& path,d
   return path.empty() ? Eigen::Vector2d::Zero() : path.back();
 }
 
+// Cross-task only: compare separated future exits, rather than repeatedly
+// sliding a narrow cluster along the predecessor. One bounded scan, <=3 exits.
+struct TaskJoinBoundary { double time{0.}, extra_arc{0.}; };
+inline std::vector<TaskJoinBoundary> crossTaskJoinBoundaries(double earliest,double end,
+    const std::function<Eigen::Vector2d(double)>& position) {
+  if(!position || !std::isfinite(earliest) || !std::isfinite(end) || earliest<0 || end<earliest)return {};
+  std::vector<TaskJoinBoundary> result{{earliest,0.}};
+  Eigen::Vector2d last=position(earliest);if(!last.allFinite())return {};
+  double arc=0.,t=earliest;
+  const double offsets[2]={.5,1.25};size_t next=0;
+  for(int i=0;i<128 && t<end && next<2;++i) {
+    t=std::min(t+.05,end);const auto p=position(t);if(!p.allFinite())return {};
+    arc+=(p-last).norm();last=p;
+    if(arc>=offsets[next]) {result.push_back({t,arc});++next;}
+  }
+  return result;
+}
+
+struct TaskEntryProbeStats {
+  size_t curves{0}, duration{0}, velocity{0}, acceleration{0}, footprint{0}, samples{0};
+};
+
 // At most 3 anchors x 2 durations x 25 probes. Complete footprint, sweep and
 // spline certification still happens downstream. No extra selector/A* pass.
 inline std::optional<TaskEntryCurve> taskEntryConnection(
     const std::vector<Eigen::Vector2d>& path,const Eigen::Vector2d& velocity,
     const Eigen::Vector2d& acceleration,const Eigen::Vector2d& end_velocity,
     double max_velocity,double max_acceleration,
-    const std::function<bool(const Eigen::Vector2d&,double)>& allowed) {
+    const std::function<bool(const Eigen::Vector2d&,double)>& allowed,
+    TaskEntryProbeStats* stats=nullptr) {
   if(path.size()<2 || !velocity.allFinite() || !acceleration.allFinite() ||
       max_velocity<=0 || max_acceleration<=0) return std::nullopt;
   double length=0.;for(size_t i=1;i<path.size();++i)length+=(path[i]-path[i-1]).norm();
@@ -622,7 +648,8 @@ inline std::optional<TaskEntryCurve> taskEntryConnection(
         1.5*(finish_velocity-velocity).norm()/max_acceleration});
     for(double scale:{1.,1.5}) {
       TaskEntryCurve c;c.duration=nominal*scale;c.join_distance=distance;
-      if(c.duration>6.)continue;
+      if(stats)++stats->curves;
+      if(c.duration>6.) {if(stats)++stats->duration;continue;}
       const Eigen::Vector2d delta=finish-path.front(),v0=velocity*c.duration,
           v1=finish_velocity*c.duration,a0=acceleration*c.duration*c.duration;
       c.coefficients[0]=path.front();c.coefficients[1]=v0;c.coefficients[2]=.5*a0;
@@ -632,9 +659,15 @@ inline std::optional<TaskEntryCurve> taskEntryConnection(
       bool valid=true;
       for(int i=0;i<=24 && valid;++i) {
         const double t=c.duration*i/24.;const Eigen::Vector2d v=c.value(t,1);
-        valid=v.cwiseAbs().maxCoeff()<=max_velocity+1e-3 &&
-            c.value(t,2).cwiseAbs().maxCoeff()<=max_acceleration+1e-3 &&
-            allowed(c.value(t),v.norm()>.01 ? std::atan2(v.y(),v.x()) : 0.);
+        if(stats)++stats->samples;
+        const bool velocity_ok=v.cwiseAbs().maxCoeff()<=max_velocity+1e-3;
+        const bool acceleration_ok=velocity_ok && c.value(t,2).cwiseAbs().maxCoeff()<=max_acceleration+1e-3;
+        valid=acceleration_ok && allowed(c.value(t),v.norm()>.01 ? std::atan2(v.y(),v.x()) : 0.);
+        if(stats && !valid) {
+          if(!velocity_ok)++stats->velocity;
+          else if(!acceleration_ok)++stats->acceleration;
+          else ++stats->footprint;
+        }
       }
       if(valid)return c;
     }
@@ -674,6 +707,23 @@ inline std::vector<Eigen::Vector2d> trimTaskApproach(
   if((join-start).norm()>1e-6) result.push_back(join);
   for(size_t i=segment;i<path.size();++i)
     if((path[i]-result.back()).norm()>1e-6) result.push_back(path[i]);
+  return result.size()>1 ? result : std::vector<Eigen::Vector2d>{};
+}
+
+
+inline std::vector<Eigen::Vector2d> taskRouteWindow(
+    const std::vector<Eigen::Vector2d>& path,const Eigen::Vector2d& start,
+    double attachment_limit,double lookahead) {
+  if(!std::isfinite(lookahead) || lookahead<=0.)return {};
+  auto route=trimTaskApproach(path,start,attachment_limit,.25);
+  if(route.empty())return {};
+  std::vector<Eigen::Vector2d> result{start};double left=lookahead;
+  for(size_t i=1;i<route.size() && left>1e-8;++i) {
+    const auto delta=route[i]-result.back();const double length=delta.norm();
+    if(length<=1e-8)continue;
+    if(length>=left) {result.push_back(result.back()+delta*(left/length));break;}
+    result.push_back(route[i]);left-=length;
+  }
   return result.size()>1 ? result : std::vector<Eigen::Vector2d>{};
 }
 

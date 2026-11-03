@@ -423,6 +423,9 @@ private:
   void scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan);
   int64_t last_laser_stamp_ns_{0}, last_laser_clock_ns_{0};
   int64_t last_ray_cloud_stamp_ns_{0};
+  int64_t last_raycast_sliding_ns_{0};
+  int64_t last_raycast_terrain_ns_{0};
+  int64_t last_raycast_loop_ns_{0};
   void locomotionStateCallback(
       const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr& msg);
   bool locomotionReady() const;

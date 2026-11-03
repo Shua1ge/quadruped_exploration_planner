@@ -214,7 +214,35 @@ namespace scan_planner
     size_t task_route_cursor_{0};
     Eigen::Vector2d task_route_last_position_{Eigen::Vector2d::Zero()};
     bool task_route_position_valid_{false};
+    std::optional<scan_planner_msgs::msg::ExecutionState> predecessor_terminal_;
+    struct TaskPreparationTiming {
+      double target_ms{0.0}, selector_ms{0.0}, clearance_ms{0.0};
+      double visibility_ms{0.0}, visibility_lock_wait_ms{0.0}, raycast_ms{0.0};
+      double seed_sample_ms{0.0};
+      size_t rays{0}, terminal_checks{0}, terminal_cache_hits{0}, dominated{0};
+      size_t visibility_cache_hits{0}, nonprogress_endpoints{0};
+      bool reused{false}, cross_task{false};
+    };
+    // One attempt owns both the motion boundary and its selected task endpoint.
+    // The optional connector is initialization, never an execution certificate.
+    struct PreparedRouteEntry {
+      std::optional<TaskEntryCurve> guide;
+      std::vector<Eigen::Vector2d> approach;
+      Eigen::Vector3d position, velocity, acceleration, target, terminal_velocity;
+      LocalTaskDomain domain;
+      TaskPreparationTiming timing;
+      uint64_t request{0}, map_revision{0};
+      int64_t predecessor{0};
+      double source_time{0.}, join_time{0.};
+    };
+    static std::optional<PreparedRouteEntry>& preparedRouteEntry() {
+      static thread_local std::optional<PreparedRouteEntry> entry;return entry;
+    }
     LocalTaskDomain observationTaskDomain() const;
+    static std::vector<Eigen::Vector2d>& planningRouteConnection() {
+      static thread_local std::vector<Eigen::Vector2d> connection;
+      return connection; // No candidate-domain mutation leaks to safety callbacks.
+    }
     uint32_t task_station_adjustments_{0};
     std::mutex execution_progress_budget_mutex_;
     ExecutionProgressBudget execution_progress_budget_;
@@ -298,6 +326,7 @@ namespace scan_planner
       double body_yaw{0.0};
       uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
       bool use_measured_progress{false};
+      RollingExecutionContract contract;
       std::chrono::steady_clock::time_point accepted_at{};
       Eigen::Vector3d accepted_position{Eigen::Vector3d::Zero()};
       bool valid{false};
@@ -306,8 +335,19 @@ namespace scan_planner
     ExecutionTrajectorySnapshot execution_snapshot_;
     PredictedCollisionInterval predicted_collision_interval_;
     std::atomic<bool> collision_interval_replan_requested_{false};
+    struct HandoffMetric {
+      uint64_t attempt{0},request{0},task{0},version{0},predecessor_request{0};
+      int64_t trajectory{0},predecessor{0};int source_mode{-1},mode{-1};
+      bool cross_task{false};double source_time{0},prefix_duration{0};
+      double prepare_ms{0},seed_ms{0},generation_ms{0},selector_ms{0};
+      std::chrono::steady_clock::time_point started{};
+    };
+    std::atomic<uint64_t> handoff_attempt_serial_{0};
+    void publishHandoffMetric(const HandoffMetric& m,const char* event,
+        const std::string& reason,int ack_status=-1,double ack_ms=-1.,double total_ms=-1.);
     struct PendingTrajectoryHandoff
     {
+      HandoffMetric metric;
       LocalTrajData candidate;
       LocalTrajData previous;
       uint64_t request_id{0};
@@ -321,6 +361,7 @@ namespace scan_planner
       double body_yaw{0.0};
       uint8_t execution_mode{scan_planner_msgs::msg::Bspline::MODE_NORMAL};
       bool use_measured_progress{false};
+      RollingExecutionContract contract;
       // Recovery is a transaction spanning two controller handoffs: the
       // short clearance-escape segment and the trajectory that rejoins the
       // unchanged reference path.  Keep the phase on the pending handoff so
@@ -356,6 +397,11 @@ namespace scan_planner
     Eigen::Vector3d safety_odom_vel_{Eigen::Vector3d::Zero()};
     Eigen::Quaterniond safety_odom_orient_{Eigen::Quaterniond::Identity()};
     double safety_yaw_rate_{0.0};
+    // Same instantaneous body-twist planar speed as Controller's install gate.
+    // A filtered pose estimate alone cannot grant a stopped entry.
+    double safety_install_speed_{std::numeric_limits<double>::infinity()};
+    double safety_install_yaw_rate_{std::numeric_limits<double>::infinity()};
+
     int64_t safety_odom_velocity_stamp_ns_{0};
     bool safety_have_odom_{false};
     struct SafetyPoseSample
@@ -416,6 +462,7 @@ namespace scan_planner
     rclcpp::Publisher<scan_planner_msgs::msg::ExecutionCommand>::SharedPtr execution_command_pub_;
     rclcpp::Publisher<scan_planner_msgs::msg::FailureEvidence>::SharedPtr failure_evidence_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr handoff_metrics_pub_;
 
     /* helper functions */
     bool callReboundReplan(
@@ -430,21 +477,15 @@ namespace scan_planner
         double seed_sample_interval = 0.0,
         const PredictedCollisionInterval *seed_interval = nullptr,
         double seed_base_time = 0.0,
-        bool fixed_body_yaw_repair = true, const UniformBspline* retained_prefix = nullptr, double retained_source_time = 0.0); // front-end and back-end method
+        bool fixed_body_yaw_repair = true, const UniformBspline* retained_prefix = nullptr, double retained_source_time = 0.0, const RollingExecutionContract* retained_contract = nullptr, double entry_selection_ms = 0.0); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromCurrentTraj();
+    bool prefix_profile_change_requested_{false};
     bool keepOrdinaryPredecessor(const LocalTrajData &previous, const char *reason);
     bool activeAlignmentOwnsMotion();
     enum class CandidateOutcome { NOT_READY, FAILED, ENTRY_MISMATCH, SUBMITTED };
     CandidateOutcome candidate_outcome_{CandidateOutcome::NOT_READY};
-    struct TaskPreparationTiming {
-      double target_ms{0.0}, selector_ms{0.0}, clearance_ms{0.0};
-      double visibility_ms{0.0}, visibility_lock_wait_ms{0.0}, raycast_ms{0.0};
-      double seed_sample_ms{0.0};
-      size_t rays{0}, terminal_checks{0}, terminal_cache_hits{0}, dominated{0};
-      size_t visibility_cache_hits{0}, nonprogress_endpoints{0};
-      bool reused{false}, cross_task{false};
-    } task_preparation_timing_;
+    TaskPreparationTiming task_preparation_timing_;
     double planning_entry_yaw_{std::numeric_limits<double>::quiet_NaN()};
     double last_rolling_prepare_wall_s_{0.25};
     bool tryStructuredLocalRepair();

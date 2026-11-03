@@ -568,7 +568,7 @@ def _angle(a, b):
 
 def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
                       depth=3, beam_width=8, retained_prefix=(), retained_demands=(),
-                      retained_stations=(), cost_model=None, resolution=1.):
+                      retained_stations=(), cost_model=None, resolution=1., committed_order=False):
     """Short joint Frontier/station visit, then a two-Region exit preview.
 
     The current Region owns all executable choices. Future legs are estimates;
@@ -707,7 +707,7 @@ def choose_joint_visit(current, lookahead, routes, *, body_yaw=None,
     incumbents = [item for item in ranked if item[2]]
     if incumbents:
         incumbent = max(incumbents, key=lambda item:item[0])
-        if best[0][0] <= incumbent[0][0]*model.reorder_ratio:
+        if committed_order or best[0][0] <= incumbent[0][0]*model.reorder_ratio:
             best = incumbent
     result = best[1]
     result.reordered = bool(retained) and not best[2]

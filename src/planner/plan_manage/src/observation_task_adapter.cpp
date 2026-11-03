@@ -289,6 +289,25 @@ void SCANReplanFSM::observationTaskCallback(
 
 bool SCANReplanFSM::processObservationTaskTransitions() {
   if (!task_mode_) return false;
+  std::optional<scan_planner_msgs::msg::ExecutionState> stopped_predecessor;
+  {std::lock_guard<std::mutex> lock(task_event_mutex_);stopped_predecessor=predecessor_terminal_;}
+  if(stopped_predecessor) {
+    bool pending=false;{std::lock_guard<std::mutex> lock(pending_handoff_mutex_);pending=pending_handoff_.valid;}
+    if(!pending) {
+      bool exact=false;{std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+        exact=execution_snapshot_.valid && execution_snapshot_.request_id==stopped_predecessor->request_id &&
+          execution_snapshot_.trajectory_id==stopped_predecessor->trajectory_id &&
+          execution_snapshot_.task_id==stopped_predecessor->task_id &&
+          execution_snapshot_.task_version==stopped_predecessor->task_version;}
+      {std::lock_guard<std::mutex> lock(task_event_mutex_);predecessor_terminal_.reset();}
+      if(exact && rolling_task_handoff_.load() && requestTaskRestartFromRest("PREDECESSOR_EXECUTION_TERMINAL")) {
+        RCLCPP_WARN(node_->get_logger(),"[PREDECESSOR_TERMINAL_CONSUMED] request=%llu trajectory=%lld reason=%s; successor station/budget unchanged",
+          static_cast<unsigned long long>(stopped_predecessor->request_id),
+          static_cast<long long>(stopped_predecessor->trajectory_id),stopped_predecessor->reason.c_str());
+        return true;
+      }
+    }
+  }
   if(task_forward_stage_failed_.exchange(false)) {
     task_turn_stage_active_=false;task_turn_stage_trajectory_id_=0;
     task_turn_stage_rest_gate_={};task_goal_available_=false;
@@ -346,6 +365,16 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
         "[TASK_HANDOFF_WAIT_ALIGNMENT] queued_request=%llu; acknowledged turn retains ownership",
         static_cast<unsigned long long>(deferred_task_->request_id));
     return false;
+  }
+  if(deferred_task_ && deferred_task_->predecessor_task_id) {
+    std::lock_guard<std::mutex> lock(execution_snapshot_mutex_);
+    if(execution_snapshot_.valid && execution_snapshot_.task_id==deferred_task_->predecessor_task_id &&
+        execution_snapshot_.task_version==deferred_task_->predecessor_task_version &&
+        execution_snapshot_.feedback_received==std::chrono::steady_clock::time_point{}) {
+      RCLCPP_INFO_THROTTLE(node_->get_logger(),*node_->get_clock(),1000,
+          "[TASK_HANDOFF_WAIT_EXECUTION_FEEDBACK] ACK is not measured execution progress");
+      return true; // Existing handoff deadline bounds missing feedback; safety remains live.
+    }
   }
   if (deferred_task_ && !task_turn_stage_active_.load()) {
     // Do not consume the finite candidate budget before the first accepted
@@ -448,7 +477,8 @@ bool SCANReplanFSM::processObservationTaskTransitions() {
       if (pending_handoff_.valid) return false; }
     double speed, rate; int64_t pose_stamp;
     { std::lock_guard<std::mutex> lock(safety_odom_mutex_);
-      speed=safety_odom_vel_.head<2>().norm(); rate=safety_yaw_rate_;
+      speed=std::max(safety_odom_vel_.head<2>().norm(),safety_install_speed_);
+      rate=std::max(std::abs(safety_yaw_rate_),std::abs(safety_install_yaw_rate_));
       pose_stamp=safety_odom_velocity_stamp_ns_; }
     const int64_t hold_stamp=task_transition_hold_stamp_.load();
     const bool fresh=pose_stamp>0 && now>=pose_stamp && now-pose_stamp<=250000000LL;
@@ -830,6 +860,65 @@ bool SCANReplanFSM::selectObservationTaskTarget(bool report_failure, bool prefer
   };
   // Same-request geometry reuse uses the SAME edge/turn/visibility/terminal
   // predicates as search. Only the source of candidate geometry changes.
+  const double original_route_margin=search_margin;
+  search_margin=planning_clearance_margin_;
+  // Normal motion follows the supplied route. Observation relocation remains
+  // a bounded fallback when this measured-space route window cannot certify.
+  if(autonomy && (!retain_goal || !task_station_target_) && !task_turn_stage_active_ &&
+      !structured_local_repair_active_.load() && !stopped_local_repair_active_.load() &&
+      !safety_stop_active_.load()) {
+    auto route=taskRouteWindow(domain.route,start_pt_.head<2>(),
+        planningRouteConnection().empty() ? std::max(.25,domain.corridor_radius) : 2.,
+        std::max(1.,reference_path_lookahead_));
+    if(preparedRouteEntry())route=preparedRouteEntry()->approach;
+    bool safe=route.size()>1;size_t samples=0;
+    auto checked_route=route;
+    if(preparedRouteEntry() && preparedRouteEntry()->guide) {
+      const auto& entry=*preparedRouteEntry()->guide;checked_route.clear();
+      for(int i=0;i<=24;++i)checked_route.push_back(entry.value(entry.duration*i/24.));
+      double arc=0.;for(size_t i=1;i<route.size();++i) {
+        arc+=(route[i]-route[i-1]).norm();if(arc>entry.join_distance+1e-6)checked_route.push_back(route[i]);
+      }
+    }
+    for(size_t i=1;i<checked_route.size() && safe;++i) {
+      const auto delta=checked_route[i]-checked_route[i-1];const double yaw=std::atan2(delta.y(),delta.x());
+      const int count=std::max(1,int(std::ceil(delta.norm()/.05)));
+      samples+=count;if(samples>256){safe=false;break;}
+      for(int j=0;j<=count && safe;++j) {
+        const auto p=checked_route[i-1]+delta*(double(j)/count);
+        safe=taskDomainContains(domain,p) && !footprintOccupiedWithMargin(map,
+            {p.x(),p.y(),start_pt_.z()},yaw,planning_clearance_margin_);
+      }
+    }
+    if(safe) {
+      const auto end=route.back();const auto delta=end-route[route.size()-2];
+      const double yaw=std::atan2(delta.y(),delta.x());
+      const bool at_end=(end-domain.route.back()).norm()<.05;
+      const bool station=at_end && taskNeedsDwell(domain,end,visible(end));
+      const double speed=station ? 0. : taskTransitTerminalSpeed(end,yaw,planner_manager_->pp_.max_vel_,
+          min_forward_command_,command_stop_latency_+predictive_replan_reaction_time_,guaranteed_braking_deceleration_,
+          [&](const Eigen::Vector2d& p,double heading){return taskDomainContains(domain,p) &&
+            !footprintOccupiedWithMargin(map,{p.x(),p.y(),start_pt_.z()},heading,planning_clearance_margin_);});
+      if((!at_end && speed>0.) || (at_end && goal_allowed(end) && terminal_safe(end,yaw,station))) {
+        task_approach_.clear();for(const auto& p:route)task_approach_.push_back({p.x(),p.y(),start_pt_.z()});
+        task_station_=task_approach_.back();local_target_pt_=task_station_;
+        task_station_target_=station;task_station_arrival_yaw_=yaw;local_target_vel_.setZero();
+        if(speed>0.)local_target_vel_.head<2>()=delta.normalized()*speed;
+        task_transit_speed_limited_=speed>0. && speed+1e-6<planner_manager_->pp_.max_vel_;
+        task_approach_margin_=planning_clearance_margin_;
+        task_goal_available_=true;task_departure_plan_=TaskDeparturePlan{TaskDepartureKind::DIRECT,end,end,entry_yaw};
+        const auto x=static_cast<uint32_t>(static_cast<int64_t>(std::floor(end.x()/.2)));
+        const auto y=static_cast<uint32_t>(static_cast<int64_t>(std::floor(end.y()/.2)));
+        task_candidate_id_.store((uint64_t(x)<<32)|y);
+        task_preparation_timing_.reused=true;
+        task_preparation_timing_.cross_task=rolling_predecessor_id_.load()!=0;
+        RCLCPP_INFO(node_->get_logger(),"[TASK_ROUTE_WINDOW] request=%llu points=%zu bridge=%d; full trajectory certification and ACK required",
+            static_cast<unsigned long long>(active_reference_request_id_.load()),route.size(),!planningRouteConnection().empty());
+        return true;
+      }
+    }
+  }
+  search_margin=original_route_margin;
   const auto reuse_began=std::chrono::steady_clock::now();
   const bool have_approach=task_goal_available_ && task_approach_.size()>1;
   const bool cross_task=rolling_task_handoff_.load();
@@ -1242,6 +1331,7 @@ LocalTaskDomain SCANReplanFSM::observationTaskDomain() const {
   LocalTaskDomain domain;
   if (!observation_task_) return domain;
   for(const auto& point:observation_task_->coarse_route) domain.route.push_back({point.x,point.y});
+  domain.connection=planningRouteConnection();
   domain.observation_center={observation_task_->goal.x,observation_task_->goal.y};
   domain.corridor_radius=observation_task_->corridor_radius;
   domain.observation_radius=observation_task_->observation_radius;

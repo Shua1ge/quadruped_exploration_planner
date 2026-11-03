@@ -5,6 +5,7 @@ thread CPU; the transaction total additionally records run-queue wait from
 /proc/self/task/<tid>/schedstat (two reads per transaction).
 """
 import csv
+import functools
 import threading
 import time
 
@@ -43,6 +44,7 @@ class WorkMetrics:
         self._seq += 1
         tx = {
             "id": self._seq,
+            "prev": getattr(self._local, "tx", None),
             "work_class": work_class,
             "tid": threading.get_native_id(),
             "t0": time.monotonic_ns(),
@@ -67,7 +69,7 @@ class WorkMetrics:
         self._row(tx["work_class"], tx["t0"], "total", tx, wall_ms, cpu_ms, runnable,
                   tx["count"], tx["input_size"], result)
         if getattr(self._local, "tx", None) is tx:
-            self._local.tx = None
+            self._local.tx = tx.get("prev")
 
     def mark(self):
         if not self.enabled:
@@ -105,3 +107,19 @@ class WorkMetrics:
             self._fh.flush()
             self._fh.close()
             self._fh = None
+
+
+def timed(work_class):
+    """Decorator: wrap a method in a WorkMetrics transaction (nested-safe)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            wm = getattr(self, "work_metrics", None)
+            tx = wm.begin_transaction(work_class) if wm is not None else None
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                if wm is not None:
+                    wm.end_transaction(tx)
+        return wrapper
+    return deco

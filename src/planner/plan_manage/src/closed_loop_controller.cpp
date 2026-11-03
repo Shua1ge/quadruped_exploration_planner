@@ -323,6 +323,7 @@ private:
         msg->max_tracking_correction > 0.0
             ? msg->max_tracking_correction
             : std::max(candidate_max_vx, candidate_max_vy);
+    const auto candidate_contract=RollingExecutionContract::from(*msg).resolved(max_vx_,max_vy_,max_vyaw_);
     Eigen::MatrixXd points(3, msg->pos_pts.size());
     for (size_t i = 0; i < msg->pos_pts.size(); ++i)
       points.col(i) << msg->pos_pts[i].x, msg->pos_pts[i].y, msg->pos_pts[i].z;
@@ -491,11 +492,17 @@ private:
         // exception needs an exact, live predecessor and a C2-identical prefix;
         // arbitrary rolling candidates retain the measured-velocity gate.
         const double source=msg->retained_predecessor_time;
+        if(const char* mismatch=rollingContractMismatch(active_contract_,candidate_contract)) {
+          RCLCPP_WARN(get_logger(),"[HANDOFF_CONTRACT_REJECTED] predecessor=%lld candidate=%lld source_mode=%u candidate_mode=%u cause=%s",
+              static_cast<long long>(traj_id_),static_cast<long long>(msg->traj_id),
+              active_contract_.mode,candidate_contract.mode,mismatch);
+          publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+              "HANDOFF_EXECUTION_CONTRACT_CHANGED",matched_time,matched_error,matched_yaw_error);return;
+        }
         bool same=receive_traj_ && traj_.size()==3 && !soft_hold_ &&
             !simulation_collision_latched_ && !motion_stalled_ && !terminal_capture_latched_ &&
             !handoff_alignment_pending_ && !handoff_alignment_deviated_ && !uncertified_turn_latched_ &&
-            active_execution_mode_==scan_planner_msgs::msg::Bspline::MODE_NORMAL &&
-            msg->execution_mode==scan_planner_msgs::msg::Bspline::MODE_NORMAL &&
+            active_execution_mode_==msg->execution_mode &&
             !candidate_fixed_yaw && active_measured_progress_ && msg->use_measured_progress &&
             active_request_id_==msg->retained_predecessor_request_id &&
             traj_id_==msg->retained_predecessor_trajectory_id &&
@@ -521,6 +528,23 @@ private:
           publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
               "HANDOFF_COMMON_PREFIX_PROOF_CHANGED",matched_time,matched_error,matched_yaw_error);
           return;
+        }
+        const auto entry_command=[&](const std::vector<UniformBspline>& curve,double duration,double t,
+            const RollingExecutionContract& contract) {
+          const double look=forwardGaitLookaheadTime(t,duration,
+              [&](double sample){return curve[0].evaluateDeBoorT(sample);});
+          return ordinaryTrackingCommand(curve[0].evaluateDeBoorT(look).head<2>(),
+              curve[1].evaluateDeBoorT(look).head<2>(),odom_pos_.head<2>(),odom_yaw_,
+              candidateDesiredYaw(curve,duration,t,false,0.,true),contract,kp_pos_,kp_yaw_,
+              (curve[0].evaluateDeBoorT(duration)-odom_pos_).head<2>().norm());
+        };
+        const auto old_command=entry_command(traj_,traj_duration_,exec_time_,active_contract_);
+        const auto new_command=entry_command(candidate,candidate_duration,matched_time,candidate_contract);
+        if(std::hypot(old_command.vx-new_command.vx,old_command.vy-new_command.vy)>
+               handoff_max_deceleration_*handoff_reaction_time_ ||
+           std::abs(old_command.wz-new_command.wz)>kp_yaw_*kHandoffAlignmentTolerance+1e-9) {
+          publishTrajectoryAck(*msg,scan_planner_msgs::msg::TrajectoryAck::STATUS_REJECTED,
+              "HANDOFF_PREFIX_COMMAND_CHANGED",matched_time,matched_error,matched_yaw_error);return;
         }
         inherits_running_prefix=true;
         RCLCPP_INFO(get_logger(),"[HANDOFF_COMMON_PREFIX_VERIFIED] predecessor=%lld successor=%lld matched=%.3f verified_span=%.3f; command continuity verified, existing measured tracking residual retained",
@@ -610,6 +634,7 @@ private:
     forward_stage_installed_at_=now();forward_stage_progress_.reset();
     forward_stage_stop_latency_=msg->forward_stage_stop_latency;
     forward_stage_deceleration_=msg->forward_stage_deceleration;
+    active_contract_=candidate_contract;
     active_max_vx_ = candidate_max_vx;
     active_min_forward_command_ = msg->min_forward_command;
     active_measured_progress_ = msg->use_measured_progress;
@@ -1244,6 +1269,13 @@ private:
     pos_des = traj_[0].evaluateDeBoorT(tracking_time);
     const Eigen::Vector3d vel_des = traj_[1].evaluateDeBoorT(tracking_time);
     const Eigen::Vector2d pos_error(pos_des.x() - odom_pos_.x(), pos_des.y() - odom_pos_.y());
+    geometry_msgs::msg::Twist command;
+    if(active_contract_.ordinary()) {
+      const auto tracked=ordinaryTrackingCommand(pos_des.head<2>(),vel_des.head<2>(),
+          odom_pos_.head<2>(),odom_yaw_,desired_yaw,active_contract_,kp_pos_,kp_yaw_,
+          (traj_[0].evaluateDeBoorT(traj_duration_)-odom_pos_).head<2>().norm());
+      command.linear.x=tracked.vx;command.linear.y=tracked.vy;command.angular.z=tracked.wz;
+    } else {
     const Eigen::Vector2d tracking_correction = clampNorm(
         kp_pos_ * pos_error, active_max_tracking_correction_);
     const Eigen::Vector2d vel_world = clampNorm(
@@ -1251,7 +1283,6 @@ private:
         std::max(active_max_vx_, active_max_vy_));
     const double c = std::cos(odom_yaw_);
     const double s = std::sin(odom_yaw_);
-    geometry_msgs::msg::Twist command;
     command.linear.x = std::clamp(
         c * vel_world.x() + s * vel_world.y(),
         -active_max_vx_, active_max_vx_);
@@ -1351,6 +1382,7 @@ private:
           remaining,terminal_deceleration_,terminal_latency_);
       const double speed=std::hypot(command.linear.x,command.linear.y);
       if(speed>bound && speed>0.) {command.linear.x*=bound/speed;command.linear.y*=bound/speed;}
+    }
     }
     const double terminal_error = pos_error.norm();
     const bool lateral_recovery=active_execution_mode_==scan_planner_msgs::msg::Bspline::MODE_RECOVERY_PRIMITIVE &&
@@ -1492,6 +1524,7 @@ private:
   uint8_t active_execution_mode_{
       scan_planner_msgs::msg::Bspline::MODE_NORMAL};
   double active_max_vx_{0.0};
+  RollingExecutionContract active_contract_;
   double active_min_forward_command_{0.0};
   bool active_measured_progress_{false};
   double active_min_forward_effective_speed_{0.0};
